@@ -49,6 +49,9 @@ extern "C" {
     /// Returns a CUDA error code (0 = success). Sets the default mem pool's release
     /// threshold to never-release so warm proves reuse allocations.
     pub fn cuda_mem_pool_init() -> i32;
+    /// Chunked atomicMin nonce search; returns the LOWEST valid nonce, matching the
+    /// SIMD grind's search order byte-exactly (non-M31 Blake2s channel only).
+    pub fn grind_blake2s(host_prefixed_digest: *const u32, pow_bits: u32) -> u64;
     pub fn copy_uint32_t_vec_from_device_to_host(
         device_ptr: *const u32,
         host_ptr: *const u32,

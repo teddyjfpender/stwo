@@ -12,8 +12,36 @@ impl Backend for CudaBackend {}
 
 // Byte-equality: grinding must reproduce the reference nonce, so it delegates to the
 // SIMD backend on both channel variants.
-impl<const IS_M31_OUTPUT: bool> GrindOps<Blake2sChannelGeneric<IS_M31_OUTPUT>> for CudaBackend {
-    fn grind(channel: &Blake2sChannelGeneric<IS_M31_OUTPUT>, pow_bits: u32) -> u64 {
+impl GrindOps<Blake2sChannelGeneric<false>> for CudaBackend {
+    /// GPU grind: chunked `atomicMin` search returning the LOWEST valid nonce, which
+    /// matches the SIMD search order byte-exactly (same `H(POW_PREFIX, [0;12], digest,
+    /// pow_bits)` preimage, same trailing-zero check on the first output word).
+    fn grind(channel: &Blake2sChannelGeneric<false>, pow_bits: u32) -> u64 {
+        use stwo::core::vcs::blake2_hash::Blake2sHasherGeneric;
+        assert!(pow_bits <= 32, "pow_bits > 32 is not supported");
+        let digest = channel.digest();
+
+        let mut hasher = Blake2sHasherGeneric::<false>::default();
+        hasher.update(&Blake2sChannelGeneric::<false>::POW_PREFIX.to_le_bytes());
+        hasher.update(&[0_u8; 12]);
+        hasher.update(&digest.0[..]);
+        hasher.update(&pow_bits.to_le_bytes());
+        let prefixed_digest = hasher.finalize();
+        let prefixed_words: Vec<u32> = prefixed_digest
+            .0
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        crate::columns::bindings::ensure_mem_pool_init();
+        unsafe { stwo_backend_cuda_kernels::raw::grind_blake2s(prefixed_words.as_ptr(), pow_bits) }
+    }
+}
+
+impl GrindOps<Blake2sChannelGeneric<true>> for CudaBackend {
+    /// The M31-output channel's PoW hash differs at finalize; the GPU kernel implements
+    /// the non-M31 variant only, so this delegates (NitrooZK does the same).
+    fn grind(channel: &Blake2sChannelGeneric<true>, pow_bits: u32) -> u64 {
         SimdBackend::grind(channel, pow_bits)
     }
 }

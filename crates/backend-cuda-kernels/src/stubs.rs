@@ -653,3 +653,8 @@ pub unsafe extern "C" fn test_offset_bit_reversed_indices(
 pub unsafe extern "C" fn cuda_mem_pool_init() -> i32 {
     no_cuda_symbol("cuda_mem_pool_init")
 }
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn grind_blake2s(_host_prefixed_digest: *const u32, _pow_bits: u32) -> u64 {
+    no_cuda_symbol("grind_blake2s")
+}
