@@ -410,6 +410,12 @@ pub fn assert_accumulation_conformance<B: Backend>() {
 
 /// Quotient accumulation and combination must agree with the reference backend.
 pub fn assert_quotient_ops_conformance<B: Backend>() {
+    assert_quotient_ops_conformance_at::<B>(8);
+}
+
+/// Size-parameterized variant: kernel bugs can be size-dependent (grid/index math), so
+/// backends should also be spot-checked at production sizes (e.g. log 19-20).
+pub fn assert_quotient_ops_conformance_at<B: Backend>(log_size: u32) {
     use stwo::core::pcs::quotients::{
         build_samples_with_randomness_and_periodicity, ColumnSampleBatch, PointSample,
     };
@@ -417,7 +423,8 @@ pub fn assert_quotient_ops_conformance<B: Backend>() {
     use stwo::prover::pcs::quotient_ops::AccumulatedNumerators;
     use stwo::prover::QuotientOps;
 
-    const LOG_SIZE: u32 = 8;
+    #[allow(non_snake_case)]
+    let LOG_SIZE: u32 = log_size;
     const LOG_BLOWUP_FACTOR: u32 = 2;
     const N_COLS: usize = 7;
 
@@ -534,8 +541,8 @@ const N_REFERENCE_COLUMNS: usize = 16;
 const REFERENCE_LOG_N_ROWS: u32 = 6;
 
 #[derive(Clone)]
-struct ReferenceEval {
-    log_n_rows: u32,
+pub struct ReferenceEval {
+    pub log_n_rows: u32,
 }
 
 impl FrameworkEval for ReferenceEval {
@@ -561,7 +568,7 @@ impl FrameworkEval for ReferenceEval {
 /// Generates the reference trace on the SIMD backend — the canonical witness-generation
 /// backend — so that the end-to-end check exercises the [`FromSimdColumns`] transfer seam
 /// exactly the way downstream provers do.
-fn generate_reference_trace(
+pub fn generate_reference_trace(
     log_n_rows: u32,
 ) -> Vec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>> {
     let n_rows = 1usize << log_n_rows;
@@ -590,16 +597,17 @@ fn generate_reference_trace(
         .collect()
 }
 
-fn prove_reference<B, MC>(
+pub fn prove_reference<B, MC>(
     trace: Vec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>,
 ) -> String
 where
     B: BackendForChannel<MC> + FrameworkBackend + FromSimdColumns,
     MC: MerkleChannel,
 {
+    let log_n_rows = trace[0].domain.log_size();
     let config = PcsConfig::default();
     let twiddles = B::precompute_twiddles(
-        CanonicCoset::new(REFERENCE_LOG_N_ROWS + 1 + config.fri_config.log_blowup_factor)
+        CanonicCoset::new(log_n_rows + 1 + config.fri_config.log_blowup_factor)
             .circle_domain()
             .half_coset,
     );
@@ -620,9 +628,7 @@ where
 
     let component = FrameworkComponent::new(
         &mut TraceLocationAllocator::default(),
-        ReferenceEval {
-            log_n_rows: REFERENCE_LOG_N_ROWS,
-        },
+        ReferenceEval { log_n_rows },
         SecureField::zero(),
     );
 
@@ -657,6 +663,15 @@ where
     let trace = generate_reference_trace(REFERENCE_LOG_N_ROWS);
 
     let proof_b = prove_reference::<B, MC>(trace.clone());
+    // Prove the same statement a second time in the same process: any global cache
+    // keyed by a reusable identity (raw pointers, FFI buffer addresses) poisons the
+    // second prove with the first prove's data. This caught a twiddle-cache aliasing
+    // bug that produced valid first proofs and corrupt second proofs.
+    let proof_b_again = prove_reference::<B, MC>(trace.clone());
+    assert_eq!(
+        proof_b, proof_b_again,
+        "backend proof is not stable across repeated proves in one process"
+    );
     let proof_reference = prove_reference::<CpuBackend, MC>(trace);
 
     assert_eq!(

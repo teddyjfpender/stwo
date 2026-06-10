@@ -1,3 +1,5 @@
+use std::sync::OnceLock;
+
 use num_traits::One;
 use stwo::core::fields::qm31::SecureField;
 use stwo_backend_metal_sys::metal::U32Buffer;
@@ -8,6 +10,10 @@ use super::BaseFieldVec;
 pub struct SecureFieldVec {
     pub(crate) buffer: U32Buffer,
     size: usize,
+    /// Lazily materialized host copy. Populated on the first bulk read and reused by
+    /// every subsequent read; MUST be invalidated (`take()`) by every `&mut self`
+    /// mutation. Constructors start empty.
+    host_cache: OnceLock<Vec<SecureField>>,
 }
 
 unsafe impl Send for SecureFieldVec {}
@@ -16,7 +22,11 @@ unsafe impl Sync for SecureFieldVec {}
 impl SecureFieldVec {
     pub(crate) fn from_buffer(buffer: U32Buffer) -> Self {
         let size = buffer.len() / 4;
-        Self { buffer, size }
+        Self {
+            buffer,
+            size,
+            host_cache: OnceLock::new(),
+        }
     }
 
     #[allow(dead_code)]
@@ -56,7 +66,11 @@ impl SecureFieldVec {
         let size = raw.len() / 4;
         let buffer =
             U32Buffer::from_slice(&raw).expect("Metal SecureFieldVec upload should initialize");
-        Self { buffer, size }
+        Self {
+            buffer,
+            size,
+            host_cache: OnceLock::new(),
+        }
     }
 
     pub fn from_base_coords(columns: [&BaseFieldVec; 4]) -> Self {
@@ -68,19 +82,31 @@ impl SecureFieldVec {
             &columns[3].buffer,
         ])
         .expect("Metal secure-field packing should succeed");
-        Self { buffer, size }
+        Self {
+            buffer,
+            size,
+            host_cache: OnceLock::new(),
+        }
     }
 
     pub fn new_uninitialized(size: usize) -> Self {
         let buffer = U32Buffer::uninitialized(size * 4)
             .expect("Metal SecureFieldVec allocation should initialize");
-        Self { buffer, size }
+        Self {
+            buffer,
+            size,
+            host_cache: OnceLock::new(),
+        }
     }
 
     pub fn new_zeroes(size: usize) -> Self {
         let buffer = U32Buffer::zeroed(size * 4)
             .expect("Metal SecureFieldVec zero allocation should initialize");
-        Self { buffer, size }
+        Self {
+            buffer,
+            size,
+            host_cache: OnceLock::new(),
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -97,6 +123,9 @@ impl SecureFieldVec {
             "secure-field index {index} out of bounds for len {}",
             self.size
         );
+        if let Some(values) = self.host_cache.get() {
+            return values[index];
+        }
         let base = index * 4;
         SecureField::from_u32_unchecked(
             self.buffer.get(base),
@@ -106,7 +135,27 @@ impl SecureFieldVec {
         )
     }
 
+    /// A host view of the whole column. One bulk readback on first use; cached after.
+    pub fn host_values(&self) -> &[SecureField] {
+        self.host_cache.get_or_init(|| {
+            // Same contract as `BaseFieldVec::host_slice`: fence the queue before a
+            // host read, in case an async producer's handle was dropped.
+            stwo_backend_metal_sys::metal::queue_drain()
+                .expect("Metal queue drain before host read should succeed");
+            let raw = self
+                .buffer
+                .to_vec()
+                .expect("Metal SecureFieldVec readback should succeed");
+            raw.chunks_exact(4)
+                .map(|limbs| {
+                    SecureField::from_u32_unchecked(limbs[0], limbs[1], limbs[2], limbs[3])
+                })
+                .collect()
+        })
+    }
+
     pub fn set_data(&mut self, index: usize, value: SecureField) {
+        let _ = self.host_cache.take();
         assert!(
             index < self.size,
             "secure-field index {index} out of bounds for len {}",
@@ -119,6 +168,7 @@ impl SecureFieldVec {
     }
 
     pub fn copy_from(&mut self, other: &Self) {
+        let _ = self.host_cache.take();
         assert!(
             self.size >= other.size,
             "destination secure-field len {} is smaller than source len {}",
@@ -131,13 +181,7 @@ impl SecureFieldVec {
     }
 
     pub fn to_vec(&self) -> Vec<SecureField> {
-        let raw = self
-            .buffer
-            .to_vec()
-            .expect("Metal SecureFieldVec readback should succeed");
-        raw.chunks_exact(4)
-            .map(|limbs| SecureField::from_u32_unchecked(limbs[0], limbs[1], limbs[2], limbs[3]))
-            .collect()
+        self.host_values().to_vec()
     }
 
     pub fn to_base_coords(&self) -> [BaseFieldVec; 4] {
@@ -154,6 +198,7 @@ impl SecureFieldVec {
     }
 
     pub fn bit_reverse(&mut self) {
+        let _ = self.host_cache.take();
         self.buffer
             .bit_reverse_u32x4(self.size)
             .expect("Metal SecureFieldVec bit reverse should succeed");
@@ -172,6 +217,7 @@ impl SecureFieldVec {
             .fri_fold_circle_into_line_first_layer_u32x4(&factors, alpha_limbs)
             .expect("Metal FRI first-layer fold should succeed");
         Self {
+            host_cache: OnceLock::new(),
             buffer,
             size: self.size / 2,
         }
@@ -188,6 +234,7 @@ impl SecureFieldVec {
             .fri_fold_circle_into_line_first_layer_u32x4(inverse_y_factors, alpha_limbs)
             .expect("Metal FRI first-layer fold should succeed");
         Self {
+            host_cache: OnceLock::new(),
             buffer,
             size: self.size / 2,
         }
@@ -295,6 +342,7 @@ impl SecureFieldVec {
             .fri_fold_line_step_u32x4(inverse_x_factors, alpha_limbs)
             .expect("Metal FRI line-fold step should succeed");
         Self {
+            host_cache: OnceLock::new(),
             buffer,
             size: self.size / 2,
         }
@@ -468,10 +516,12 @@ impl SecureFieldVec {
             .expect("Metal SecureFieldVec split_at_mid right half GPU copy should succeed");
         (
             Self {
+                host_cache: OnceLock::new(),
                 buffer: left_buffer,
                 size: mid,
             },
             Self {
+                host_cache: OnceLock::new(),
                 buffer: right_buffer,
                 size: mid,
             },
@@ -484,6 +534,7 @@ impl Clone for SecureFieldVec {
         Self {
             buffer: self.buffer.clone(),
             size: self.size,
+            host_cache: OnceLock::new(),
         }
     }
 }

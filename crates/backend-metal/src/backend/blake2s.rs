@@ -23,12 +23,8 @@ use crate::columns::blake2s_hash_vec::Blake2sHashVec as MetalBlake2sHashVec;
 const HOST_BLAKE2S_LEAF_CHUNK_COLUMNS: usize = 16;
 
 fn materialize_leaf_columns<'a>(columns: &'a [&'a MetalBaseFieldVec]) -> Vec<&'a [BaseField]> {
-    // The columns may still be in flight: `evaluate_polynomials` submits its
-    // RFFTs asynchronously and drops the completion handles, relying on
-    // same-queue ordering to serialize *GPU* consumers. This is a *host*
-    // consumer, so fence the queue before reading the buffers.
-    stwo_backend_metal_sys::metal::queue_drain()
-        .expect("Metal queue drain before host-side leaf hashing should succeed");
+    // `host_slice` fences the GPU queue internally, so reading possibly-in-flight
+    // columns (async RFFTs with dropped handles) is safe here.
     columns.iter().map(|column| column.host_slice()).collect()
 }
 

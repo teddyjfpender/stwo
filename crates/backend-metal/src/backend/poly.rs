@@ -86,11 +86,32 @@ fn batch_eval_coeff_cache() -> &'static BatchEvalCoeffCache {
     CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
-type TwiddleTailCache = Mutex<BTreeMap<(usize, usize), Arc<U32Buffer>>>;
+type TwiddleTailCache = Mutex<BTreeMap<(u64, usize), Arc<U32Buffer>>>;
 
 fn twiddle_tail_cache() -> &'static TwiddleTailCache {
     static CACHE: OnceLock<TwiddleTailCache> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// Content fingerprint of a twiddle vector, used as a cache key.
+///
+/// NEVER key this cache by the vector's address: allocations are reused, and a fresh
+/// tree's *forward* twiddles can land on a freed tree's *inverse* twiddle allocation —
+/// which silently fed inverse twiddles to the RFFT on every prove after the first.
+/// Twiddles are structured, domain-determined data (not attacker-chosen), so a sampled
+/// fingerprint over 64 evenly spaced elements plus the ends identifies them; a false
+/// hit would require two different twiddle vectors agreeing on every sampled position.
+fn twiddle_content_fingerprint(twiddles: &[BaseField]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    twiddles.len().hash(&mut hasher);
+    let step = (twiddles.len() / 64).max(1);
+    for value in twiddles.iter().step_by(step) {
+        value.0.hash(&mut hasher);
+    }
+    twiddles.first().map(|v| v.0).hash(&mut hasher);
+    twiddles.last().map(|v| v.0).hash(&mut hasher);
+    hasher.finish()
 }
 
 fn coeff_buffer_key(poly: &CircleCoefficients<MetalBackend>) -> usize {
@@ -233,8 +254,7 @@ fn tail_twiddle_buffer(
         twiddles.len()
     );
 
-    let twiddle_data_ptr = twiddles.as_ptr() as usize;
-    let key = (twiddle_data_ptr, values_len);
+    let key = (twiddle_content_fingerprint(twiddles), values_len);
 
     if let Some(cached) = twiddle_tail_cache()
         .lock()
@@ -387,9 +407,18 @@ impl PolyOps for MetalBackend {
         evals: &CircleEvaluation<Self, BaseField, BitReversedOrder>,
         weights: &Col<Self, SecureField>,
     ) -> SecureField {
-        (0..evals.domain.size()).fold(SecureField::zero(), |acc, i| {
-            acc + (evals.values.at(i) * weights.at(i))
-        })
+        // Materialize both columns once: per-element `at()` crosses the FFI per value
+        // (4x per secure felt), which dominates the whole prove at e2e sizes. The
+        // weights column is shared across all same-size columns, so its host view is
+        // cached across calls.
+        let values = evals.values.host_slice();
+        let weights = weights.host_values();
+        values
+            .iter()
+            .zip(weights.iter())
+            .fold(SecureField::zero(), |acc, (&value, &weight)| {
+                acc + weight * value
+            })
     }
 
     fn eval_at_point_by_folding(
@@ -579,11 +608,10 @@ impl PolyOps for MetalBackend {
         // eliminates ~600 CPU-GPU synchronization points, allowing the
         // GPU to transition directly from RFFT to Merkle without a gap.
         //
-        // CONTRACT: this ordering argument only covers GPU consumers. Any
-        // HOST-side read of these evaluation buffers before a later command
-        // buffer has been waited on must first fence the queue with
-        // `stwo_backend_metal_sys::metal::queue_drain()` (the M31-output
-        // Merkle leaf builder does this in `materialize_leaf_columns`).
+        // CONTRACT: this ordering argument only covers GPU consumers. Host
+        // reads are made safe at the accessor level: `BaseFieldVec::host_slice`,
+        // `SecureFieldVec::host_values`, and `Blake2sHashVec::to_vec` fence the
+        // queue (`queue_drain()`) before exposing bytes to the host.
         //
         // Coefficient buffers are promoted non-blocking (GPU blit goes
         // to the same queue, ordered after the RFFT).

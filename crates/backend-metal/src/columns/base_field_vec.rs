@@ -28,6 +28,13 @@ impl BaseFieldVec {
             return values;
         }
 
+        // The buffer may still be written by an in-flight async GPU submission whose
+        // completion handle was dropped (`evaluate_polynomials` relies on queue order,
+        // which covers GPU consumers only). Fence before any host view; this is the
+        // single choke point that makes every host read of GPU data safe.
+        stwo_backend_metal_sys::metal::queue_drain()
+            .expect("Metal queue drain before host read should succeed");
+
         let raw = unsafe { self.buffer.host_ptr() };
         if !raw.is_null() {
             return unsafe { std::slice::from_raw_parts(raw.cast::<BaseField>(), self.size) };

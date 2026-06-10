@@ -85,6 +85,10 @@ impl Blake2sHashVec {
             return values.clone();
         }
 
+        // Same contract as `BaseFieldVec::host_slice`: fence before a host read in
+        // case the layer is still being written by an in-flight GPU submission.
+        stwo_backend_metal_sys::metal::queue_drain()
+            .expect("Metal queue drain before host read should succeed");
         let words =
             unsafe { std::slice::from_raw_parts(self.buffer.host_ptr(), self.buffer.len()) };
         let decoded = words

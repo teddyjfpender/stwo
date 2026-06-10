@@ -12,6 +12,10 @@
 //! `stwo-backend-testkit` (proof byte-equality on both Blake2s channels), mirroring
 //! `stwo-backend-metal`.
 
+pub mod raw;
+#[cfg(not(stwo_cuda_link))]
+mod stubs;
+
 /// True when the CUDA kernels were compiled and linked into this build.
 pub const CUDA_KERNELS_BUILT: bool = cfg!(stwo_cuda_link);
 

@@ -81,6 +81,16 @@ impl Drop for RuntimeHandle {
 pub struct U32Buffer {
     raw: NonNull<c_void>,
     len: usize,
+    /// Process-unique id, never reused. Raw pointers (FFI or MTLBuffer addresses) can
+    /// alias across alloc/free cycles, which poisoned pointer-keyed caches; key caches
+    /// by this instead.
+    unique_id: u64,
+}
+
+fn next_buffer_unique_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 unsafe impl Send for U32Buffer {}
@@ -90,8 +100,10 @@ impl U32Buffer {
     /// Returns an opaque process-local identifier suitable for internal caching.
     ///
     /// This does not promise pointer stability across processes or serialization.
+    /// A process-unique, never-reused identity for this buffer object. Unlike a raw
+    /// pointer, it cannot alias a freed buffer, so it is safe as a cache key.
     pub fn identity(&self) -> usize {
-        self.raw.as_ptr() as usize
+        self.unique_id as usize
     }
 
     /// Returns the raw FFI pointer for this buffer, for use in batch GPU operations.
@@ -112,6 +124,7 @@ impl U32Buffer {
         Ok(Self {
             raw,
             len: values.len(),
+            unique_id: next_buffer_unique_id(),
         })
     }
 
@@ -119,7 +132,11 @@ impl U32Buffer {
         let runtime = shared_runtime()?;
         let raw =
             unsafe { ffi::buffer_alloc_zeroed(runtime.raw.as_ptr(), len, error_buffer_mut_ptr) }?;
-        Ok(Self { raw, len })
+        Ok(Self {
+            raw,
+            len,
+            unique_id: next_buffer_unique_id(),
+        })
     }
 
     pub fn uninitialized(len: usize) -> Result<Self, MetalError> {
@@ -127,7 +144,11 @@ impl U32Buffer {
         let raw = unsafe {
             ffi::buffer_alloc_uninitialized(runtime.raw.as_ptr(), len, error_buffer_mut_ptr)
         }?;
-        Ok(Self { raw, len })
+        Ok(Self {
+            raw,
+            len,
+            unique_id: next_buffer_unique_id(),
+        })
     }
 
     /// Allocates a private (GPU-only) buffer with the given contents uploaded
@@ -147,6 +168,7 @@ impl U32Buffer {
         Ok(Self {
             raw,
             len: values.len(),
+            unique_id: next_buffer_unique_id(),
         })
     }
 
@@ -156,7 +178,11 @@ impl U32Buffer {
         let raw = unsafe {
             ffi::buffer_alloc_uninitialized_private(runtime.raw.as_ptr(), len, error_buffer_mut_ptr)
         }?;
-        Ok(Self { raw, len })
+        Ok(Self {
+            raw,
+            len,
+            unique_id: next_buffer_unique_id(),
+        })
     }
 
     /// Returns true if this buffer uses `MTLResourceStorageModePrivate`.

@@ -370,7 +370,7 @@ fn subdomain_eval_domain(max_constraint_log_degree_bound: u32, log_expansion: u3
     committed_domain.split(log_expansion).0
 }
 
-fn accumulate_pointwise_cpu<E: FrameworkEval>(
+fn accumulate_pointwise_cpu<E: FrameworkEval + Sync>(
     component: &FrameworkComponent<E>,
     trace_cols: TreeVec<Vec<&CircleEvaluation<CpuBackend, BaseField, BitReversedOrder>>>,
     eval_log_size: u32,
@@ -379,23 +379,33 @@ fn accumulate_pointwise_cpu<E: FrameworkEval>(
     random_coeff_powers: &[SecureField],
     accum: &SecureColumnByCoords<CpuBackend>,
 ) -> SecureColumnByCoords<CpuBackend> {
-    let mut res = SecureColumnByCoords::zeros(1 << eval_log_size);
-    for row in 0..(1 << eval_log_size) {
-        // Evaluate constrains at row.
-        let eval = CpuDomainEvaluator::new(
-            &trace_cols,
-            row,
-            random_coeff_powers,
-            trace_log_size,
-            eval_log_size,
-            component.eval.log_size(),
-            component.claimed_sum,
-        );
-        let row_res = component.eval.evaluate(eval).row_res;
+    // Capture only `Sync` pieces: the component itself holds a non-Sync info cache.
+    let component_eval = &component.eval;
+    let component_log_size = component.eval.log_size();
+    let claimed_sum = component.claimed_sum;
+    // Rows are independent; evaluate them in parallel and scatter into the column.
+    let rows: Vec<SecureField> = stwo::parallel_iter!(0..(1usize << eval_log_size))
+        .map(|row| {
+            // Evaluate constrains at row.
+            let eval = CpuDomainEvaluator::new(
+                &trace_cols,
+                row,
+                random_coeff_powers,
+                trace_log_size,
+                eval_log_size,
+                component_log_size,
+                claimed_sum,
+            );
+            let row_res = component_eval.evaluate(eval).row_res;
 
-        // Finalize row.
-        let row_denom_inv = denom_inv[row >> trace_log_size];
-        res.set(row, accum.at(row) + row_res * row_denom_inv)
+            // Finalize row.
+            let row_denom_inv = denom_inv[row >> trace_log_size];
+            accum.at(row) + row_res * row_denom_inv
+        })
+        .collect();
+    let mut res = SecureColumnByCoords::zeros(1 << eval_log_size);
+    for (row, value) in rows.into_iter().enumerate() {
+        res.set(row, value);
     }
     res
 }
