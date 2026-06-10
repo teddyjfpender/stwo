@@ -1,22 +1,27 @@
-# Performance Proposals Requiring Approval (Supervised Tier)
+# Performance Proposals (Supervised Tier)
 
-Proposals below touch soundness/security-critical components or change algorithmic behavior, so
-per `CLAUDE.md` they need explicit human approval before implementation. Each is grounded in
-measurements taken on 2026-06-09 (Apple M5 Max, 18 cores, 64 GB; baselines in
-`/tmp/stwo-baseline/`). E2e baselines: blake 2^18 = 12.5 s / 21.1 GB peak RSS;
-plonk 2^20 (blowup 2^4) = 1.4 s / 11.1 GB peak RSS.
-After the implemented rounds 1–3: blake 2^18 = 7.1 s / 20.0 GB; plonk 2^20 = 1.07 s / 6.55 GB.
+Status after the approved implementation round (branch `perf-optimizations`). Measurements on
+Apple M5 Max, 18 cores, 64 GB; baselines in `/tmp/stwo-baseline/`.
+Original baselines: blake 2^18 = 12.5 s / 21.1 GB peak RSS; plonk 2^20 (blowup 2^4) = 1.4 s /
+11.1 GB. Current: blake 2^18 = ~7.1 s / 20.0 GB; plonk 2^20 = ~1.07 s / 6.55 GB.
 
-## P0. "Low-memory mode" — retain only trace-domain evaluations (largest remaining RSS lever)
+## P0. Low-memory mode — **IMPLEMENTED** (opt-in), with one honest caveat
 
-Blake-shaped AIRs (blowup 1, thousands of columns) hold ~15 GB of LDE evaluations until
-decommit. They are needed for (a) Merkle leaves — already consumed at commit; (b) quotient
-accumulation — uses only the trace-domain bit-reversed prefix; (c) OODS evaluation — could use
-the subdomain (P3); (d) decommit queried values + pruned-layer recompute — the only consumer
-that genuinely needs LDE rows. A `low_memory` option on `CommitmentSchemeProver` could retain
-only the subdomain prefix (halving eval memory at blowup 1, ÷16 at blowup 2^4) and re-extend
-columns (IFFT+FFT per column, parallel) at decommit. Trades ~1–3 s prove time for −7 GB+ on
-blake-shaped workloads. Needs design sign-off: touches the commitment scheme prover flow.
+`CommitmentSchemeProver::set_low_memory()`: after the FRI quotients, each owned tree's columns
+are compacted to at most half their size (in-place interpolation, verified-zero upper
+coefficient half dropped); decommit regenerates each column transiently and bit-exactly and
+reads only the gathered rows. Proof bytes verified identical across blowup configs.
+
+**Caveat (measured):** peak RSS for blowup-1, degree-2 AIRs (blake-shaped) is *unchanged*,
+because the peak occurs at composition time, when constraint evaluation genuinely reads the
+full LDE of every column. The mode reduces the FRI-through-decommit phase footprint (e.g.
+plonk 2^20: 4.4 GB after OODS instead of holding ~6.5 GB to the end) at ~20–30% extra prove
+time — useful when pipelining proofs or co-running provers.
+
+**Follow-up that would move peak RSS (needs design work):** streamed/extension-on-demand
+constraint evaluation — evaluate the composition subdomain-chunk by subdomain-chunk so full
+LDEs of all columns never coexist; or early eval-truncation driven by a caller-provided
+max-constraint-degree hint (sound for blowup > degree headroom, e.g. plonk-shaped AIRs).
 
 ## P1. Stop retaining bottom Merkle hash layers until decommit — **IMPLEMENTED**
 
@@ -31,22 +36,24 @@ contains the bottom 4 layers; in-repo consumers were migrated to the new `log_si
 **Possible follow-up:** deeper pruning (k>4) is a pure constant change
 (`N_UNRETAINED_BOTTOM_LAYERS`); recompute cost grows 2^k per query.
 
-## P2. NEON PackedM31 multiplication kernel
+## P2. NEON PackedM31 multiplication kernel — **IMPLEMENTED**
 
-**Where:** `crates/stwo/src/prover/backend/simd/m31.rs` (`mul_neon`, `mul_doubled_neon`) — field
-arithmetic, approval required by the operations boundary even though verifier behavior is
-untouched.
-**Problem:** The current kernel decomposes u32x16 into 8× 2-lane `vqdmull_s32` + 8 deinterleaves
-+ 4 shifts. A plonky3-style kernel via `vqdmulhq_s32`/`vmulq_u32` on 4-lane registers needs
-roughly half the instructions. M31 multiplication dominates FFT butterflies (iFFT 2^24 = 55.5 ms
-single-core) and quotient accumulation (309 ms for 2^21×100 cols single-core).
-**Invariant preserved:** For all a, b ∈ [0, P]: result ≡ a·b (mod P) and lies in [0, P].
-**Verification:** Exhaustive edge-case + randomized differential tests vs scalar `M31` mul
-(extend `multiplication_works` with 0, 1, P−1, P boundary values), plus the full proof test
-suite.
-**Expected:** 15–30% on FFT-heavy stages on aarch64.
+`vqdmulhq_s32`-based kernel (hi = (2ab)>>32 exactly; lo = low 31 bits), 5 instructions per 4
+lanes with no cross-lane shuffles. Exhaustive edge-case tests over the unreduced `[0, P]`
+boundary (including `P` itself) for both the plain and doubled-twiddle variants.
+**Measured:** `mul_simd` −12.3%, simd iFFT 2^20–2^24 −9.3…−9.7% (single-core).
 
-## P3. Out-of-domain barycentric evaluation on the trace subdomain
+## P3. Out-of-domain barycentric evaluation on the trace subdomain — **OPEN, de-scoped**
+
+Implementation note from this round: the bit-reversed prefix subdomain of a canonic domain is
+*not itself canonic*, and both barycentric-weights implementations hardcode canonic structure
+(generator initial index, the S_i conjugation argument). Generalizing them correctly to split
+subdomains is exactly the kind of math-adjacent change that deserves its own focused review;
+the memory half of the motivation is meanwhile served by P0 (coeffs-based OODS when
+`store_polynomials_coefficients` is set). Remaining value: ~0.7 s of blake 2^18 in default
+mode.
+
+### Original analysis
 
 **Where:** `prover/pcs/mod.rs::prove_values`, `barycentric_weights` callers.
 **Problem:** OODS evaluation builds barycentric weight columns sized to the *full LDE domain*
@@ -62,14 +69,14 @@ plus existing CPU/SIMD barycentric consistency tests.
 blowups; weights memory shrinks by the blowup factor. (Round-1 change already drops the weights
 map right after use; this proposal shrinks it while alive.)
 
-## P4. Wire the SIMD Keccak-f[1600] primitive into Keccak256 Merkle ops
+## P4. Wire the SIMD Keccak-f[1600] primitive into Keccak256 Merkle ops — **SCOPED, NOT DONE**
 
-**Where:** `prover/backend/simd/keccak256.rs` (+ `keccak256_permutation.rs` from PR #1398).
-**Problem:** The SIMD-parallel Keccak permutation was merged but Keccak256 Merkle commitment
-still hashes scalar-per-node with per-node allocations.
-**Invariant preserved:** Identical hashes/roots (same function, vectorized).
-**Verification:** Existing CPU↔SIMD root-equality tests for the Keccak merkle hasher.
-**Expected:** Large speedup for Keccak-channel users; no effect on Blake2s channels.
+On inspection, `prover/backend/simd/keccak256.rs` is an intentional correctness-first CPU
+delegate (it copies all columns to the CPU backend). "Wiring" the `keccak_f1600x8` primitive
+is a full SIMD implementation of the lifted leaf sponge semantics (incremental absorption
+across size groups, 136-byte rate vs the 16-felt chunking) — a standalone kernel project with
+its own correctness surface. No benchmarked path uses the Keccak channel today. Recommend
+scheduling separately; the existing CPU↔SIMD root-equality test is the gate.
 
 ## P5. FRI inner-layer leaf packing (`fold_step`)
 
@@ -84,9 +91,9 @@ tree count/sizes and decommitment cost but changes proof structure and verifier 
 `cargo build --release` on x86_64 (no `-C target-cpu=native` / `target-feature`) falls back to
 the portable kernel for M31 multiplication and the FFT — a large silent regression for library
 consumers on x86.
-**Options:** (a) document required RUSTFLAGS prominently in README build section (autonomous,
-low effort); (b) add runtime feature detection + multiversioned kernels (larger change in
-field-arithmetic dispatch — needs approval).
+**Options:** (a) document required RUSTFLAGS prominently in README build section — **DONE**
+(see "Performance builds" in the README); (b) add runtime feature detection + multiversioned
+kernels (larger change in field-arithmetic dispatch — still open).
 
 ## Deprioritized (autonomous but not in current hot paths)
 
