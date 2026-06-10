@@ -120,6 +120,14 @@ pub fn evaluate_constraint_quotients<E: FrameworkEval + Sync>(
         let cumsum_shift =
             component.claimed_sum() / BaseField::from_u32_unchecked(1u32 << trace_log_size);
 
+        let accum_prev_snapshot = if std::env::var_os("STWO_CUDA_CONSTRAINT_VERIFY").is_some() {
+            SecureColumnByCoords {
+                columns: accum.col.columns.each_ref().map(|column| column.to_cpu()),
+            }
+        } else {
+            SecureColumnByCoords::zeros(0)
+        };
+
         crate::columns::bindings::ensure_mem_pool_init();
         let handled = unsafe {
             stwo_backend_cuda_kernels::raw::evaluate_constraint_quotients_on_domain(
@@ -160,6 +168,56 @@ pub fn evaluate_constraint_quotients<E: FrameworkEval + Sync>(
             );
         }
         if handled {
+            // Differential-verify mode: recompute on CPU from the pre-GPU snapshot and
+            // compare, reporting the mismatch pattern. The CPU result is kept so the
+            // prove stays correct while kernels are being qualified.
+            if std::env::var_os("STWO_CUDA_CONSTRAINT_VERIFY").is_some() {
+                let gpu_result: Vec<Vec<BaseField>> = accum
+                    .col
+                    .columns
+                    .iter()
+                    .map(|column| column.to_cpu())
+                    .collect();
+                let trace_cols_cpu = trace.as_cols_ref().map_cols(|column| {
+                    CircleEvaluation::new(column.domain, column.values.to_cpu())
+                });
+                let cpu_result = accumulate_pointwise_cpu(
+                    component,
+                    trace_cols_cpu.as_cols_ref(),
+                    eval_domain.log_size(),
+                    trace_domain.log_size(),
+                    denom_inv.clone(),
+                    &accum.random_coeff_powers,
+                    &accum_prev_snapshot,
+                );
+                let mut mismatches = 0usize;
+                let mut first: Option<(usize, usize)> = None;
+                for coord in 0..4 {
+                    for (row, (gpu, cpu)) in gpu_result[coord]
+                        .iter()
+                        .zip(cpu_result.columns[coord].iter())
+                        .enumerate()
+                    {
+                        if gpu != cpu {
+                            mismatches += 1;
+                            if first.is_none() {
+                                first = Some((coord, row));
+                            }
+                        }
+                    }
+                }
+                let total = 4 * gpu_result[0].len();
+                eprintln!(
+                    "VERIFY component={eval_name}: {mismatches}/{total} mismatched, first={first:?}"
+                );
+                if mismatches > 0 {
+                    *accum.col = SecureColumnByCoords {
+                        columns: cpu_result
+                            .columns
+                            .map(|values| values.into_iter().collect()),
+                    };
+                }
+            }
             return;
         }
     } else if log {
