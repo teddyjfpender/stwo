@@ -159,6 +159,12 @@ impl<E: FrameworkEval> FrameworkComponent<E> {
         }
     }
 
+    /// The underlying evaluator. Exposed for backend constraint-evaluation drivers
+    /// (e.g. GPU lowering) that re-run the evaluation with a custom [`EvalAtRow`].
+    pub fn evaluator(&self) -> &E {
+        &self.eval
+    }
+
     pub fn trace_locations(&self) -> &[TreeSubspan] {
         &self.trace_locations
     }

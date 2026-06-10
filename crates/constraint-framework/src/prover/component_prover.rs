@@ -32,11 +32,23 @@ const CHUNK_SIZE: usize = 8;
 const _: () = assert!(CHUNK_SIZE.is_power_of_two());
 
 /// Common inputs for constraint quotient evaluation, shared between the SIMD and CPU backends.
-struct ConstraintQuotientInputs<'a, B: Backend> {
-    eval_domain: CircleDomain,
-    trace_domain: CanonicCoset,
-    trace: TreeVec<Vec<Cow<'a, CircleEvaluation<B, BaseField, BitReversedOrder>>>>,
-    denom_inv: Vec<BaseField>,
+/// The shared inputs every constraint-quotient evaluation lane consumes: the component's
+/// trace columns prepared for the evaluation domain, and the quotient denominators.
+/// Exposed so out-of-tree backends (e.g. GPU lanes) can mirror the CPU lane exactly.
+pub struct ConstraintQuotientInputs<'a, B: Backend> {
+    pub eval_domain: CircleDomain,
+    pub trace_domain: CanonicCoset,
+    pub trace: TreeVec<Vec<Cow<'a, CircleEvaluation<B, BaseField, BitReversedOrder>>>>,
+    pub denom_inv: Vec<BaseField>,
+}
+
+/// Public entry to [`get_constraint_quotient_inputs`] for backend drivers.
+pub fn constraint_quotient_inputs<'a, E: FrameworkEval, B: Backend>(
+    component: &FrameworkComponent<E>,
+    trace: &'a Trace<'a, B>,
+    mode: EvaluationMode,
+) -> ConstraintQuotientInputs<'a, B> {
+    get_constraint_quotient_inputs(component, trace, mode)
 }
 
 /// Prepares trace evaluations: borrows directly (subdomain) or extends to eval domain.

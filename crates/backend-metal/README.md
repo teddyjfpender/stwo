@@ -41,8 +41,14 @@ the CPU constraint-evaluation lane. The SIMD backend's throughput *rises* with s
 its fixed costs amortize. Profiling notes live in the history of
 `tests/bench_prove.rs`; the largest structural deficits, in order:
 
-1. **Constraint evaluation runs on the CPU** (`evaluate_constraint_quotients_via_cpu`)
-   — correct for any AIR, but the composition stage does no GPU work at all.
+1. ~~Constraint evaluation runs on the CPU~~ — **a JIT GPU constraint lane now exists**
+   (`src/backend/jit/`): the component's constraint tree is recorded to bytecode once,
+   compiled to a fused Metal kernel (cached by semantic hash), and evaluated on GPU,
+   falling back to the CPU lane on any failure (`STWO_METAL_DISABLE_JIT` forces the
+   fallback). It is byte-equal to the CPU lane and conformance-gated — but it does
+   **not** move the e2e numbers above (≤0.2% at log 18–20): after the CPU lane was
+   parallelized, constraint evaluation was no longer the wall. The remaining costs
+   are spread across per-dispatch synchronization and host-side OODS.
 2. **Per-dispatch synchronization** — most kernels submit one command buffer and wait.
    The async-submission pattern exists (`evaluate_polynomials`) but covers one stage.
 3. **Host-side OODS** — barycentric evaluation is a CPU dot product per (column, point)

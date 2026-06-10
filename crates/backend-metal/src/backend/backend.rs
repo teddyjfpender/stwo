@@ -17,10 +17,23 @@ impl FrameworkBackend for MetalBackend {
         trace: &Trace<'_, Self>,
         evaluation_accumulator: &mut DomainEvaluationAccumulator<Self>,
     ) {
-        // v1: the correct-but-slow generic CPU driver (column conversion is zero-copy-ish on
-        // unified memory). The native GPU constraint evaluator — the JIT shader compiler from
-        // the original stwo-metal project — is the planned replacement.
-        evaluate_constraint_quotients_via_cpu(component, trace, evaluation_accumulator);
+        // Native lane: record the constraint tree once, JIT-compile a fused Metal kernel
+        // (cached by semantic hash), evaluate on GPU. Any failure (unsupported feature,
+        // runtime error, STWO_METAL_DISABLE_JIT) falls back to the generic CPU driver.
+        // Both lanes are byte-equal by construction and gated by the testkit.
+        match super::jit::evaluate_constraint_quotients_via_jit(
+            component,
+            trace,
+            evaluation_accumulator,
+        ) {
+            Ok(()) => {}
+            Err(reason) => {
+                if std::env::var_os("STWO_METAL_JIT_LOG").is_some() {
+                    eprintln!("stwo-metal JIT lane unavailable, using CPU lane: {reason:?}");
+                }
+                evaluate_constraint_quotients_via_cpu(component, trace, evaluation_accumulator);
+            }
+        }
     }
 }
 

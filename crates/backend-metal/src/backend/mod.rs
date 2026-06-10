@@ -4,6 +4,7 @@ mod backend;
 mod blake2s;
 mod column;
 mod fri;
+mod jit;
 mod line;
 mod lookups;
 mod poly;
