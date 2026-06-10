@@ -1,0 +1,26 @@
+[package]
+name = "stwo-backend-cuda"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CUDA GPU proving backend for STWO (compile-gated; stub without nvcc)"
+
+[features]
+parallel = ["stwo/parallel", "stwo-constraint-framework/parallel"]
+
+[dependencies]
+itertools.workspace = true
+num-traits.workspace = true
+serde.workspace = true
+stwo = { path = "../stwo", version = "~2.2.0", features = ["prover"] }
+stwo-backend-cuda-kernels = { path = "../backend-cuda-kernels" }
+stwo-constraint-framework = { path = "../constraint-framework", version = "~2.2.0", features = [
+    "prover",
+] }
+
+[dev-dependencies]
+rand.workspace = true
+stwo-backend-testkit = { path = "../backend-testkit" }
+
+[lib]
+bench = false

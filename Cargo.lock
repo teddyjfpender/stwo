@@ -1340,6 +1340,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "stwo-backend-cuda"
+version = "2.2.0"
+dependencies = [
+ "itertools 0.12.1",
+ "num-traits",
+ "rand",
+ "serde",
+ "stwo",
+ "stwo-backend-cuda-kernels",
+ "stwo-backend-testkit",
+ "stwo-constraint-framework",
+]
+
+[[package]]
 name = "stwo-backend-cuda-kernels"
 version = "0.1.0"
 

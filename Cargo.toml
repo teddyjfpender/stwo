@@ -3,6 +3,7 @@ members = [
     "crates/stwo",
     "crates/air-utils",
     "crates/air-utils-derive",
+    "crates/backend-cuda",
     "crates/backend-cuda-kernels",
     "crates/backend-metal",
     "crates/backend-metal-sys",
