@@ -73,8 +73,27 @@ fn main() {
     println!("cargo:rustc-env=STWO_CUDA_BUILD_MODE=cuda");
     println!("cargo:rustc-cfg=stwo_cuda_link");
     println!("cargo:rustc-link-search=native={}", out_dir.display());
+    if let Some(lib_dir) = cuda_lib_dir(&nvcc) {
+        println!("cargo:rustc-link-search=native={}", lib_dir.display());
+    }
     println!("cargo:rustc-link-lib=static=stwo_cuda_kernels");
     println!("cargo:rustc-link-lib=cudart");
+}
+
+/// The toolkit's library directory (for `-lcudart`), from `CUDA_HOME`/`CUDA_PATH` or
+/// derived from the nvcc binary's location (`<root>/bin/nvcc` -> `<root>/lib64`).
+fn cuda_lib_dir(nvcc: &str) -> Option<PathBuf> {
+    let root = env::var_os("CUDA_HOME")
+        .or_else(|| env::var_os("CUDA_PATH"))
+        .map(PathBuf::from)
+        .or_else(|| {
+            let which = Command::new("which").arg(nvcc).output().ok()?;
+            let path = String::from_utf8(which.stdout).ok()?;
+            Some(PathBuf::from(path.trim()).parent()?.parent()?.to_path_buf())
+        })?;
+    [root.join("lib64"), root.join("lib")]
+        .into_iter()
+        .find(|dir| dir.is_dir())
 }
 
 fn kernel_sources() -> Vec<PathBuf> {
