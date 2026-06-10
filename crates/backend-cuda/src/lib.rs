@@ -9,3 +9,14 @@ mod columns;
 
 pub use backend::CudaBackend;
 pub use columns::{BaseFieldVec, Blake2sHashVec, SecureFieldVec};
+
+/// (free_bytes, total_bytes) of GPU memory; (0, 0) without CUDA.
+pub fn gpu_memory_info() -> (usize, usize) {
+    if !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
+        return (0, 0);
+    }
+    let mut free = 0usize;
+    let mut total = 0usize;
+    unsafe { columns::bindings::cuda_get_memory_info(&mut free, &mut total) };
+    (free, total)
+}

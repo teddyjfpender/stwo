@@ -16,6 +16,7 @@ unsafe impl Sync for BaseFieldVec {}
 
 impl BaseFieldVec {
     pub fn new(device_ptr: *const u32, size: usize) -> Self {
+        crate::columns::bindings::ensure_mem_pool_init();
         Self {
             device_ptr,
             size,
@@ -35,6 +36,7 @@ impl BaseFieldVec {
     }
 
     pub fn from_vec(host_array: Vec<BaseField>) -> Self {
+        crate::columns::bindings::ensure_mem_pool_init();
         let device_ptr = unsafe {
             bindings::copy_uint32_t_vec_from_host_to_device(
                 host_array.as_ptr().cast::<u32>(),
@@ -46,11 +48,13 @@ impl BaseFieldVec {
     }
 
     pub fn new_uninitialized(size: usize) -> Self {
+        crate::columns::bindings::ensure_mem_pool_init();
         let device_ptr = unsafe { bindings::cuda_malloc_uint32_t(size as u32) };
         Self::new(device_ptr, size)
     }
 
     pub fn new_zeroes(size: usize) -> Self {
+        crate::columns::bindings::ensure_mem_pool_init();
         let device_ptr = unsafe { bindings::cuda_alloc_zeroes_uint32_t(size as u32) };
         Self::new(device_ptr, size)
     }
@@ -154,10 +158,12 @@ unsafe impl Sync for Uint32Vec {}
 #[allow(unused_variables)]
 impl Uint32Vec {
     pub fn new(device_ptr: *const u32, size: usize) -> Self {
+        crate::columns::bindings::ensure_mem_pool_init();
         Self { device_ptr, size }
     }
 
     pub fn from_vec(host_array: Vec<u32>) -> Self {
+        crate::columns::bindings::ensure_mem_pool_init();
         let device_ptr = unsafe {
             bindings::copy_uint32_t_vec_from_host_to_device(
                 host_array.as_ptr(),
@@ -169,10 +175,12 @@ impl Uint32Vec {
     }
 
     pub fn new_uninitialized(size: usize) -> Self {
+        crate::columns::bindings::ensure_mem_pool_init();
         Self::new(unsafe { bindings::cuda_malloc_uint32_t(size as u32) }, size)
     }
 
     pub fn new_zeroes(size: usize) -> Self {
+        crate::columns::bindings::ensure_mem_pool_init();
         Self::new(
             unsafe { bindings::cuda_alloc_zeroes_uint32_t(size as u32) },
             size,
@@ -264,10 +272,12 @@ unsafe impl Sync for Uint128Vec {}
 #[allow(unused_variables)]
 impl Uint128Vec {
     pub fn new(device_ptr: *const u32, size: usize) -> Self {
+        crate::columns::bindings::ensure_mem_pool_init();
         Self { device_ptr, size }
     }
 
     pub fn from_vec(host_array: Vec<u128>) -> Self {
+        crate::columns::bindings::ensure_mem_pool_init();
         let device_ptr = unsafe {
             bindings::copy_uint32_t_vec_from_host_to_device(
                 host_array.as_ptr().cast::<u32>(),
@@ -279,6 +289,7 @@ impl Uint128Vec {
     }
 
     pub fn new_uninitialized(size: usize) -> Self {
+        crate::columns::bindings::ensure_mem_pool_init();
         Self::new(
             unsafe { bindings::cuda_malloc_uint32_t(4 * size as u32) },
             size,
@@ -286,6 +297,7 @@ impl Uint128Vec {
     }
 
     pub fn new_zeroes(size: usize) -> Self {
+        crate::columns::bindings::ensure_mem_pool_init();
         Self::new(
             unsafe { bindings::cuda_alloc_zeroes_uint32_t(4 * size as u32) },
             size,

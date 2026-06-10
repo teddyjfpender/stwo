@@ -46,6 +46,9 @@ pub struct Blake2sHash(pub [u8; 32]);
 
 #[cfg_attr(stwo_cuda_link, link(name = "stwo_cuda_kernels", kind = "static"))]
 extern "C" {
+    /// Returns a CUDA error code (0 = success). Sets the default mem pool's release
+    /// threshold to never-release so warm proves reuse allocations.
+    pub fn cuda_mem_pool_init() -> i32;
     pub fn copy_uint32_t_vec_from_device_to_host(
         device_ptr: *const u32,
         host_ptr: *const u32,

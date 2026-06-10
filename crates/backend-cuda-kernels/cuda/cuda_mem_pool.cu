@@ -1,5 +1,6 @@
 #include "cuda_mem_pool.cuh"
 #include <cuda_runtime.h>
+#include <cstdint>
 
 extern "C" cudaError_t cuda_mem_pool_init() {
     int device_id;
@@ -8,7 +9,15 @@ extern "C" cudaError_t cuda_mem_pool_init() {
         return err;
     }
     cudaMemPool_t default_pool = nullptr;
-    return cudaDeviceGetDefaultMemPool(&default_pool, device_id);
+    err = cudaDeviceGetDefaultMemPool(&default_pool, device_id);
+    if (err != cudaSuccess) {
+        return err;
+    }
+    // Never release pooled memory back to the OS: warm proves reuse allocations
+    // instead of paying cudaMalloc/cudaFree on every run
+    // (cudaMemPoolAttrReleaseThreshold = UINT64_MAX, as in the NitrooZK setup).
+    uint64_t threshold = UINT64_MAX;
+    return cudaMemPoolSetAttribute(default_pool, cudaMemPoolAttrReleaseThreshold, &threshold);
 }
 
 extern "C" cudaError_t cuda_mem_pool_destroy() {
@@ -32,6 +41,8 @@ cudaError_t cuda_allocator_context_init(CudaAllocatorContext* context, cudaStrea
         cudaMemPool_t default_pool = nullptr;
         context->pool_init_status = cudaDeviceGetDefaultMemPool(&default_pool, device_id);
         if (context->pool_init_status == cudaSuccess && default_pool != nullptr) {
+            uint64_t threshold = UINT64_MAX;
+            cudaMemPoolSetAttribute(default_pool, cudaMemPoolAttrReleaseThreshold, &threshold);
             context->mem_pool = default_pool;
             context->use_mem_pool = true;
             return cudaSuccess;

@@ -15,9 +15,11 @@ unsafe impl Sync for SecureFieldVec {}
 
 impl SecureFieldVec {
     pub fn new(device_ptr: *const u32, size: usize) -> Self {
+        crate::columns::bindings::ensure_mem_pool_init();
         Self { device_ptr, size }
     }
     pub fn from_vec(host_array: Vec<SecureField>) -> Self {
+        crate::columns::bindings::ensure_mem_pool_init();
         // let start_time = Instant::now();
         let device_ptr = unsafe {
             bindings::copy_uint32_t_vec_from_host_to_device(
@@ -35,11 +37,13 @@ impl SecureFieldVec {
     }
 
     pub fn new_uninitialized(size: usize) -> Self {
+        crate::columns::bindings::ensure_mem_pool_init();
         let device_ptr = unsafe { bindings::cuda_malloc_uint32_t((4 * size) as u32) };
         Self::new(device_ptr, size)
     }
 
     pub fn new_zeroes(size: usize) -> Self {
+        crate::columns::bindings::ensure_mem_pool_init();
         let device_ptr = unsafe { bindings::cuda_alloc_zeroes_uint32_t((4 * size) as u32) };
         Self::new(device_ptr, size)
     }

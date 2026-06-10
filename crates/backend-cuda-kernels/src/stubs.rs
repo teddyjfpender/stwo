@@ -648,3 +648,8 @@ pub unsafe extern "C" fn test_offset_bit_reversed_indices(
 ) {
     no_cuda_symbol("test_offset_bit_reversed_indices")
 }
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cuda_mem_pool_init() -> i32 {
+    no_cuda_symbol("cuda_mem_pool_init")
+}

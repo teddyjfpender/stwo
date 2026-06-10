@@ -10,6 +10,18 @@ use stwo::core::fields::qm31::SecureField;
 use stwo::core::vcs::blake2_hash::Blake2sHash;
 use stwo_backend_cuda_kernels::raw as sys_raw;
 
+/// One-time CUDA mem-pool setup (never-release threshold; see the kernels crate).
+/// Cheap to call before any device allocation.
+pub fn ensure_mem_pool_init() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let code = unsafe { sys_raw::cuda_mem_pool_init() };
+        if code != 0 {
+            eprintln!("stwo-backend-cuda: cuda_mem_pool_init failed with CUDA error {code}");
+        }
+    });
+}
+
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct CudaSecureField {
@@ -125,8 +137,9 @@ pub use sys_raw::{
     copy_device_pointer_vec_from_host_to_device, copy_uint32_t_vec_from_device_to_device,
     copy_uint32_t_vec_from_device_to_device_offset, copy_uint32_t_vec_from_device_to_host,
     copy_uint32_t_vec_from_host_to_device, cuda_alloc_zeroes_uint32_t, cuda_free_memory,
-    cuda_get_uint32_t, cuda_increase_at, cuda_malloc_uint32_t, cuda_release_uploaded_pointer_vec,
-    cuda_set_uint32_t, lift_accumulate_secure_columns, ntt_b2n_column, ntt_n2b_columns,
+    cuda_get_memory_info, cuda_get_uint32_t, cuda_increase_at, cuda_malloc_uint32_t,
+    cuda_release_uploaded_pointer_vec, cuda_set_uint32_t, lift_accumulate_secure_columns,
+    ntt_b2n_column, ntt_n2b_columns,
 };
 
 pub unsafe fn cuda_get_secure_field(device_ptr: *const c_void, index: usize) -> CudaSecureField {

@@ -16,10 +16,12 @@ unsafe impl Sync for Blake2sHashVec {}
 
 impl Blake2sHashVec {
     pub fn new(device_ptr: *const Blake2sHash, size: usize) -> Self {
+        crate::columns::bindings::ensure_mem_pool_init();
         Self { device_ptr, size }
     }
 
     pub fn from_vec(host_array: Vec<Blake2sHash>) -> Self {
+        crate::columns::bindings::ensure_mem_pool_init();
         let size = host_array.len();
         let device_ptr = unsafe {
             bindings::copy_blake_2s_hash_vec_from_host_to_device(host_array.as_ptr(), size)
@@ -28,10 +30,12 @@ impl Blake2sHashVec {
     }
 
     pub fn new_uninitialized(size: usize) -> Self {
+        crate::columns::bindings::ensure_mem_pool_init();
         Self::new(unsafe { bindings::cuda_malloc_blake_2s_hash(size) }, size)
     }
 
     pub fn new_zeroes(size: usize) -> Self {
+        crate::columns::bindings::ensure_mem_pool_init();
         Self::new(
             unsafe { bindings::cuda_alloc_zeroes_blake_2s_hash(size) },
             size,

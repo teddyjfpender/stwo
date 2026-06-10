@@ -38,9 +38,11 @@ where
         }
         println!("{name} log_n_rows={log_n_rows} iter={iter} ms={elapsed:.1}");
     }
+    let (free, total) = stwo_backend_cuda::gpu_memory_info();
     println!(
-        "RESULT {name} log_n_rows={log_n_rows} warm_best_ms={best:.1} warm_rows_per_s={:.0}",
-        n_rows as f64 / (best / 1000.0)
+        "RESULT {name} log_n_rows={log_n_rows} warm_best_ms={best:.1} warm_rows_per_s={:.0} vram_used_mb={}",
+        n_rows as f64 / (best / 1000.0),
+        if total > 0 { (total - free) / (1024 * 1024) } else { 0 }
     );
 }
 

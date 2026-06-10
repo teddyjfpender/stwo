@@ -614,6 +614,11 @@ where
 
     let channel = &mut MC::C::default();
     let mut commitment_scheme = CommitmentSchemeProver::<B, MC>::new(config, &twiddles);
+    // Big-trace mode: compact committed columns and regenerate bit-exactly at decommit
+    // (proofs must stay byte-identical; the conformance gate verifies this holds).
+    if std::env::var_os("STWO_BENCH_LOW_MEMORY").is_some() {
+        commitment_scheme.set_low_memory();
+    }
 
     // Preprocessed trace (empty).
     let mut tree_builder = commitment_scheme.tree_builder();
