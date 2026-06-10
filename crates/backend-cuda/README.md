@@ -79,10 +79,11 @@ the true in-flight peak; a high-water-mark probe is future work.
   Merkle leaves/layers hashed on host; `TwiddleBuffer::extract_subdomain_twiddles` and
   `PolyOps::join_at_mid` download/upload; the quotient combine kernel runs on the
   evaluation subdomain with the interpolate/extend tail through `PolyOps`.
-- **Grinding delegates to `SimdBackend`** on both channels. NitrooZK's
-  `grind_blake2s.cu` shows the right fix: chunked `atomicMin` search returning the
-  *lowest* valid nonce, which matches the SIMD search order byte-exactly while being
-  ~200× faster at production `pow_bits` — a straightforward port, deferred.
+- **Grinding runs on GPU for the non-M31 channel** (ported from NitrooZK's
+  `grind_blake2s.cu`): chunked `atomicMin` search returning the *lowest* valid nonce,
+  nonce-equal with `SimdBackend` (testkit-gated on hardware), ~200× at production
+  `pow_bits` per their measurements. The M31-output channel still delegates to
+  `SimdBackend` (its PoW hash differs at finalize; NitrooZK does the same).
 
 ## Fixes over the prototype
 
@@ -98,6 +99,17 @@ the true in-flight peak; a high-water-mark probe is future work.
 - Dropped lanes: capability/planner registries, framework plan/overlay (bytecode
   constraint dispatch), Poseidon252 channel (kernels staged in
   `backend-cuda-kernels/cuda/`, lane unported), prototype witness generators.
+
+## stwo-cairo
+
+The fork at `teddyjfpender/stwo-cairo` (branch `generic-backend`) proves real Cairo
+programs on this backend: `prove_cairo::<CudaBackend, Blake2sMerkleChannel>` with the
+witness generated on `SimdBackend` and transferred via `FromSimdColumns`. Gate (passes
+on RTX 3090): `test_prove_verify_all_opcode_components_cuda` proves + verifies the
+all-opcode program and asserts the serialized proof felts are **identical** to the
+SIMD backend's proof. Note from reviewing NitrooZK's production fork: their base and
+interaction traces are also CPU/SIMD-generated — their GPU witness advantage is
+preprocessed-column generation and batched NTT, both incremental follow-ups here.
 
 ## Testing
 
