@@ -78,10 +78,17 @@ pub fn evaluate_constraint_quotients<E: FrameworkEval + Sync>(
     // Lane control without rebuilds: DISABLE wins; otherwise an ALLOWLIST (comma-
     // separated component names) restricts the GPU lane to listed components — used to
     // bisect kernels whose generated constraints don't match this AIR revision.
+    // OPT-IN: the ported kernel set was generated against NitrooZK's stwo v2.1.1 +
+    // their stwo-cairo AIR rev. Differential verification against this stack showed
+    // 100%-of-rows mismatches from row 0 on every component (the eval-struct
+    // layout/AIR-rev skew fingerprint), so no kernel is qualified by default.
+    // Qualification path for regenerated kernels: STWO_CUDA_CONSTRAINT_VERIFY=1 with
+    // an ALLOWLIST; components reporting 0 mismatches may be promoted.
     let gpu_enabled = std::env::var_os("STWO_CUDA_DISABLE_CONSTRAINT_KERNELS").is_none()
-        && std::env::var("STWO_CUDA_CONSTRAINT_ALLOWLIST")
-            .map(|list| list.split(',').any(|name| name.trim() == eval_name))
-            .unwrap_or(true);
+        && match std::env::var("STWO_CUDA_CONSTRAINT_ALLOWLIST") {
+            Ok(list) => list.split(',').any(|name| name.trim() == eval_name),
+            Err(_) => std::env::var_os("STWO_CUDA_ENABLE_CONSTRAINT_KERNELS").is_some(),
+        };
 
     if gpu_enabled {
         let gpu_denom_inv = BaseFieldVec::from_vec(denom_inv.clone());
