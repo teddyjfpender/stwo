@@ -47,29 +47,71 @@ fn main() {
         .map(|flags| flags.split_whitespace().map(str::to_string).collect())
         .unwrap_or_default();
 
+    // Separable compilation (-rdc=true) requires an explicit device-link step: the
+    // final Rust link knows nothing about CUDA, so the device-link object must be in
+    // the archive. Pipeline: each .cu -> .o (-dc), then nvcc -dlink over all objects,
+    // then everything into one archive.
+    let run_nvcc = |args: &mut Command| {
+        let output = args
+            .output()
+            .expect("nvcc was detected but could not be launched");
+        assert!(
+            output.status.success(),
+            "nvcc failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+
+    let mut objects: Vec<PathBuf> = Vec::with_capacity(sources.len() + 1);
+    for source in &sources {
+        let object = out_dir.join(format!(
+            "{}.o",
+            source.file_stem().expect("kernel file stem").to_string_lossy()
+        ));
+        run_nvcc(
+            Command::new(&nvcc)
+                .arg("-dc")
+                .arg("-O3")
+                .arg("--std=c++17")
+                // The fp256/poseidon252 stack calls `constexpr __host__` accessors from
+                // device code (sppark lineage); nvcc requires this flag for that pattern.
+                .arg("--expt-relaxed-constexpr")
+                .arg("-Xcompiler")
+                .arg("-fPIC")
+                .arg(format!("-arch={arch}"))
+                .args(&extra_flags)
+                .arg(source)
+                .arg("-o")
+                .arg(&object),
+        );
+        objects.push(object);
+    }
+    let dlink = out_dir.join("stwo_cuda_kernels_dlink.o");
+    run_nvcc(
+        Command::new(&nvcc)
+            .arg("-dlink")
+            .arg("-Xcompiler")
+            .arg("-fPIC")
+            .arg(format!("-arch={arch}"))
+            .args(&objects)
+            .arg("-o")
+            .arg(&dlink),
+    );
+    objects.push(dlink);
+
     let archive = out_dir.join("libstwo_cuda_kernels.a");
-    let mut compile = Command::new(&nvcc);
-    compile
-        .arg("-lib")
-        .arg("-rdc=true")
-        .arg("-dlto")
-        .arg("-O3")
-        .arg("--std=c++17")
-        // The fp256/poseidon252 stack calls `constexpr __host__` accessors from device
-        // code (sppark lineage); nvcc requires this flag for that pattern.
-        .arg("--expt-relaxed-constexpr")
-        .arg(format!("-arch={arch}"))
-        .args(&extra_flags)
-        .args(&sources)
-        .arg("-o")
-        .arg(&archive);
-    let output = compile
+    let _ = std::fs::remove_file(&archive);
+    let ar = env::var("AR").unwrap_or_else(|_| "ar".to_string());
+    let output = Command::new(&ar)
+        .arg("crs")
+        .arg(&archive)
+        .args(&objects)
         .output()
-        .expect("nvcc was detected but could not be launched");
+        .expect("ar should be available to archive the kernel objects");
     assert!(
         output.status.success(),
-        "nvcc failed to compile the CUDA kernels:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
+        "ar failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 
@@ -81,6 +123,8 @@ fn main() {
     }
     println!("cargo:rustc-link-lib=static=stwo_cuda_kernels");
     println!("cargo:rustc-link-lib=cudart");
+    // The .cu host code uses C++ exceptions and the C++ runtime.
+    println!("cargo:rustc-link-lib=stdc++");
 }
 
 /// The compute capability of the local GPU as an `-arch` value (e.g. `sm_86`), queried
