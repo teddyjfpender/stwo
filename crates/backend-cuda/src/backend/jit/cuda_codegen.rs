@@ -26,8 +26,8 @@ pub fn compile_v1_to_cuda_source(program: &OwnedMetalEvaluationProgramV1) -> Opt
     emit_preamble(&mut src);
 
     src.push_str(&format!(
-        "extern \"C\" __global__ void {name}(\n\
-         \x20   const unsigned *trace_values,\n\
+        "extern \"C\" __global__ void __launch_bounds__(128) {name}(\n\
+         \x20   const unsigned *const *trace_cols,\n\
          \x20   const unsigned *interaction_offsets,\n\
          \x20   const unsigned *base_params,\n\
          \x20   const unsigned *ext_params,\n\
@@ -76,7 +76,7 @@ fn emit_instruction_body(program: &OwnedMetalEvaluationProgramV1, src: &mut Stri
             BaseOp::TraceCol => {
                 let (interaction, column, offset) = (inst.interaction, inst.a, inst.imm);
                 src.push_str(&format!(
-                    "    {decl}{dst_var} = stwo_trace_value(trace_values, \
+                    "    {decl}{dst_var} = stwo_trace_value(trace_cols, \
                      interaction_offsets, row_count, {interaction}u, {column}u, row_index, \
                      {offset});\n"
                 ));
@@ -303,7 +303,7 @@ __device__ __forceinline__ unsigned stwo_offset_bit_reversed_circle_domain_index
 }
 
 __device__ __forceinline__ unsigned stwo_trace_value(
-    const unsigned *trace_values, const unsigned *interaction_offsets, unsigned row_count,
+    const unsigned *const *trace_cols, const unsigned *interaction_offsets, unsigned row_count,
     unsigned interaction, unsigned column, unsigned row_index, int offset
 ) {
     unsigned target_row;
@@ -318,7 +318,7 @@ __device__ __forceinline__ unsigned stwo_trace_value(
             row_index, domain_log_size, eval_log_size, offset);
     }
     unsigned global_column = interaction_offsets[interaction] + column;
-    return trace_values[global_column * row_count + target_row];
+    return trace_cols[global_column][target_row];
 }
 
 ",

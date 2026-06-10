@@ -754,6 +754,10 @@ pub fn lower_framework_eval_to_v1_with_logup<F: FrameworkEval>(
     }
     let n_ext_params = n_ext_params.max(if shift_parameterized { 1 } else { 0 });
 
+    // Compact registers (linear-scan reuse) so big components don't spill: the
+    // recorder's monotonic SSA allocation can produce hundreds of live slots.
+    state.compact_registers();
+
     // Sanity check: every ext instruction's registers must be valid.
     let max_er = state.max_ext_regs();
     let max_br = state.max_base_regs();

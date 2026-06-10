@@ -120,7 +120,7 @@ extern "C" bool stwo_cuda_jit_eval_fused(
         (void *)&coord_0,      (void *)&coord_1,             (void *)&coord_2,
         (void *)&coord_3,      (void *)&row_count,           (void *)&log_n_rows,
     };
-    const unsigned block = 256;
+    const unsigned block = 128;  // must match the generated kernel's __launch_bounds__
     const unsigned grid = (row_count + block - 1) / block;
     if (cuLaunchKernel(function, grid, 1, 1, block, 1, 1, 0, nullptr, args, nullptr) !=
         CUDA_SUCCESS) {

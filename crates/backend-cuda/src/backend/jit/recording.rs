@@ -191,6 +191,147 @@ impl RecordingState {
     pub fn max_ext_regs(&self) -> u32 {
         self.next_ext_reg as u32
     }
+
+    /// Linear-scan register compaction. The recorder allocates registers
+    /// monotonically (pure SSA, each written once), so large components end up with
+    /// hundreds of live variable slots in the generated kernel and spill to local
+    /// memory. Recompute liveness and reuse freed slots; values and ordering are
+    /// untouched, only register NAMES are remapped (gated by the differential-verify
+    /// harness and proof byte-equality).
+    pub fn compact_registers(&mut self) {
+        use {MetalEvaluationProgramBaseOpcodeV1 as B, MetalEvaluationProgramExtOpcodeV1 as X};
+
+        const LIVE_FOREVER: usize = usize::MAX;
+        let n_base = self.next_base_reg as usize;
+        let n_ext = self.next_ext_reg as usize;
+
+        // Base-register last uses: src reads within base insts; any read from an ext
+        // SecureCol keeps the base register live through the whole base section.
+        let mut base_last = vec![0usize; n_base];
+        for (i, inst) in self.base_insts.iter().enumerate() {
+            match B::from_raw(inst.op) {
+                Some(B::Add) | Some(B::Sub) | Some(B::Mul) => {
+                    base_last[inst.a as usize] = base_last[inst.a as usize].max(i);
+                    base_last[inst.b as usize] = base_last[inst.b as usize].max(i);
+                }
+                Some(B::Neg) | Some(B::Inv) => {
+                    base_last[inst.a as usize] = base_last[inst.a as usize].max(i);
+                }
+                _ => {}
+            }
+        }
+        for inst in &self.ext_insts {
+            if X::from_raw(inst.op) == Some(X::SecureCol) {
+                for r in [inst.a, inst.b, inst.c, inst.d] {
+                    base_last[r as usize] = LIVE_FOREVER;
+                }
+            }
+        }
+
+        // Ext-register last uses: src reads; constraint roots are read at the end.
+        let mut ext_last = vec![0usize; n_ext];
+        for (i, inst) in self.ext_insts.iter().enumerate() {
+            match X::from_raw(inst.op) {
+                Some(X::Add) | Some(X::Sub) | Some(X::Mul) => {
+                    ext_last[inst.a as usize] = ext_last[inst.a as usize].max(i);
+                    ext_last[inst.b as usize] = ext_last[inst.b as usize].max(i);
+                }
+                Some(X::Neg) => {
+                    ext_last[inst.a as usize] = ext_last[inst.a as usize].max(i);
+                }
+                _ => {}
+            }
+        }
+        for &root in &self.constraint_roots {
+            ext_last[root as usize] = LIVE_FOREVER;
+        }
+
+        fn scan(
+            n_old: usize,
+            writes_at: &[(usize, u16)], // (inst index, old reg) in write order
+            last_use: &[usize],
+        ) -> (Vec<u16>, u16) {
+            let mut map = vec![u16::MAX; n_old];
+            let mut free: Vec<u16> = Vec::new();
+            let mut next: u16 = 0;
+            // Expirations sorted by instruction position.
+            let mut expiring: Vec<(usize, u16)> = (0..n_old)
+                .filter(|&r| last_use[r] != usize::MAX)
+                .map(|r| (last_use[r], r as u16))
+                .collect();
+            expiring.sort_unstable();
+            let mut exp_i = 0usize;
+            for &(pos, old) in writes_at {
+                while exp_i < expiring.len() && expiring[exp_i].0 < pos {
+                    let dead_old = expiring[exp_i].1 as usize;
+                    if map[dead_old] != u16::MAX {
+                        free.push(map[dead_old]);
+                    }
+                    exp_i += 1;
+                }
+                map[old as usize] = free.pop().unwrap_or_else(|| {
+                    let r = next;
+                    next += 1;
+                    r
+                });
+            }
+            (map, next)
+        }
+
+        let base_writes: Vec<(usize, u16)> = self
+            .base_insts
+            .iter()
+            .enumerate()
+            .map(|(i, inst)| (i, inst.dst))
+            .collect();
+        let (base_map, base_count) = scan(n_base, &base_writes, &base_last);
+        let ext_writes: Vec<(usize, u16)> = self
+            .ext_insts
+            .iter()
+            .enumerate()
+            .map(|(i, inst)| (i, inst.dst))
+            .collect();
+        let (ext_map, ext_count) = scan(n_ext, &ext_writes, &ext_last);
+
+        for (i, inst) in self.base_insts.iter_mut().enumerate() {
+            let _ = i;
+            inst.dst = base_map[inst.dst as usize];
+            match B::from_raw(inst.op) {
+                Some(B::Add) | Some(B::Sub) | Some(B::Mul) => {
+                    inst.a = base_map[inst.a as usize] as u32;
+                    inst.b = base_map[inst.b as usize] as u32;
+                }
+                Some(B::Neg) | Some(B::Inv) => {
+                    inst.a = base_map[inst.a as usize] as u32;
+                }
+                _ => {}
+            }
+        }
+        for inst in self.ext_insts.iter_mut() {
+            inst.dst = ext_map[inst.dst as usize];
+            match X::from_raw(inst.op) {
+                Some(X::SecureCol) => {
+                    inst.a = base_map[inst.a as usize] as u32;
+                    inst.b = base_map[inst.b as usize] as u32;
+                    inst.c = base_map[inst.c as usize] as u32;
+                    inst.d = base_map[inst.d as usize] as u32;
+                }
+                Some(X::Add) | Some(X::Sub) | Some(X::Mul) => {
+                    inst.a = ext_map[inst.a as usize] as u32;
+                    inst.b = ext_map[inst.b as usize] as u32;
+                }
+                Some(X::Neg) => {
+                    inst.a = ext_map[inst.a as usize] as u32;
+                }
+                _ => {}
+            }
+        }
+        for root in self.constraint_roots.iter_mut() {
+            *root = ext_map[*root as usize] as u32;
+        }
+        self.next_base_reg = base_count;
+        self.next_ext_reg = ext_count;
+    }
 }
 
 type SharedState = Rc<RefCell<RecordingState>>;

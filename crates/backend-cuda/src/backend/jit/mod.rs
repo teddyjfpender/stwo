@@ -54,27 +54,21 @@ pub(crate) fn try_jit_constraint_quotients<E: FrameworkEval>(
     let kernel_name = cuda_codegen::fused_kernel_name(program.header().semantic_hash);
 
     let n_rows = inputs.n_rows;
-    // Flatten the trace into one column-major device buffer (n_rows per column; in
-    // SubDomain mode columns are longer and the first n_rows bit-reversed entries are
-    // exactly the evaluation subdomain — same prefix the CPU lane reads).
-    let n_columns: usize = inputs.trace_ptrs.iter().map(|tree| tree.len()).sum();
-    let flat = BaseFieldVec::new_uninitialized(n_columns * n_rows);
+    // Pointer-table trace ABI: the kernel indexes trace_cols[global_column][row], so
+    // no flattening copies are needed (and no u32 length overflow at log >= 23 sizes;
+    // each column pointer addresses its own buffer). In SubDomain mode columns are
+    // longer than n_rows; the first n_rows bit-reversed entries are the evaluation
+    // subdomain — the same prefix the CPU lane reads.
     let mut interaction_offsets = [0u32; 3];
-    let mut next_column = 0usize;
+    let mut all_column_ptrs: Vec<*const u32> = Vec::new();
     for (interaction, tree) in inputs.trace_ptrs.iter().enumerate() {
-        interaction_offsets[interaction] = next_column as u32;
+        interaction_offsets[interaction] = all_column_ptrs.len() as u32;
         for (column_idx, &src_ptr) in tree.iter().enumerate() {
             assert!(inputs.trace_column_lens[interaction][column_idx] >= n_rows);
-            unsafe {
-                stwo_backend_cuda_kernels::raw::copy_uint32_t_vec_from_device_to_device(
-                    src_ptr,
-                    flat.device_ptr.add(next_column * n_rows).cast_mut(),
-                    n_rows as u32,
-                );
-            }
-            next_column += 1;
+            all_column_ptrs.push(src_ptr);
         }
     }
+    let trace_table = crate::backend::UploadedDevicePointerVec::upload(&all_column_ptrs);
     let offsets_dev = BaseFieldVec::from_vec(
         interaction_offsets
             .iter()
@@ -100,7 +94,7 @@ pub(crate) fn try_jit_constraint_quotients<E: FrameworkEval>(
             source_c.as_ptr(),
             name_c.as_ptr(),
             program.header().semantic_hash,
-            flat.device_ptr,
+            trace_table.as_ptr().cast(),
             offsets_dev.device_ptr,
             empty.device_ptr,
             ext_params.device_ptr,
