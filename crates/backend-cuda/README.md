@@ -35,6 +35,41 @@ Apple Silicon (see `crates/backend-metal/README.md`), where an exceptionally str
 CPU and per-dispatch overhead leave the GPU behind — on typical x86 cloud hosts the
 discrete GPU wins, and these numbers still include all the v1 host roundtrips below.
 
+## Big-trace proving (architecture per the SIMD-vs-CUDA performance review)
+
+Requirements applied from the NitrooZK/AntChain performance review (RTX 5090 deck,
+Feb 2026) and their [`NitrooZK-stwo`](https://github.com/AntChainOpenLabs/NitrooZK-stwo)
+fork:
+
+- **Never-release memory pool**: the default CUDA mem pool's release threshold is set
+  to `UINT64_MAX` at first allocation, so warm proves reuse device allocations instead
+  of paying `cudaMalloc`/`cudaFree` per run (the deck reports stable warm VRAM and a
+  ~280 ms cold→warm saving on their workload).
+- **Low-memory big-trace mode**: their L1 roadmap item ("spill evaluations after each
+  tree commit, keep coefficients, regenerate per group at decommit" — the prerequisite
+  for proving sn_pie-scale traces that OOM a 32 GB card) is *exactly* this repository's
+  generic low-memory machinery (`CommitmentSchemeProver::set_low_memory`): committed
+  LDE evaluations are compacted to half-size coefficient columns after commit (the
+  blowup-sized buffers return to the pool) and regenerated **bit-exactly** at decommit.
+  It is generic over `Backend` and now validated on `CudaBackend`:
+  conformance (proof byte-equality, both channels) passes with the mode ON.
+
+Measured on an H100 80GB (224-vCPU host), reference AIR, warm-best, end-of-run pool
+footprint (`STWO_BENCH_LOW_MEMORY=1` toggles the mode in the bench/testkit harness):
+
+| rows | CUDA (lm off) | CUDA (lm on) | pool footprint off → on | SIMD (host CPU) |
+|---|---|---|---|---|
+| 2^18 | 622 ms | 658 ms (+6%) | 752 → 720 MB | 1219 ms |
+| 2^20 | 2337 ms | 2543 ms (+9%) | 1168 → 1072 MB | 5281 ms |
+| 2^22 | 9393 ms | 10602 ms (+13%) | 2800 → 2416 MB (−14%) | — |
+
+Notes: CUDA is 2.0–2.3× the 224-vCPU SIMD run at these sizes. The VRAM saving is
+modest on this 16-column AIR (quotient/FRI working set dominates); the mode targets
+many-tree, many-column workloads (Cairo's preprocessed + base + interaction trees)
+where committed-LDE retention is the dominant term — the deck's 51 GB interaction
+trace is the motivating case. The probe reports the end-of-run pool footprint, not
+the true in-flight peak; a high-water-mark probe is future work.
+
 ## v1 caveats (correctness first; known perf headroom)
 
 - **Constraint evaluation runs on the CPU** (`evaluate_constraint_quotients_via_cpu`).
@@ -44,8 +79,10 @@ discrete GPU wins, and these numbers still include all the v1 host roundtrips be
   Merkle leaves/layers hashed on host; `TwiddleBuffer::extract_subdomain_twiddles` and
   `PolyOps::join_at_mid` download/upload; the quotient combine kernel runs on the
   evaluation subdomain with the interpolate/extend tail through `PolyOps`.
-- **Grinding delegates to `SimdBackend`** on both channels (byte-equality: a GPU grind
-  finding a different valid nonce changes proof bytes).
+- **Grinding delegates to `SimdBackend`** on both channels. NitrooZK's
+  `grind_blake2s.cu` shows the right fix: chunked `atomicMin` search returning the
+  *lowest* valid nonce, which matches the SIMD search order byte-exactly while being
+  ~200× faster at production `pow_bits` — a straightforward port, deferred.
 
 ## Fixes over the prototype
 
