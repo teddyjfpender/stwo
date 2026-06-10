@@ -283,6 +283,15 @@ impl PolyOps for CpuBackend {
             CircleCoefficients::new(right),
         )
     }
+
+    fn join_at_mid(
+        mut left: CircleCoefficients<Self>,
+        right: CircleCoefficients<Self>,
+    ) -> CircleCoefficients<Self> {
+        assert_eq!(left.coeffs.len(), right.coeffs.len());
+        left.coeffs.extend(right.coeffs);
+        CircleCoefficients::new(left.coeffs)
+    }
 }
 
 pub fn slow_precompute_twiddles(mut coset: Coset) -> Vec<BaseField> {

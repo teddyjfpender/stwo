@@ -130,6 +130,10 @@ impl Column<BaseField> for BaseColumn {
             },
         )
     }
+
+    fn shrink_to_fit(&mut self) {
+        self.data.shrink_to_fit();
+    }
 }
 
 impl FromIterator<BaseField> for BaseColumn {

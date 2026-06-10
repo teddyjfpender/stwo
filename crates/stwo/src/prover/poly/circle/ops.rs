@@ -148,4 +148,13 @@ pub trait PolyOps: ColumnOps<BaseField> + ColumnOps<SecureField> + Sized {
     fn split_at_mid(
         poly: CircleCoefficients<Self>,
     ) -> (CircleCoefficients<Self>, CircleCoefficients<Self>);
+
+    /// Concatenates two equal-size coefficient halves back into a single polynomial.
+    ///
+    /// This is the exact inverse of [`Self::split_at_mid`]:
+    /// `join_at_mid(split_at_mid(poly)) == poly`, bit for bit.
+    fn join_at_mid(
+        left: CircleCoefficients<Self>,
+        right: CircleCoefficients<Self>,
+    ) -> CircleCoefficients<Self>;
 }

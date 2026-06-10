@@ -63,4 +63,7 @@ pub trait Column<T>: Clone + Debug + FromIterator<T> + Send + Sync {
     fn set(&mut self, index: usize, value: T);
     /// Splits the column into two halves.
     fn split_at_mid(self) -> (Self, Self);
+    /// Shrinks the column's backing allocation to fit its length. Backends without a
+    /// meaningful implementation may leave this as a no-op.
+    fn shrink_to_fit(&mut self) {}
 }

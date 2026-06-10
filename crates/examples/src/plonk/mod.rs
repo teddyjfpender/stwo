@@ -190,6 +190,10 @@ pub fn prove_fibonacci_plonk(
     let mut commitment_scheme =
         CommitmentSchemeProver::<_, Blake2sMerkleChannel>::new(config, &twiddles);
     commitment_scheme.set_store_polynomials_coefficients();
+    // Benchmarking hook: LOW_MEMORY=1 enables the low-memory proving mode (identical proof).
+    if std::env::var("LOW_MEMORY").is_ok() {
+        commitment_scheme.set_low_memory();
+    }
 
     // Preprocessed trace.
     let span = span!(Level::INFO, "Constant").entered();

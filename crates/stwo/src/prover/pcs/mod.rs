@@ -1,7 +1,7 @@
 use hashbrown::HashMap;
 use itertools::Itertools;
 #[cfg(feature = "parallel")]
-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use tracing::{info, span, Level};
 
 use crate::core::channel::{Channel, MerkleChannel};
@@ -13,20 +13,20 @@ use crate::core::pcs::quotients::{
 };
 use crate::core::pcs::utils::prepare_preprocessed_query_positions;
 use crate::core::pcs::{PcsConfig, TreeSubspan, TreeVec};
-use crate::core::poly::circle::CanonicCoset;
+use crate::core::poly::circle::{CanonicCoset, CircleDomain};
 use crate::core::utils::MaybeOwned;
 use crate::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
 use crate::core::vcs_lifted::verifier::ExtendedMerkleDecommitmentLifted;
 use crate::core::ColumnVec;
 use crate::prover::air::component_prover::{Poly, Trace, WeightsHashMap};
-use crate::prover::backend::{BackendForChannel, Col};
+use crate::prover::backend::{Backend, BackendForChannel, Col, Column};
 use crate::prover::fri::{FriDecommitResult, FriProver};
 use crate::prover::mempool::BaseColumnPool;
 use crate::prover::pcs::quotient_ops::compute_fri_quotients;
 use crate::prover::poly::circle::{CircleCoefficients, CircleEvaluation};
 use crate::prover::poly::twiddles::TwiddleTree;
 use crate::prover::poly::BitReversedOrder;
-use crate::prover::vcs_lifted::prover::MerkleProverLifted;
+use crate::prover::vcs_lifted::prover::{GatheredColumns, MerkleProverLifted};
 
 pub mod quotient_ops;
 
@@ -36,6 +36,8 @@ pub struct CommitmentSchemeProver<'a, B: BackendForChannel<MC>, MC: MerkleChanne
     pub config: PcsConfig,
     pub twiddles: &'a TwiddleTree<B>,
     pub store_polynomials_coefficients: bool,
+    /// See [`Self::set_low_memory`].
+    pub low_memory: bool,
     /// Pre-allocated base field column pool for polynomial evaluation during commit.
     pub base_column_pool: MaybeOwned<'a, BaseColumnPool<B>>,
 }
@@ -48,6 +50,7 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
             config,
             twiddles,
             store_polynomials_coefficients: false,
+            low_memory: false,
             base_column_pool: MaybeOwned::Owned(BaseColumnPool::new()),
         }
     }
@@ -62,6 +65,7 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
             config,
             twiddles,
             store_polynomials_coefficients: false,
+            low_memory: false,
             base_column_pool: MaybeOwned::Borrowed(base_column_pool),
         }
     }
@@ -70,6 +74,21 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
     /// commit.
     pub const fn set_store_polynomials_coefficients(&mut self) {
         self.store_polynomials_coefficients = true;
+    }
+
+    /// Enables low-memory mode.
+    ///
+    /// Once the committed column evaluations have served their last bulk consumer (the FRI
+    /// quotients), each owned tree's columns are compacted to at most half their size by
+    /// interpolating in place and dropping the (verified all-zero) upper coefficient half. At
+    /// decommit time, the evaluations are regenerated transiently, column by column, via the
+    /// bit-exact inverse of that interpolation, so the produced proof is identical.
+    ///
+    /// Trades one inverse FFT per column at compaction plus one FFT per column at
+    /// decommitment for a significantly lower peak memory between the FRI phase and the end
+    /// of proving.
+    pub const fn set_low_memory(&mut self) {
+        self.low_memory = true;
     }
 
     /// Evaluates the given polynomials, commits them into a Merkle tree, mixes the root into
@@ -240,6 +259,29 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
             self.config.fri_config.log_blowup_factor,
         );
 
+        // In low-memory mode, the full column evaluations have now served their last bulk
+        // consumer (the FRI quotients above): compact each owned tree's columns. They are
+        // regenerated transiently — and bit-exactly — at decommit time.
+        let mut compact_trees: Vec<Option<CompactTreeColumns<B>>> = if self.low_memory {
+            let _span = span!(Level::INFO, "Eval compaction", class = "EvalCompaction").entered();
+            self.trees
+                .0
+                .iter_mut()
+                .map(|tree| match tree {
+                    MaybeOwned::Owned(tree) if !tree.polynomials.is_empty() => {
+                        Some(compact_tree_columns(
+                            std::mem::take(&mut tree.polynomials),
+                            self.twiddles,
+                            &self.base_column_pool,
+                        ))
+                    }
+                    _ => None,
+                })
+                .collect()
+        } else {
+            self.trees.iter().map(|_| None).collect()
+        };
+
         // Run FRI commitment phase on the oods quotients.
         let fri_prover =
             FriProver::<B, MC>::commit(channel, self.config.fri_config, &quotients, self.twiddles);
@@ -280,9 +322,19 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
             .trees
             .as_ref()
             .zip_eq(query_positions_tree)
-            .map(|(tree, query_positions)| tree.decommit(query_positions))
             .0
             .into_iter()
+            .zip(compact_trees.drain(..))
+            .map(|((tree, query_positions), compact)| match compact {
+                Some(compact) => decommit_compact_tree(
+                    tree,
+                    compact,
+                    query_positions,
+                    self.twiddles,
+                    &self.base_column_pool,
+                ),
+                None => tree.decommit(query_positions),
+            })
             .map(|(v, x)| (v, x.decommitment, x.aux))
             .multiunzip();
 
@@ -420,6 +472,118 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
             .collect_vec();
         self.commitment.decommit(queries, eval_vec)
     }
+}
+
+/// A compacted representation of a committed column in low-memory mode: enough information to
+/// regenerate the committed evaluation bit-exactly at decommit time, at half (or less) of the
+/// evaluation's memory.
+enum CompactColumn<B: Backend> {
+    /// The original coefficients the column was committed from (available when
+    /// `store_polynomials_coefficients` is set). Regeneration replays the commit-time
+    /// evaluation.
+    Original(CircleCoefficients<B>),
+    /// The lower half of the in-place interpolated coefficients; the upper half was verified
+    /// to be all zeros and is reconstructed as such. Regeneration evaluates the rejoined
+    /// polynomial on its own domain — the bit-exact inverse of the interpolation.
+    Half(CircleCoefficients<B>),
+    /// The full interpolated coefficients. Only used in the unexpected case that the upper
+    /// coefficient half is not all zeros (i.e. the committed evaluation was not a low-degree
+    /// extension); saves no memory but stays correct.
+    Full(CircleCoefficients<B>),
+}
+
+/// The compacted columns of one commitment tree, in commit order, with their committed
+/// evaluation domains.
+struct CompactTreeColumns<B: Backend> {
+    columns: Vec<(CompactColumn<B>, CircleDomain)>,
+}
+
+/// Compacts a tree's columns; see [`CommitmentSchemeProver::set_low_memory`].
+fn compact_tree_columns<B: Backend>(
+    polynomials: ColumnVec<Poly<B>>,
+    twiddles: &TwiddleTree<B>,
+    pool: &BaseColumnPool<B>,
+) -> CompactTreeColumns<B> {
+    #[cfg(not(feature = "parallel"))]
+    let iter = polynomials.into_iter();
+    #[cfg(feature = "parallel")]
+    let iter = polynomials.into_par_iter();
+
+    let columns = iter
+        .map(|poly| {
+            let domain = poly.evals.domain;
+            if let Some(coeffs) = poly.coeffs {
+                // The original coefficients are sufficient; recycle the evaluation buffer.
+                pool.give_back(domain.log_size(), poly.evals.values);
+                return (CompactColumn::Original(coeffs), domain);
+            }
+            // In-place interpolation: reuses the evaluation buffer.
+            let coeffs = poly.evals.interpolate_with_twiddles(twiddles);
+            let (mut left, right) = coeffs.split_at_mid();
+            let upper_half_is_zero = right.coeffs.to_cpu().iter().all(|v| v.0 == 0);
+            if upper_half_is_zero {
+                // Actually release the upper half's memory.
+                left.coeffs.shrink_to_fit();
+                (CompactColumn::Half(left), domain)
+            } else {
+                (CompactColumn::Full(B::join_at_mid(left, right)), domain)
+            }
+        })
+        .collect();
+
+    CompactTreeColumns { columns }
+}
+
+/// Decommits a tree whose column evaluations were compacted: regenerates each column
+/// transiently (bit-exactly), gathers only the rows the decommit reads, and decommits from the
+/// gathered view.
+fn decommit_compact_tree<B: BackendForChannel<MC>, MC: MerkleChannel>(
+    tree: &CommitmentTreeProver<B, MC>,
+    compact: CompactTreeColumns<B>,
+    query_positions: &[usize],
+    twiddles: &TwiddleTree<B>,
+    pool: &BaseColumnPool<B>,
+) -> (
+    ColumnVec<Vec<BaseField>>,
+    ExtendedMerkleDecommitmentLifted<MC::H>,
+) {
+    let lifting_log_size = tree.commitment.log_size();
+    // The leaves whose hashes the decommit will recompute (unretained bottom tree layers).
+    let leaf_indices = tree.commitment.unretained_leaf_indices(query_positions);
+
+    #[cfg(not(feature = "parallel"))]
+    let iter = compact.columns.into_iter();
+    #[cfg(feature = "parallel")]
+    let iter = compact.columns.into_par_iter();
+
+    let (log_sizes, rows): (Vec<u32>, Vec<HashMap<usize, BaseField>>) = iter
+        .map(|(column, domain)| {
+            let log_size = domain.log_size();
+            let shift = lifting_log_size - log_size;
+            let buffer = pool.take_or_alloc(log_size);
+            let evals = match column {
+                CompactColumn::Original(coeffs) | CompactColumn::Full(coeffs) => {
+                    B::evaluate_into(&coeffs, domain, twiddles, buffer)
+                }
+                CompactColumn::Half(left) => {
+                    let zeros =
+                        CircleCoefficients::new(Col::<B, BaseField>::zeros(left.coeffs.len()));
+                    let joined = B::join_at_mid(left, zeros);
+                    B::evaluate_into(&joined, domain, twiddles, buffer)
+                }
+            };
+            let mut gathered = HashMap::new();
+            for pos in query_positions.iter().chain(leaf_indices.iter()) {
+                let row = (pos >> (shift + 1) << 1) + (pos & 1);
+                gathered.entry(row).or_insert_with(|| evals.values.at(row));
+            }
+            pool.give_back(log_size, evals.values);
+            (log_size, gathered)
+        })
+        .unzip();
+
+    tree.commitment
+        .decommit_gathered(query_positions, &GatheredColumns { log_sizes, rows })
 }
 
 fn print_column_size_histogram<B: BackendForChannel<MC>, MC: MerkleChannel>(

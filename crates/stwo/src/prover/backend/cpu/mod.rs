@@ -67,6 +67,9 @@ impl<T: Debug + Clone + Default + Send + Sync> Column<T> for Vec<T> {
         let second = self.split_off(self.len() / 2);
         (self, second)
     }
+    fn shrink_to_fit(&mut self) {
+        Vec::shrink_to_fit(self);
+    }
 }
 
 pub type CpuCirclePoly = CircleCoefficients<CpuBackend>;

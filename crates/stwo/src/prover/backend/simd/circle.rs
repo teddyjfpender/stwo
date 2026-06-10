@@ -553,6 +553,58 @@ impl PolyOps for SimdBackend {
             }),
         )
     }
+
+    /// The exact inverse of [`Self::split_at_mid`]: undoes the per-half transposes, concatenates,
+    /// and re-applies the full-size transpose ([`transpose_vecs`] is an involution).
+    fn join_at_mid(
+        left: CircleCoefficients<Self>,
+        right: CircleCoefficients<Self>,
+    ) -> CircleCoefficients<Self> {
+        assert_eq!(left.coeffs.length, right.coeffs.length);
+        let length = left.coeffs.length + right.coeffs.length;
+
+        // If the result fits in one SIMD vector, join on the CPU.
+        if length <= 1 << LOG_N_LANES {
+            let mut cpu_vec = left.coeffs.to_cpu();
+            cpu_vec.extend(right.coeffs.to_cpu());
+            return CircleCoefficients::new(cpu_vec.into_iter().collect());
+        }
+
+        let log_length = length.ilog2();
+        let log_n_vecs = log_length - LOG_N_LANES;
+
+        let mut data = left.coeffs.data;
+        let mut right_data = right.coeffs.data;
+
+        // Undo the per-half transposes that `split_at_mid` applies when the halves are large.
+        if log_length - 1 > CACHED_FFT_LOG_SIZE {
+            unsafe {
+                transpose_vecs(
+                    transmute::<*mut PackedBaseField, *mut u32>(data.as_mut_ptr()),
+                    (log_n_vecs - 1) as usize,
+                );
+                transpose_vecs(
+                    transmute::<*mut PackedBaseField, *mut u32>(right_data.as_mut_ptr()),
+                    (log_n_vecs - 1) as usize,
+                );
+            }
+        }
+
+        data.append(&mut right_data);
+
+        // Re-apply the full-size transpose: for large polynomials the FFT expects the
+        // coefficients in transposed order.
+        if log_length > CACHED_FFT_LOG_SIZE {
+            unsafe {
+                transpose_vecs(
+                    transmute::<*mut PackedBaseField, *mut u32>(data.as_mut_ptr()),
+                    log_n_vecs as usize,
+                );
+            }
+        }
+
+        CircleCoefficients::new(BaseColumn { data, length })
+    }
 }
 
 fn compute_small_coset_twiddles(coset: Coset) -> TwiddleTree<SimdBackend> {
@@ -832,6 +884,29 @@ mod tests {
                 + random_point.repeated_double(log_size - 2).x * right.eval_at_point(random_point),
             poly.eval_at_point(random_point)
         );
+    }
+
+    /// `join_at_mid` must be the bit-exact inverse of `split_at_mid` across all layout regimes
+    /// (CPU fallback, plain order, transposed whole, transposed halves).
+    #[test]
+    fn test_join_at_mid_inverts_split_at_mid() {
+        let mut rng = SmallRng::seed_from_u64(0);
+        for log_size in [
+            3,
+            LOG_N_LANES,
+            10,
+            CACHED_FFT_LOG_SIZE,
+            CACHED_FFT_LOG_SIZE + 1,
+            CACHED_FFT_LOG_SIZE + 2,
+        ] {
+            let coeffs: Vec<BaseField> = (0..1 << log_size).map(|_| rng.gen()).collect();
+            let poly = CircleCoefficients::<SimdBackend>::new(coeffs.iter().copied().collect());
+
+            let (left, right) = poly.split_at_mid();
+            let joined = SimdBackend::join_at_mid(left, right);
+
+            assert_eq!(joined.coeffs.to_cpu(), coeffs, "log_size = {log_size}");
+        }
     }
 
     #[test]
