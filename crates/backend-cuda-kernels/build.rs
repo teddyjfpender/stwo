@@ -138,6 +138,9 @@ fn main() {
     }
     println!("cargo:rustc-link-lib=static=stwo_cuda_kernels");
     println!("cargo:rustc-link-lib=cudart");
+    // The JIT runtime (runtime_jit.cu) compiles generated kernels at runtime.
+    println!("cargo:rustc-link-lib=nvrtc");
+    println!("cargo:rustc-link-lib=cuda");
     // The .cu host code uses C++ exceptions and the C++ runtime.
     println!("cargo:rustc-link-lib=stdc++");
 }

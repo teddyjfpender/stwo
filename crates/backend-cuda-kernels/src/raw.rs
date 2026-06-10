@@ -52,6 +52,27 @@ extern "C" {
     /// Chunked atomicMin nonce search; returns the LOWEST valid nonce, matching the
     /// SIMD grind's search order byte-exactly (non-M31 Blake2s channel only).
     pub fn grind_blake2s(host_prefixed_digest: *const u32, pow_bits: u32) -> u64;
+    /// JIT-compile (NVRTC; cached by the CONTENT semantic hash, never pointers) and
+    /// launch a generated fused constraint kernel. Returns false on any compile or
+    /// launch failure; the caller falls back to the CPU lane.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stwo_cuda_jit_eval_fused(
+        source: *const core::ffi::c_char,
+        kernel_name: *const core::ffi::c_char,
+        semantic_hash: u64,
+        trace_values: *const u32,
+        interaction_offsets: *const u32,
+        base_params: *const u32,
+        ext_params: *const u32,
+        random_coeff_powers: *const u32,
+        denom_inv: *const u32,
+        coord_0: *mut u32,
+        coord_1: *mut u32,
+        coord_2: *mut u32,
+        coord_3: *mut u32,
+        row_count: u32,
+        log_n_rows: u32,
+    ) -> bool;
     /// Per-component constraint-quotient kernel dispatch (NitrooZK lineage). The first
     /// 4 bytes behind `eval` are an FNV1a hash of the component name selecting the
     /// kernel; the rest is the raw `FrameworkEval` struct the kernel's generated code

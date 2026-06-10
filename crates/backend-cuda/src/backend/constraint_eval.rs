@@ -90,24 +90,32 @@ pub fn evaluate_constraint_quotients<E: FrameworkEval + Sync>(
             Err(_) => std::env::var_os("STWO_CUDA_ENABLE_CONSTRAINT_KERNELS").is_some(),
         };
 
+    // Common GPU marshaling, shared by the precompiled and JIT lanes.
+    let gpu_denom_inv = BaseFieldVec::from_vec(denom_inv.clone());
+    let random_coeff_powers = SecureFieldVec::from_vec(accum.random_coeff_powers.clone());
+    let trace_ptrs: Vec<Vec<*const u32>> = (0..3)
+        .map(|interaction| {
+            trace
+                .get(interaction)
+                .map(|columns| {
+                    columns
+                        .iter()
+                        .map(|column| column.values.device_ptr)
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+        .collect();
+    let trace_column_lens: Vec<Vec<usize>> = (0..3)
+        .map(|interaction| {
+            trace
+                .get(interaction)
+                .map(|columns| columns.iter().map(|column| column.values.len()).collect())
+                .unwrap_or_default()
+        })
+        .collect();
+
     if gpu_enabled {
-        let gpu_denom_inv = BaseFieldVec::from_vec(denom_inv.clone());
-        let random_coeff_powers = SecureFieldVec::from_vec(accum.random_coeff_powers.clone());
-
-        let trace_ptrs: Vec<Vec<*const u32>> = (0..3)
-            .map(|interaction| {
-                trace
-                    .get(interaction)
-                    .map(|columns| {
-                        columns
-                            .iter()
-                            .map(|column| column.values.device_ptr)
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            })
-            .collect();
-
         // The dispatcher reads a 4-byte FNV1a id, then the raw eval struct (the
         // generated kernel code mirrors the Rust field layout of its component).
         let eval_id = fnv1a_eval_id(eval_name);
@@ -229,6 +237,94 @@ pub fn evaluate_constraint_quotients<E: FrameworkEval + Sync>(
         }
     } else if log {
         eprintln!("stwo-backend-cuda constraint eval: component={eval_name} lane=CPU (disabled)");
+    }
+
+    // JIT lane: kernels generated from THIS build's AIR via the recording evaluator
+    // (NVRTC, content-hash cached) — consistent by construction, explicit C ABI.
+    if let Some(scratch) = super::jit::try_jit_constraint_quotients(
+        component,
+        &super::jit::JitInputs {
+            trace_ptrs: &trace_ptrs,
+            trace_column_lens: &trace_column_lens,
+            random_coeff_powers: &random_coeff_powers,
+            denom_inv: &gpu_denom_inv,
+            accum_coords: [
+                accum.col.columns[0].device_ptr.cast_mut(),
+                accum.col.columns[1].device_ptr.cast_mut(),
+                accum.col.columns[2].device_ptr.cast_mut(),
+                accum.col.columns[3].device_ptr.cast_mut(),
+            ],
+            n_rows: eval_domain.size(),
+            trace_log_size: trace_domain.log_size(),
+        },
+    ) {
+        if log {
+            eprintln!("stwo-backend-cuda constraint eval: component={eval_name} lane=JIT");
+        }
+        let verify = std::env::var_os("STWO_CUDA_CONSTRAINT_VERIFY").is_some();
+        let accum_prev_snapshot = if verify {
+            Some(SecureColumnByCoords {
+                columns: accum.col.columns.each_ref().map(|column| column.to_cpu()),
+            })
+        } else {
+            None
+        };
+        // accum += scratch (exact field arithmetic; same value as the CPU lane's
+        // accum_prev + row_res * denom_inv).
+        let jit_column = SecureColumnByCoords::<CudaBackend> { columns: scratch };
+        <CudaBackend as stwo::prover::AccumulationOps>::accumulate(accum.col, &jit_column);
+
+        if let Some(snapshot) = accum_prev_snapshot {
+            let gpu_result: Vec<Vec<BaseField>> = accum
+                .col
+                .columns
+                .iter()
+                .map(|column| column.to_cpu())
+                .collect();
+            let trace_cols_cpu = trace
+                .as_cols_ref()
+                .map_cols(|column| CircleEvaluation::new(column.domain, column.values.to_cpu()));
+            let cpu_result = accumulate_pointwise_cpu(
+                component,
+                trace_cols_cpu.as_cols_ref(),
+                eval_domain.log_size(),
+                trace_domain.log_size(),
+                denom_inv.clone(),
+                &accum.random_coeff_powers,
+                &snapshot,
+            );
+            let mut mismatches = 0usize;
+            let mut first: Option<(usize, usize)> = None;
+            for (coord, gpu_column) in gpu_result.iter().enumerate() {
+                for (row, (gpu, cpu)) in gpu_column
+                    .iter()
+                    .zip(cpu_result.columns[coord].iter())
+                    .enumerate()
+                {
+                    if gpu != cpu {
+                        mismatches += 1;
+                        if first.is_none() {
+                            first = Some((coord, row));
+                        }
+                    }
+                }
+            }
+            let total = 4 * gpu_result[0].len();
+            eprintln!(
+                "VERIFY-JIT component={eval_name}: {mismatches}/{total} mismatched, first={first:?}"
+            );
+            if mismatches > 0 {
+                *accum.col = SecureColumnByCoords {
+                    columns: cpu_result
+                        .columns
+                        .map(|values| values.into_iter().collect()),
+                };
+            }
+        }
+        return;
+    }
+    if log {
+        eprintln!("stwo-backend-cuda constraint eval: component={eval_name} lane=CPU");
     }
 
     // CPU fallback on the SAME accumulator claim, mirroring

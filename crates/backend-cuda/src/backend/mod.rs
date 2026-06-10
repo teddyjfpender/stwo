@@ -6,6 +6,7 @@ mod column;
 mod constraint_eval;
 mod field;
 mod fri;
+mod jit;
 mod lookups;
 mod pointer_vec;
 mod poly;
