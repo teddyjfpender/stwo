@@ -70,6 +70,21 @@ where committed-LDE retention is the dominant term — the deck's 51 GB interact
 trace is the motivating case. The probe reports the end-of-run pool footprint, not
 the true in-flight peak; a high-water-mark probe is future work.
 
+## stwo-cairo GPU witness pieces
+
+- **GPU preprocessed columns** (`GenPreprocessedTrace` hook in the stwo-cairo fork):
+  the Seq, RangeCheck, and BitwiseXor families generate directly on device (family
+  caches keyed by family *parameters* — content, never pointers); other columns take
+  the SIMD path per column, and id-parse failures degrade to SIMD, never to wrong
+  values. Validated: the Cairo e2e (which pins the preprocessed root) stays
+  byte-equal. `PREPROCESSED_TRACE_GPU_GENERATE=0` forces the SIMD path. Batch-NTT
+  commitment interpolation and the Pedersen GPU table are the queued follow-ups.
+- **Big-trace mode in prove_cairo**: `STWO_CAIRO_LOW_MEMORY=1` enables the
+  compact/regenerate low-memory machinery for the whole Cairo prove — validated
+  byte-equal on the all-opcode e2e (+~3% time). True sn_pie-scale (~25M steps, the
+  51 GB OOM case) validation still needs the sn_pie input artifact (~130 MB, not in
+  this repo).
+
 ## v1 caveats (correctness first; known perf headroom)
 
 - **Constraint evaluation runs on the CPU** (`evaluate_constraint_quotients_via_cpu`).
