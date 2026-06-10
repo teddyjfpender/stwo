@@ -197,6 +197,19 @@ void copy_uint32_t_vec_from_device_to_device(uint32_t *, uint32_t*, int);
 extern "C"
 void copy_uint32_t_vec_from_device_to_device_offset(uint32_t *from, uint32_t *dst, int size, int offset);
 
+// Zero-pad helper and pinned-host staging primitives (see utils.cu for docs).
+extern "C"
+void cuda_zero_device_region(uint32_t *ptr, uint64_t offset_words, uint64_t n_words);
+
+extern "C"
+uint32_t* cuda_alloc_pinned_host_u32(uint64_t n_words);
+
+extern "C"
+void cuda_free_pinned_host_u32(uint32_t *ptr);
+
+extern "C"
+void copy_uint32_t_vec_from_host_to_device_into(const uint32_t *host_ptr, uint32_t *device_ptr, uint64_t n_words);
+
 extern "C"
 uint32_t* cuda_malloc_uint32_t(int);
 

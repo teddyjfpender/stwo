@@ -6,6 +6,17 @@ cross-check that verified every load-bearing claim against the source. This is
 the blueprint for the re-architecture; no further GPU benchmarking until the
 blocking measurements below are taken.*
 
+> **IMPLEMENTATION STATUS**: the 5-point plan below is implemented in full as of
+> commit `25798d20` ("perf(cuda): stream-ordered rebuild"). See the
+> "Stream-ordered execution (rebuild round 3)" section of
+> `crates/backend-cuda/README.md` for what shipped, the byte-equality reasoning,
+> and the two deliberate deviations (per-call barycentric OODS kept — post-rebuild
+> cost is one launch plus a 16-byte fenced readback; `cuda_malloc_uint32_t` still
+> zero-fills, now as a stream-ordered memset, because flipping to true
+> uninitialized memory needs a per-call-site conformance audit). Debug/observability
+> hooks added in lieu of the nsys session: `STWO_CUDA_DEBUG_SYNC=1` (restore
+> per-launch syncs), `STWO_JIT_LOG=1` (NVRTC compile timing + cache source).
+
 ## Verdict
 
 The backend is **latency-bound by construction, not compute-bound**. The kernels
