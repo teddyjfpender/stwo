@@ -14,7 +14,7 @@ use stwo::prover::backend::simd::column::VeryPackedSecureColumnByCoords;
 use stwo::prover::backend::simd::m31::LOG_N_LANES;
 use stwo::prover::backend::simd::very_packed_m31::{VeryPackedBaseField, LOG_N_VERY_PACKED_ELEMS};
 use stwo::prover::backend::simd::SimdBackend;
-use stwo::prover::backend::{Backend, CpuBackend};
+use stwo::prover::backend::{Backend, Column, CpuBackend};
 use stwo::prover::poly::circle::CircleEvaluation;
 use stwo::prover::poly::BitReversedOrder;
 use stwo::prover::secure_column::SecureColumnByCoords;
@@ -294,6 +294,68 @@ impl FrameworkBackend for CpuBackend {
             accum.col,
         );
     }
+}
+
+/// Evaluates a component's constraint quotients by converting the trace columns to the
+/// [`CpuBackend`], evaluating there, and writing the result back into the backend-typed
+/// accumulator.
+///
+/// This is a correct-but-slow generic driver that lets a new backend implement
+/// [`FrameworkBackend`] (and so become fully provable) before it has a native constraint
+/// evaluator. Backends should replace it with a native implementation for performance.
+///
+/// NOTE: when `EvaluationMode::ExtendToEvalDomain` is used, the backend's coefficient
+/// representation must match the CPU backend's (plain bit-reversed order).
+pub fn evaluate_constraint_quotients_via_cpu<E: FrameworkEval + Sync, B: Backend>(
+    component: &FrameworkComponent<E>,
+    trace: &Trace<'_, B>,
+    evaluation_accumulator: &mut DomainEvaluationAccumulator<B>,
+) {
+    if component.n_constraints() == 0 {
+        return;
+    }
+
+    let ConstraintQuotientInputs {
+        eval_domain,
+        trace_domain,
+        trace,
+        denom_inv,
+    } = get_constraint_quotient_inputs(component, trace, evaluation_accumulator.evaluation_mode());
+
+    let [mut accum] =
+        evaluation_accumulator.columns([(eval_domain.log_size(), component.n_constraints())]);
+    accum.random_coeff_powers.reverse();
+
+    let _span = span!(
+        Level::INFO,
+        "Constraint point-wise eval",
+        class = "ConstraintEval"
+    )
+    .entered();
+
+    // Convert the (borrowed or extended) trace columns and the accumulator to the CPU
+    // backend, evaluate, and write back.
+    let trace_cols_cpu: TreeVec<Vec<CircleEvaluation<CpuBackend, BaseField, BitReversedOrder>>> =
+        trace
+            .as_cols_ref()
+            .map_cols(|column| CircleEvaluation::new(column.domain, column.values.to_cpu()));
+    let accum_prev_cpu = SecureColumnByCoords::<CpuBackend> {
+        columns: accum.col.columns.each_ref().map(|column| column.to_cpu()),
+    };
+
+    let result = accumulate_pointwise_cpu(
+        component,
+        trace_cols_cpu.as_cols_ref(),
+        eval_domain.log_size(),
+        trace_domain.log_size(),
+        denom_inv,
+        &accum.random_coeff_powers,
+        &accum_prev_cpu,
+    );
+
+    *accum.col = SecureColumnByCoords {
+        columns: result.columns.map(|values| values.into_iter().collect()),
+    };
 }
 
 /// Computes the evaluation subdomain for a component given its constraint degree bound

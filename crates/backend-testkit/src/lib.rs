@@ -61,6 +61,8 @@ where
     assert_column_ops_conformance::<B>();
     assert_poly_ops_conformance::<B>();
     assert_fri_fold_conformance::<B>();
+    assert_accumulation_conformance::<B>();
+    assert_quotient_ops_conformance::<B>();
     assert_from_simd_columns_conformance::<B>();
     assert_merkle_conformance::<B, MC>();
     assert_grind_conformance::<B, MC>();
@@ -154,6 +156,58 @@ pub fn assert_poly_ops_conformance<B: Backend>() {
             roundtrip.values.to_cpu(),
             values,
             "interpolate/evaluate round trip, log_size={log_size}"
+        );
+
+        // Coefficient-order semantics: splitting at the mid must produce the same two
+        // half-polynomials as the reference backend (the composition polynomial is committed
+        // via this split). A backend whose coefficient ORDER differs would pass every
+        // self-consistent check above but fail here.
+        let (left_b, right_b) = B::split_at_mid(poly_b);
+        let (left_cpu, right_cpu) = CpuBackend::split_at_mid(poly_cpu);
+        assert_eq!(
+            left_b.eval_at_point(point),
+            left_cpu.eval_at_point(point),
+            "split_at_mid left half, log_size={log_size}"
+        );
+        assert_eq!(
+            right_b.eval_at_point(point),
+            right_cpu.eval_at_point(point),
+            "split_at_mid right half, log_size={log_size}"
+        );
+        // join_at_mid must be the exact inverse.
+        let rejoined_b = B::join_at_mid(left_b, right_b);
+        let rejoined_cpu = CpuBackend::join_at_mid(left_cpu, right_cpu);
+        assert_eq!(
+            rejoined_b.eval_at_point(point),
+            rejoined_cpu.eval_at_point(point),
+            "join_at_mid, log_size={log_size}"
+        );
+
+        // Barycentric OODS path: the weights-based evaluation used by `prove_values`.
+        let coset = CanonicCoset::new(log_size);
+        let weights_b =
+            CircleEvaluation::<B, BaseField, BitReversedOrder>::barycentric_weights(coset, point);
+        let weights_cpu =
+            CircleEvaluation::<CpuBackend, BaseField, BitReversedOrder>::barycentric_weights(
+                coset, point,
+            );
+        assert_eq!(
+            weights_b.to_cpu(),
+            weights_cpu.to_cpu(),
+            "barycentric weights, log_size={log_size}"
+        );
+        let eval_b2 = CircleEvaluation::<B, BaseField, BitReversedOrder>::new(
+            domain,
+            values.iter().copied().collect(),
+        );
+        let eval_cpu2 = CircleEvaluation::<CpuBackend, BaseField, BitReversedOrder>::new(
+            domain,
+            values.clone(),
+        );
+        assert_eq!(
+            eval_b2.barycentric_eval_at_point(&weights_b),
+            eval_cpu2.barycentric_eval_at_point(&weights_cpu),
+            "barycentric eval, log_size={log_size}"
         );
     }
 }
@@ -295,6 +349,183 @@ where
         let nonce_cpu = CpuBackend::grind(&channel, pow_bits);
         assert_eq!(nonce_b, nonce_cpu, "grind nonce, pow_bits={pow_bits}");
     }
+}
+
+/// Secure-column accumulation and lift-and-accumulate must agree with the reference backend.
+pub fn assert_accumulation_conformance<B: Backend>() {
+    use stwo::prover::secure_column::SecureColumnByCoords;
+    use stwo::prover::AccumulationOps;
+
+    let mut rng = SmallRng::seed_from_u64(5);
+    for log_size in [5u32, 8, 11] {
+        let a: [Vec<BaseField>; 4] =
+            std::array::from_fn(|_| random_base_field_vec(&mut rng, 1 << log_size));
+        let b: [Vec<BaseField>; 4] =
+            std::array::from_fn(|_| random_base_field_vec(&mut rng, 1 << log_size));
+
+        let mut col_b = SecureColumnByCoords::<B> {
+            columns: std::array::from_fn(|i| a[i].iter().copied().collect()),
+        };
+        let other_b = SecureColumnByCoords::<B> {
+            columns: std::array::from_fn(|i| b[i].iter().copied().collect()),
+        };
+        B::accumulate(&mut col_b, &other_b);
+
+        let mut col_cpu = SecureColumnByCoords::<CpuBackend> { columns: a.clone() };
+        let other_cpu = SecureColumnByCoords::<CpuBackend> { columns: b.clone() };
+        CpuBackend::accumulate(&mut col_cpu, &other_cpu);
+
+        assert_eq!(
+            col_b.columns.each_ref().map(|c| c.to_cpu()),
+            col_cpu.columns,
+            "accumulate, log_size={log_size}"
+        );
+
+        // lift_and_accumulate over mixed sizes.
+        let small: [Vec<BaseField>; 4] =
+            std::array::from_fn(|_| random_base_field_vec(&mut rng, 1 << (log_size - 2)));
+        let lifted_b = B::lift_and_accumulate(vec![
+            SecureColumnByCoords::<B> {
+                columns: std::array::from_fn(|i| small[i].iter().copied().collect()),
+            },
+            SecureColumnByCoords::<B> {
+                columns: std::array::from_fn(|i| a[i].iter().copied().collect()),
+            },
+        ])
+        .unwrap();
+        let lifted_cpu = CpuBackend::lift_and_accumulate(vec![
+            SecureColumnByCoords::<CpuBackend> {
+                columns: small.clone(),
+            },
+            SecureColumnByCoords::<CpuBackend> { columns: a.clone() },
+        ])
+        .unwrap();
+        assert_eq!(
+            lifted_b.columns.each_ref().map(|c| c.to_cpu()),
+            lifted_cpu.columns,
+            "lift_and_accumulate, log_size={log_size}"
+        );
+    }
+}
+
+/// Quotient accumulation and combination must agree with the reference backend.
+pub fn assert_quotient_ops_conformance<B: Backend>() {
+    use stwo::core::pcs::quotients::{
+        build_samples_with_randomness_and_periodicity, ColumnSampleBatch, PointSample,
+    };
+    use stwo::core::pcs::TreeVec;
+    use stwo::prover::pcs::quotient_ops::AccumulatedNumerators;
+    use stwo::prover::QuotientOps;
+
+    const LOG_SIZE: u32 = 8;
+    const LOG_BLOWUP_FACTOR: u32 = 2;
+    const N_COLS: usize = 7;
+
+    let mut rng = SmallRng::seed_from_u64(6);
+    let domain = CanonicCoset::new(LOG_SIZE).circle_domain();
+    let column_values: Vec<Vec<BaseField>> = (0..N_COLS)
+        .map(|_| random_base_field_vec(&mut rng, 1 << LOG_SIZE))
+        .collect();
+
+    let points = [
+        SECURE_FIELD_CIRCLE_GEN.mul(rng.gen::<u128>()),
+        SECURE_FIELD_CIRCLE_GEN.mul(rng.gen::<u128>()),
+    ];
+    let samples = (0..N_COLS)
+        .map(|i| {
+            points
+                .iter()
+                .take(1 + i % 2)
+                .map(|&point| PointSample {
+                    point,
+                    value: SecureField::from_u32_unchecked(
+                        rng.gen::<u32>() % (1 << 30),
+                        rng.gen::<u32>() % (1 << 30),
+                        rng.gen::<u32>() % (1 << 30),
+                        rng.gen::<u32>() % (1 << 30),
+                    ),
+                })
+                .collect_vec()
+        })
+        .collect_vec();
+    let random_coeff = SecureField::from_u32_unchecked(98, 76, 54, 32);
+    let sample_batches = ColumnSampleBatch::new_vec(
+        &build_samples_with_randomness_and_periodicity(
+            &TreeVec(vec![samples]),
+            vec![vec![LOG_SIZE; N_COLS].into_iter()],
+            LOG_SIZE,
+            random_coeff,
+        )
+        .iter()
+        .flatten()
+        .collect_vec(),
+    );
+
+    let columns_b: Vec<CircleEvaluation<B, BaseField, BitReversedOrder>> = column_values
+        .iter()
+        .map(|values| CircleEvaluation::new(domain, values.iter().copied().collect()))
+        .collect();
+    let columns_cpu: Vec<CircleEvaluation<CpuBackend, BaseField, BitReversedOrder>> = column_values
+        .iter()
+        .map(|values| CircleEvaluation::new(domain, values.clone()))
+        .collect();
+
+    let mut acc_b: Vec<AccumulatedNumerators<B>> = vec![];
+    B::accumulate_numerators(
+        &columns_b.iter().collect_vec(),
+        &sample_batches,
+        &mut acc_b,
+        LOG_BLOWUP_FACTOR,
+    );
+    let mut acc_cpu: Vec<AccumulatedNumerators<CpuBackend>> = vec![];
+    CpuBackend::accumulate_numerators(
+        &columns_cpu.iter().collect_vec(),
+        &sample_batches,
+        &mut acc_cpu,
+        LOG_BLOWUP_FACTOR,
+    );
+
+    assert_eq!(acc_b.len(), acc_cpu.len(), "accumulation count");
+    for (b, cpu) in acc_b.iter().zip(acc_cpu.iter()) {
+        assert_eq!(
+            b.first_linear_term_acc, cpu.first_linear_term_acc,
+            "first linear term"
+        );
+        assert_eq!(
+            b.partial_numerators_acc
+                .columns
+                .each_ref()
+                .map(|c| c.to_cpu()),
+            cpu.partial_numerators_acc.columns,
+            "partial numerators"
+        );
+    }
+
+    // Combine: requires twiddles for the lifting domain.
+    let lifting_log_size = LOG_SIZE + LOG_BLOWUP_FACTOR;
+    let twiddles_b = B::precompute_twiddles(
+        CanonicCoset::new(lifting_log_size)
+            .circle_domain()
+            .half_coset,
+    );
+    let twiddles_cpu = CpuBackend::precompute_twiddles(
+        CanonicCoset::new(lifting_log_size)
+            .circle_domain()
+            .half_coset,
+    );
+    let combined_b =
+        B::compute_quotients_and_combine(acc_b, lifting_log_size, LOG_BLOWUP_FACTOR, &twiddles_b);
+    let combined_cpu = CpuBackend::compute_quotients_and_combine(
+        acc_cpu,
+        lifting_log_size,
+        LOG_BLOWUP_FACTOR,
+        &twiddles_cpu,
+    );
+    assert_eq!(
+        combined_b.values.columns.each_ref().map(|c| c.to_cpu()),
+        combined_cpu.values.columns,
+        "combined quotients"
+    );
 }
 
 /// The reference AIR for the end-to-end check: each row holds an independent sequence

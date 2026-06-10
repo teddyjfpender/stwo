@@ -3,6 +3,8 @@ members = [
     "crates/stwo",
     "crates/air-utils",
     "crates/air-utils-derive",
+    "crates/backend-metal",
+    "crates/backend-metal-sys",
     "crates/backend-testkit",
     "crates/constraint-framework",
     "crates/examples",

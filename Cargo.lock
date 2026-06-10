@@ -1340,6 +1340,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "stwo-backend-metal"
+version = "2.2.0"
+dependencies = [
+ "hashbrown 0.15.4",
+ "itertools 0.12.1",
+ "num-traits",
+ "rand",
+ "rayon",
+ "serde",
+ "stwo",
+ "stwo-backend-metal-sys",
+ "stwo-backend-testkit",
+ "stwo-constraint-framework",
+]
+
+[[package]]
+name = "stwo-backend-metal-sys"
+version = "2.2.0"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "stwo-backend-testkit"
 version = "2.2.0"
 dependencies = [
