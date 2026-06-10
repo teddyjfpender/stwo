@@ -42,7 +42,7 @@ fn main() {
     }
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR must be set"));
-    let arch = env::var("STWO_CUDA_ARCH").unwrap_or_else(|_| "native".to_string());
+    let arch = env::var("STWO_CUDA_ARCH").unwrap_or_else(|_| detect_arch());
     let extra_flags: Vec<String> = env::var("STWO_CUDA_NVCC_FLAGS")
         .map(|flags| flags.split_whitespace().map(str::to_string).collect())
         .unwrap_or_default();
@@ -55,6 +55,9 @@ fn main() {
         .arg("-dlto")
         .arg("-O3")
         .arg("--std=c++17")
+        // The fp256/poseidon252 stack calls `constexpr __host__` accessors from device
+        // code (sppark lineage); nvcc requires this flag for that pattern.
+        .arg("--expt-relaxed-constexpr")
         .arg(format!("-arch={arch}"))
         .args(&extra_flags)
         .args(&sources)
@@ -78,6 +81,24 @@ fn main() {
     }
     println!("cargo:rustc-link-lib=static=stwo_cuda_kernels");
     println!("cargo:rustc-link-lib=cudart");
+}
+
+/// The compute capability of the local GPU as an `-arch` value (e.g. `sm_86`), queried
+/// via `nvidia-smi`. Falls back to `native` — but note `-arch=native` segfaults nvcc
+/// 11.8's detection path (validated on RunPod), which is why the explicit query is the
+/// default and `STWO_CUDA_ARCH` exists as an override.
+fn detect_arch() -> String {
+    Command::new("nvidia-smi")
+        .args(["--query-gpu=compute_cap", "--format=csv,noheader"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| {
+            let cap = String::from_utf8(output.stdout).ok()?;
+            let cap = cap.lines().next()?.trim().replace('.', "");
+            (!cap.is_empty()).then(|| format!("sm_{cap}"))
+        })
+        .unwrap_or_else(|| "native".to_string())
 }
 
 /// The toolkit's library directory (for `-lcudart`), from `CUDA_HOME`/`CUDA_PATH` or
