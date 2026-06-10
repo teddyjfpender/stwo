@@ -64,6 +64,12 @@ fn main() {
         );
     };
 
+    // Every kernel directory is an include root: the generated headers include each
+    // other by bare name regardless of subdirectory.
+    let mut include_dirs: Vec<String> = vec!["cuda".to_string()];
+    collect_dirs(std::path::Path::new("cuda"), &mut include_dirs);
+    include_dirs.sort();
+
     let mut objects: Vec<PathBuf> = Vec::with_capacity(sources.len() + 1);
     for source in &sources {
         let object = out_dir.join(format!(
@@ -81,10 +87,7 @@ fn main() {
                 // The fp256/poseidon252 stack calls `constexpr __host__` accessors from
                 // device code (sppark lineage); nvcc requires this flag for that pattern.
                 .arg("--expt-relaxed-constexpr")
-                .arg("-I")
-                .arg("cuda")
-                .arg("-I")
-                .arg("cuda/constraints")
+                .args(include_dirs.iter().flat_map(|dir| ["-I".to_string(), dir.clone()]))
                 .arg("-Xcompiler")
                 .arg("-fPIC")
                 .arg(format!("-arch={arch}"))
@@ -185,6 +188,16 @@ fn collect_cu(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
             collect_cu(&path, out);
         } else if path.extension().is_some_and(|ext| ext == "cu") {
             out.push(path);
+        }
+    }
+}
+
+fn collect_dirs(dir: &std::path::Path, out: &mut Vec<String>) {
+    for entry in std::fs::read_dir(dir).expect("cuda/ directory must exist") {
+        let path = entry.expect("readable directory entry").path();
+        if path.is_dir() {
+            out.push(path.to_string_lossy().into_owned());
+            collect_dirs(&path, out);
         }
     }
 }
