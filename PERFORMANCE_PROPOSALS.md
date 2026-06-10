@@ -103,6 +103,105 @@ kernels (larger change in field-arithmetic dispatch — still open).
   generators parallelized in this round); the e2e test is currently `#[ignore]`d so there is no
   measurable benefit until it is re-enabled.
 
+## Round 2 candidates (research assessment, 2026-06-10)
+
+Based on a profiled blake 2^18 run plus static audits of the hot path, SIMD kernels, memory,
+and parallelism, and a survey of upstream stwo / Plonky3 / FRI literature.
+
+**Measured baseline (local machine — Apple M4 Pro, 14 cores, 24 GB; NOT the M5 Max above):**
+blake 2^18 default mode = **14.6 s median wall** (clean sequential runs; see R1_BASELINE.md —
+an earlier 25.8 s profiled figure was taken under concurrent load and is invalid for
+absolute timing, though its phase *ratios* and hot-function attribution below remain
+representative), peak RSS 10.1 GiB. Phase split from that profile: composition 26.7%,
+OODS 12.5%, extension rFFT 12.4%, trace gen 11.8%, Merkle commits 9.6%, interaction gen 8.8%,
+FRI quotients 6.9%, iFFT 5.2%, decommit 4.4%. Average utilization ~6.3 of 14 cores; ~6% of
+samples in memmove. Hot functions: PackedQM31 mul (~9.6% of samples), blake2s compress16
+(9.0%), FFT loops (8.3%), LookupElements::combine (6.3%), finalize_logup_batched (4.6%).
+
+### R1. Delayed-reduction accumulation in LogUp/quotient/composition loops
+
+**Where:** `LookupElements::combine`, LogUp fraction accumulation
+(`finalize_logup_batched`), quotient numerator loops (`simd/quotients.rs`).
+**Problem:** Every PackedM31/QM31 product is reduced immediately. Plonky3 (issue #252)
+accumulates unreduced 62-bit products across dot-product/sum loops and reduces once,
+reporting ~2.6x on reduction-heavy M31 loops on NEON/AVX. The composition phase (26.7% of
+prove) is dominated by exactly these loops (~20% of all on-CPU samples).
+**Expected:** ~10–15% end-to-end prove time. Backend-only, no proof change.
+**Risk:** Performance-critical, not soundness-critical; unreduced-accumulator bounds need
+careful documentation; gated by existing field/quotient/logup tests plus new edge-case tests
+at accumulator-width boundaries.
+
+### R2. Parallel utilization fixes (basket)
+
+Measured ~6.3/14 cores average — the largest aggregate headroom. In order of confidence:
+- **Parallelize decommit across the 4 commitment trees** — `prove_values` decommits trees
+  sequentially via `.into_iter()` (`pcs/mod.rs`); with `commit_pruned` recomputing bottom
+  layers per tree this serializes real hash work. `into_par_iter()` is a small change.
+- **Retune rayon chunk sizes** — `COMBINE_CHUNK_SIZE = 16` packed vecs (~1 KB/task),
+  `NUMERATORS_CHUNK_SIZE = 64`, `FOLD_CHUNK_SIZE = 128`; all empirical constants from older
+  hardware. Cheap to re-benchmark.
+- **Batch FFT work across columns** — extension/interpolation parallelism is per-column;
+  cores idle when a tree has few columns (FFT phases ≈ 17.6% of wall combined).
+**Expected:** ~10–20% end-to-end in aggregate. All autonomous tier.
+**Rejected from this basket:** "Merkle layer pipelining" — layers strictly depend on the
+previous layer and `build_next_layer` is already internally parallel; no pipeline exists.
+
+### R3. OODS cost reduction — re-open P3, plus two cheap partial wins
+
+OODS measures 12.5% of prove (3.2 s; 2,636 columns), confirming P3's motivation. Independent
+of the full subdomain-barycentric math (which still needs its own focused review per the P3
+de-scope note), two autonomous-tier wins:
+- **Bound the barycentric weights map** — today it grows one full SecureField column
+  (16 B x 2^lifting_log_size) per distinct (log_size, point) pair; an LRU or per-phase scope
+  bounds both RSS and allocation churn.
+- **Share the materialized domain-point buffer** across sample points in
+  `denominator_inverses` (`simd/circle.rs`).
+**Expected:** partial wins ~1–2% e2e + memory; full P3 ~halves the OODS phase (~6% e2e).
+
+### R4. Streamed (coset-chunked) composition evaluation — the capacity headline
+
+The P0 caveat follow-up, now confirmed feasible: constraint evaluation has no cross-row
+dependencies beyond fixed mask offsets (satisfiable with a small sliding window of cosets),
+and all tree commitments complete before composition, so chunk-wise extension does not
+perturb Fiat-Shamir ordering. Evaluate the composition coset-by-coset so full LDEs of all
+columns never coexist.
+**Expected:** 40–60% of the composition-time peak, the binding RSS constraint for blowup-1
+degree-2 AIRs — roughly one additional log_size of capacity in the same RAM for blake-shaped
+traces.
+**Risk:** High effort; needs a design doc and supervised review (touches the composition
+evaluation order, though not its math).
+
+### R5. Smaller memory wins (autonomous)
+
+- Drop extended trace columns immediately after each component's constraint eval.
+- Route component-prover extension buffers through the existing `base_column_pool` pattern.
+- Replace the per-column HashMap gather in `decommit_compact_tree` with a sorted Vec/bitset
+  (query counts are small and known upfront).
+
+### R6. FFT and hash kernel polish
+
+- Plonky3 landed fused cache-resident parallel CFFT butterfly passes and collapsed
+  allocations (June 2026, PRs #1796/#1795/#1778) — read before further FFT tuning.
+- Doubled-twiddle NEON mul is not dispatched in parts of the forward (rfft) path.
+- Vecwise butterfly layers carry ~20 shuffles/pass; batched in-register transpose could
+  roughly halve them.
+- blake2s `transpose_msgs`/`untranspose_states` shuffle count reducible with arch-native
+  transposes (~few % of Merkle phase).
+**Note:** the NEON M31 mul kernel (P2) is at parity with known state of the art (Plonky3
+uses the same vqdmulhq decomposition); per-mul headroom is exhausted — remaining arithmetic
+wins are loop-level (see R1).
+
+### Strategic (design review required; not perf-sprint items)
+
+- **GPU (ICICLE-stwo revival):** the only real GPU backend, 3.25–7x over SIMD, but stale
+  since March 2025 and predates lifted Merkle / FRI jumps / the 2.x proof format. Reviving
+  it is an integration project, realistically with Ingonyama. No Metal backend exists.
+- **Blake3 Merkle hasher:** ceiling ~1.4x on the Merkle phase only (7 vs 10 rounds; the 5x
+  headline applies to long messages, not 2-to-1 compressions) and changes proof structure.
+- **STIR/WHIR:** proof-size/verifier-time plays, not prover speed; no published circle-code
+  adaptation as of June 2026; FRI jumps already capture part of the benefit.
+- Upstream stwo is already fully merged into this fork's `dev` (May 2026) — nothing to port.
+
 ## Pre-existing footgun worth an upstream fix (not a perf item)
 
 `VeryPackedSecureColumnByCoords::transform_under_mut` produces a view whose inner `Vec` lengths
