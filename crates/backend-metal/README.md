@@ -19,6 +19,43 @@ repository's backend extension points (`FrameworkBackend`, `FromSimdColumns`,
   at startup by the Metal driver (one `MTLLibrary` per translation unit, so file-scope
   helpers don't collide). Command Line Tools are sufficient.
 
+## Performance
+
+End-to-end prove of the testkit reference AIR (16 base columns, degree-2 constraints,
+`Blake2sMerkleChannel`, `PcsConfig::default()`), Apple M5 Max (18 cores, 64 GB), warm-best
+of 3 iterations, single process per backend
+(`crates/backend-metal/tests/bench_prove.rs`):
+
+| rows | MetalBackend | SimdBackend (NEON, rayon) | SIMD advantage | peak RSS (Metal / SIMD) |
+|---|---|---|---|---|
+| 2^16 | 1.05 s (63k rows/s) | 30 ms (2.2M rows/s) | 35× | 78 MB / 63 MB |
+| 2^18 | 4.67 s (56k rows/s) | 65 ms (4.0M rows/s) | 71× | 231 MB / 233 MB |
+| 2^20 | 20.5 s (51k rows/s) | 178 ms (5.9M rows/s) | 115× | 892 MB / 931 MB |
+
+**The honest reading: the current Metal lane is not competitive with the SIMD backend on
+Apple Silicon, and the gap grows with size.** Metal's throughput is flat (~55k rows/s) —
+the pipeline is bound by fixed per-operation costs, not compute: hundreds of small
+synchronous GPU dispatches (each paying command-buffer creation, ObjC retain/release
+churn, and a `waitUntilCompleted`), host-side OODS dot products over full columns, and
+the CPU constraint-evaluation lane. The SIMD backend's throughput *rises* with size as
+its fixed costs amortize. Profiling notes live in the history of
+`tests/bench_prove.rs`; the largest structural deficits, in order:
+
+1. **Constraint evaluation runs on the CPU** (`evaluate_constraint_quotients_via_cpu`)
+   — correct for any AIR, but the composition stage does no GPU work at all.
+2. **Per-dispatch synchronization** — most kernels submit one command buffer and wait.
+   The async-submission pattern exists (`evaluate_polynomials`) but covers one stage.
+3. **Host-side OODS** — barycentric evaluation is a CPU dot product per (column, point)
+   over the full LDE; the GPU batch path exists but is bypassed by the
+   weights-hash-map flow.
+
+Benchmarking at production sizes also surfaced two prove-corrupting bugs that the
+log-6 conformance suite could not see (both fixed, both now gated): a pointer-keyed
+GPU twiddle cache that poisoned every prove after the first when a freed twiddle
+allocation was reused (first proof valid, second proof garbage), and host reads of
+async-written buffers without a queue fence. The testkit now proves every statement
+twice per process and requires byte-identical proofs.
+
 ## Architecture
 
 ```
