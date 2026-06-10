@@ -87,9 +87,7 @@ pub fn prove_ex<B: BackendForChannel<MC>, MC: MerkleChannel>(
         .last()
         .unwrap()
         .commitment
-        .layers
-        .len() as u32
-        - 1;
+        .log_size();
 
     // If `self.config.lifting_log_size` is None, the lifting size is the length of the split
     // composition polynomials' domain.
@@ -100,9 +98,7 @@ pub fn prove_ex<B: BackendForChannel<MC>, MC: MerkleChannel>(
         // or equal to the preprocessed log size.
         let preprocessed_log_size = commitment_scheme.trees[PREPROCESSED_TRACE_IDX]
             .commitment
-            .layers
-            .len() as u32
-            - 1;
+            .log_size();
         if lifting_log_size < preprocessed_log_size {
             Err(InvalidLiftingLogSizeError {
                 lifting_log_size,

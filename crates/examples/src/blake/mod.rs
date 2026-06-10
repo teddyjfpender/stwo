@@ -30,6 +30,25 @@ const N_ROUNDS: usize = 10;
 /// A splitting N_ROUNDS into several powers of 2.
 const ROUND_LOG_SPLIT: [u32; 2] = [3, 1];
 
+/// Shared-mutable pointer used by parallel trace generators whose row tasks write disjoint
+/// `vec_row` slots of the same columns.
+#[cfg(feature = "parallel")]
+struct UnsafeSharedRows<T>(*mut T);
+#[cfg(feature = "parallel")]
+unsafe impl<T> Send for UnsafeSharedRows<T> {}
+#[cfg(feature = "parallel")]
+unsafe impl<T> Sync for UnsafeSharedRows<T> {}
+#[cfg(feature = "parallel")]
+impl<T> UnsafeSharedRows<T> {
+    /// # Safety
+    ///
+    /// Concurrent users must only perform mutually disjoint writes.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn get(&self) -> &mut T {
+        unsafe { &mut *self.0 }
+    }
+}
+
 #[derive(Default)]
 struct XorAccums {
     xor12: xor12::XorAccumulator<12, 4>,

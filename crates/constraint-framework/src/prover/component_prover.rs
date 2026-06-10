@@ -24,7 +24,9 @@ use tracing::{span, Level};
 use super::{CpuDomainEvaluator, SimdDomainEvaluator};
 use crate::{FrameworkComponent, FrameworkEval, PREPROCESSED_TRACE_IDX};
 
-const CHUNK_SIZE: usize = 1;
+/// Number of `VeryPacked` rows processed per (parallel) task. Amortizes task-scheduling
+/// overhead while keeping enough tasks for load balancing on wide machines.
+const CHUNK_SIZE: usize = 8;
 
 /// Common inputs for constraint quotient evaluation, shared between the SIMD and CPU backends.
 struct ConstraintQuotientInputs<'a, B: Backend> {
@@ -159,27 +161,33 @@ impl<E: FrameworkEval + Sync> ComponentProver<SimdBackend> for FrameworkComponen
 
         let col = unsafe { VeryPackedSecureColumnByCoords::transform_under_mut(accum.col) };
 
-        let range = 0..(1 << (eval_domain.log_size() - LOG_N_LANES - LOG_N_VERY_PACKED_ELEMS));
+        // NOTE: `col` is a transmuted view whose inner lengths are still counted in
+        // `PackedBaseField` units, so its chunk iterators yield more chunks than there are real
+        // `VeryPacked` rows. Only the first `n_chunks` chunks may be consumed.
+        let n_vec_rows: usize =
+            1 << (eval_domain.log_size() - LOG_N_LANES - LOG_N_VERY_PACKED_ELEMS);
+        // Both are powers of two, so `chunk_size` always divides `n_vec_rows`.
+        let chunk_size = CHUNK_SIZE.min(n_vec_rows);
+        let n_chunks = n_vec_rows / chunk_size;
 
         #[cfg(not(feature = "parallel"))]
-        let iter = range.step_by(CHUNK_SIZE).zip(col.chunks_mut(CHUNK_SIZE));
+        let iter = col.chunks_mut(chunk_size).take(n_chunks).enumerate();
 
         #[cfg(feature = "parallel")]
-        let iter = range
-            .into_par_iter()
-            .step_by(CHUNK_SIZE)
-            .zip(col.par_chunks_mut(CHUNK_SIZE));
+        let iter = col.par_chunks_mut(chunk_size).take(n_chunks).enumerate();
 
         // Define any `self` values outside the loop to prevent the compiler thinking there is a
         // `Sync` requirement on `Self`.
         let self_eval = &self.eval;
         let self_claimed_sum = self.claimed_sum;
 
-        iter.for_each(|(chunk_idx, mut chunk)| {
-            let trace_cols = trace.as_cols_ref().map_cols(|c| c.as_ref());
+        // Build the column reference tree once; rebuilding it per row allocates a vector of
+        // references per column tree and dominates the loop for wide traces.
+        let trace_cols = trace.as_cols_ref().map_cols(|c| c.as_ref());
 
-            for idx_in_chunk in 0..CHUNK_SIZE {
-                let vec_row = chunk_idx * CHUNK_SIZE + idx_in_chunk;
+        iter.for_each(|(chunk_idx, mut chunk)| {
+            for idx_in_chunk in 0..chunk_size {
+                let vec_row = chunk_idx * chunk_size + idx_in_chunk;
                 // Evaluate constrains at row.
                 let eval = SimdDomainEvaluator::new(
                     &trace_cols,

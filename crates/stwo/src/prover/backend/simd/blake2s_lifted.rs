@@ -9,7 +9,7 @@ use num_traits::Zero;
 use rayon::prelude::*;
 
 use super::m31::LOG_N_LANES;
-use super::utils::to_lifted_simd;
+use super::utils::{to_lifted_simd, UnsafeMut};
 use super::SimdBackend;
 use crate::core::fields::m31::{BaseField, N_BYTES_FELT};
 use crate::core::fields::qm31::SECURE_EXTENSION_DEGREE;
@@ -77,12 +77,11 @@ impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M3
         let mut next_layer_states: Vec<[u32x16; N_FELTS_IN_BLAKE_STATE]> =
             unsafe { uninit_vec(1 << max_log_size) };
 
-        #[cfg(not(feature = "parallel"))]
-        prev_layer_states.fill(INITIAL_STATE);
-        #[cfg(feature = "parallel")]
-        prev_layer_states
-            .par_iter_mut()
-            .for_each(|uninit| *uninit = INITIAL_STATE);
+        // In the first iteration `prev_chunk_max_log_size == 0`, so `i >> log_ratio == 0` for
+        // every `i`: only entry 0 of `prev_layer_states` is ever read before the buffers are
+        // swapped. Initializing just that entry avoids touching (and committing pages for) the
+        // whole buffer.
+        prev_layer_states[0] = INITIAL_STATE;
 
         // The last column chunk, which requires the `compress_finalize` permutation, is
         // `columns[last_chunk_index..]`. This chunk is treated on its own towards the end of the
@@ -165,55 +164,34 @@ impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M3
             *state = compress_finalize(prev_state, msgs, byte_count);
         });
 
-        // let additional_lifting_ratio = (lifting_log_size - LOG_N_LANES) - max_log_size;
         let lifting_log_size_packed = lifting_log_size - LOG_N_LANES;
         // Prepare the output buffer.
-        // TODO(Leo): ideally, we wouldn't need to write to a new buffer and instead we could
-        // transmute `next_layer_states`, but there are alignment issues. Think about how to avoid
-        // this copy.
         // Safety: we never read from `res`, only write to it.
         let mut res =
             unsafe { uninit_vec(1 << (lifting_log_size_packed + LOG_N_HASHES_PER_SIMD_STATE)) };
 
-        // Lift the next_layer_states if needed.
-        let mut trasposed_states = if lifting_log_size_packed == max_log_size {
-            next_layer_states
-        } else {
-            let mut buf: Vec<[u32x16; N_FELTS_IN_BLAKE_STATE]> =
-                unsafe { uninit_vec(1 << lifting_log_size_packed) };
-            let log_ratio = lifting_log_size_packed - max_log_size;
+        // Lift (if needed), untranspose, reduce modulo M31 if `IS_M31_OUTPUT == true`, and write
+        // directly into `res`. Fusing these steps avoids materializing a full lifted copy of the
+        // states (a buffer of 512 bytes per packed state).
+        let log_ratio = lifting_log_size_packed - max_log_size;
 
-            #[cfg(not(feature = "parallel"))]
-            let iter = buf.iter_mut();
-            #[cfg(feature = "parallel")]
-            let iter = buf.par_iter_mut();
-
-            iter.enumerate().for_each(|(i, dest)| {
-                let packed_before_lift: [u32x16; N_FELTS_IN_BLAKE_STATE] =
-                    next_layer_states[i >> log_ratio];
-                let packed_after_lift =
-                    std::array::from_fn(|j| to_lifted_simd(packed_before_lift[j], log_ratio, i));
-                *dest = packed_after_lift;
-            });
-            buf
-        };
-
-        // Untranspose the states and reduce modulo M31 if `IS_M31_OUTPUT == true`.
         #[cfg(not(feature = "parallel"))]
-        let iter_states = trasposed_states
-            .iter_mut()
-            .zip(res.chunks_mut(1 << LOG_N_HASHES_PER_SIMD_STATE));
+        let iter_states = res.chunks_mut(1 << LOG_N_HASHES_PER_SIMD_STATE).enumerate();
         #[cfg(feature = "parallel")]
-        let iter_states = trasposed_states
-            .par_iter_mut()
-            .zip(res.par_chunks_exact_mut(1 << LOG_N_HASHES_PER_SIMD_STATE));
+        let iter_states = res
+            .par_chunks_exact_mut(1 << LOG_N_HASHES_PER_SIMD_STATE)
+            .enumerate();
 
-        iter_states.for_each(|(state, dst)| {
+        iter_states.for_each(|(i, dst)| {
+            let state_before_lift = &next_layer_states[i >> log_ratio];
+            // `to_lifted_simd` is the identity when `log_ratio == 0`.
+            let state: [u32x16; N_FELTS_IN_BLAKE_STATE] =
+                std::array::from_fn(|j| to_lifted_simd(state_before_lift[j], log_ratio, i));
             let untransposed = if IS_M31_OUTPUT {
-                let tmp = untranspose_states(*state);
+                let tmp = untranspose_states(state);
                 std::array::from_fn(|i| reduce_to_m31_simd(tmp[i]))
             } else {
-                untranspose_states(*state)
+                untranspose_states(state)
             };
             let dst: &mut [Blake2sHash; 16] = dst.try_into().unwrap();
             *dst = unsafe { transmute::<[u32x16; 8], [Blake2sHash; 16]>(untransposed) };
@@ -278,8 +256,11 @@ impl PackLeavesOps for SimdBackend {
 
         let output_packed_len_floor = output_len / N_LANES;
 
-        // TODO(Leo): parallelize.
-        for row in 0..output_packed_len_floor {
+        let packed_simd_ptr = UnsafeMut(&raw mut packed_simd);
+        parallel_iter!(0..output_packed_len_floor).for_each(|row| {
+            // SAFETY: every iteration writes only index `row` of each output column, so the
+            // writes of distinct iterations are disjoint.
+            let packed_simd = unsafe { &mut *packed_simd_ptr.get() };
             let packed_start_idx = row * PACKED_LEAF_SIZE;
             let packed_values = core::array::from_fn(|j| {
                 core::array::from_fn(|i| values[i].data[packed_start_idx + j])
@@ -291,7 +272,7 @@ impl PackLeavesOps for SimdBackend {
                         packed_leaf_column[coord];
                 }
             }
-        }
+        });
 
         // Transpose the tail. If `tail_rows > 0` then necessarily we haven't entered the previous
         // loop.

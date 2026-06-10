@@ -185,7 +185,7 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         )
         .entered();
 
-        let lifting_log_size = self.trees.last().unwrap().commitment.layers.len() as u32 - 1;
+        let lifting_log_size = self.trees.last().unwrap().commitment.log_size();
         let weights_hash_map = if self.store_polynomials_coefficients {
             None
         } else {
@@ -219,6 +219,10 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
             .par_map_cols(eval_at_points);
 
         span.exit();
+        // The barycentric weights are only needed for the out-of-domain evaluations above.
+        // Each entry is a full eval-domain-sized secure-field column, so dropping the map now
+        // (instead of at the end of the function) significantly reduces peak memory during FRI.
+        drop(weights_hash_map);
         let sampled_values = samples
             .as_cols_ref()
             .map_cols(|x| x.iter().map(|o| o.value).collect());
@@ -256,7 +260,7 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         let preprocessed_query_positions = prepare_preprocessed_query_positions(
             &query_positions,
             lifting_log_size,
-            self.trees[0].commitment.layers.len() as u32 - 1,
+            self.trees[0].commitment.log_size(),
         );
         let query_positions_tree = TreeVec::new(
             self.trees
@@ -382,13 +386,14 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
             .max()
             .unwrap_or_default();
         let lifting_log_size = lifting_log_size.unwrap_or(max_log_domain_size);
-        let tree = MerkleProverLifted::commit(
+        // Pruned commit: the bottom tree layers are recomputed from the column evaluations at
+        // decommit time instead of being held in memory for the whole proving pipeline.
+        let tree = MerkleProverLifted::commit_pruned(
             polynomials
                 .iter()
                 .map(|poly: &Poly<B>| &poly.evals.values)
                 .collect(),
             lifting_log_size,
-            0,
         );
 
         CommitmentTreeProver {

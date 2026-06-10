@@ -1,7 +1,9 @@
 use itertools::{zip_eq, Itertools};
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 
 use crate::core::fields::qm31::SecureField;
-use crate::prover::backend::simd::m31::{PackedM31, LOG_N_LANES, N_LANES};
+use crate::prover::backend::simd::m31::{PackedM31, N_LANES};
 use crate::prover::backend::simd::qm31::PackedSecureField;
 use crate::prover::backend::simd::utils::to_lifted_simd;
 use crate::prover::backend::simd::SimdBackend;
@@ -11,9 +13,16 @@ use crate::prover::AccumulationOps;
 
 impl AccumulationOps for SimdBackend {
     fn accumulate(column: &mut SecureColumnByCoords<Self>, other: &SecureColumnByCoords<Self>) {
-        for i in 0..column.packed_len() {
-            let res_coeff = unsafe { column.packed_at(i) + other.packed_at(i) };
-            unsafe { column.set_packed(i, res_coeff) };
+        // The sum is coordinate-wise; process each coordinate column independently.
+        for (dst, src) in zip_eq(column.columns.iter_mut(), other.columns.iter()) {
+            #[cfg(not(feature = "parallel"))]
+            zip_eq(dst.data.iter_mut(), src.data.iter()).for_each(|(d, s)| *d += *s);
+            #[cfg(feature = "parallel")]
+            dst.data
+                .par_iter_mut()
+                .zip(src.data.par_iter())
+                .with_min_len(1 << 12)
+                .for_each(|(d, s)| *d += *s);
         }
     }
 
@@ -52,26 +61,33 @@ impl AccumulationOps for SimdBackend {
         let mut prev = first;
         for mut col in cols_iter {
             // Perform the lift on the previous accumulation (which is of smaller size) and add it
-            // to the current accumulation.
+            // to the current accumulation. Each packed row is independent.
             let log_ratio = col.len().ilog2() - prev.len().ilog2();
-            for i in 0..col.len() >> LOG_N_LANES {
-                unsafe {
-                    let packed_before_lift: [PackedM31; 4] =
-                        prev.packed_at(i >> log_ratio).into_packed_m31s();
-                    let packed_after_lift: [PackedM31; 4] = std::array::from_fn(|j| {
-                        PackedM31::from_simd_unchecked(to_lifted_simd(
-                            packed_before_lift[j].into_simd(),
-                            log_ratio,
-                            i,
-                        ))
-                    });
-                    for (base_column, lift_value) in
-                        zip_eq(col.columns.iter_mut(), packed_after_lift)
-                    {
-                        base_column.data[i] += lift_value;
-                    }
+            let lift_add = |(i, dst): (usize, [&mut PackedM31; 4])| unsafe {
+                let packed_before_lift: [PackedM31; 4] =
+                    prev.packed_at(i >> log_ratio).into_packed_m31s();
+                for (j, dst_value) in dst.into_iter().enumerate() {
+                    *dst_value += PackedM31::from_simd_unchecked(to_lifted_simd(
+                        packed_before_lift[j].into_simd(),
+                        log_ratio,
+                        i,
+                    ));
                 }
-            }
+            };
+            let [c0, c1, c2, c3] = col.columns.each_mut().map(|c| &mut c.data);
+
+            #[cfg(not(feature = "parallel"))]
+            itertools::multizip((c0, c1, c2, c3))
+                .enumerate()
+                .for_each(|(i, (d0, d1, d2, d3))| lift_add((i, [d0, d1, d2, d3])));
+
+            #[cfg(feature = "parallel")]
+            (c0, c1, c2, c3)
+                .into_par_iter()
+                .enumerate()
+                .with_min_len(1 << 12)
+                .for_each(|(i, (d0, d1, d2, d3))| lift_add((i, [d0, d1, d2, d3])));
+
             prev = col;
         }
         Some(prev)

@@ -160,7 +160,16 @@ impl PolyOps for SimdBackend {
 
         // TODO(alont): Cache this inversion.
         let inv = PackedBaseField::broadcast(BaseField::from(eval.domain.size()).inverse());
+        #[cfg(not(feature = "parallel"))]
         values.data.iter_mut().for_each(|x| *x *= inv);
+        // `with_min_len` keeps small columns on a single thread, avoiding rayon dispatch
+        // overhead when many small columns are interpolated in a parallel outer loop.
+        #[cfg(feature = "parallel")]
+        values
+            .data
+            .par_iter_mut()
+            .with_min_len(1 << 13)
+            .for_each(|x| *x *= inv);
 
         CircleCoefficients::new(values)
     }
@@ -408,9 +417,16 @@ impl PolyOps for SimdBackend {
         let twiddles = domain_line_twiddles_from_tree(domain, &twiddles.twiddles);
 
         // Evaluate on big domains by evaluating on several subdomains.
-        let log_subdomains = log_size - fft_log_size;
+        // Each subdomain FFT reads the shared coefficients and writes a disjoint chunk of the
+        // output buffer, so the subdomains can be processed in parallel.
+        let subdomain_n_vecs = 1 << (fft_log_size - LOG_N_LANES);
 
-        for i in 0..(1 << log_subdomains) {
+        #[cfg(not(feature = "parallel"))]
+        let iter = buffer.data.chunks_mut(subdomain_n_vecs).enumerate();
+        #[cfg(feature = "parallel")]
+        let iter = buffer.data.par_chunks_mut(subdomain_n_vecs).enumerate();
+
+        iter.for_each(|(i, chunk)| {
             // The subdomain twiddles are a slice of the large domain twiddles.
             let subdomain_twiddles = (0..(fft_log_size - 1))
                 .map(|layer_i| {
@@ -419,20 +435,16 @@ impl PolyOps for SimdBackend {
                 })
                 .collect::<Vec<_>>();
 
-            // FFT from the coefficients buffer directly into the provided buffer.
+            // FFT from the coefficients buffer directly into the corresponding output chunk.
             unsafe {
                 rfft::fft(
                     transmute::<*const PackedBaseField, *const u32>(poly.coeffs.data.as_ptr()),
-                    transmute::<*mut PackedBaseField, *mut u32>(
-                        buffer.data[i << (fft_log_size - LOG_N_LANES)
-                            ..(i + 1) << (fft_log_size - LOG_N_LANES)]
-                            .as_mut_ptr(),
-                    ),
+                    transmute::<*mut PackedBaseField, *mut u32>(chunk.as_mut_ptr()),
                     &subdomain_twiddles,
                     fft_log_size as usize,
                 );
             }
-        }
+        });
 
         CircleEvaluation::new(domain, buffer)
     }
