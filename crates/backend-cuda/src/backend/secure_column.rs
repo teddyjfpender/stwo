@@ -10,16 +10,13 @@ pub struct CudaSecureColumn {
 
 #[allow(dead_code)]
 impl CudaSecureColumn {
+    /// Four independent uninitialized coordinate columns. Callers overwrite every
+    /// element before reading (FRI fold writes the full output), so no zero-fill is
+    /// needed — and cloning one uninitialized buffer would only add three
+    /// device-to-device copies of garbage.
     pub unsafe fn new_with_size(size: usize) -> SecureColumnByCoords<CudaBackend> {
-        let folded_values_column = BaseFieldVec::new_uninitialized(size);
-
         SecureColumnByCoords {
-            columns: [
-                folded_values_column.clone(),
-                folded_values_column.clone(),
-                folded_values_column.clone(),
-                folded_values_column,
-            ],
+            columns: std::array::from_fn(|_| BaseFieldVec::new_uninitialized(size)),
         }
     }
 

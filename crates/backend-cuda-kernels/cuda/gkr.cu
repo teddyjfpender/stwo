@@ -310,7 +310,7 @@ void launch_next_grand_product_layer(
         output_layer
     );
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
-    ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+    stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 }
 
@@ -334,7 +334,7 @@ void launch_next_logup_layer(
         next_denominators
     );
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
-    ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+    stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 }
 
@@ -355,7 +355,7 @@ void launch_next_logup_singles_layer(
         next_denominators
     );
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
-    ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+    stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 }
 
@@ -383,7 +383,7 @@ void finish_gkr_sum_kernel(
     qm31 *eval_at_2
 ) {
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
-    ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+    stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 
     m31 host_coordinate_sums[8];
@@ -434,7 +434,7 @@ void gen_eq_evals(qm31 v, qm31 *y, uint32_t y_size, qm31 *evals, uint32_t evals_
 
     gen_eq_evals_kernel<<<NUMBER_OF_BLOCKS, min(evals_size, BLOCK_SIZE)>>>(v, factors_device, y_size, evals);
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
-    ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+    stwo_maybe_debug_sync();
 
     cuda_proving_free(factors_device);
 }

@@ -70,6 +70,36 @@ impl stwo_constraint_framework::FrameworkBackend for CudaBackend {
     }
 }
 
+/// Process-wide pinned (page-locked) staging buffer for witness upload.
+///
+/// Pinned pages let `cudaMemcpy` run at full PCIe bandwidth; pageable copies bounce
+/// through the driver's internal staging area at roughly half speed. The buffer is
+/// grow-only scratch reused across batches and proves: it carries NO cached data and
+/// is never read after the upload, so reusing the allocation needs no cache key (the
+/// repository's cache-keying rule applies to cached *content*, of which there is
+/// none here). Capacity is capped so big traces are uploaded in batches instead of
+/// page-locking gigabytes of host RAM.
+struct PinnedStaging {
+    ptr: *mut u32,
+    capacity_words: usize,
+}
+// The raw pointer is only ever used under the Mutex below.
+unsafe impl Send for PinnedStaging {}
+
+/// 256 Mi u32 words = 1 GiB of page-locked staging at most.
+const PINNED_STAGING_CAP_WORDS: usize = 1 << 28;
+
+fn pinned_staging() -> &'static std::sync::Mutex<PinnedStaging> {
+    static STAGING: std::sync::OnceLock<std::sync::Mutex<PinnedStaging>> =
+        std::sync::OnceLock::new();
+    STAGING.get_or_init(|| {
+        std::sync::Mutex::new(PinnedStaging {
+            ptr: std::ptr::null_mut(),
+            capacity_words: 0,
+        })
+    })
+}
+
 impl stwo::prover::backend::FromSimdColumns for CudaBackend {
     fn from_simd_base_column(
         column: stwo::prover::backend::Col<SimdBackend, stwo::core::fields::m31::BaseField>,
@@ -78,6 +108,18 @@ impl stwo::prover::backend::FromSimdColumns for CudaBackend {
         crate::columns::BaseFieldVec::from_vec(column.to_cpu())
     }
 
+    /// Batched witness ingestion. The default (and previous) path uploaded the trace
+    /// one column at a time: a single-threaded SIMD unpack, then an allocating H2D
+    /// copy per column — hundreds of small pageable transfers, each paying the full
+    /// allocator and synchronization overhead. Here:
+    ///
+    /// 1. Columns are packed into the process-wide PINNED staging buffer in parallel (rayon), in
+    ///    batches that fit the staging cap.
+    /// 2. Each column is uploaded from its staging offset with one `cudaMemcpy` from pinned memory
+    ///    into its own freshly allocated device buffer.
+    ///
+    /// The device contents are word-for-word identical to the per-column path, so
+    /// proof byte-equality is unaffected.
     fn from_simd_evals(
         evals: Vec<
             stwo::prover::poly::circle::CircleEvaluation<
@@ -93,14 +135,99 @@ impl stwo::prover::backend::FromSimdColumns for CudaBackend {
             stwo::prover::poly::BitReversedOrder,
         >,
     > {
-        evals
-            .into_iter()
-            .map(|eval| {
-                stwo::prover::poly::circle::CircleEvaluation::new(
+        use rayon::prelude::*;
+        use stwo::prover::backend::Column;
+
+        if evals.is_empty() {
+            return Vec::new();
+        }
+        crate::columns::bindings::ensure_mem_pool_init();
+
+        let mut staging = pinned_staging().lock().unwrap();
+        // Capacity: the whole batch if it fits the cap, otherwise the cap — but always
+        // at least the largest single column (so every batch below is non-empty).
+        let total: usize = evals.iter().map(|eval| eval.values.len()).sum();
+        let largest: usize = evals.iter().map(|eval| eval.values.len()).max().unwrap();
+        let needed = largest.max(total.min(PINNED_STAGING_CAP_WORDS));
+        if staging.capacity_words < needed {
+            unsafe {
+                crate::columns::bindings::cuda_free_pinned_host_u32(staging.ptr);
+                staging.ptr = crate::columns::bindings::cuda_alloc_pinned_host_u32(needed as u64);
+            }
+            staging.capacity_words = if staging.ptr.is_null() { 0 } else { needed };
+        }
+
+        // Pinned allocation failed (or stub backend): plain per-column fallback.
+        if staging.ptr.is_null() {
+            return evals
+                .into_iter()
+                .map(|eval| {
+                    stwo::prover::poly::circle::CircleEvaluation::new(
+                        eval.domain,
+                        Self::from_simd_base_column(eval.values),
+                    )
+                })
+                .collect();
+        }
+
+        let mut results = Vec::with_capacity(evals.len());
+        let mut batch_start = 0;
+        while batch_start < evals.len() {
+            // Greedily take columns while they fit the staging buffer (always at
+            // least one: capacity covers the largest single column).
+            let mut batch_end = batch_start;
+            let mut words = 0usize;
+            let mut offsets = Vec::new();
+            while batch_end < evals.len()
+                && (batch_end == batch_start
+                    || words + evals[batch_end].values.len() <= staging.capacity_words)
+            {
+                offsets.push(words);
+                words += evals[batch_end].values.len();
+                batch_end += 1;
+            }
+            let batch = &evals[batch_start..batch_end];
+
+            // Parallel pack: each column unpacks its SIMD lanes straight into its
+            // disjoint staging slice (BaseField is a transparent u32 wrapper).
+            let staging_slice =
+                unsafe { std::slice::from_raw_parts_mut(staging.ptr, staging.capacity_words) };
+            let mut chunks: Vec<&mut [u32]> = Vec::with_capacity(batch.len());
+            let mut rest = staging_slice;
+            for eval in batch.iter() {
+                let (chunk, tail) = rest.split_at_mut(eval.values.len());
+                chunks.push(chunk);
+                rest = tail;
+            }
+            batch
+                .par_iter()
+                .zip(chunks.par_iter_mut())
+                .for_each(|(eval, chunk)| {
+                    let host = eval.values.to_cpu();
+                    // BaseField is repr(transparent) over u32.
+                    let words: &[u32] =
+                        unsafe { std::slice::from_raw_parts(host.as_ptr().cast(), host.len()) };
+                    chunk.copy_from_slice(words);
+                });
+
+            // Upload each column from its pinned staging offset into its own buffer.
+            for (i, eval) in batch.iter().enumerate() {
+                let len = eval.values.len();
+                let column = crate::columns::BaseFieldVec::new_uninitialized(len);
+                unsafe {
+                    crate::columns::bindings::copy_uint32_t_vec_from_host_to_device_into(
+                        staging.ptr.add(offsets[i]),
+                        column.device_ptr,
+                        len as u64,
+                    );
+                }
+                results.push(stwo::prover::poly::circle::CircleEvaluation::new(
                     eval.domain,
-                    Self::from_simd_base_column(eval.values),
-                )
-            })
-            .collect()
+                    column,
+                ));
+            }
+            batch_start = batch_end;
+        }
+        results
     }
 }

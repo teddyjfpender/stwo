@@ -85,20 +85,61 @@ the true in-flight peak; a high-water-mark probe is future work.
   51 GB OOM case) validation still needs the sn_pie input artifact (~130 MB, not in
   this repo).
 
-## v1 caveats (correctness first; known perf headroom)
+## Stream-ordered execution (rebuild round 3)
 
-- **Constraint evaluation runs on the CPU** (`evaluate_constraint_quotients_via_cpu`).
-  A native lane analogous to the Metal JIT shader compiler is the natural next step.
-- **Per-launch `cudaDeviceSynchronize`** in most kernel wrappers — no stream pipelining.
-- **Host roundtrips** kept from the port for byte-equality or simplicity: M31-output
-  Merkle leaves/layers hashed on host; `TwiddleBuffer::extract_subdomain_twiddles` and
-  `PolyOps::join_at_mid` download/upload; the quotient combine kernel runs on the
-  evaluation subdomain with the interpolate/extend tail through `PolyOps`.
-- **Grinding runs on GPU for the non-M31 channel** (ported from NitrooZK's
-  `grind_blake2s.cu`): chunked `atomicMin` search returning the *lowest* valid nonce,
-  nonce-equal with `SimdBackend` (testkit-gated on hardware), ~200× at production
-  `pow_bits` per their measurements. The M31-output channel still delegates to
-  `SimdBackend` (its PoW hash differs at finalize; NitrooZK does the same).
+Implementation of the ranked plan in `docs/gpu-architecture-analysis.md`. The backend
+was latency-bound by construction — ~10k blocking events per prove between per-launch
+device synchronization and an allocator that created, synchronized, and destroyed a
+private stream around every alloc/free. The rebuild:
+
+1. **Stream-ordered execution.** Everything — kernels, copies, `cudaMallocFromPoolAsync`,
+   `cudaMemsetAsync`, `cudaFreeAsync` — runs on the **legacy default stream**, which
+   orders it all automatically. All 82 per-wrapper `cudaDeviceSynchronize` calls are
+   gone (`STWO_CUDA_DEBUG_SYNC=1` restores them for kernel-level error attribution).
+   Host reads happen exclusively through synchronous `cudaMemcpy`, which orders after
+   prior default-stream work *and* blocks until the data is host-visible — the fences
+   are structural, not sprinkled. The decommit gather kernels were moved off private
+   streams for exactly this reason (a private-stream kernel could race in-flight
+   default-stream writes — the Metal `queue_drain` bug class). The discipline is
+   documented at the top of `cuda/utils.cuh` and `cuda/cuda_mem_pool.cuh`.
+2. **Statement-independent JIT kernels + persistent PTX cache.** The lowering hoists
+   *every* ext constant (channel-drawn lookup elements, logup cumsum shift) out of the
+   bytecode into a runtime parameter buffer, so the semantic hash — and the compiled
+   kernel — depends only on the AIR structure. Compiled PTX persists to
+   `$STWO_JIT_CACHE_DIR` (default `~/.cache/stwo-jit`), keyed by
+   (semantic hash, GPU arch, `CODEGEN_VERSION`): new statements, new inputs, and new
+   processes all reuse kernels. `STWO_JIT_LOG=1` reports per-kernel readiness time and
+   cache source.
+3. **Batched NTT everywhere.** `evaluate_polynomials` is overridden to group columns by
+   evaluation size with one multi-column NTT per group (mirror of
+   `interpolate_columns`); the quotient tail runs its 4 coordinate columns as one
+   batched inverse + one batched forward NTT; the redundant extend-then-copy in
+   `evaluate_into` is one copy plus one tail memset.
+4. **Pinned witness ingestion.** `from_simd_evals` packs SIMD columns in parallel
+   (rayon) into a process-wide pinned staging buffer (1 GiB cap, batched) and uploads
+   from page-locked memory — replacing hundreds of sequential allocate-zero-copy
+   roundtrips.
+5. **Waste bundle.** Fused in-kernel accumulate (the JIT kernel adds into the
+   accumulator coordinates in place; no scratch columns, no separate accumulate pass);
+   FRI fold allocates 4 independent buffers instead of cloning uninitialized garbage
+   3×; `split_at_mid`/`join_at_mid` and `extract_subdomain_twiddles` are device-side
+   D2D copies (previously full host roundtrips — multi-GB over PCIe at big-trace
+   sizes); the H2D upload path no longer zero-fills buffers the copy overwrites.
+
+Deliberately not done: per-call barycentric OODS evaluation is kept (after item 1 each
+call is one launch plus a 16-byte fenced readback; batching would touch the generic
+PCS flow for ms-scale gains), and `cuda_malloc_uint32_t` still zero-fills (now as a
+cheap stream-ordered memset) because flipping it to true uninitialized memory would
+turn any not-fully-written buffer into nondeterminism — that flip needs the
+conformance gate per call site.
+
+## Grinding
+
+- **GPU for the non-M31 channel** (ported from NitrooZK's `grind_blake2s.cu`): chunked
+  `atomicMin` search returning the *lowest* valid nonce, nonce-equal with `SimdBackend`
+  (testkit-gated on hardware), ~200× at production `pow_bits` per their measurements.
+  The M31-output channel still delegates to `SimdBackend` (its PoW hash differs at
+  finalize; NitrooZK does the same).
 
 ## Fixes over the prototype
 
@@ -150,9 +191,12 @@ conformance byte-equal with the lane engaged, and the Cairo all-opcode e2e passe
 - Lane order per component: precompiled kernels (opt-in) → JIT → CPU pointwise, all on
   one accumulator claim. `STWO_CUDA_DISABLE_JIT` forces CPU;
   `STWO_CUDA_CONSTRAINT_VERIFY=1` differentially checks the JIT lane per component.
-- Known cost: logup components bake `claimed_sum` into the bytecode, so first proves of
-  a new statement pay NVRTC compiles (~100 ms/component); parameterizing the cumsum
-  shift is the queued follow-up.
+- Statement independence: every ext constant (lookup elements, cumsum shift) is hoisted
+  into a runtime parameter buffer during lowering, so the bytecode hash is a pure
+  function of the AIR — kernels are shared across statements, inputs, and (via the
+  on-disk PTX cache) processes. The fused kernel also performs the accumulator update
+  in place; a `false` return guarantees the accumulator was untouched (CPU fallback
+  stays sound).
 
 ## Per-component constraint kernels (opt-in)
 

@@ -30,18 +30,30 @@ pub(crate) struct JitInputs<'a> {
     pub trace_log_size: u32,
 }
 
-/// Record, compile (cached), and launch the fused kernel; the kernel writes
-/// `sum_i rc[i]*constraint_i(row) * denom_inv[row >> trace_log]` into scratch and the
-/// caller adds it into the accumulator. Returns false to request the CPU lane.
+/// Record, compile (cached), and launch the fused kernel; the kernel adds
+/// `sum_i rc[i]*constraint_i(row) * denom_inv[row >> trace_log]` directly into the
+/// accumulator coordinates (`inputs.accum_coords`) in place — there is no separate
+/// scratch buffer or accumulate pass. Returns `false` to request the CPU lane, in
+/// which case the accumulator has NOT been touched.
 pub(crate) fn try_jit_constraint_quotients<E: FrameworkEval>(
     component: &FrameworkComponent<E>,
     inputs: &JitInputs<'_>,
-) -> Option<[BaseFieldVec; 4]> {
+) -> bool {
     if std::env::var_os("STWO_CUDA_DISABLE_JIT").is_some() {
-        return None;
+        return false;
     }
+    try_jit_constraint_quotients_inner(component, inputs).is_some()
+}
 
-    let program = lower_framework_eval_to_v1_with_logup(
+fn try_jit_constraint_quotients_inner<E: FrameworkEval>(
+    component: &FrameworkComponent<E>,
+    inputs: &JitInputs<'_>,
+) -> Option<()> {
+    // Lowering hoists every ext constant (lookup elements, cumsum shift) into
+    // `ext_param_values`, so `program` — and its semantic hash — depends only on the
+    // AIR structure. The hash therefore stays stable across statements and the
+    // compiled kernel is reused from the in-memory or on-disk PTX cache.
+    let (program, ext_param_values) = lower_framework_eval_to_v1_with_logup(
         component.evaluator(),
         inputs.trace_ptrs.len() as u32,
         0,
@@ -76,38 +88,39 @@ pub(crate) fn try_jit_constraint_quotients<E: FrameworkEval>(
             .collect(),
     );
 
-    let scratch: [BaseFieldVec; 4] = std::array::from_fn(|_| BaseFieldVec::new_zeroes(n_rows));
     let source_c = CString::new(source).ok()?;
     let name_c = CString::new(kernel_name).ok()?;
     let empty = BaseFieldVec::new_zeroes(1);
-    // Ext param slot 0 = the logup cumsum shift (see the lowering's statement-
-    // independence rewrite). Harmless when the program doesn't read it.
-    let cumsum_shift = component.claimed_sum()
-        / stwo::core::fields::m31::BaseField::from_u32_unchecked(
-            1u32 << component.evaluator().log_size(),
-        );
-    let ext_params = SecureFieldVec::from_vec(vec![cumsum_shift]);
+    // Ext params = every constant the lowering hoisted out of the bytecode (lookup
+    // elements, cumsum shift, structural constants), uploaded in slot order. A
+    // one-element zero buffer keeps the ABI pointer valid for const-free programs.
+    let ext_params = SecureFieldVec::from_vec(if ext_param_values.is_empty() {
+        vec![num_traits::Zero::zero()]
+    } else {
+        ext_param_values
+    });
 
     crate::columns::bindings::ensure_mem_pool_init();
+    // The kernel accumulates in place into the accumulator coordinates; no scratch
+    // columns and no separate accumulate dispatch (see cuda_codegen's fused store).
     let ok = unsafe {
         stwo_backend_cuda_kernels::raw::stwo_cuda_jit_eval_fused(
             source_c.as_ptr(),
             name_c.as_ptr(),
-            program.header().semantic_hash,
+            cuda_codegen::jit_cache_key(program.header().semantic_hash),
             trace_table.as_ptr().cast(),
             offsets_dev.device_ptr,
             empty.device_ptr,
             ext_params.device_ptr,
             inputs.random_coeff_powers.device_ptr,
             inputs.denom_inv.device_ptr,
-            scratch[0].device_ptr.cast_mut(),
-            scratch[1].device_ptr.cast_mut(),
-            scratch[2].device_ptr.cast_mut(),
-            scratch[3].device_ptr.cast_mut(),
+            inputs.accum_coords[0],
+            inputs.accum_coords[1],
+            inputs.accum_coords[2],
+            inputs.accum_coords[3],
             n_rows as u32,
             inputs.trace_log_size,
         )
     };
-    let _ = inputs.accum_coords;
-    ok.then_some(scratch)
+    ok.then_some(())
 }

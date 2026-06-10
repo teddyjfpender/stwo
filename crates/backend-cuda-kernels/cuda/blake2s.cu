@@ -251,7 +251,7 @@ void commit_on_first_layer(
     commit_on_first_layer_in_gpu<<<number_of_blocks_for(size), BLOCK_SIZE>>>(
         size, number_of_columns, device_columns, result);
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
-    ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+    stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 }
 
@@ -266,7 +266,7 @@ void commit_on_first_layer_lifted(
     commit_on_first_layer_lifted_in_gpu<<<number_of_blocks_for(size), BLOCK_SIZE>>>(
         size, number_of_columns, device_columns, column_log_sizes, lifting_log_size, result);
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
-    ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+    stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 }
 
@@ -280,6 +280,6 @@ void commit_on_layer_with_previous(
     commit_on_layer_using_previous_in_gpu<<<number_of_blocks_for(size), BLOCK_SIZE>>>(
         size, number_of_columns, device_columns, previous_layer, result);
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
-    ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+    stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 }

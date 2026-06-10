@@ -17,6 +17,9 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <sys/stat.h>
+#include <cstdlib>
+#include <chrono>
 
 namespace {
 
@@ -31,38 +34,102 @@ JitCache &jit_cache() {
     return cache;
 }
 
-bool compile_kernel(const char *source, const char *kernel_name, CUfunction *out) {
-    nvrtcProgram program;
-    if (nvrtcCreateProgram(&program, source, "stwo_jit.cu", 0, nullptr, nullptr) !=
-        NVRTC_SUCCESS) {
-        return false;
+// Filesystem PTX cache: JIT-compiled kernels persist across processes, keyed by the
+// program's CONTENT semantic hash + the GPU architecture (the same content-keying
+// rule as the in-memory cache — never pointers, never implicit scope). Directory:
+// $STWO_JIT_CACHE_DIR, else $HOME/.cache/stwo-jit. Disable with STWO_JIT_CACHE_DIR
+// set to the empty string.
+static std::string ptx_cache_path(uint64_t semantic_hash, int major, int minor) {
+    const char *dir = getenv("STWO_JIT_CACHE_DIR");
+    std::string base;
+    if (dir != nullptr) {
+        if (dir[0] == '\0') return std::string();
+        base = dir;
+    } else {
+        const char *home = getenv("HOME");
+        if (home == nullptr) return std::string();
+        base = std::string(home) + "/.cache/stwo-jit";
     }
+    char name[128];
+    snprintf(name, sizeof(name), "/sm%d%d_%016llx.ptx", major, minor,
+             (unsigned long long)semantic_hash);
+    return base + name;
+}
 
+bool jit_log_enabled() {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *env = getenv("STWO_JIT_LOG");
+        enabled = (env != nullptr && env[0] != '\0' && env[0] != '0') ? 1 : 0;
+    }
+    return enabled == 1;
+}
+
+bool compile_kernel(const char *source, const char *kernel_name, uint64_t semantic_hash,
+                    CUfunction *out) {
+    auto t_start = std::chrono::steady_clock::now();
+    bool from_disk = false;
     int device = 0;
     cudaGetDevice(&device);
     cudaDeviceProp props;
     cudaGetDeviceProperties(&props, device);
-    char arch_flag[64];
-    snprintf(arch_flag, sizeof(arch_flag), "--gpu-architecture=compute_%d%d", props.major,
-             props.minor);
-    const char *options[] = {arch_flag, "--std=c++14"};
 
-    nvrtcResult compile_result = nvrtcCompileProgram(program, 2, options);
-    if (compile_result != NVRTC_SUCCESS) {
-        size_t log_size = 0;
-        nvrtcGetProgramLogSize(program, &log_size);
-        std::string log(log_size, '\0');
-        nvrtcGetProgramLog(program, &log[0]);
-        fprintf(stderr, "stwo JIT: NVRTC compilation failed:\n%s\n", log.c_str());
-        nvrtcDestroyProgram(&program);
-        return false;
+    std::vector<char> ptx;
+    std::string cache_file = ptx_cache_path(semantic_hash, props.major, props.minor);
+    if (!cache_file.empty()) {
+        if (FILE *f = fopen(cache_file.c_str(), "rb")) {
+            fseek(f, 0, SEEK_END);
+            long len = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            if (len > 0) {
+                ptx.resize((size_t)len);
+                if (fread(ptx.data(), 1, (size_t)len, f) != (size_t)len) ptx.clear();
+            }
+            fclose(f);
+            from_disk = !ptx.empty();
+        }
     }
 
-    size_t ptx_size = 0;
-    nvrtcGetPTXSize(program, &ptx_size);
-    std::vector<char> ptx(ptx_size);
-    nvrtcGetPTX(program, ptx.data());
-    nvrtcDestroyProgram(&program);
+    if (ptx.empty()) {
+        nvrtcProgram program;
+        if (nvrtcCreateProgram(&program, source, "stwo_jit.cu", 0, nullptr, nullptr) !=
+            NVRTC_SUCCESS) {
+            return false;
+        }
+        char arch_flag[64];
+        snprintf(arch_flag, sizeof(arch_flag), "--gpu-architecture=compute_%d%d",
+                 props.major, props.minor);
+        const char *options[] = {arch_flag, "--std=c++14"};
+        nvrtcResult compile_result = nvrtcCompileProgram(program, 2, options);
+        if (compile_result != NVRTC_SUCCESS) {
+            size_t log_size = 0;
+            nvrtcGetProgramLogSize(program, &log_size);
+            std::string log(log_size, '\0');
+            nvrtcGetProgramLog(program, &log[0]);
+            fprintf(stderr, "stwo JIT: NVRTC compilation failed:\n%s\n", log.c_str());
+            nvrtcDestroyProgram(&program);
+            return false;
+        }
+        size_t ptx_size = 0;
+        nvrtcGetPTXSize(program, &ptx_size);
+        ptx.resize(ptx_size);
+        nvrtcGetPTX(program, ptx.data());
+        nvrtcDestroyProgram(&program);
+
+        if (!cache_file.empty()) {
+            // mkdir -p the cache dir (two levels at most), best-effort.
+            std::string dir = cache_file.substr(0, cache_file.find_last_of('/'));
+            std::string parent = dir.substr(0, dir.find_last_of('/'));
+            mkdir(parent.c_str(), 0755);
+            mkdir(dir.c_str(), 0755);
+            std::string tmp = cache_file + ".tmp";
+            if (FILE *f = fopen(tmp.c_str(), "wb")) {
+                fwrite(ptx.data(), 1, ptx.size(), f);
+                fclose(f);
+                rename(tmp.c_str(), cache_file.c_str());
+            }
+        }
+    }
 
     // Ensure the runtime API's primary context is current for the driver API.
     cudaFree(0);
@@ -75,17 +142,28 @@ bool compile_kernel(const char *source, const char *kernel_name, CUfunction *out
         fprintf(stderr, "stwo JIT: kernel %s not found in module\n", kernel_name);
         return false;
     }
+    if (jit_log_enabled()) {
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - t_start)
+                      .count();
+        fprintf(stderr, "stwo JIT: %s ready in %lld ms (%s)\n", kernel_name, (long long)ms,
+                from_disk ? "disk PTX cache" : "NVRTC compile");
+    }
     return true;
 }
 
 }  // namespace
 
-// Compiles (cached by semantic_hash) and launches the fused constraint kernel.
-// Returns true on success; false means the caller must use the CPU lane.
+// Compiles (cached by cache_key = semantic hash mixed with the Rust emitter's
+// CODEGEN_VERSION) and launches the fused constraint kernel. Returns true once the
+// kernel is enqueued on the legacy default stream; false means nothing was launched
+// and the caller must use the CPU lane. No device synchronization happens here: the
+// kernel's outputs are only ever consumed by later same-stream work or by
+// synchronous D2H copies, both of which the legacy stream orders after this launch.
 extern "C" bool stwo_cuda_jit_eval_fused(
     const char *source,
     const char *kernel_name,
-    uint64_t semantic_hash,
+    uint64_t cache_key,
     const uint32_t *trace_values,
     const uint32_t *interaction_offsets,
     const uint32_t *base_params,
@@ -103,14 +181,14 @@ extern "C" bool stwo_cuda_jit_eval_fused(
     {
         JitCache &cache = jit_cache();
         std::lock_guard<std::mutex> guard(cache.mutex);
-        auto it = cache.functions.find(semantic_hash);
+        auto it = cache.functions.find(cache_key);
         if (it != cache.functions.end()) {
             function = it->second;
         } else {
-            if (!compile_kernel(source, kernel_name, &function)) {
+            if (!compile_kernel(source, kernel_name, cache_key, &function)) {
                 return false;
             }
-            cache.functions.emplace(semantic_hash, function);
+            cache.functions.emplace(cache_key, function);
         }
     }
 
@@ -122,15 +200,15 @@ extern "C" bool stwo_cuda_jit_eval_fused(
     };
     const unsigned block = 128;  // must match the generated kernel's __launch_bounds__
     const unsigned grid = (row_count + block - 1) / block;
+    // A launch failure happens before any device write, so returning false here still
+    // permits the CPU fallback. After a successful enqueue the kernel updates the
+    // accumulator in place; an asynchronous execution fault becomes a sticky context
+    // error and aborts the prove at the next checked CUDA call — it must NOT fall
+    // back (the accumulator state would be indeterminate), and it cannot, since we
+    // already returned true.
     if (cuLaunchKernel(function, grid, 1, 1, block, 1, 1, 0, nullptr, args, nullptr) !=
         CUDA_SUCCESS) {
         fprintf(stderr, "stwo JIT: cuLaunchKernel failed for %s\n", kernel_name);
-        return false;
-    }
-    cudaError_t sync = cudaDeviceSynchronize();
-    if (sync != cudaSuccess) {
-        fprintf(stderr, "stwo JIT: kernel %s failed: %s\n", kernel_name,
-                cudaGetErrorString(sync));
         return false;
     }
     return true;

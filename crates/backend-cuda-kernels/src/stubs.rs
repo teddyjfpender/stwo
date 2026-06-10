@@ -52,6 +52,34 @@ pub unsafe extern "C" fn copy_uint32_t_vec_from_device_to_device_offset(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn cuda_zero_device_region(ptr: *const u32, offset_words: u64, n_words: u64) {
+    let _ = (ptr, offset_words, n_words);
+    no_cuda_symbol("cuda_zero_device_region")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cuda_alloc_pinned_host_u32(n_words: u64) -> *mut u32 {
+    let _ = n_words;
+    no_cuda_symbol("cuda_alloc_pinned_host_u32")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cuda_free_pinned_host_u32(ptr: *mut u32) {
+    let _ = ptr;
+    no_cuda_symbol("cuda_free_pinned_host_u32")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn copy_uint32_t_vec_from_host_to_device_into(
+    host_ptr: *const u32,
+    device_ptr: *const u32,
+    n_words: u64,
+) {
+    let _ = (host_ptr, device_ptr, n_words);
+    no_cuda_symbol("copy_uint32_t_vec_from_host_to_device_into")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn cuda_malloc_uint32_t(size: u32) -> *const u32 {
     no_cuda_symbol("cuda_malloc_uint32_t")
 }

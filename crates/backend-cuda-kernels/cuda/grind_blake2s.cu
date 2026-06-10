@@ -144,7 +144,7 @@ uint64_t grind_blake2s(const uint32_t* host_prefixed_digest, uint32_t pow_bits) 
         grind_blake2s_kernel<<<grid_size, block_size>>>(
             d_prefixed_digest, pow_bits, hi, d_result_low
         );
-        ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+        stwo_maybe_debug_sync();
         ASSERT_CUDA_SUCCESS(cudaGetLastError());
 
         // Check if a valid nonce was found in this hi chunk.

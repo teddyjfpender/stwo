@@ -10,15 +10,23 @@ use crate::columns::bindings;
 use crate::columns::blake_2s_hash_vec::Blake2sHashVec;
 use crate::columns::secure_field_vec::SecureFieldVec;
 
-fn split_host_backed_vec<T, V>(values: Vec<T>, from_vec: fn(Vec<T>) -> V) -> (V, V) {
-    assert!(
-        values.len().is_multiple_of(2),
-        "column split_at_mid requires an even-length column"
-    );
-    let mid = values.len() / 2;
-    let mut values = values;
-    let right = values.split_off(mid);
-    (from_vec(values), from_vec(right))
+/// Split a device buffer of `2 * half_words` u32 words into two freshly allocated
+/// device buffers of `half_words` each — two device-to-device copies, no host
+/// roundtrip. Returns the halves' device pointers; the caller wraps them in the
+/// appropriate column type (which owns and later frees them). The source buffer is
+/// not freed here; it is released when the consumed column drops.
+fn split_device_words(src: *const u32, half_words: usize) -> (*const u32, *const u32) {
+    let left = unsafe { bindings::cuda_malloc_uint32_t(half_words as u32) };
+    let right = unsafe { bindings::cuda_malloc_uint32_t(half_words as u32) };
+    unsafe {
+        bindings::copy_uint32_t_vec_from_device_to_device(src, left, half_words as u32);
+        bindings::copy_uint32_t_vec_from_device_to_device(
+            src.add(half_words),
+            right,
+            half_words as u32,
+        );
+    }
+    (left, right)
 }
 
 impl ColumnOps<BaseField> for CudaBackend {
@@ -68,7 +76,13 @@ impl Column<BaseField> for interface::base_field_vec::BaseFieldVec {
     }
 
     fn split_at_mid(self) -> (Self, Self) {
-        split_host_backed_vec(self.to_vec(), BaseFieldVec::from_vec)
+        assert!(
+            self.size.is_multiple_of(2),
+            "column split_at_mid requires an even-length column"
+        );
+        let mid = self.size / 2;
+        let (left, right) = split_device_words(self.device_ptr, mid);
+        (BaseFieldVec::new(left, mid), BaseFieldVec::new(right, mid))
     }
 
     unsafe fn uninitialized(len: usize) -> Self {
@@ -119,7 +133,17 @@ impl Column<SecureField> for SecureFieldVec {
     }
 
     fn split_at_mid(self) -> (Self, Self) {
-        split_host_backed_vec(self.to_vec(), SecureFieldVec::from_vec)
+        assert!(
+            self.size.is_multiple_of(2),
+            "column split_at_mid requires an even-length column"
+        );
+        let mid = self.size / 2;
+        // 4 u32 words per QM31 element.
+        let (left, right) = split_device_words(self.device_ptr, 4 * mid);
+        (
+            SecureFieldVec::new(left, mid),
+            SecureFieldVec::new(right, mid),
+        )
     }
 
     unsafe fn uninitialized(len: usize) -> Self {
@@ -166,7 +190,17 @@ impl Column<Blake2sHash> for Blake2sHashVec {
     }
 
     fn split_at_mid(self) -> (Self, Self) {
-        split_host_backed_vec(self.to_vec(), Blake2sHashVec::from_vec)
+        assert!(
+            self.size.is_multiple_of(2),
+            "column split_at_mid requires an even-length column"
+        );
+        let mid = self.size / 2;
+        // A Blake2sHash is 32 bytes = 8 u32 words.
+        let (left, right) = split_device_words(self.device_ptr.cast(), 8 * mid);
+        (
+            Blake2sHashVec::new(left.cast(), mid),
+            Blake2sHashVec::new(right.cast(), mid),
+        )
     }
 }
 

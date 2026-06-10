@@ -60,7 +60,7 @@ void interpolate(int eval_domain_size, m31 *values, m31 *inverse_twiddles_tree, 
         layer_domain_offset += layer_domain_size;
         i += 1;
         ASSERT_CUDA_SUCCESS(cudaGetLastError());
-        ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+        stwo_maybe_debug_sync();
         ASSERT_CUDA_SUCCESS(cudaGetLastError());
 
     }
@@ -70,7 +70,7 @@ void interpolate(int eval_domain_size, m31 *values, m31 *inverse_twiddles_tree, 
     m31 factor = inv(pow(m31{2}, log_values_size));
     rescale<<<num_blocks, block_dim>>>(values, values_size, factor);
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
-    ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+    stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 }
 
@@ -160,7 +160,7 @@ void interpolate_columns(int eval_domain_size, m31 **values, m31 *inverse_twiddl
 
     batch_ifft_circle_part<<<gridDimensions, blockDimensions>>>(device_values, inverseTwiddlesTree, values_size, number_of_rows);
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
-    ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+    stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 
     int log_number_of_rows = log_2(number_of_rows);
@@ -180,7 +180,7 @@ void interpolate_columns(int eval_domain_size, m31 **values, m31 *inverse_twiddl
         i += 1;
     }
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
-    ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+    stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 
     m31 factor = inv(pow(m31{2}, log_number_of_rows));
@@ -188,7 +188,7 @@ void interpolate_columns(int eval_domain_size, m31 **values, m31 *inverse_twiddl
     dim3 rescaleGridDimensions(values_size, numBlocks);
     batch_rescale<<<rescaleGridDimensions, blockDimensions>>>(device_values, values_size, number_of_rows, factor);
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
-    ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+    stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 
     cuda_proving_free(device_values);
@@ -309,7 +309,7 @@ EXTERN void ntt_b2n_init_7_stage_batch(m31** input, m31** output,
         input, output,
         log_n, num_poly, start_stage, end_stage, g_twiddles);
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
-    ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+    stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 }
 
@@ -333,7 +333,7 @@ EXTERN void ntt_b2n_init_8_stage_batch(m31** input, m31** output,
         input, output,
         log_n, num_poly, start_stage, end_stage, g_twiddles);
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
-    ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+    stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 }
 
@@ -505,7 +505,7 @@ EXTERN void ntt_b2n_init_9_stage_batch(m31** input, m31** output,
         input, output,
         log_n, num_poly, start_stage, end_stage, g_twiddles);
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
-    ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+    stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 }
 
@@ -526,7 +526,7 @@ EXTERN void ntt_b2n_init_10_stage_batch(m31** input, m31** output,
         input, output,
         log_n, num_poly, start_stage, end_stage, g_twiddles);
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
-    ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+    stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 }
 
@@ -546,7 +546,7 @@ EXTERN void ntt_b2n_init_11_stage_batch(m31** input, m31** output,
         input, output,
         log_n, num_poly, start_stage, end_stage, g_twiddles);
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
-    ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+    stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 }
 
@@ -566,7 +566,7 @@ EXTERN void ntt_b2n_init_12_stage_batch(m31** input, m31** output,
         input, output,
         log_n, num_poly, start_stage, end_stage, g_twiddles);
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
-    ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+    stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 }
 EXTERN void ntt_b2n_init_6_3_stage_batch(m31** input, m31** output,
@@ -586,7 +586,7 @@ EXTERN void ntt_b2n_init_6_3_stage_batch(m31** input, m31** output,
         input, output,
         log_n, num_poly, start_stage, end_stage, g_twiddles);
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
-    ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+    stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 }
 
@@ -730,7 +730,7 @@ EXTERN void ntt_b2n_noinit_4_stage_batch(m31** input, m31** output,
         input, output,
         log_n, num_poly, start_stage, end_stage, g_twiddles, rescale_factor);
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
-    ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+    stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 }
 
@@ -755,7 +755,7 @@ EXTERN void ntt_b2n_noinit_6_stage_batch(m31** input, m31** output,
         input, output,
         log_n, num_poly, start_stage, end_stage, g_twiddles, rescale_factor);
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
-    ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+    stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 }
 
@@ -780,7 +780,7 @@ EXTERN void ntt_b2n_noinit_8_stage_batch(m31** input, m31** output,
         input, output,
         log_n, num_poly, start_stage, end_stage, g_twiddles, rescale_factor);
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
-    ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+    stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 }
 
@@ -856,7 +856,7 @@ EXTERN void ntt_b2n_native_batch(m31** input, m31** output,
         layer_domain_size >>= 1;
         layer_domain_offset += layer_domain_size;
     }
-    ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+    stwo_maybe_debug_sync();
 }
 
 EXTERN void ntt_b2n_column(
@@ -867,7 +867,7 @@ EXTERN void ntt_b2n_column(
     uint32_t twiddles_size,
     uint32_t eval_domain_size
 ) {
-    ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+    stwo_maybe_debug_sync();
 
     m31 **device_values = cuda_proving_clone_to_device<m31*>(values_columns, num_poly);
 
@@ -994,7 +994,7 @@ EXTERN void ntt_b2n_column(
         throw std::runtime_error("b2n log_n too big");
     }
 
-    ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+    stwo_maybe_debug_sync();
 
     cuda_proving_free(device_values);
 }

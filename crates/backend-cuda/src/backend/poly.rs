@@ -166,6 +166,24 @@ fn to_cpu_twiddle_tree(
     }
 }
 
+/// Prepare `buffer` as the in-place NTT input for evaluating `poly` on a domain of
+/// `buffer.len()` points: the polynomial's coefficients followed by a zero tail.
+/// `buffer` may arrive in any state (the mempool hands out uninitialized buffers),
+/// so every word is written: one device-to-device copy plus one region memset —
+/// no intermediate "extend" allocation and no second full-buffer copy.
+fn fill_ntt_buffer(poly: &CirclePoly<CudaBackend>, buffer: &mut BaseFieldVec) {
+    let n_coeffs = poly.coeffs.len();
+    debug_assert!(buffer.len() >= n_coeffs);
+    buffer.copy_from(&poly.coeffs);
+    unsafe {
+        interface::bindings::cuda_zero_device_region(
+            buffer.device_ptr,
+            n_coeffs as u64,
+            (buffer.len() - n_coeffs) as u64,
+        );
+    }
+}
+
 fn evaluate_into_cuda(
     poly: &CirclePoly<CudaBackend>,
     domain: CircleDomain,
@@ -186,8 +204,7 @@ fn evaluate_into_cuda(
         return CudaCircleEvaluation::new(cpu_circle_eval.domain, buffer);
     }
 
-    let extended = CudaBackend::extend(poly, domain_log_size);
-    buffer.copy_from(&extended.coeffs);
+    fill_ntt_buffer(poly, &mut buffer);
 
     unsafe {
         interface::bindings::ntt_n2b_columns(
@@ -479,6 +496,93 @@ impl PolyOps for CudaBackend {
         evaluate_into_cuda(poly, domain, twiddles, buffer)
     }
 
+    /// Batched override of the per-column default: the trace's polynomials are grouped
+    /// by evaluation size and each group runs as ONE multi-column NTT launch (the
+    /// mirror of [`Self::interpolate_columns`]). On the Cairo trace this collapses
+    /// hundreds of `ntt_n2b_columns(num_poly=1)` launches — each preceded and followed
+    /// by wrapper synchronization — into a handful of saturating dispatches.
+    fn evaluate_polynomials(
+        polynomials: stwo::core::ColumnVec<CirclePoly<Self>>,
+        log_blowup_factor: u32,
+        twiddles: &TwiddleTree<Self>,
+        store_polynomials_coefficients: bool,
+        pool: &stwo::prover::mempool::BaseColumnPool<Self>,
+    ) -> Vec<stwo::prover::Poly<Self>> {
+        // Buffer per polynomial, pooled where possible (uninitialized contents;
+        // fill_ntt_buffer writes every word).
+        let buffers: Vec<BaseFieldVec> = polynomials
+            .iter()
+            .map(|poly| pool.take_or_alloc(poly.log_size() + log_blowup_factor))
+            .collect();
+
+        // Pair each polynomial with its buffer and original position, group by
+        // evaluation log size for the batch NTT.
+        let mut indexed: Vec<(usize, u32, CirclePoly<Self>, BaseFieldVec)> = polynomials
+            .into_iter()
+            .zip(buffers)
+            .enumerate()
+            .map(|(i, (poly, buffer))| {
+                let log_eval_size = poly.log_size() + log_blowup_factor;
+                (i, log_eval_size, poly, buffer)
+            })
+            .collect();
+        indexed.sort_by_key(|(_, log_eval_size, ..)| *log_eval_size);
+
+        // Phase 1: stage every group's buffers in place (coefficients + zero tail),
+        // then run ONE batch NTT per group. Domains of log size <= 3 are left for the
+        // CPU reference path in phase 2 (matching `evaluate_into`'s fallback).
+        let mut group_start = 0;
+        while group_start < indexed.len() {
+            let log_eval_size = indexed[group_start].1;
+            let mut group_end = group_start + 1;
+            while group_end < indexed.len() && indexed[group_end].1 == log_eval_size {
+                group_end += 1;
+            }
+            if log_eval_size > 3 {
+                let group = &mut indexed[group_start..group_end];
+                let domain = CanonicCoset::new(log_eval_size).circle_domain();
+                for (_, _, poly, buffer) in group.iter_mut() {
+                    assert_eq!(buffer.len(), domain.size());
+                    fill_ntt_buffer(poly, buffer);
+                }
+                let mut ptrs: Vec<*mut u32> = group
+                    .iter()
+                    .map(|(.., buffer)| buffer.device_ptr as *mut u32)
+                    .collect();
+                unsafe {
+                    interface::bindings::ntt_n2b_columns(
+                        ptrs.as_mut_ptr(),
+                        log_eval_size,
+                        group.len() as u32,
+                        twiddles.twiddles.device_ptr,
+                        twiddles.twiddles.len() as u32,
+                        domain.half_coset.size() as u32,
+                    );
+                }
+            }
+            group_start = group_end;
+        }
+
+        // Phase 2: wrap results in original column order.
+        let mut results: Vec<(usize, stwo::prover::Poly<Self>)> = indexed
+            .into_iter()
+            .map(|(i, log_eval_size, poly, buffer)| {
+                let domain = CanonicCoset::new(log_eval_size).circle_domain();
+                let evals = if log_eval_size <= 3 {
+                    evaluate_into_cuda(&poly, domain, twiddles, buffer)
+                } else {
+                    CircleEvaluation::new(domain, buffer)
+                };
+                (
+                    i,
+                    stwo::prover::Poly::new(store_polynomials_coefficients.then_some(poly), evals),
+                )
+            })
+            .collect();
+        results.sort_by_key(|(idx, _)| *idx);
+        results.into_iter().map(|(_, poly)| poly).collect()
+    }
+
     fn precompute_twiddles(coset: Coset) -> TwiddleTree<Self> {
         unsafe {
             let twiddles = BaseFieldVec::new(
@@ -508,12 +612,21 @@ impl PolyOps for CudaBackend {
         (CirclePoly::new(left), CirclePoly::new(right))
     }
 
-    /// Inverse of [`Self::split_at_mid`]: concatenate the halves' coefficients.
-    /// v1: host roundtrip; a device-side concat (two cudaMemcpys) can replace it.
+    /// Inverse of [`Self::split_at_mid`]: concatenate the halves' coefficients with
+    /// two device-to-device copies into a fresh buffer — no host roundtrip. (At
+    /// big-trace sizes the previous download/upload moved multiple gigabytes over
+    /// PCIe per call.)
     fn join_at_mid(left: CirclePoly<Self>, right: CirclePoly<Self>) -> CirclePoly<Self> {
-        let mut coeffs = left.coeffs.to_vec();
-        coeffs.extend(right.coeffs.to_vec());
-        CirclePoly::new(BaseFieldVec::from_vec(coeffs))
+        let half = left.coeffs.len();
+        assert_eq!(
+            half,
+            right.coeffs.len(),
+            "join_at_mid requires equal-length halves"
+        );
+        let mut coeffs = BaseFieldVec::new_uninitialized(2 * half);
+        coeffs.copy_from(&left.coeffs);
+        coeffs.copy_from_offset(&right.coeffs, half);
+        CirclePoly::new(coeffs)
     }
 }
 #[cfg(all(test, stwo_cuda_link))]

@@ -107,7 +107,7 @@ void barycentric_weights_from_point_vanishings(
         odd_scale,
         result_weights
     );
-    ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+    stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 
     cuda_proving_free(inverses);
@@ -127,7 +127,7 @@ qm31 barycentric_eval_base_field(
         size,
         partials
     );
-    ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+    stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 
     uint32_t current_size = num_blocks;
@@ -140,7 +140,7 @@ qm31 barycentric_eval_base_field(
             current_size,
             next
         );
-        ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+        stwo_maybe_debug_sync();
         ASSERT_CUDA_SUCCESS(cudaGetLastError());
         cuda_proving_free(current);
         current = next;

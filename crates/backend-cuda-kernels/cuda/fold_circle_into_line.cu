@@ -63,7 +63,7 @@ void fold_circle_into_line(m31 *gpu_domain, uint32_t twiddle_offset, uint32_t n,
     );
 
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
-    ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+    stwo_maybe_debug_sync();
 
     cuda_proving_free(eval_values_device);
     cuda_proving_free(folded_values_device);

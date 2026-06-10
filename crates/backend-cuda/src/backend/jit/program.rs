@@ -686,7 +686,8 @@ pub fn lower_framework_eval_to_v1<F: FrameworkEval>(
     n_interactions: u32,
     n_base_params: u32,
     n_ext_params: u32,
-) -> Result<OwnedMetalEvaluationProgramV1, MetalEvaluationProgramLoweringError> {
+) -> Result<(OwnedMetalEvaluationProgramV1, Vec<SecureField>), MetalEvaluationProgramLoweringError>
+{
     lower_framework_eval_to_v1_with_logup(
         eval,
         n_interactions,
@@ -705,6 +706,14 @@ pub fn lower_framework_eval_to_v1<F: FrameworkEval>(
 /// `n_rows` to produce the per-row `cumsum_shift`.  When `claimed_sum` is
 /// zero (e.g. for components without logup), the shift is zero and has no
 /// effect.
+///
+/// Returns the program together with its ext-parameter values: every ext
+/// constant the recorder produced (channel-drawn lookup elements, logup
+/// cumsum shift, structural constants) is hoisted out of the bytecode into a
+/// runtime parameter slot, so the bytecode — and therefore the semantic hash
+/// and the JIT-compiled kernel — depends only on the AIR's structure, never
+/// on the statement being proven. The returned values must be uploaded as the
+/// kernel's `ext_params` buffer in slot order.
 pub fn lower_framework_eval_to_v1_with_logup<F: FrameworkEval>(
     eval: &F,
     n_interactions: u32,
@@ -712,7 +721,8 @@ pub fn lower_framework_eval_to_v1_with_logup<F: FrameworkEval>(
     n_ext_params: u32,
     claimed_sum: SecureField,
     log_size: u32,
-) -> Result<OwnedMetalEvaluationProgramV1, MetalEvaluationProgramLoweringError> {
+) -> Result<(OwnedMetalEvaluationProgramV1, Vec<SecureField>), MetalEvaluationProgramLoweringError>
+{
     validate_eval_program_abi_layout_v1()?;
 
     let mut recorder = RecordingEvaluator::new();
@@ -728,31 +738,37 @@ pub fn lower_framework_eval_to_v1_with_logup<F: FrameworkEval>(
     let recorder = eval.evaluate(recorder);
     let mut state = recorder.finish();
 
-    // Statement-independence: the logup cumsum shift (claimed_sum / 2^log_size) gets
-    // recorded as an ext CONSTANT, which would change the bytecode — and therefore the
-    // semantic hash and the NVRTC-compiled kernel — for every new statement. Rewrite
-    // any ext const matching the shift into a Param read (slot 0); the dispatcher
-    // passes the value through the ext_params buffer instead. Zero shifts are left
-    // alone (they'd collide with legitimate zero constants and are already stable).
-    let cumsum_shift =
-        claimed_sum / stwo::core::fields::m31::BaseField::from_u32_unchecked(1u32 << log_size);
-    let mut shift_parameterized = false;
-    if !num_traits::Zero::is_zero(&cumsum_shift) {
-        let limbs = cumsum_shift.to_m31_array().map(|l| l.0);
-        for inst in state.ext_insts.iter_mut() {
-            if inst.op == MetalEvaluationProgramExtOpcodeV1::Const as u8
-                && [inst.a, inst.b, inst.c, inst.d] == limbs
-            {
-                inst.op = MetalEvaluationProgramExtOpcodeV1::Param as u8;
-                inst.a = 0; // ext param slot 0
-                inst.b = 0;
-                inst.c = 0;
-                inst.d = 0;
-                shift_parameterized = true;
-            }
+    // Statement-independence: channel-drawn lookup elements, the logup cumsum shift
+    // (claimed_sum / 2^log_size), and record-time const folds of either all land in
+    // the bytecode as ext CONSTANTS, which would change the semantic hash — and
+    // therefore force an NVRTC recompile — for every new statement. Hoist EVERY ext
+    // constant into a runtime parameter slot (deduplicated by value, slots assigned
+    // in encounter order, values returned to the dispatcher for the ext_params
+    // buffer). After this rewrite the bytecode is a pure function of the AIR's
+    // structure, so the kernel cache (in-memory and on-disk) hits across statements,
+    // inputs, and processes. The kernel reads ext_params[slot] instead of an
+    // immediate — identical values, identical arithmetic, byte-identical results.
+    let mut ext_param_values: Vec<SecureField> = Vec::new();
+    let mut slot_by_value: std::collections::HashMap<[u32; 4], u32> =
+        std::collections::HashMap::new();
+    for inst in state.ext_insts.iter_mut() {
+        if inst.op == MetalEvaluationProgramExtOpcodeV1::Const as u8 {
+            let limbs = [inst.a, inst.b, inst.c, inst.d];
+            let slot = *slot_by_value.entry(limbs).or_insert_with(|| {
+                let slot = ext_param_values.len() as u32;
+                ext_param_values.push(SecureField::from_m31_array(
+                    limbs.map(stwo::core::fields::m31::BaseField::from_u32_unchecked),
+                ));
+                slot
+            });
+            inst.op = MetalEvaluationProgramExtOpcodeV1::Param as u8;
+            inst.a = slot;
+            inst.b = 0;
+            inst.c = 0;
+            inst.d = 0;
         }
     }
-    let n_ext_params = n_ext_params.max(if shift_parameterized { 1 } else { 0 });
+    let n_ext_params = n_ext_params.max(ext_param_values.len() as u32);
 
     // Compact registers (linear-scan reuse) so big components don't spill: the
     // recorder's monotonic SSA allocation can produce hundreds of live slots.
@@ -814,7 +830,7 @@ pub fn lower_framework_eval_to_v1_with_logup<F: FrameworkEval>(
         }
     }
 
-    Ok(build_owned_program_v1(
+    let program = build_owned_program_v1(
         STWO_METAL_EVAL_PROGRAM_CAP_BASE_INV_V1
             | STWO_METAL_EVAL_PROGRAM_CAP_EXT_MUL_V1
             | STWO_METAL_EVAL_PROGRAM_CAP_PREFINALIZED_LOGUP_V1,
@@ -829,5 +845,6 @@ pub fn lower_framework_eval_to_v1_with_logup<F: FrameworkEval>(
         state.ext_insts,
         state.constraint_roots,
         log_size,
-    ))
+    );
+    Ok((program, ext_param_values))
 }

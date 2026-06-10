@@ -534,7 +534,7 @@ static void pedersen_table_runtime_publish_active_columns() {
         device_columns,
         s_pedersen_table_runtime.n_rows
     );
-    ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+    stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 
     pedersen_runtime_release_uploaded_column_ptrs(device_columns);
@@ -542,7 +542,7 @@ static void pedersen_table_runtime_publish_active_columns() {
 
 static void pedersen_table_runtime_clear_published_columns() {
     clear_global_pedersen_table_pointers_kernel<<<1, 1>>>();
-    ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+    stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 }
 
@@ -689,14 +689,14 @@ extern "C" void initialize_pedersen_table() {
             POINT_P0, window
         );
     }
-    ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+    stwo_maybe_debug_sync();
 
     // Generate P1 section (16 rows)
     printf("[PEDERSEN_TABLE_GPU] Generating P1 section...\n");
     gen_pedersen_small_section_kernel_init<<<1, 16>>>(
         d_columns, INIT_PEDERSEN_P1_START, 16, POINT_P1
     );
-    ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+    stwo_maybe_debug_sync();
 
     // Generate P2 section (14 windows × 262144 rows each)
     // Using optimized binary decomposition kernel: O(log k) additions instead of O(k)
@@ -709,18 +709,18 @@ extern "C" void initialize_pedersen_table() {
             POINT_P2, window
         );
     }
-    ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+    stwo_maybe_debug_sync();
 
     // Generate P3 section (16 rows)
     printf("[PEDERSEN_TABLE_GPU] Generating P3 section...\n");
     gen_pedersen_small_section_kernel_init<<<1, 16>>>(
         d_columns, INIT_PEDERSEN_P3_START, 16, POINT_P3
     );
-    ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+    stwo_maybe_debug_sync();
 
     // Set global device symbol pointers (same symbols used by pedersen_table.cuh)
     set_global_pedersen_table_pointers_kernel<<<1, 1>>>(d_columns, n_rows);
-    ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+    stwo_maybe_debug_sync();
 
     pedersen_runtime_release_uploaded_column_ptrs(d_columns);
 
@@ -778,7 +778,7 @@ extern "C" void debug_get_P0_constant(uint32_t* x_limbs, uint32_t* y_limbs) {
     uint32_t* d_y = pedersen_runtime_alloc_u32_words(8);
 
     debug_get_P0_kernel<<<1, 1>>>(d_x, d_y);
-    cudaDeviceSynchronize();
+    stwo_maybe_debug_sync();
 
     cudaMemcpy(x_limbs, d_x, 8 * sizeof(uint32_t), cudaMemcpyDeviceToHost);
     cudaMemcpy(y_limbs, d_y, 8 * sizeof(uint32_t), cudaMemcpyDeviceToHost);
@@ -802,7 +802,7 @@ extern "C" void debug_get_shift_constant(uint32_t* x_limbs, uint32_t* y_limbs) {
     uint32_t* d_y = pedersen_runtime_alloc_u32_words(8);
 
     debug_get_shift_kernel<<<1, 1>>>(d_x, d_y);
-    cudaDeviceSynchronize();
+    stwo_maybe_debug_sync();
 
     cudaMemcpy(x_limbs, d_x, 8 * sizeof(uint32_t), cudaMemcpyDeviceToHost);
     cudaMemcpy(y_limbs, d_y, 8 * sizeof(uint32_t), cudaMemcpyDeviceToHost);
@@ -841,7 +841,7 @@ extern "C" void debug_negate_shift(uint32_t* x_limbs, uint32_t* y_limbs) {
     uint32_t* d_y = pedersen_runtime_alloc_u32_words(8);
 
     debug_negate_shift_kernel<<<1, 1>>>(d_x, d_y);
-    cudaDeviceSynchronize();
+    stwo_maybe_debug_sync();
 
     cudaMemcpy(x_limbs, d_x, 8 * sizeof(uint32_t), cudaMemcpyDeviceToHost);
     cudaMemcpy(y_limbs, d_y, 8 * sizeof(uint32_t), cudaMemcpyDeviceToHost);
@@ -915,7 +915,7 @@ extern "C" void debug_mont_roundtrip(uint32_t* result) {
     uint32_t* d_result = pedersen_runtime_alloc_u32_words(8);
 
     debug_mont_roundtrip_kernel<<<1, 1>>>(d_result);
-    cudaDeviceSynchronize();
+    stwo_maybe_debug_sync();
 
     cudaMemcpy(result, d_result, 8 * sizeof(uint32_t), cudaMemcpyDeviceToHost);
     pedersen_runtime_release_u32_words(d_result);
@@ -951,7 +951,7 @@ __global__ void debug_shift_plus_neg_shift_kernel(uint32_t* z_out) {
 extern "C" void debug_shift_plus_neg_shift(uint32_t* z_limbs) {
     uint32_t* d_z = pedersen_runtime_alloc_u32_words(8);
     debug_shift_plus_neg_shift_kernel<<<1, 1>>>(d_z);
-    cudaDeviceSynchronize();
+    stwo_maybe_debug_sync();
     cudaMemcpy(z_limbs, d_z, 8 * sizeof(uint32_t), cudaMemcpyDeviceToHost);
     pedersen_runtime_release_u32_words(d_z);
 }
@@ -1010,7 +1010,7 @@ extern "C" void debug_compute_affine_add(uint32_t* x_limbs, uint32_t* y_limbs) {
     uint32_t* d_y = pedersen_runtime_alloc_u32_words(8);
 
     debug_compute_affine_add_kernel<<<1, 1>>>(d_x, d_y);
-    cudaDeviceSynchronize();
+    stwo_maybe_debug_sync();
 
     cudaMemcpy(x_limbs, d_x, 8 * sizeof(uint32_t), cudaMemcpyDeviceToHost);
     cudaMemcpy(y_limbs, d_y, 8 * sizeof(uint32_t), cudaMemcpyDeviceToHost);
@@ -1072,7 +1072,7 @@ extern "C" void debug_compute_shift_plus_p0(uint32_t* x_limbs, uint32_t* y_limbs
     uint32_t* d_y = pedersen_runtime_alloc_u32_words(8);
 
     debug_compute_shift_plus_p0_kernel<<<1, 1>>>(d_x, d_y);
-    cudaDeviceSynchronize();
+    stwo_maybe_debug_sync();
 
     cudaMemcpy(x_limbs, d_x, 8 * sizeof(uint32_t), cudaMemcpyDeviceToHost);
     cudaMemcpy(y_limbs, d_y, 8 * sizeof(uint32_t), cudaMemcpyDeviceToHost);

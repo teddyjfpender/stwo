@@ -38,6 +38,34 @@ static void handle_cuda_error(cudaError_t cuda_error, const char *const file,
   }
 }
 #define ASSERT_CUDA_SUCCESS(error) handle_cuda_error(error, __FILE__, __LINE__)
+
+// ---------------------------------------------------------------------------
+// Stream-ordering discipline (see docs/gpu-architecture-analysis.md, item 1).
+//
+// All kernels, copies, allocations, and frees in this crate run on the LEGACY
+// DEFAULT STREAM, which orders them against each other automatically. Host reads
+// happen exclusively through synchronous cudaMemcpy calls, which both order after
+// all prior default-stream work AND block until the data is on the host — they are
+// the fences. Wrappers therefore launch without device synchronization; a kernel
+// fault surfaces as a sticky context error at the next checked call.
+//
+// Set STWO_CUDA_DEBUG_SYNC=1 to restore a full device synchronization after every
+// launch for kernel-level error attribution while debugging.
+//
+// IMPORTANT: do NOT launch work on private streams without explicitly ordering it
+// against the default stream (events or stream synchronization) — a private-stream
+// kernel can otherwise race unfinished default-stream writes to its inputs.
+// ---------------------------------------------------------------------------
+inline void stwo_maybe_debug_sync() {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *env = getenv("STWO_CUDA_DEBUG_SYNC");
+        enabled = (env != nullptr && env[0] != '\0' && env[0] != '0') ? 1 : 0;
+    }
+    if (enabled == 1) {
+        ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+    }
+}
 #endif
 
 #define HANDLE_CUDA_ERROR(statement)                                                                                                                           \

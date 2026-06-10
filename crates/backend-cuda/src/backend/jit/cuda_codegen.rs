@@ -12,13 +12,39 @@ use super::program::{
     OwnedMetalEvaluationProgramV1,
 };
 
+/// Version of this source emitter. Mixed into [`jit_cache_key`] so that a change to
+/// the emitted CUDA (new fusion, different ABI) can never collide with PTX persisted
+/// to disk by an older build for the same bytecode. MUST be bumped whenever the
+/// emitted source for a fixed program changes.
+///
+/// History: 1 = initial scratch-writing kernel; 2 = fused accumulate (the kernel adds
+/// into the accumulator coordinates in place).
+pub const CODEGEN_VERSION: u64 = 2;
+
+/// Cache key for compiled kernels: the program's content semantic hash mixed (FNV-1a)
+/// with [`CODEGEN_VERSION`]. This is the key for both the in-process function cache
+/// and the on-disk PTX cache — content + emitter version, never pointers or implicit
+/// scope, per the repository's cache-keying rule.
+pub fn jit_cache_key(semantic_hash: u64) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in semantic_hash
+        .to_le_bytes()
+        .into_iter()
+        .chain(CODEGEN_VERSION.to_le_bytes())
+    {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
 pub fn fused_kernel_name(semantic_hash: u64) -> String {
     format!("stwo_jit_fused_{semantic_hash:016x}")
 }
 
 /// Compile a V1 program into CUDA C source defining one fused `__global__` kernel:
 /// constraint evaluation, random-coefficient accumulation, `denom_inv` multiply, and
-/// coordinate stores, one thread per row.
+/// in-place accumulator update, one thread per row.
 pub fn compile_v1_to_cuda_source(program: &OwnedMetalEvaluationProgramV1) -> Option<String> {
     let header = program.header();
     let name = fused_kernel_name(header.semantic_hash);
@@ -46,13 +72,16 @@ pub fn compile_v1_to_cuda_source(program: &OwnedMetalEvaluationProgramV1) -> Opt
 
     emit_instruction_body(program, &mut src)?;
 
-    src.push_str("    // Fused denom_inv multiply + coordinate stores.\n");
+    // Fused accumulate: coord_i[row] += result — the same per-coordinate M31 add the
+    // separate AccumulationOps::accumulate pass performed, done in-register here.
+    // Each thread touches only its own row, so the read-modify-write is race-free.
+    src.push_str("    // Fused denom_inv multiply + in-place accumulator update.\n");
     src.push_str("    unsigned denom_idx = row_index >> log_n_rows;\n");
     src.push_str("    StwoCudaQm31 result = stwo_qm31_mul_base(acc, denom_inv[denom_idx]);\n");
-    src.push_str("    coord_0[row_index] = result.a;\n");
-    src.push_str("    coord_1[row_index] = result.b;\n");
-    src.push_str("    coord_2[row_index] = result.c;\n");
-    src.push_str("    coord_3[row_index] = result.d;\n");
+    src.push_str("    coord_0[row_index] = stwo_m31_add(coord_0[row_index], result.a);\n");
+    src.push_str("    coord_1[row_index] = stwo_m31_add(coord_1[row_index], result.b);\n");
+    src.push_str("    coord_2[row_index] = stwo_m31_add(coord_2[row_index], result.c);\n");
+    src.push_str("    coord_3[row_index] = stwo_m31_add(coord_3[row_index], result.d);\n");
     src.push_str("}\n");
     Some(src)
 }

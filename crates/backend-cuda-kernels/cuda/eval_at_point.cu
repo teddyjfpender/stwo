@@ -143,7 +143,7 @@ qm31 eval_at_point(m31 *coeffs, int coeffs_size, qm31 point_x, qm31 point_y) {
     eval_at_point_first_pass<<<num_blocks, block_dim, shared_memory_bytes>>>(coeffs, temp, device_mappings, coeffs_size,
                                                                              log_coeffs_size, output_offset);
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
-    ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+    stwo_maybe_debug_sync();
 
     // Second pass
     int mappings_offset = log_coeffs_size - 1;
@@ -157,14 +157,14 @@ qm31 eval_at_point(m31 *coeffs, int coeffs_size, qm31 point_x, qm31 point_y) {
                                                                                       mappings_offset, level_offset,
                                                                                       output_offset);
         ASSERT_CUDA_SUCCESS(cudaGetLastError());
-        ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+        stwo_maybe_debug_sync();
         num_blocks = new_num_blocks;
         level_offset = output_offset;
     }
 
     qm31 result = qm31{cm31{0, 0}, cm31{0, 1}};
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
-    ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+    stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 
     cuda_mem_copy_device_to_host<qm31>(temp, &result, 1);
@@ -388,7 +388,7 @@ void batch_eval_at_points(
         coeffs_ptrs, temp, device_mappings, coeffs_size, log_coeffs_size, level_sizes[0]
     );
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
-    ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+    stwo_maybe_debug_sync();
 
     // 6. Reduction passes
     int mappings_offset = log_coeffs_size - 1;
@@ -408,7 +408,7 @@ void batch_eval_at_points(
             level_offsets[lvl]      // output offset
         );
         ASSERT_CUDA_SUCCESS(cudaGetLastError());
-        ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+        stwo_maybe_debug_sync();
         current_num_blocks = new_num_blocks;
     }
 

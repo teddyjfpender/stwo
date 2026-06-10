@@ -241,7 +241,18 @@ pub fn evaluate_constraint_quotients<E: FrameworkEval + Sync>(
 
     // JIT lane: kernels generated from THIS build's AIR via the recording evaluator
     // (NVRTC, content-hash cached) — consistent by construction, explicit C ABI.
-    if let Some(scratch) = super::jit::try_jit_constraint_quotients(
+    // The fused kernel adds into the accumulator coordinates IN PLACE (no scratch,
+    // no separate accumulate pass), so the verify-mode snapshot must be taken before
+    // the launch. A `false` return guarantees the accumulator was not touched.
+    let verify = std::env::var_os("STWO_CUDA_CONSTRAINT_VERIFY").is_some();
+    let accum_prev_snapshot = if verify {
+        Some(SecureColumnByCoords {
+            columns: accum.col.columns.each_ref().map(|column| column.to_cpu()),
+        })
+    } else {
+        None
+    };
+    if super::jit::try_jit_constraint_quotients(
         component,
         &super::jit::JitInputs {
             trace_ptrs: &trace_ptrs,
@@ -261,19 +272,6 @@ pub fn evaluate_constraint_quotients<E: FrameworkEval + Sync>(
         if log {
             eprintln!("stwo-backend-cuda constraint eval: component={eval_name} lane=JIT");
         }
-        let verify = std::env::var_os("STWO_CUDA_CONSTRAINT_VERIFY").is_some();
-        let accum_prev_snapshot = if verify {
-            Some(SecureColumnByCoords {
-                columns: accum.col.columns.each_ref().map(|column| column.to_cpu()),
-            })
-        } else {
-            None
-        };
-        // accum += scratch (exact field arithmetic; same value as the CPU lane's
-        // accum_prev + row_res * denom_inv).
-        let jit_column = SecureColumnByCoords::<CudaBackend> { columns: scratch };
-        <CudaBackend as stwo::prover::AccumulationOps>::accumulate(accum.col, &jit_column);
-
         if let Some(snapshot) = accum_prev_snapshot {
             let gpu_result: Vec<Vec<BaseField>> = accum
                 .col

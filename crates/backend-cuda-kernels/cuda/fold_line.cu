@@ -47,7 +47,7 @@ void fold_line(m31 *gpu_domain, uint32_t twiddle_offset, uint32_t n, m31 **eval_
         folded_values_device
     );
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
-    ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+    stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 
     cuda_proving_free(eval_values_device);

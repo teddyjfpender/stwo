@@ -36,7 +36,7 @@ void accumulate(int size, m31 **left_columns, m31 **right_columns) {
     int block_dim = 1024;
     int num_blocks = (size + block_dim - 1) / block_dim;
     accumulate_kernel<<<num_blocks, block_dim>>>(size, left_columns_device, right_columns_device);
-    ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+    stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 
     cuda_proving_free(left_columns_device);
@@ -60,7 +60,7 @@ void lift_accumulate_secure_columns(
         previous_columns_device,
         current_columns_device
     );
-    ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+    stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 
     cuda_proving_free(previous_columns_device);

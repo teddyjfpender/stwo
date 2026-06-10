@@ -114,7 +114,7 @@ void evaluate_wide_fibonacci_constraint_quotients_on_domain(
         d_intermediate_fractions,
         logup_counts
     );
-    ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+    stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
     // global_timer.end("evaluate_wide_fibonacci_constraint_quotients_on_domain");
 
@@ -172,7 +172,7 @@ void generate_wide_fibonacci_trace(
         n_columns
     );
 
-    ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+    stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 
     cuda_free_memory(device_trace);

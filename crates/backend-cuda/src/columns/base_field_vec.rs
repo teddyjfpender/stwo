@@ -394,15 +394,51 @@ impl stwo::prover::poly::twiddles::TwiddleBuffer<stwo::prover::poly::BitReversed
         BaseFieldVec::from_vec(Vec::new())
     }
 
-    /// v1: host roundtrip (download, extract with the reference implementation, upload).
-    /// Runs once per prove per subdomain size; a device-side gather can replace it later.
+    /// Device-side extraction: the reference implementation (`Vec<T>`'s impl in
+    /// `stwo::prover::poly::twiddles`) takes one CONTIGUOUS prefix slice per FFT layer
+    /// plus a single padding element, so the same selection is performed here as one
+    /// device-to-device copy per layer — no host roundtrip of the (potentially
+    /// hundreds of MB) full twiddle buffer. The layer offset arithmetic below mirrors
+    /// the reference line for line; keep them in sync.
     fn extract_subdomain_twiddles(&self, domain_log_size: u32, subdomain_log_size: u32) -> Self {
-        let host: Vec<stwo::core::fields::m31::BaseField> = self.to_vec();
-        let extracted = stwo::prover::poly::twiddles::TwiddleBuffer::<
-            stwo::prover::poly::BitReversedOrder,
-        >::extract_subdomain_twiddles(
-            &host, domain_log_size, subdomain_log_size
+        let domain_half_log_size = domain_log_size - 1;
+        let subdomain_half_log_size = subdomain_log_size - 1;
+        let buf_half_log_size = self.size.ilog2();
+        assert!(
+            subdomain_half_log_size <= domain_half_log_size
+                && domain_half_log_size <= buf_half_log_size,
+            "Invalid sizes: subdomain_half={subdomain_half_log_size}, \
+             domain_half={domain_half_log_size}, buf_half={buf_half_log_size}"
         );
-        BaseFieldVec::from_vec(extracted)
+
+        let skip_layers = buf_half_log_size - domain_half_log_size;
+        let buf_size = 1usize << buf_half_log_size;
+        let out_size = 1usize << subdomain_half_log_size;
+        let result = BaseFieldVec::new_uninitialized(out_size);
+
+        let mut out_offset = 0usize;
+        for layer in 0..subdomain_half_log_size as usize {
+            let root_layer = skip_layers as usize + layer;
+            let layer_start = buf_size - (buf_size >> root_layer);
+            let subdomain_layer_size = 1usize << (subdomain_half_log_size as usize - 1 - layer);
+            unsafe {
+                bindings::copy_uint32_t_vec_from_device_to_device(
+                    self.device_ptr.add(layer_start),
+                    result.device_ptr.add(out_offset),
+                    subdomain_layer_size as u32,
+                );
+            }
+            out_offset += subdomain_layer_size;
+        }
+        // Padding to round the output buffer to a power of two.
+        unsafe {
+            bindings::copy_uint32_t_vec_from_device_to_device(
+                self.device_ptr.add(self.size - 1),
+                result.device_ptr.add(out_offset),
+                1,
+            );
+        }
+        debug_assert_eq!(out_offset + 1, out_size);
+        result
     }
 }

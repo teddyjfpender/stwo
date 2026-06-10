@@ -15,56 +15,31 @@ namespace {
 
 constexpr uint32_t MAX_MULTI_LAYER_BATCH_GET_LAYERS = 24;
 
-CudaAllocatorContext create_private_utils_allocator_context() {
-    CudaAllocatorContext context = {};
-    ASSERT_CUDA_SUCCESS(cuda_allocator_context_create_private_stream(&context));
-    return context;
-}
-
-void release_private_utils_allocator_context(CudaAllocatorContext* context) {
-    ASSERT_CUDA_SUCCESS(cuda_allocator_context_release(context));
-}
-
-const uint32_t* const* upload_device_pointer_vec_with_private_context(
+// Legacy-stream pointer-vec upload: a stream-ordered allocation plus one
+// synchronous H2D copy (the copy is ordered after the allocation and blocks
+// until the table is on the device). The previous version spun up a private
+// stream per upload; private streams are now forbidden in this crate unless
+// explicitly ordered against the default stream (see utils.cuh).
+const uint32_t* const* upload_device_pointer_vec(
     const uint32_t* const* host_ptr,
     uint32_t size
 ) {
     if (size == 0) {
         return nullptr;
     }
-
-    CudaAllocatorContext context = create_private_utils_allocator_context();
     const uint32_t** device_ptr =
-        cuda_allocator_allocate_in_context<const uint32_t*>(context, size);
+        cuda_allocator_allocate_for_proving<const uint32_t*>(size);
     if (device_ptr == nullptr) {
         printf("Failed to allocate device pointer vector upload buffer\n");
-        release_private_utils_allocator_context(&context);
         return nullptr;
     }
-
-    ASSERT_CUDA_SUCCESS(cudaMemcpyAsync(
+    ASSERT_CUDA_SUCCESS(cudaMemcpy(
         const_cast<uint32_t**>(device_ptr),
         host_ptr,
         size * sizeof(uint32_t*),
-        cudaMemcpyHostToDevice,
-        context.stream
+        cudaMemcpyHostToDevice
     ));
-    ASSERT_CUDA_SUCCESS(cuda_allocator_context_synchronize(&context));
-    release_private_utils_allocator_context(&context);
     return device_ptr;
-}
-
-void release_uploaded_pointer_vec_with_private_context(
-    const uint32_t* const* device_ptr
-) {
-    if (device_ptr == nullptr) {
-        return;
-    }
-
-    CudaAllocatorContext context = create_private_utils_allocator_context();
-    cuda_allocator_free_in_context(context, device_ptr);
-    ASSERT_CUDA_SUCCESS(cuda_allocator_context_synchronize(&context));
-    release_private_utils_allocator_context(&context);
 }
 
 }  // namespace
@@ -74,7 +49,9 @@ void copy_uint32_t_vec_from_device_to_host(uint32_t *device_ptr, uint32_t *host_
 }
 
 uint32_t* copy_uint32_t_vec_from_host_to_device(uint32_t *host_ptr, int size) {
-    uint32_t* device_ptr = cuda_proving_alloc_zeroes_u32_words(size);
+    // Plain (non-zeroing) allocation: the copy below overwrites every word, so the
+    // previous zero-fill was a wasted full-buffer memset per upload.
+    uint32_t* device_ptr = cuda_proving_malloc<uint32_t>(size);
     cuda_mem_copy_host_to_device(host_ptr, device_ptr, size);
     return device_ptr;
 }
@@ -85,6 +62,42 @@ void copy_uint32_t_vec_from_device_to_device(uint32_t *from, uint32_t *dst, int 
 
 void copy_uint32_t_vec_from_device_to_device_offset(uint32_t *from, uint32_t *dst, int size, int offset) {
     cuda_mem_copy_device_to_device<uint32_t>(from, dst + offset, size);
+}
+
+// Pinned (page-locked) host staging memory for witness upload. Pinned pages let
+// cudaMemcpy run at full PCIe bandwidth (pageable copies bounce through an internal
+// staging area at roughly half speed). Allocated once and reused as scratch — the
+// buffer carries no cached data and is never read back, so pointer reuse is safe.
+uint32_t* cuda_alloc_pinned_host_u32(uint64_t n_words) {
+    void *ptr = nullptr;
+    if (cudaMallocHost(&ptr, n_words * sizeof(uint32_t)) != cudaSuccess) {
+        return nullptr;  // caller falls back to pageable memory
+    }
+    return static_cast<uint32_t *>(ptr);
+}
+
+void cuda_free_pinned_host_u32(uint32_t *ptr) {
+    if (ptr != nullptr) {
+        ASSERT_CUDA_SUCCESS(cudaFreeHost(ptr));
+    }
+}
+
+// H2D copy into an EXISTING device buffer (the older copy_uint32_t_vec_from_host_to_
+// device allocates internally, forcing one allocation round-trip per column).
+void copy_uint32_t_vec_from_host_to_device_into(const uint32_t *host_ptr, uint32_t *device_ptr,
+                                                uint64_t n_words) {
+    ASSERT_CUDA_SUCCESS(
+        cudaMemcpy(device_ptr, host_ptr, n_words * sizeof(uint32_t), cudaMemcpyHostToDevice));
+}
+
+// Zero `n_words` u32 words starting at `ptr + offset_words`. Used to zero-pad the
+// extension tail of NTT buffers in place of allocating a fresh zeroed buffer and
+// copying into it (which costs a full extra device pass per column).
+void cuda_zero_device_region(uint32_t *ptr, uint64_t offset_words, uint64_t n_words) {
+    if (n_words == 0) {
+        return;
+    }
+    ASSERT_CUDA_SUCCESS(cudaMemsetAsync(ptr + offset_words, 0, n_words * sizeof(uint32_t), 0));
 }
 
 uint32_t* cuda_malloc_uint32_t(int size) {
@@ -192,60 +205,34 @@ void cuda_batch_get_blake_2s_hash(
         return;
     }
 
-    CudaAllocatorContext context = create_private_utils_allocator_context();
-
-    // 1. Allocate GPU memory for indices array from the explicit allocator context.
-    uint32_t* d_indices = cuda_allocator_allocate_in_context<uint32_t>(context, n_indices);
-    if (!d_indices) {
-        printf("Failed to allocate indices buffer in batch_get\n");
-        release_private_utils_allocator_context(&context);
+    // All work on the legacy default stream: the gather kernel is automatically
+    // ordered after the (possibly still in-flight) producer of `device_ptr`, and
+    // the final synchronous D2H copy is the host-read fence.
+    uint32_t* d_indices = cuda_allocator_allocate_for_proving<uint32_t>(n_indices);
+    Blake2sHash* d_result = cuda_allocator_allocate_for_proving<Blake2sHash>(n_indices);
+    if (!d_indices || !d_result) {
+        printf("Failed to allocate buffers in batch_get\n");
+        cuda_allocator_free_for_proving(d_indices);
+        cuda_allocator_free_for_proving(d_result);
         return;
     }
 
-    // 2. Allocate GPU memory for result array from the same explicit context.
-    Blake2sHash* d_result = cuda_allocator_allocate_in_context<Blake2sHash>(context, n_indices);
-    if (!d_result) {
-        printf("Failed to allocate result buffer in batch_get\n");
-        cuda_allocator_free_in_context(context, d_indices);
-        ASSERT_CUDA_SUCCESS(cuda_allocator_context_synchronize(&context));
-        release_private_utils_allocator_context(&context);
-        return;
-    }
+    ASSERT_CUDA_SUCCESS(cudaMemcpy(
+        d_indices, indices, n_indices * sizeof(uint32_t), cudaMemcpyHostToDevice));
 
-    // 3. Copy indices to GPU asynchronously on the private stream.
-    ASSERT_CUDA_SUCCESS(cudaMemcpyAsync(
-        d_indices,
-        indices,
-        n_indices * sizeof(uint32_t),
-        cudaMemcpyHostToDevice,
-        context.stream
-    ));
-
-    // 4. Launch kernel to gather hashes in parallel
     const int block_size = 256;
     const int num_blocks = (n_indices + block_size - 1) / block_size;
-    batch_get_blake2s_kernel<<<num_blocks, block_size, 0, context.stream>>>(
+    batch_get_blake2s_kernel<<<num_blocks, block_size>>>(
         device_ptr, d_result, d_indices, n_indices
     );
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 
-    // 5. Copy result back to CPU asynchronously on the same explicit stream.
-    ASSERT_CUDA_SUCCESS(cudaMemcpyAsync(
-        host_ptr,
-        d_result,
-        n_indices * sizeof(Blake2sHash),
-        cudaMemcpyDeviceToHost,
-        context.stream
-    ));
+    // Synchronous D2H: orders after the kernel and blocks until the data is host-visible.
+    ASSERT_CUDA_SUCCESS(cudaMemcpy(
+        host_ptr, d_result, n_indices * sizeof(Blake2sHash), cudaMemcpyDeviceToHost));
 
-    // 6. Synchronize the explicit stream to ensure all operations complete.
-    ASSERT_CUDA_SUCCESS(cuda_allocator_context_synchronize(&context));
-
-    // 7. Free temporary GPU memory back through the same explicit context.
-    cuda_allocator_free_in_context(context, d_indices);
-    cuda_allocator_free_in_context(context, d_result);
-    ASSERT_CUDA_SUCCESS(cuda_allocator_context_synchronize(&context));
-    release_private_utils_allocator_context(&context);
+    cuda_allocator_free_for_proving(d_indices);
+    cuda_allocator_free_for_proving(d_result);
 }
 
 // Multi-layer batch get kernel
@@ -282,80 +269,42 @@ void cuda_multi_layer_batch_get_blake_2s_hash(
         return;
     }
 
-    CudaAllocatorContext context = create_private_utils_allocator_context();
-
-    // 1. Allocate GPU memory for layer pointers array.
+    // Legacy default stream throughout; see cuda_batch_get_blake_2s_hash.
     const Blake2sHash** d_layer_ptrs =
-        cuda_allocator_allocate_in_context<const Blake2sHash*>(context, MAX_MULTI_LAYER_BATCH_GET_LAYERS);
-    if (!d_layer_ptrs) {
-        printf("Failed to allocate layer pointers in multi_layer_batch_get\n");
-        release_private_utils_allocator_context(&context);
+        cuda_allocator_allocate_for_proving<const Blake2sHash*>(MAX_MULTI_LAYER_BATCH_GET_LAYERS);
+    LayerIndexPair* d_pairs = cuda_allocator_allocate_for_proving<LayerIndexPair>(n_pairs);
+    Blake2sHash* d_result = cuda_allocator_allocate_for_proving<Blake2sHash>(n_pairs);
+    if (!d_layer_ptrs || !d_pairs || !d_result) {
+        printf("Failed to allocate buffers in multi_layer_batch_get\n");
+        cuda_allocator_free_for_proving(d_layer_ptrs);
+        cuda_allocator_free_for_proving(d_pairs);
+        cuda_allocator_free_for_proving(d_result);
         return;
     }
 
-    // 2. Allocate GPU memory for pairs array.
-    LayerIndexPair* d_pairs = cuda_allocator_allocate_in_context<LayerIndexPair>(context, n_pairs);
-    if (!d_pairs) {
-        printf("Failed to allocate pairs buffer in multi_layer_batch_get\n");
-        cuda_allocator_free_in_context(context, d_layer_ptrs);
-        ASSERT_CUDA_SUCCESS(cuda_allocator_context_synchronize(&context));
-        release_private_utils_allocator_context(&context);
-        return;
-    }
-
-    // 3. Allocate GPU memory for result array.
-    Blake2sHash* d_result = cuda_allocator_allocate_in_context<Blake2sHash>(context, n_pairs);
-    if (!d_result) {
-        printf("Failed to allocate result buffer in multi_layer_batch_get\n");
-        cuda_allocator_free_in_context(context, d_layer_ptrs);
-        cuda_allocator_free_in_context(context, d_pairs);
-        ASSERT_CUDA_SUCCESS(cuda_allocator_context_synchronize(&context));
-        release_private_utils_allocator_context(&context);
-        return;
-    }
-
-    // 4. Copy layer pointers and pairs to GPU asynchronously on the explicit stream.
-    ASSERT_CUDA_SUCCESS(cudaMemcpyAsync(
+    ASSERT_CUDA_SUCCESS(cudaMemcpy(
         (void*)d_layer_ptrs,
         layer_device_ptrs,
         MAX_MULTI_LAYER_BATCH_GET_LAYERS * sizeof(Blake2sHash*),
-        cudaMemcpyHostToDevice,
-        context.stream
+        cudaMemcpyHostToDevice
     ));
-    ASSERT_CUDA_SUCCESS(cudaMemcpyAsync(
-        d_pairs,
-        pairs,
-        n_pairs * sizeof(LayerIndexPair),
-        cudaMemcpyHostToDevice,
-        context.stream
-    ));
+    ASSERT_CUDA_SUCCESS(cudaMemcpy(
+        d_pairs, pairs, n_pairs * sizeof(LayerIndexPair), cudaMemcpyHostToDevice));
 
-    // 5. Launch kernel to gather hashes in parallel from multiple layers
     const int block_size = 256;
     const int num_blocks = (n_pairs + block_size - 1) / block_size;
-    multi_layer_batch_get_kernel<<<num_blocks, block_size, 0, context.stream>>>(
+    multi_layer_batch_get_kernel<<<num_blocks, block_size>>>(
         d_layer_ptrs, d_result, d_pairs, n_pairs
     );
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 
-    // 6. Copy result back to CPU asynchronously on the same explicit stream.
-    ASSERT_CUDA_SUCCESS(cudaMemcpyAsync(
-        host_ptr,
-        d_result,
-        n_pairs * sizeof(Blake2sHash),
-        cudaMemcpyDeviceToHost,
-        context.stream
-    ));
+    // Synchronous D2H: the host-read fence.
+    ASSERT_CUDA_SUCCESS(cudaMemcpy(
+        host_ptr, d_result, n_pairs * sizeof(Blake2sHash), cudaMemcpyDeviceToHost));
 
-    // 7. Synchronize the explicit stream.
-    ASSERT_CUDA_SUCCESS(cuda_allocator_context_synchronize(&context));
-
-    // 8. Free temporary GPU memory through the same explicit context.
-    cuda_allocator_free_in_context(context, d_layer_ptrs);
-    cuda_allocator_free_in_context(context, d_pairs);
-    cuda_allocator_free_in_context(context, d_result);
-    ASSERT_CUDA_SUCCESS(cuda_allocator_context_synchronize(&context));
-    release_private_utils_allocator_context(&context);
+    cuda_allocator_free_for_proving(d_layer_ptrs);
+    cuda_allocator_free_for_proving(d_pairs);
+    cuda_allocator_free_for_proving(d_result);
 }
 
 void copy_blake_2s_hash_vec_from_device_to_host(Blake2sHash *device_ptr, Blake2sHash *host_ptr, uint32_t size) {
@@ -370,11 +319,11 @@ const uint32_t* const* copy_device_pointer_vec_from_host_to_device(
     const uint32_t* const* host_ptr,
     uint32_t size
 ) {
-    return upload_device_pointer_vec_with_private_context(host_ptr, size);
+    return upload_device_pointer_vec(host_ptr, size);
 }
 
 void cuda_release_uploaded_pointer_vec(const uint32_t* const* device_ptr) {
-    release_uploaded_pointer_vec_with_private_context(device_ptr);
+    cuda_allocator_free_for_proving(device_ptr);
 }
 
 // void** copy_device_pointer_vec_from_host_to_device(const void** ptrs, size_t n) {
@@ -433,7 +382,7 @@ extern "C" void test_offset_bit_reversed_indices(
         result_device, domain_log_size, eval_log_size, offset, n
     );
 
-    cudaDeviceSynchronize();
+    stwo_maybe_debug_sync();
     cuda_mem_copy_device_to_host(result_device, result_host, n);
     cuda_proving_free(result_device);
 }

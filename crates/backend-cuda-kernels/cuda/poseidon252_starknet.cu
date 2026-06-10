@@ -420,7 +420,7 @@ extern "C" void poseidon252_commit_on_first_layer(
         reinterpret_cast<uint8_t*>(result)
     );
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
-    ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+    stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 }
 
@@ -445,6 +445,6 @@ extern "C" void poseidon252_commit_on_layer_with_previous(
         reinterpret_cast<uint8_t*>(result)
     );
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
-    ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+    stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 }

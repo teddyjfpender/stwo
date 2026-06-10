@@ -131,6 +131,18 @@ extern "C" {
         offset: u32,
     );
 
+    pub fn cuda_zero_device_region(ptr: *const u32, offset_words: u64, n_words: u64);
+
+    pub fn cuda_alloc_pinned_host_u32(n_words: u64) -> *mut u32;
+
+    pub fn cuda_free_pinned_host_u32(ptr: *mut u32);
+
+    pub fn copy_uint32_t_vec_from_host_to_device_into(
+        host_ptr: *const u32,
+        device_ptr: *const u32,
+        n_words: u64,
+    );
+
     pub fn cuda_malloc_uint32_t(size: u32) -> *const u32;
 
     pub fn cuda_set_uint32_t(device_ptr: *const c_void, index: usize, val: u32);

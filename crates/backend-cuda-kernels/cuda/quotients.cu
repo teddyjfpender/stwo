@@ -356,7 +356,7 @@ void accumulate_quotients(
             line_coeffs_sizes_device,
             batch_random_coeffs_device
     );
-    ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+    stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 
     // TODO: set to 1024
@@ -381,7 +381,7 @@ void accumulate_quotients(
             batch_random_coeffs_device,
             denominator_inverses
     );
-    ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+    stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 
     free(sample_batches);
@@ -431,7 +431,7 @@ void accumulate_partial_quotient_numerators(
             result_column_2,
             result_column_3
     );
-    ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+    stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 
     cuda_proving_free(sample_column_indexes_device);
@@ -490,7 +490,7 @@ void combine_quotients_from_numerators(
             result_column_3,
             denominator_inverses
     );
-    ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+    stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 
     cuda_proving_free(sample_points_device);

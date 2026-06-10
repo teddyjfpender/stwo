@@ -160,6 +160,9 @@ impl QuotientOps for CudaBackend {
 
         // Interpolate on the subdomain and evaluate on the full domain, with itwiddles
         // extracted for the subdomain (same construction as the reference backend).
+        // The four QM31 coordinate columns share both domain sizes, so the eight
+        // single-column NTTs the per-coordinate path would issue collapse into one
+        // batched inverse NTT plus one batched forward NTT.
         let subdomain_twiddles = TwiddleTree {
             root_coset: eval_subdomain.half_coset,
             twiddles: TwiddleBuffer::empty(),
@@ -172,15 +175,76 @@ impl QuotientOps for CudaBackend {
             twiddles: twiddles.twiddles.clone(),
             itwiddles: TwiddleBuffer::empty(),
         };
-        let evals = SecureColumnByCoords {
-            columns: quotients.columns.map(|column| {
-                CircleEvaluation::<Self, BaseField, BitReversedOrder>::new(eval_subdomain, column)
+
+        if eval_subdomain.log_size() <= 3 {
+            // Tiny domains use the reference CPU path inside interpolate/evaluate.
+            let evals = SecureColumnByCoords {
+                columns: quotients.columns.map(|column| {
+                    CircleEvaluation::<Self, BaseField, BitReversedOrder>::new(
+                        eval_subdomain,
+                        column,
+                    )
                     .interpolate_with_twiddles(&subdomain_twiddles)
                     .evaluate_with_twiddles(eval_domain, &full_twiddles)
                     .values
-            }),
-        };
-        SecureEvaluation::new(eval_domain, evals)
+                }),
+            };
+            return SecureEvaluation::new(eval_domain, evals);
+        }
+
+        // Batched interpolate: one inverse NTT over the 4 coordinate columns in place.
+        let mut interp_ptrs: Vec<*mut u32> = quotients
+            .columns
+            .iter()
+            .map(|column| column.device_ptr as *mut u32)
+            .collect();
+        unsafe {
+            bindings::ntt_b2n_column(
+                interp_ptrs.as_mut_ptr(),
+                eval_subdomain.log_size(),
+                4,
+                subdomain_twiddles.itwiddles.device_ptr,
+                subdomain_twiddles.itwiddles.len() as u32,
+                eval_subdomain.half_coset.size() as u32,
+            );
+        }
+
+        // Batched evaluate: extend each coefficient column into a full-domain buffer
+        // (coefficients + zero tail), then one forward NTT over the 4 buffers.
+        let eval_columns = quotients.columns.map(|coeffs| {
+            let mut buffer =
+                crate::columns::base_field_vec::BaseFieldVec::new_uninitialized(eval_domain.size());
+            buffer.copy_from(&coeffs);
+            unsafe {
+                bindings::cuda_zero_device_region(
+                    buffer.device_ptr,
+                    coeffs.len() as u64,
+                    (eval_domain.size() - coeffs.len()) as u64,
+                );
+            }
+            buffer
+        });
+        let mut eval_ptrs: Vec<*mut u32> = eval_columns
+            .iter()
+            .map(|column| column.device_ptr as *mut u32)
+            .collect();
+        unsafe {
+            bindings::ntt_n2b_columns(
+                eval_ptrs.as_mut_ptr(),
+                eval_domain.log_size(),
+                4,
+                full_twiddles.twiddles.device_ptr,
+                full_twiddles.twiddles.len() as u32,
+                eval_domain.half_coset.size() as u32,
+            );
+        }
+
+        SecureEvaluation::new(
+            eval_domain,
+            SecureColumnByCoords {
+                columns: eval_columns,
+            },
+        )
     }
 }
 
