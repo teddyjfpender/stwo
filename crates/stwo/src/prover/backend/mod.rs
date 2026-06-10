@@ -34,6 +34,83 @@ pub trait BackendForChannel<MC: MerkleChannel>:
 {
 }
 
+/// Conversion of columns produced by the [`simd::SimdBackend`] into this backend's column
+/// representation.
+///
+/// Witness generation is typically written directly against the SIMD backend's column types —
+/// the portable host representation. This trait is the transfer seam between such a witness
+/// generator and the proving backend: the witness is generated on the host and handed to the
+/// target backend at the commitment boundary. For device backends (GPU), the natural
+/// implementation is the host-to-device upload; such backends should override
+/// [`Self::from_simd_evals`] to batch or overlap transfers.
+pub trait FromSimdColumns: Backend {
+    /// Converts a SIMD base-field column into this backend's column type.
+    fn from_simd_base_column(column: Col<simd::SimdBackend, BaseField>) -> Col<Self, BaseField>;
+
+    /// Converts SIMD circle evaluations (e.g. a generated trace) into this backend's.
+    fn from_simd_evals(
+        evals: Vec<
+            crate::prover::poly::circle::CircleEvaluation<
+                simd::SimdBackend,
+                BaseField,
+                crate::prover::poly::BitReversedOrder,
+            >,
+        >,
+    ) -> Vec<
+        crate::prover::poly::circle::CircleEvaluation<
+            Self,
+            BaseField,
+            crate::prover::poly::BitReversedOrder,
+        >,
+    > {
+        #[cfg(feature = "parallel")]
+        use rayon::prelude::*;
+
+        #[cfg(not(feature = "parallel"))]
+        let iter = evals.into_iter();
+        #[cfg(feature = "parallel")]
+        let iter = evals.into_par_iter();
+
+        iter.map(|eval| {
+            crate::prover::poly::circle::CircleEvaluation::new(
+                eval.domain,
+                Self::from_simd_base_column(eval.values),
+            )
+        })
+        .collect()
+    }
+}
+
+impl FromSimdColumns for simd::SimdBackend {
+    fn from_simd_base_column(column: Col<simd::SimdBackend, BaseField>) -> Col<Self, BaseField> {
+        column
+    }
+
+    fn from_simd_evals(
+        evals: Vec<
+            crate::prover::poly::circle::CircleEvaluation<
+                simd::SimdBackend,
+                BaseField,
+                crate::prover::poly::BitReversedOrder,
+            >,
+        >,
+    ) -> Vec<
+        crate::prover::poly::circle::CircleEvaluation<
+            Self,
+            BaseField,
+            crate::prover::poly::BitReversedOrder,
+        >,
+    > {
+        evals
+    }
+}
+
+impl FromSimdColumns for CpuBackend {
+    fn from_simd_base_column(column: Col<simd::SimdBackend, BaseField>) -> Col<Self, BaseField> {
+        column.to_cpu()
+    }
+}
+
 pub trait ColumnOps<T> {
     type Column: Column<T>;
     fn bit_reverse_column(column: &mut Self::Column);

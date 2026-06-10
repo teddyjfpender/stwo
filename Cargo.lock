@@ -1340,6 +1340,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "stwo-backend-testkit"
+version = "2.2.0"
+dependencies = [
+ "itertools 0.12.1",
+ "num-traits",
+ "rand",
+ "stwo",
+ "stwo-constraint-framework",
+]
+
+[[package]]
 name = "stwo-constraint-framework"
 version = "2.2.0"
 dependencies = [

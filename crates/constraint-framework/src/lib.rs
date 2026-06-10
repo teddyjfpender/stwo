@@ -25,7 +25,7 @@ use preprocessed_columns::PreProcessedColumnId;
 #[cfg(all(feature = "prover", feature = "std"))]
 pub use prover::{
     assert_constraints_on_polys, assert_constraints_on_trace, relation_tracker, AssertEvaluator,
-    CpuDomainEvaluator, FractionWriter, LogupColGenerator, LogupTraceGenerator,
+    CpuDomainEvaluator, FractionWriter, FrameworkBackend, LogupColGenerator, LogupTraceGenerator,
     SimdDomainEvaluator,
 };
 use stwo::core::fields::m31::BaseField;

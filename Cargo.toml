@@ -3,6 +3,7 @@ members = [
     "crates/stwo",
     "crates/air-utils",
     "crates/air-utils-derive",
+    "crates/backend-testkit",
     "crates/constraint-framework",
     "crates/examples",
     "crates/std-shims",

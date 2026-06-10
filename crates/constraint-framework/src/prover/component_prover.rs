@@ -118,13 +118,41 @@ fn get_constraint_quotient_inputs<'a, E: FrameworkEval, B: Backend>(
     }
 }
 
-impl<E: FrameworkEval + Sync> ComponentProver<SimdBackend> for FrameworkComponent<E> {
+/// The backend extension point of the constraint framework.
+///
+/// Implementing this trait for a backend makes every [`FrameworkComponent<E>`] a
+/// [`ComponentProver`] for that backend, through the single blanket impl below. This exists
+/// because Rust's orphan rules prevent an out-of-tree backend crate from writing
+/// `impl<E> ComponentProver<TheirBackend> for FrameworkComponent<E>` directly (`E` is an
+/// uncovered foreign type parameter); implementing `FrameworkBackend` for their (local)
+/// backend type is allowed.
+pub trait FrameworkBackend: Backend {
+    /// Evaluates the constraint quotients of `component` on the evaluation domain and
+    /// accumulates them in `evaluation_accumulator`.
+    fn evaluate_constraint_quotients_on_domain<E: FrameworkEval + Sync>(
+        component: &FrameworkComponent<E>,
+        trace: &Trace<'_, Self>,
+        evaluation_accumulator: &mut DomainEvaluationAccumulator<Self>,
+    );
+}
+
+impl<E: FrameworkEval + Sync, B: FrameworkBackend> ComponentProver<B> for FrameworkComponent<E> {
     fn evaluate_constraint_quotients_on_domain(
         &self,
+        trace: &Trace<'_, B>,
+        evaluation_accumulator: &mut DomainEvaluationAccumulator<B>,
+    ) {
+        B::evaluate_constraint_quotients_on_domain(self, trace, evaluation_accumulator);
+    }
+}
+
+impl FrameworkBackend for SimdBackend {
+    fn evaluate_constraint_quotients_on_domain<E: FrameworkEval + Sync>(
+        component: &FrameworkComponent<E>,
         trace: &Trace<'_, SimdBackend>,
         evaluation_accumulator: &mut DomainEvaluationAccumulator<SimdBackend>,
     ) {
-        if self.n_constraints() == 0 {
+        if component.n_constraints() == 0 {
             return;
         }
 
@@ -133,10 +161,14 @@ impl<E: FrameworkEval + Sync> ComponentProver<SimdBackend> for FrameworkComponen
             trace_domain,
             trace,
             denom_inv,
-        } = get_constraint_quotient_inputs(self, trace, evaluation_accumulator.evaluation_mode());
+        } = get_constraint_quotient_inputs(
+            component,
+            trace,
+            evaluation_accumulator.evaluation_mode(),
+        );
 
         let [mut accum] =
-            evaluation_accumulator.columns([(eval_domain.log_size(), self.n_constraints())]);
+            evaluation_accumulator.columns([(eval_domain.log_size(), component.n_constraints())]);
         accum.random_coeff_powers.reverse();
 
         let _span = span!(
@@ -151,7 +183,7 @@ impl<E: FrameworkEval + Sync> ComponentProver<SimdBackend> for FrameworkComponen
             let trace_cols = trace.as_cols_ref().map_cols(|c| c.to_cpu());
             let trace_cols = trace_cols.as_cols_ref();
             *accum.col = SecureColumnByCoords::from_cpu(accumulate_pointwise_cpu(
-                self,
+                component,
                 trace_cols,
                 eval_domain.log_size(),
                 trace_domain.log_size(),
@@ -179,10 +211,10 @@ impl<E: FrameworkEval + Sync> ComponentProver<SimdBackend> for FrameworkComponen
         #[cfg(feature = "parallel")]
         let iter = col.par_chunks_mut(chunk_size).take(n_chunks).enumerate();
 
-        // Define any `self` values outside the loop to prevent the compiler thinking there is a
-        // `Sync` requirement on `Self`.
-        let self_eval = &self.eval;
-        let self_claimed_sum = self.claimed_sum;
+        // Define any component values outside the loop to prevent the compiler thinking there
+        // is a `Sync` requirement on the component type.
+        let self_eval = &component.eval;
+        let self_claimed_sum = component.claimed_sum;
 
         // Build the column reference tree once; rebuilding it per row allocates a vector of
         // references per column tree and dominates the loop for wide traces.
@@ -219,13 +251,13 @@ impl<E: FrameworkEval + Sync> ComponentProver<SimdBackend> for FrameworkComponen
     }
 }
 
-impl<E: FrameworkEval + Sync> ComponentProver<CpuBackend> for FrameworkComponent<E> {
-    fn evaluate_constraint_quotients_on_domain(
-        &self,
+impl FrameworkBackend for CpuBackend {
+    fn evaluate_constraint_quotients_on_domain<E: FrameworkEval + Sync>(
+        component: &FrameworkComponent<E>,
         trace: &Trace<'_, CpuBackend>,
         evaluation_accumulator: &mut DomainEvaluationAccumulator<CpuBackend>,
     ) {
-        if self.n_constraints() == 0 {
+        if component.n_constraints() == 0 {
             return;
         }
 
@@ -234,10 +266,14 @@ impl<E: FrameworkEval + Sync> ComponentProver<CpuBackend> for FrameworkComponent
             trace_domain,
             trace,
             denom_inv,
-        } = get_constraint_quotient_inputs(self, trace, evaluation_accumulator.evaluation_mode());
+        } = get_constraint_quotient_inputs(
+            component,
+            trace,
+            evaluation_accumulator.evaluation_mode(),
+        );
 
         let [mut accum] =
-            evaluation_accumulator.columns([(eval_domain.log_size(), self.n_constraints())]);
+            evaluation_accumulator.columns([(eval_domain.log_size(), component.n_constraints())]);
         accum.random_coeff_powers.reverse();
 
         let _span = span!(
@@ -249,7 +285,7 @@ impl<E: FrameworkEval + Sync> ComponentProver<CpuBackend> for FrameworkComponent
         let trace_cols = trace.as_cols_ref().map_cols(|c| c.as_ref());
 
         *accum.col = accumulate_pointwise_cpu(
-            self,
+            component,
             trace_cols,
             eval_domain.log_size(),
             trace_domain.log_size(),
