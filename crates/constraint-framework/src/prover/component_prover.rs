@@ -382,7 +382,10 @@ fn subdomain_eval_domain(max_constraint_log_degree_bound: u32, log_expansion: u3
     committed_domain.split(log_expansion).0
 }
 
-fn accumulate_pointwise_cpu<E: FrameworkEval + Sync>(
+/// Pointwise CPU constraint evaluation over prepared trace columns. Public so backend
+/// drivers with their own GPU lane can fall back onto an already-claimed accumulator
+/// (claiming twice would consume two random-coefficient ranges).
+pub fn accumulate_pointwise_cpu<E: FrameworkEval + Sync>(
     component: &FrameworkComponent<E>,
     trace_cols: TreeVec<Vec<&CircleEvaluation<CpuBackend, BaseField, BitReversedOrder>>>,
     eval_log_size: u32,

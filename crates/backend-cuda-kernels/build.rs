@@ -29,6 +29,7 @@ fn main() {
     for source in &sources {
         println!("cargo:rerun-if-changed={}", source.display());
     }
+    println!("cargo:rerun-if-changed=cuda/constraints");
 
     let nvcc = env::var("STWO_CUDA_NVCC").unwrap_or_else(|_| "nvcc".to_string());
     let nvcc_available = Command::new(&nvcc)
@@ -80,6 +81,8 @@ fn main() {
                 // The fp256/poseidon252 stack calls `constexpr __host__` accessors from
                 // device code (sppark lineage); nvcc requires this flag for that pattern.
                 .arg("--expt-relaxed-constexpr")
+                .arg("-I")
+                .arg("cuda")
                 .arg("-Xcompiler")
                 .arg("-fPIC")
                 .arg(format!("-arch={arch}"))
@@ -166,14 +169,20 @@ fn cuda_lib_dir(nvcc: &str) -> Option<PathBuf> {
 
 fn kernel_sources() -> Vec<PathBuf> {
     let cuda_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap()).join("cuda");
-    let mut sources: Vec<PathBuf> = std::fs::read_dir(&cuda_dir)
-        .expect("cuda/ kernel directory must exist")
-        .filter_map(|entry| {
-            let path = entry.expect("readable cuda/ directory entry").path();
-            (path.extension().is_some_and(|ext| ext == "cu")).then_some(path)
-        })
-        .collect();
+    let mut sources = Vec::new();
+    collect_cu(&cuda_dir, &mut sources);
     sources.sort();
     assert!(!sources.is_empty(), "no .cu kernels found under cuda/");
     sources
+}
+
+fn collect_cu(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(dir).expect("cuda/ kernel directory must exist") {
+        let path = entry.expect("readable cuda/ directory entry").path();
+        if path.is_dir() {
+            collect_cu(&path, out);
+        } else if path.extension().is_some_and(|ext| ext == "cu") {
+            out.push(path);
+        }
+    }
 }

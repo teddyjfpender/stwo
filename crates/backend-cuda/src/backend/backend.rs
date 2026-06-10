@@ -60,9 +60,9 @@ impl stwo_constraint_framework::FrameworkBackend for CudaBackend {
         trace: &stwo::prover::Trace<'_, Self>,
         evaluation_accumulator: &mut stwo::prover::DomainEvaluationAccumulator<Self>,
     ) {
-        // v1: the generic CPU driver (columns round-trip through the host). A native
-        // lane analogous to the Metal JIT shader can follow once it pays for itself.
-        stwo_constraint_framework::evaluate_constraint_quotients_via_cpu(
+        // Per-component GPU kernels (NitrooZK lineage) with CPU fallback on the same
+        // accumulator claim; STWO_CUDA_DISABLE_CONSTRAINT_KERNELS forces the fallback.
+        super::constraint_eval::evaluate_constraint_quotients(
             component,
             trace,
             evaluation_accumulator,

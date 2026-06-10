@@ -658,3 +658,30 @@ pub unsafe extern "C" fn cuda_mem_pool_init() -> i32 {
 pub unsafe extern "C" fn grind_blake2s(_host_prefixed_digest: *const u32, _pow_bits: u32) -> u64 {
     no_cuda_symbol("grind_blake2s")
 }
+
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn evaluate_constraint_quotients_on_domain(
+    _q0: *const u32,
+    _q1: *const u32,
+    _q2: *const u32,
+    _q3: *const u32,
+    _t0: *const *const u32,
+    _t0_len: u32,
+    _t1: *const *const u32,
+    _t1_len: u32,
+    _t2: *const *const u32,
+    _t2_len: u32,
+    _rc: *const u32,
+    _denom: *const u32,
+    _domain_log_size: u32,
+    _eval_domain_log_size: u32,
+    _n_columns: u32,
+    _logup_counts: u32,
+    _eval: *mut c_void,
+    _cumsum_shift: CudaSecureField,
+    _should_accumulate: bool,
+    _use_assert_evaluator: bool,
+) -> bool {
+    no_cuda_symbol("evaluate_constraint_quotients_on_domain")
+}

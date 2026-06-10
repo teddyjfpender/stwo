@@ -3,6 +3,7 @@ mod accumulation;
 mod backend;
 mod blake2s;
 mod column;
+mod constraint_eval;
 mod field;
 mod fri;
 mod lookups;

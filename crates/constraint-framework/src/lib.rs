@@ -24,10 +24,10 @@ pub use point::PointEvaluator;
 use preprocessed_columns::PreProcessedColumnId;
 #[cfg(all(feature = "prover", feature = "std"))]
 pub use prover::{
-    assert_constraints_on_polys, assert_constraints_on_trace, constraint_quotient_inputs,
-    evaluate_constraint_quotients_via_cpu, relation_tracker, AssertEvaluator,
-    ConstraintQuotientInputs, CpuDomainEvaluator, FractionWriter, FrameworkBackend,
-    LogupColGenerator, LogupTraceGenerator, SimdDomainEvaluator,
+    accumulate_pointwise_cpu, assert_constraints_on_polys, assert_constraints_on_trace,
+    constraint_quotient_inputs, evaluate_constraint_quotients_via_cpu, relation_tracker,
+    AssertEvaluator, ConstraintQuotientInputs, CpuDomainEvaluator, FractionWriter,
+    FrameworkBackend, LogupColGenerator, LogupTraceGenerator, SimdDomainEvaluator,
 };
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::{SecureField, SECURE_EXTENSION_DEGREE};
