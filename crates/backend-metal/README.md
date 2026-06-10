@@ -87,12 +87,13 @@ Key design points carried over from the prototype:
   `stwo_backend_metal_sys::metal::queue_drain()` — see `materialize_leaf_columns` in
   `src/backend/blake2s.rs` for the canonical example (the M31-output Merkle hasher builds
   leaves on the host).
-- **CPU constraint evaluation**: `FrameworkBackend` is implemented via
-  `evaluate_constraint_quotients_via_cpu` — trace columns are converted to `CpuBackend`,
-  constraints evaluated there, and the quotient accumulated back. This keeps the backend
-  correct for *any* AIR without a GPU constraint compiler. (The prototype's bytecode-JIT
-  constraint lane — `eval_program_v1` / shader codegen — is the natural future replacement;
-  see "Not ported" below.)
+- **JIT constraint evaluation with CPU fallback**: `FrameworkBackend` first tries the
+  native lane (`src/backend/jit/`): the constraint tree is recorded to V1 bytecode via a
+  generic `EvalAtRow` recorder (logup included), compiled to a fused Metal kernel cached
+  by semantic hash, and evaluated in one GPU dispatch. Any failure falls back to
+  `evaluate_constraint_quotients_via_cpu`, which stays correct for *any* AIR. Both lanes
+  are byte-equal; `STWO_METAL_DISABLE_JIT` forces the fallback and `STWO_METAL_JIT_LOG`
+  reports it.
 
 ## Byte-equality decisions
 
@@ -114,10 +115,10 @@ From the `stwo-metal` prototype, the following were deliberately left behind:
   `commitment_slice`, `proof_slice`): coupled to stwo-cairo's component set; this repo's
   seam for that is `FromSimdColumns` + the generic `prove_cairo<B, MC>` in the stwo-cairo
   fork.
-- **Bytecode-JIT constraint evaluation** (`eval_program_v1`, `recording_eval`,
-  `shader_compiler_v1`): a promising design (records the AIR once, compiles a fused GPU
-  kernel) but unfinished and unsound to adopt without its own conformance story. It is the
-  natural path to a native-GPU `FrameworkBackend`.
+- ~~Bytecode-JIT constraint evaluation~~ — since ported (see `src/backend/jit/`): the
+  recorder and shader compiler were adapted to the current constraint-framework API and
+  gated on proof byte-equality. The prototype's interpreter, program registry, and
+  per-AIR hand-lowered overlays remain unported.
 - **Capability/planner/benchmark scaffolding** (`capability`, `planner`, `execution_plan`,
   `workload`, `benchmark`, `prove_runtime_v1`): runtime auto-tuning machinery, orthogonal to
   a correct backend and a large maintenance surface.
