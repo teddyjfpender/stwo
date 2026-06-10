@@ -73,9 +73,15 @@ pub fn evaluate_constraint_quotients<E: FrameworkEval + Sync>(
         evaluation_accumulator.columns([(eval_domain.log_size(), component.n_constraints())]);
     accum.random_coeff_powers.reverse();
 
-    let gpu_enabled = std::env::var_os("STWO_CUDA_DISABLE_CONSTRAINT_KERNELS").is_none();
     let eval_name = derived_eval_name::<E>();
     let log = std::env::var_os("STWO_CUDA_CONSTRAINT_LOG").is_some();
+    // Lane control without rebuilds: DISABLE wins; otherwise an ALLOWLIST (comma-
+    // separated component names) restricts the GPU lane to listed components — used to
+    // bisect kernels whose generated constraints don't match this AIR revision.
+    let gpu_enabled = std::env::var_os("STWO_CUDA_DISABLE_CONSTRAINT_KERNELS").is_none()
+        && std::env::var("STWO_CUDA_CONSTRAINT_ALLOWLIST")
+            .map(|list| list.split(',').any(|name| name.trim() == eval_name))
+            .unwrap_or(true);
 
     if gpu_enabled {
         let gpu_denom_inv = BaseFieldVec::from_vec(denom_inv.clone());

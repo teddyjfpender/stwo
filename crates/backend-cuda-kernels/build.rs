@@ -87,7 +87,11 @@ fn main() {
                 // The fp256/poseidon252 stack calls `constexpr __host__` accessors from
                 // device code (sppark lineage); nvcc requires this flag for that pattern.
                 .arg("--expt-relaxed-constexpr")
-                .args(include_dirs.iter().flat_map(|dir| ["-I".to_string(), dir.clone()]))
+                .args(
+                    include_dirs
+                        .iter()
+                        .flat_map(|dir| ["-I".to_string(), dir.clone()]),
+                )
                 .arg("-Xcompiler")
                 .arg("-fPIC")
                 .arg(format!("-arch={arch}"))
