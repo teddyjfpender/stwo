@@ -1,0 +1,9 @@
+[package]
+name = "stwo-backend-cuda-kernels"
+version = "0.1.0"
+edition = "2021"
+description = "Compile-gated CUDA kernel library for a future stwo-backend-cuda"
+license = "Apache-2.0"
+
+[lib]
+path = "src/lib.rs"

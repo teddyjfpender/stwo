@@ -4,9 +4,13 @@ Champion CUDA kernels harvested from the standalone
 [`stwo-cuda`](https://github.com/starkware-libs/stwo-cuda) prototype, staged here as the
 starting point for a future `stwo-backend-cuda` crate.
 
-**This directory is not a Cargo crate and is not built by the workspace** — there is no
-CUDA toolkit requirement for building or testing stwo. The kernels are source-only until
-someone with an NVIDIA box wires them up (see "How to turn this into a backend" below).
+**The crate is compile-gated**: without `nvcc` it builds as a stub, so there is no CUDA
+toolkit requirement for building or testing stwo. With `nvcc` available (on `PATH` or via
+`STWO_CUDA_NVCC`), `cargo build -p stwo-backend-cuda-kernels` compiles every kernel under
+`cuda/` into a static archive (`-rdc=true -dlto`, `-arch` from `STWO_CUDA_ARCH`, default
+`native`) — run that on an NVIDIA box as the first validation gate for the staged
+sources. No FFI bindings are exposed yet; they belong with the `stwo-backend-cuda` trait
+implementations (see "How to turn this into a backend" below).
 
 ## What was taken
 
