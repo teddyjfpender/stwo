@@ -117,6 +117,12 @@ the true in-flight peak; a high-water-mark probe is future work.
 
 ## stwo-cairo
 
+Full Cairo e2e proving benchmarks in the stwo-book format (H100 SXM, secure config,
+with same-host SIMD and stwo-book CPU references) live in the stwo-cairo fork at
+`gpu_benchmarks/RESULTS.md` — honest verdict: the v1 lane scales with size but does
+not yet beat strong CPUs on real many-component Cairo proofs; the headroom items are
+listed there.
+
 The fork at `teddyjfpender/stwo-cairo` (branch `generic-backend`) proves real Cairo
 programs on this backend: `prove_cairo::<CudaBackend, Blake2sMerkleChannel>` with the
 witness generated on `SimdBackend` and transferred via `FromSimdColumns`. Gate (passes
