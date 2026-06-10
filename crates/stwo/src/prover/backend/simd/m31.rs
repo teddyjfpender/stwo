@@ -406,7 +406,9 @@ cfg_if::cfg_if! {
 
         /// Returns `a * b`.
         ///
-        /// `b_double` should be in the range `[0, 2P]`.
+        /// `b_double` must equal `2 * b` for `b` in the range `[0, P]` (in particular, it is
+        /// even). The aarch64 kernel relies on the evenness; treat it as the contract of the
+        /// whole `mul_doubled_*` family.
         pub(crate) fn mul_doubled_wasm(a: PackedM31, b_double: u32x16) -> PackedM31 {
             let [a0, a1, a2, a3]: [v128; 4] = unsafe { transmute(a) };
             let [b_double0, b_double1, b_double2, b_double3]: [v128; 4] = unsafe { transmute(b_double) };
@@ -447,7 +449,9 @@ cfg_if::cfg_if! {
 
         /// Returns `a * b`.
         ///
-        /// `b_double` should be in the range `[0, 2P]`.
+        /// `b_double` must equal `2 * b` for `b` in the range `[0, P]` (in particular, it is
+        /// even). The aarch64 kernel relies on the evenness; treat it as the contract of the
+        /// whole `mul_doubled_*` family.
         pub(crate) fn mul_doubled_avx512(a: PackedM31, b_double: u32x16) -> PackedM31 {
             let a: __m512i = unsafe { transmute(a) };
             let b_double: __m512i = unsafe { transmute(b_double) };
@@ -498,7 +502,9 @@ cfg_if::cfg_if! {
 
         /// Returns `a * b`.
         ///
-        /// `b_double` should be in the range `[0, 2P]`.
+        /// `b_double` must equal `2 * b` for `b` in the range `[0, P]` (in particular, it is
+        /// even). The aarch64 kernel relies on the evenness; treat it as the contract of the
+        /// whole `mul_doubled_*` family.
         pub(crate) fn mul_doubled_avx2(a: PackedM31, b_double: u32x16) -> PackedM31 {
             let [a0, a1]: [__m256i; 2] = unsafe { transmute::<PackedM31, [__m256i; 2]>(a) };
             let [b0_dbl, b1_dbl]: [__m256i; 2] = unsafe { transmute::<u32x16, [__m256i; 2]>(b_double) };
@@ -563,7 +569,9 @@ cfg_if::cfg_if! {
         ///
         /// Should only be used in the absence of a platform specific implementation.
         ///
-        /// `b_double` should be in the range `[0, 2P]`.
+        /// `b_double` must equal `2 * b` for `b` in the range `[0, P]` (in particular, it is
+        /// even). The aarch64 kernel relies on the evenness; treat it as the contract of the
+        /// whole `mul_doubled_*` family.
         pub(crate) fn mul_doubled_simd(a: PackedM31, b_double: u32x16) -> PackedM31 {
             const MASK_EVENS: Simd<u64, { N_LANES / 2 }> = Simd::from_array([0xFFFFFFFF; { N_LANES / 2 }]);
 
@@ -699,6 +707,52 @@ mod tests {
 
                 let expected = M31::reduce(a as u64 * b as u64);
                 assert_eq!(res, [expected; 16], "a={a}, b={b}");
+            }
+        }
+    }
+
+    /// Distinct per-lane values (including the `[0, P]` boundary) to catch lane-mapping
+    /// errors in the arch-specific kernels, which splat-based tests cannot detect.
+    #[test]
+    fn multiplication_lane_order_works() {
+        use crate::core::fields::m31::P;
+        let a_vals: [u32; 16] = std::array::from_fn(|i| {
+            if i.is_multiple_of(3) {
+                P - i as u32
+            } else {
+                (i as u32 + 1) * 123_456_789 % P
+            }
+        });
+        let b_vals: [u32; 16] = std::array::from_fn(|i| {
+            if i.is_multiple_of(4) {
+                P
+            } else {
+                ((i as u64) * 987_654_321 % P as u64) as u32
+            }
+        });
+        let a = unsafe { PackedM31::from_simd_unchecked(u32x16::from_array(a_vals)) };
+        let b = unsafe { PackedM31::from_simd_unchecked(u32x16::from_array(b_vals)) };
+
+        let res = (a * b).to_array();
+
+        for i in 0..16 {
+            assert_eq!(
+                res[i],
+                M31::reduce(a_vals[i] as u64 * b_vals[i] as u64),
+                "lane {i}"
+            );
+        }
+
+        #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+        {
+            let b_double = u32x16::from_array(b_vals.map(|v| 2 * v));
+            let res = super::mul_doubled_neon(a, b_double).to_array();
+            for i in 0..16 {
+                assert_eq!(
+                    res[i],
+                    M31::reduce(a_vals[i] as u64 * b_vals[i] as u64),
+                    "doubled lane {i}"
+                );
             }
         }
     }

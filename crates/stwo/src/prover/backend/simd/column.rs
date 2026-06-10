@@ -134,6 +134,11 @@ impl Column<BaseField> for BaseColumn {
     fn shrink_to_fit(&mut self) {
         self.data.shrink_to_fit();
     }
+
+    fn at_unreduced(&self, index: usize) -> BaseField {
+        // The raw stored representation, which may be the unreduced value `P`.
+        crate::core::fields::m31::M31(self.data[index / N_LANES].into_simd()[index % N_LANES])
+    }
 }
 
 impl FromIterator<BaseField> for BaseColumn {

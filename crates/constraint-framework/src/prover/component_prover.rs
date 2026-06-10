@@ -27,6 +27,9 @@ use crate::{FrameworkComponent, FrameworkEval, PREPROCESSED_TRACE_IDX};
 /// Number of `VeryPacked` rows processed per (parallel) task. Amortizes task-scheduling
 /// overhead while keeping enough tasks for load balancing on wide machines.
 const CHUNK_SIZE: usize = 8;
+// The chunked iteration below requires the effective chunk size to divide the (power-of-two)
+// number of rows; rows beyond `n_chunks * chunk_size` would silently be skipped otherwise.
+const _: () = assert!(CHUNK_SIZE.is_power_of_two());
 
 /// Common inputs for constraint quotient evaluation, shared between the SIMD and CPU backends.
 struct ConstraintQuotientInputs<'a, B: Backend> {

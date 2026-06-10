@@ -74,6 +74,13 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
         log_rows_per_leaf: u32,
         n_unretained_layers: u32,
     ) -> Self {
+        // Pruned trees recompute leaf hashes from the committed columns at decommit time;
+        // the packed-leaves path does not pass its (packed) columns to decommit, so the two
+        // must not be combined.
+        assert!(
+            log_rows_per_leaf == 0 || n_unretained_layers == 0,
+            "Layer pruning is not supported for packed leaves."
+        );
         let _span = span!(Level::TRACE, "Merkle", class = "MerkleCommitment").entered();
         if columns.is_empty() {
             return Self {
@@ -192,10 +199,17 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
         }
 
         // Used to recompute nodes of unretained bottom layers (trees committed with
-        // `commit_pruned`). Sorted by length exactly like in `commit_inner`.
-        let sorted_columns = (0..columns.n_columns())
-            .sorted_by_key(|&col| columns.column_log_size(col))
-            .collect_vec();
+        // `commit_pruned`). Sorted by length exactly like in `commit_inner`. Skipped for
+        // fully-retained trees (e.g. the FRI layer trees), where every node is read from a
+        // stored layer.
+        let is_pruned = self.layers.len() <= self.leaf_log_size as usize;
+        let sorted_columns = if is_pruned {
+            (0..columns.n_columns())
+                .sorted_by_key(|&col| columns.column_log_size(col))
+                .collect_vec()
+        } else {
+            vec![]
+        };
         let mut node_memo = HashMap::<(usize, usize), H::Hash>::new();
 
         let mut prev_layer_queries = query_positions.to_vec();
@@ -337,7 +351,13 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
 trait ColumnAccess {
     fn n_columns(&self) -> usize;
     fn column_log_size(&self, col: usize) -> u32;
+    /// The canonical field value at `row`; used for the queried values returned to the
+    /// verifier.
     fn value(&self, col: usize, row: usize) -> BaseField;
+    /// The raw stored representation at `row` (possibly the unreduced value `P`); used when
+    /// recomputing leaf hashes, which must reproduce the exact bytes that
+    /// [`MerkleOpsLifted::build_leaves`] committed.
+    fn raw_value(&self, col: usize, row: usize) -> BaseField;
 }
 
 /// Dense access: the full committed columns.
@@ -353,6 +373,9 @@ impl<B: ColumnOps<BaseField>> ColumnAccess for DenseColumns<'_, B> {
     fn value(&self, col: usize, row: usize) -> BaseField {
         self.0[col].at(row)
     }
+    fn raw_value(&self, col: usize, row: usize) -> BaseField {
+        self.0[col].at_unreduced(row)
+    }
 }
 
 /// A sparse, row-gathered view of a tree's committed columns, sufficient for decommitting a
@@ -361,7 +384,8 @@ impl<B: ColumnOps<BaseField>> ColumnAccess for DenseColumns<'_, B> {
 pub struct GatheredColumns {
     /// Per column, in commit order: the column's log size.
     pub log_sizes: Vec<u32>,
-    /// Per column, in commit order: the (row -> value) entries needed for the decommit.
+    /// Per column, in commit order: the (row -> raw stored value) entries needed for the
+    /// decommit. Values are gathered with [`Column::at_unreduced`].
     pub rows: Vec<HashMap<usize, BaseField>>,
 }
 
@@ -373,6 +397,10 @@ impl ColumnAccess for GatheredColumns {
         self.log_sizes[col]
     }
     fn value(&self, col: usize, row: usize) -> BaseField {
+        // The gathered entries hold raw representations; canonicalize like `Column::at` does.
+        BaseField::reduce(self.rows[col][&row].0 as u64)
+    }
+    fn raw_value(&self, col: usize, row: usize) -> BaseField {
         self.rows[col][&row]
     }
 }
@@ -397,10 +425,12 @@ fn leaf_hash<H: MerkleHasherLifted>(
         let group_idx = (idx >> (shift + 1) << 1) + (idx & 1);
         let group = group.collect_vec();
         for chunk in group.chunks(16) {
+            // Hash the raw stored representations: the leaf hash must reproduce the exact
+            // bytes `build_leaves` committed, which are not canonicalized.
             hasher.update_leaf(
                 &chunk
                     .iter()
-                    .map(|&&col| columns.value(col, group_idx))
+                    .map(|&&col| columns.raw_value(col, group_idx))
                     .collect_vec(),
             );
         }

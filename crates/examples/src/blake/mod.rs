@@ -32,6 +32,12 @@ const ROUND_LOG_SPLIT: [u32; 2] = [3, 1];
 
 /// Shared-mutable pointer used by parallel trace generators whose row tasks write disjoint
 /// `vec_row` slots of the same columns.
+///
+/// NOTE: like the `UnsafeMut` pattern used by the SIMD FFT, concurrent tasks materialize
+/// aliasing `&mut` references whose element-level writes are disjoint. This is not blessed by
+/// Rust's formal aliasing model (the references also cover bytes other tasks read), but
+/// follows the established convention in this codebase; replacing it with per-column raw
+/// pointers would be the strict alternative.
 #[cfg(feature = "parallel")]
 struct UnsafeSharedRows<T>(*mut T);
 #[cfg(feature = "parallel")]

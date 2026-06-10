@@ -698,7 +698,9 @@ mod tests {
 
     #[test]
     fn test_interpolate_and_eval() {
-        for log_size in MIN_FFT_LOG_SIZE..CACHED_FFT_LOG_SIZE + 4 {
+        // Covers past 2^20: the low-memory mode's bit-exact regeneration relies on this
+        // round-trip identity, including in the transposed-coefficients regime.
+        for log_size in MIN_FFT_LOG_SIZE..=CACHED_FFT_LOG_SIZE + 5 {
             let domain = CanonicCoset::new(log_size).circle_domain();
             let evaluation = CircleEvaluation::<SimdBackend, BaseField, BitReversedOrder>::new(
                 domain,
@@ -898,6 +900,7 @@ mod tests {
             CACHED_FFT_LOG_SIZE,
             CACHED_FFT_LOG_SIZE + 1,
             CACHED_FFT_LOG_SIZE + 2,
+            CACHED_FFT_LOG_SIZE + 3,
         ] {
             let coeffs: Vec<BaseField> = (0..1 << log_size).map(|_| rng.gen()).collect();
             let poly = CircleCoefficients::<SimdBackend>::new(coeffs.iter().copied().collect());

@@ -15,6 +15,9 @@ impl AccumulationOps for SimdBackend {
     fn accumulate(column: &mut SecureColumnByCoords<Self>, other: &SecureColumnByCoords<Self>) {
         // The sum is coordinate-wise; process each coordinate column independently.
         for (dst, src) in zip_eq(column.columns.iter_mut(), other.columns.iter()) {
+            // rayon's `zip` truncates on length mismatch instead of panicking like `zip_eq`;
+            // check explicitly so both cfg builds fail loudly on misuse.
+            assert_eq!(dst.data.len(), src.data.len());
             #[cfg(not(feature = "parallel"))]
             zip_eq(dst.data.iter_mut(), src.data.iter()).for_each(|(d, s)| *d += *s);
             #[cfg(feature = "parallel")]
@@ -62,6 +65,11 @@ impl AccumulationOps for SimdBackend {
         for mut col in cols_iter {
             // Perform the lift on the previous accumulation (which is of smaller size) and add it
             // to the current accumulation. Each packed row is independent.
+            //
+            // Only full SIMD packs are processed (matching the historical `len >> LOG_N_LANES`
+            // bound): a trailing partial pack would lift `prev`'s padding lanes into valid
+            // output lanes.
+            let n_full_packs = col.len() >> crate::prover::backend::simd::m31::LOG_N_LANES;
             let log_ratio = col.len().ilog2() - prev.len().ilog2();
             let lift_add = |(i, dst): (usize, [&mut PackedM31; 4])| unsafe {
                 let packed_before_lift: [PackedM31; 4] =
@@ -79,12 +87,14 @@ impl AccumulationOps for SimdBackend {
             #[cfg(not(feature = "parallel"))]
             itertools::multizip((c0, c1, c2, c3))
                 .enumerate()
+                .take(n_full_packs)
                 .for_each(|(i, (d0, d1, d2, d3))| lift_add((i, [d0, d1, d2, d3])));
 
             #[cfg(feature = "parallel")]
             (c0, c1, c2, c3)
                 .into_par_iter()
                 .enumerate()
+                .take(n_full_packs)
                 .with_min_len(1 << 12)
                 .for_each(|(i, (d0, d1, d2, d3))| lift_add((i, [d0, d1, d2, d3])));
 

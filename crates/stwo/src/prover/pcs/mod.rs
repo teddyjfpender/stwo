@@ -87,6 +87,14 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
     /// Trades one inverse FFT per column at compaction plus one FFT per column at
     /// decommitment for a significantly lower peak memory between the FRI phase and the end
     /// of proving.
+    ///
+    /// NOTE: when the original coefficients are not stored, regeneration runs a different
+    /// (same-size) FFT schedule than the commit-time (subdomain-decomposed) evaluation. The
+    /// two agree as field elements; bit-equality of the regenerated raw values additionally
+    /// relies on FFT outputs being canonically represented (a field zero is stored as 0, not
+    /// `P`), which holds for the current kernels and is exercised by the proof-equality tests.
+    /// With `set_store_polynomials_coefficients`, regeneration replays the commit-time
+    /// computation exactly and carries no such dependency.
     pub const fn set_low_memory(&mut self) {
         self.low_memory = true;
     }
@@ -575,7 +583,11 @@ fn decommit_compact_tree<B: BackendForChannel<MC>, MC: MerkleChannel>(
             let mut gathered = HashMap::new();
             for pos in query_positions.iter().chain(leaf_indices.iter()) {
                 let row = (pos >> (shift + 1) << 1) + (pos & 1);
-                gathered.entry(row).or_insert_with(|| evals.values.at(row));
+                // Gather raw stored representations: leaf-hash recomputation must reproduce
+                // the exact committed bytes.
+                gathered
+                    .entry(row)
+                    .or_insert_with(|| evals.values.at_unreduced(row));
             }
             pool.give_back(log_size, evals.values);
             (log_size, gathered)
