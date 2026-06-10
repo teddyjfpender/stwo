@@ -29,7 +29,11 @@ fn main() {
     for source in &sources {
         println!("cargo:rerun-if-changed={}", source.display());
     }
-    println!("cargo:rerun-if-changed=cuda/constraints");
+    // Track the whole cuda/ tree (cargo traverses directories recursively): headers
+    // (.cuh) are compiled into every translation unit, so an edit there must dirty
+    // the build just like a .cu edit — otherwise stale objects with old symbol
+    // signatures survive in the archive.
+    println!("cargo:rerun-if-changed=cuda");
 
     let nvcc = env::var("STWO_CUDA_NVCC").unwrap_or_else(|_| "nvcc".to_string());
     let nvcc_available = Command::new(&nvcc)
