@@ -2,6 +2,7 @@ use std::iter::Sum;
 use std::mem::transmute;
 use std::ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign};
 use std::ptr;
+use std::simd::num::SimdUint;
 use std::simd::{u32x16, Simd};
 
 use bytemuck::{Pod, Zeroable};
@@ -629,6 +630,148 @@ pub fn reduce_to_m31_simd(val: u32x16) -> u32x16 {
     ((((val >> MODULUS_BITS) + val + u32x16::splat(1)) >> MODULUS_BITS) + val) & u32x16::splat(P)
 }
 
+// ---------------------------------------------------------------------------
+// Delayed-reduction dot products (R1).
+//
+// These primitives compute Σ a_i · b_i over `PackedM31` lanes while deferring the
+// modular reduction to the very end of the loop, instead of reducing each product
+// individually as `PackedM31::mul` does. They compute the *identical* field element a
+// naive reduced fold would, but with fewer reductions; this is a pure re-association of
+// exact integer arithmetic, no rounding or probabilistic argument.
+//
+// ## Mathematical basis
+//
+// Work in M31, p = 2^31 − 1, so 2^31 ≡ 1 (mod p). Inputs are `PackedM31` values, which
+// per the representation invariant lie in `[0, P]` (the boundary value `P` is allowed,
+// see `PackedM31`'s doc comment). For inputs a, b ∈ [0, P]:
+//   - full product a·b ≤ P² = 2^62 − 2^32 + 1 < 2^62, and
+//   - the Mersenne split a·b = hi·2^31 + lo with hi, lo < 2^31 satisfies a·b ≡ hi + lo (mod p),
+//     where hi + lo < 2^32.
+//
+// ## Accumulation strategy (strategy 2 from the spec: per-product partial reduction)
+//
+// For each term we fold the full 64-bit product into `hi + lo < 2^32` and accumulate that
+// in a per-lane u64. After `k` terms the accumulator is `< k · 2^32`. The final
+// single-pass Mersenne reduction (see [`reduce_u64_lanes_to_m31`]) is the same one the
+// scalar `M31::reduce` uses, which is exact for accumulators `< 2^62`. We therefore cap the
+// supported length at [`DOT_DELAYED_MAX_LEN`] = 2^30 so that `len · 2^32 ≤ 2^62`, and
+// `debug_assert!` it. Real call sites are orders of magnitude shorter (≤ a few thousand), so
+// the cap never binds in practice.
+//
+// Strategy 2 is chosen over strategy 1 (accumulating full < 2^62 products, which overflows
+// u64 after only 3 adds and needs a fold every ≤ 3 terms) because the per-term cost is one
+// extra add but no fold bookkeeping, and the loop lengths here are tiny relative to the
+// 2^30 cap. The benefit over the naive fold is removing the per-product compare/min/select
+// reduction (and, for the QM31 sites, the cross-coordinate adds).
+//
+// ## Output representation
+//
+// The single-pass reduction returns a value in `[0, P]` — like every other `PackedM31` op,
+// it may return the boundary `P` (the unreduced representative of 0) rather than 0. This
+// matches the representation the naive `PackedM31` fold produces for the same inputs, so the
+// result is byte-identical to the naive path, and `[0, P]` satisfies the `PackedM31`
+// invariant. (Empirically, for the inputs and lengths these primitives see, both paths
+// produce the identical raw representative; see the equivalence tests.)
+
+/// Maximum dot-product length these primitives accept.
+///
+/// Bound derivation (strategy 2): each accumulated term is `hi + lo < 2^32`, so after `len`
+/// terms each lane accumulator is `< len · 2^32`. The final Mersenne reduction
+/// ([`reduce_u64_lanes_to_m31`]) is exact only for accumulators `< 2^62`, so we require
+/// `len · 2^32 ≤ 2^62`, i.e. `len ≤ 2^30`. Real call sites are orders of magnitude shorter
+/// (≤ a few thousand), so this cap never binds.
+pub const DOT_DELAYED_MAX_LEN: usize = 1 << 30;
+
+/// Mask selecting the low 31 bits (i.e. `lo = (a·b) mod 2^31`).
+const LOW_31_MASK_U64: u64 = (1 << 31) - 1;
+
+/// Reduces 16 independent u64 lane accumulators modulo P, each assumed `< 2^62`.
+///
+/// Identical algorithm to [`M31::reduce`], applied per lane. `M31::reduce(v)` computes
+/// `((((v >> 31) + v + 1) >> 31) + v) & P`, which is the exact two-limb Mersenne reduction
+/// for any `v < 2^62`. Within `[0, P]` the output may be the boundary representative `P`
+/// (the unreduced form of 0), exactly as the scalar `M31::reduce` and `PackedM31` ops do, so
+/// the result satisfies the `PackedM31` `[0, P]` invariant and matches the naive path.
+#[inline]
+pub(crate) fn reduce_u64_lanes_to_m31(acc: Simd<u64, N_LANES>) -> PackedM31 {
+    debug_assert!(
+        acc.to_array().iter().all(|&v| v < (1 << 62)),
+        "delayed-reduction accumulator exceeded its 2^62 bound (reduction would be inexact)"
+    );
+    let shift = Simd::<u64, N_LANES>::splat(MODULUS_BITS as u64);
+    let one = Simd::<u64, N_LANES>::splat(1);
+    let p = Simd::<u64, N_LANES>::splat(P as u64);
+    let reduced = (((((acc >> shift) + acc + one) >> shift) + acc) & p).cast::<u32>();
+    // Each reduced lane is in [0, P], satisfying the `PackedM31` invariant.
+    unsafe { PackedM31::from_simd_unchecked(reduced) }
+}
+
+/// Folds one product vector `prod = a · b` (held as full 64-bit lane products) into its
+/// partially-reduced `hi + lo` form, where `hi = prod >> 31` and `lo = prod & (2^31 - 1)`.
+///
+/// Since `2^31 ≡ 1 (mod p)`, `prod ≡ hi + lo (mod p)`. With `prod < 2^62` we have
+/// `hi < 2^31` and `lo < 2^31`, so `hi + lo < 2^32`.
+#[inline]
+fn product_hi_plus_lo(prod: Simd<u64, N_LANES>) -> Simd<u64, N_LANES> {
+    let lo = prod & Simd::splat(LOW_31_MASK_U64);
+    let hi = prod >> Simd::splat(MODULUS_BITS as u64);
+    hi + lo
+}
+
+/// Dot product `Σ a_i · b_i` over `PackedM31` lanes with delayed modular reduction.
+///
+/// Output is reduced to the `PackedM31` `[0, P]` representation (matching the naive fold).
+/// Inputs may be in the unreduced `[0, P]` representation. The two slices must have equal
+/// length, which must not exceed [`DOT_DELAYED_MAX_LEN`]. See the module-level R1 comment for
+/// the bound derivation.
+pub fn dot_delayed(a: &[PackedM31], b: &[PackedM31]) -> PackedM31 {
+    assert_eq!(a.len(), b.len(), "dot_delayed: length mismatch");
+    assert!(
+        a.len() <= DOT_DELAYED_MAX_LEN,
+        "dot_delayed: length {} exceeds DOT_DELAYED_MAX_LEN",
+        a.len()
+    );
+
+    // Per-lane accumulator. After `k` terms each lane is `< k · 2^32 ≤ len · 2^32`.
+    let mut acc = Simd::<u64, N_LANES>::splat(0);
+    for (ai, bi) in a.iter().zip(b.iter()) {
+        // a_i, b_i ∈ [0, P] ⇒ each lane product < P² < 2^62.
+        let prod = ai.0.cast::<u64>() * bi.0.cast::<u64>();
+        acc += product_hi_plus_lo(prod);
+    }
+    reduce_u64_lanes_to_m31(acc)
+}
+
+/// Dot product `Σ coeffs_i · values_i` where each `coeffs_i` is a scalar `M31` constant
+/// broadcast across all lanes, and `values_i` is a `PackedM31`, with delayed reduction.
+///
+/// Output is reduced to the `PackedM31` `[0, P]` representation (matching the naive fold).
+/// Values may be in the unreduced `[0, P]` representation; the scalar coefficients are
+/// reduced `M31` (always `< P`). The slices must have equal length, which must not exceed
+/// [`DOT_DELAYED_MAX_LEN`]. See the module-level R1 comment for the bound derivation (same as
+/// [`dot_delayed`]: each term `< 2^32`, accumulator `< len · 2^32`).
+pub fn dot_delayed_scalar(coeffs: &[M31], values: &[PackedM31]) -> PackedM31 {
+    assert_eq!(
+        coeffs.len(),
+        values.len(),
+        "dot_delayed_scalar: length mismatch"
+    );
+    assert!(
+        coeffs.len() <= DOT_DELAYED_MAX_LEN,
+        "dot_delayed_scalar: length {} exceeds DOT_DELAYED_MAX_LEN",
+        coeffs.len()
+    );
+
+    let mut acc = Simd::<u64, N_LANES>::splat(0);
+    for (coeff, val) in coeffs.iter().zip(values.iter()) {
+        // coeff ∈ [0, P) (reduced M31), val ∈ [0, P] ⇒ each lane product < P² < 2^62.
+        let coeff_lane = Simd::<u64, N_LANES>::splat(coeff.0 as u64);
+        let prod = coeff_lane * val.0.cast::<u64>();
+        acc += product_hi_plus_lo(prod);
+    }
+    reduce_u64_lanes_to_m31(acc)
+}
+
 #[cfg(test)]
 mod tests {
     use std::array;
@@ -828,5 +971,131 @@ mod tests {
             reduce_to_m31_simd(simd_val),
             u32x16::from_array(std::array::from_fn(|i| M31::reduce(vals[i] as u64).0))
         );
+    }
+
+    // -- Delayed-reduction dot product tests (R1) ----------------------------------------
+
+    use super::{dot_delayed, dot_delayed_scalar};
+    use crate::core::fields::m31::P;
+
+    /// Builds a `PackedM31` from raw lane values, allowing the unreduced boundary value `P`
+    /// (which the public `from_array` would reduce away), to exercise the `[0, P]` invariant.
+    fn packed_from_raw(lanes: [u32; 16]) -> PackedM31 {
+        unsafe { PackedM31::from_simd_unchecked(u32x16::from_array(lanes)) }
+    }
+
+    /// Naive reference: per lane, `Σ_i a_i · b_i (mod P)` via the existing reduced `M31` ops.
+    fn naive_dot_per_lane(a: &[PackedM31], b: &[PackedM31]) -> [M31; 16] {
+        let a_lanes: Vec<[M31; 16]> = a.iter().map(|p| p.to_array()).collect();
+        let b_lanes: Vec<[M31; 16]> = b.iter().map(|p| p.to_array()).collect();
+        array::from_fn(|lane| {
+            let mut acc = M31::from_u32_unchecked(0);
+            for j in 0..a.len() {
+                acc += a_lanes[j][lane] * b_lanes[j][lane];
+            }
+            acc
+        })
+    }
+
+    #[test]
+    fn dot_delayed_matches_naive_random() {
+        let mut rng = SmallRng::seed_from_u64(11);
+        // 10k+ random instances across an assortment of lengths.
+        for _ in 0..10_001 {
+            let len = rng.gen_range(0..=130);
+            let a: Vec<PackedM31> = (0..len).map(|_| rng.gen()).collect();
+            let b: Vec<PackedM31> = (0..len).map(|_| rng.gen()).collect();
+            assert_eq!(
+                dot_delayed(&a, &b).to_array(),
+                naive_dot_per_lane(&a, &b),
+                "len={len}"
+            );
+        }
+    }
+
+    #[test]
+    fn dot_delayed_scalar_matches_naive_random() {
+        let mut rng = SmallRng::seed_from_u64(12);
+        for _ in 0..10_001 {
+            let len = rng.gen_range(0..=130);
+            let coeffs: Vec<M31> = (0..len).map(|_| rng.gen()).collect();
+            let values: Vec<PackedM31> = (0..len).map(|_| rng.gen()).collect();
+            // Reference: broadcast each scalar coeff to a PackedM31 and reuse the naive fold.
+            let coeffs_packed: Vec<PackedM31> =
+                coeffs.iter().map(|c| PackedM31::broadcast(*c)).collect();
+            assert_eq!(
+                dot_delayed_scalar(&coeffs, &values).to_array(),
+                naive_dot_per_lane(&coeffs_packed, &values),
+                "len={len}"
+            );
+        }
+    }
+
+    /// Boundary lanes including the unreduced representation `P`, and mixtures across lanes,
+    /// at the fold-boundary lengths 0..=5 and a long length matching the largest real call
+    /// site (the longest `LookupElements` tuple, `N_ROUND_INPUT_FELTS = 96`) plus one.
+    #[test]
+    fn dot_delayed_edge_lanes_and_lengths() {
+        const EDGE: [u32; 6] = [0, 1, 2, (1 << 30) - 1, P - 1, P];
+        // Per-lane assignment that mixes the edge values across the 16 lanes.
+        let mixed =
+            |seed: usize| -> [u32; 16] { array::from_fn(|lane| EDGE[(lane + seed) % EDGE.len()]) };
+
+        for len in [0usize, 1, 2, 3, 4, 5, 97] {
+            // Splatted-edge instances: every term is a constant edge value across all lanes.
+            for &av in &EDGE {
+                for &bv in &EDGE {
+                    let a: Vec<PackedM31> = (0..len).map(|_| packed_from_raw([av; 16])).collect();
+                    let b: Vec<PackedM31> = (0..len).map(|_| packed_from_raw([bv; 16])).collect();
+                    assert_eq!(
+                        dot_delayed(&a, &b).to_array(),
+                        naive_dot_per_lane(&a, &b),
+                        "len={len}, a={av}, b={bv}"
+                    );
+                }
+            }
+            // Per-lane-mixed instances: each lane sees a different edge value, and the values
+            // rotate per term so different lanes hit `P` at different positions.
+            let a: Vec<PackedM31> = (0..len).map(|j| packed_from_raw(mixed(j))).collect();
+            let b: Vec<PackedM31> = (0..len).map(|j| packed_from_raw(mixed(j + 3))).collect();
+            assert_eq!(
+                dot_delayed(&a, &b).to_array(),
+                naive_dot_per_lane(&a, &b),
+                "mixed len={len}"
+            );
+
+            // Scalar variant on the same lengths with edge-valued reduced coeffs.
+            let coeffs: Vec<M31> = (0..len)
+                .map(|j| M31::reduce(EDGE[j % EDGE.len()] as u64))
+                .collect();
+            let values: Vec<PackedM31> = (0..len).map(|j| packed_from_raw(mixed(j))).collect();
+            let coeffs_packed: Vec<PackedM31> =
+                coeffs.iter().map(|c| PackedM31::broadcast(*c)).collect();
+            assert_eq!(
+                dot_delayed_scalar(&coeffs, &values).to_array(),
+                naive_dot_per_lane(&coeffs_packed, &values),
+                "scalar len={len}"
+            );
+        }
+    }
+
+    #[test]
+    fn dot_delayed_empty_is_zero() {
+        assert_eq!(
+            dot_delayed(&[], &[]).to_array(),
+            [M31::from_u32_unchecked(0); 16]
+        );
+        assert_eq!(
+            dot_delayed_scalar(&[], &[]).to_array(),
+            [M31::from_u32_unchecked(0); 16]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "length mismatch")]
+    fn dot_delayed_length_mismatch_panics() {
+        let a = vec![PackedM31::broadcast(M31::from_u32_unchecked(1)); 2];
+        let b = vec![PackedM31::broadcast(M31::from_u32_unchecked(1)); 3];
+        let _ = dot_delayed(&a, &b);
     }
 }

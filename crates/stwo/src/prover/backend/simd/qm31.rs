@@ -1,15 +1,17 @@
 use std::array;
 use std::iter::Sum;
 use std::ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign};
+use std::simd::num::SimdUint;
+use std::simd::Simd;
 
 use bytemuck::{Pod, Zeroable};
 use num_traits::{One, Zero};
 use rand::distributions::{Distribution, Standard};
 
 use super::cm31::PackedCM31;
-use super::m31::{PackedM31, N_LANES};
+use super::m31::{reduce_u64_lanes_to_m31, PackedM31, DOT_DELAYED_MAX_LEN, N_LANES};
 use super::PACKED_QM31_BATCH_INVERSE_CHUNK_SIZE;
-use crate::core::fields::m31::M31;
+use crate::core::fields::m31::{M31, MODULUS_BITS};
 use crate::core::fields::qm31::QM31;
 use crate::core::fields::{batch_inverse_chunked, FieldExpOps};
 use crate::core::utils;
@@ -331,6 +333,105 @@ impl From<QM31> for PackedQM31 {
     }
 }
 
+/// Mask selecting the low 31 bits of a lane (i.e. `lo = (a·b) mod 2^31`).
+const LOW_31_MASK_U64: u64 = (1 << 31) - 1;
+
+/// Delayed-reduction accumulator for a `Σ coeff_j · value_j` dot product with `QM31` scalar
+/// coefficients and [`PackedM31`] values, used by the R1 prover hot loops (the
+/// `LookupElements::combine` SIMD path and the FRI quotient numerator loop).
+///
+/// A `QM31 × M31` product distributes coordinate-wise: the `c`-th `QM31` coordinate of
+/// `coeff · value` is the `M31 × PackedM31` product `coeff.coord_c · value`. So a sum of such
+/// products is four independent M31 dot products, one per coordinate. This struct holds the
+/// four coordinate sums as unreduced per-lane `u64` accumulators and reduces them only at
+/// [`Self::finalize`], rather than reducing each product as `PackedQM31 * PackedM31` would.
+/// The result is the *identical* field element the naive reduced fold computes — a pure
+/// re-association of exact integer arithmetic, no rounding or probabilistic argument.
+///
+/// ## Bound discipline (strategy 2: per-product partial reduction)
+///
+/// Each accumulated term is the Mersenne fold `hi + lo` of a single product. For
+/// `coeff.coord_c ∈ [0, P)` (reduced `M31`) and `value ∈ [0, P]` (the `PackedM31`
+/// representation invariant), the product is `< P² < 2^62`, so with `prod = hi·2^31 + lo`,
+/// `hi, lo < 2^31` and `prod ≡ hi + lo (mod P)` with `hi + lo < 2^32`. After `k` accumulated
+/// terms each lane is therefore `< k · 2^32`. [`Self::accumulate`] tracks `k` and
+/// `debug_assert!`s it against [`DOT_DELAYED_MAX_LEN`] (= 2^30), keeping every lane `< 2^62`
+/// — the range over which the final single-pass Mersenne reduction is exact. As with the
+/// `PackedM31` ops, the per-coordinate output is in `[0, P]` (boundary-inclusive), matching
+/// the naive path's representative.
+pub(crate) struct PackedQM31DelayedDot {
+    /// One unreduced lane accumulator per QM31 coordinate.
+    coords: [Simd<u64, N_LANES>; 4],
+    /// Number of products accumulated so far (the `k` in the bound `lane < k · 2^32`).
+    n_terms: usize,
+}
+
+impl PackedQM31DelayedDot {
+    #[inline]
+    pub(crate) const fn new() -> Self {
+        Self {
+            coords: [Simd::from_array([0; N_LANES]); 4],
+            n_terms: 0,
+        }
+    }
+
+    /// Accumulates `coeff · value` (coordinate-wise) into the unreduced accumulators.
+    #[inline]
+    pub(crate) fn accumulate(&mut self, coeff_coords: &[M31; 4], value: PackedM31) {
+        // Bound: each new term contributes `< 2^32` per lane; after this call the accumulator
+        // has folded `n_terms + 1` products, so each lane is `< (n_terms + 1) · 2^32`. We cap
+        // `n_terms` at DOT_DELAYED_MAX_LEN (= 2^30) so lanes stay `< 2^62`, where the final
+        // Mersenne reduction is exact.
+        self.n_terms += 1;
+        debug_assert!(
+            self.n_terms <= DOT_DELAYED_MAX_LEN,
+            "delayed-reduction dot product exceeded DOT_DELAYED_MAX_LEN terms"
+        );
+        let value_u64 = value.into_simd().cast::<u64>();
+        for (acc, coeff) in self.coords.iter_mut().zip(coeff_coords.iter()) {
+            // coeff ∈ [0, P), value ∈ [0, P] ⇒ each lane product < P² < 2^62.
+            let prod = Simd::<u64, N_LANES>::splat(coeff.0 as u64) * value_u64;
+            // a·b = hi·2^31 + lo ≡ hi + lo (mod P), with hi + lo < 2^32.
+            let lo = prod & Simd::splat(LOW_31_MASK_U64);
+            let hi = prod >> Simd::splat(MODULUS_BITS as u64);
+            *acc += hi + lo;
+        }
+    }
+
+    /// Reduces the four coordinate accumulators once and assembles the result `PackedQM31`.
+    #[inline]
+    pub(crate) fn finalize(&self) -> PackedQM31 {
+        PackedQM31::from_packed_m31s(self.coords.map(reduce_u64_lanes_to_m31))
+    }
+}
+
+/// Dot product `Σ coeffs_j · values_j` where each `coeffs_j` is a scalar [`QM31`] constant
+/// (broadcast across all lanes) and each `values_j` is a [`PackedM31`], with delayed modular
+/// reduction. Each output coordinate is in the `PackedM31` `[0, P]` representation.
+///
+/// This is the SIMD specialization of the per-coordinate accumulation that
+/// `LookupElements::combine` performs with `PackedQM31 * PackedM31` multiplies. See
+/// [`PackedQM31DelayedDot`] for the coordinate decomposition and the accumulation bound. The
+/// slices must have equal length, which must not exceed [`DOT_DELAYED_MAX_LEN`].
+pub fn dot_delayed_qm31_scalar(coeffs: &[QM31], values: &[PackedM31]) -> PackedQM31 {
+    assert_eq!(
+        coeffs.len(),
+        values.len(),
+        "dot_delayed_qm31_scalar: length mismatch"
+    );
+    assert!(
+        coeffs.len() <= DOT_DELAYED_MAX_LEN,
+        "dot_delayed_qm31_scalar: length {} exceeds DOT_DELAYED_MAX_LEN",
+        coeffs.len()
+    );
+
+    let mut dot = PackedQM31DelayedDot::new();
+    for (coeff, val) in coeffs.iter().zip(values.iter()) {
+        dot.accumulate(&coeff.to_m31_array(), *val);
+    }
+    dot.finalize()
+}
+
 #[cfg(test)]
 mod tests {
     use std::array;
@@ -388,5 +489,75 @@ mod tests {
         let res = -packed_values;
 
         assert_eq!(res.to_array(), values.map(|v| -v));
+    }
+
+    // -- Delayed-reduction QM31-scalar dot product tests (R1) ----------------------------
+
+    use std::simd::u32x16;
+
+    use num_traits::Zero;
+
+    use super::dot_delayed_qm31_scalar;
+    use crate::core::fields::m31::P;
+    use crate::core::fields::qm31::QM31;
+    use crate::prover::backend::simd::m31::PackedM31;
+
+    /// Builds a `PackedM31` from raw lane values, allowing the unreduced boundary value `P`.
+    fn packed_from_raw(lanes: [u32; 16]) -> PackedM31 {
+        unsafe { PackedM31::from_simd_unchecked(u32x16::from_array(lanes)) }
+    }
+
+    /// Reference: the naive reduced fold `Σ_j broadcast(coeff_j) * value_j` using the existing
+    /// `PackedQM31 * PackedM31` multiply and `PackedQM31` add, reducing every product.
+    fn naive_qm31_dot(coeffs: &[QM31], values: &[PackedM31]) -> PackedQM31 {
+        coeffs
+            .iter()
+            .zip(values.iter())
+            .fold(PackedQM31::zero(), |acc, (c, v)| {
+                acc + PackedQM31::broadcast(*c) * *v
+            })
+    }
+
+    #[test]
+    fn dot_delayed_qm31_scalar_matches_naive_random() {
+        let mut rng = SmallRng::seed_from_u64(21);
+        for _ in 0..10_001 {
+            let len = rng.gen_range(0..=130);
+            let coeffs: Vec<QM31> = (0..len).map(|_| rng.gen()).collect();
+            let values: Vec<PackedM31> = (0..len).map(|_| rng.gen()).collect();
+            assert_eq!(
+                dot_delayed_qm31_scalar(&coeffs, &values).to_array(),
+                naive_qm31_dot(&coeffs, &values).to_array(),
+                "len={len}"
+            );
+        }
+    }
+
+    /// Boundary `PackedM31` lanes (including the unreduced `P`) at the fold-boundary lengths
+    /// 0..=5 and the largest real call-site length (96) + 1.
+    #[test]
+    fn dot_delayed_qm31_scalar_edge_lanes_and_lengths() {
+        const EDGE: [u32; 6] = [0, 1, 2, (1 << 30) - 1, P - 1, P];
+        let mut rng = SmallRng::seed_from_u64(22);
+        let mixed =
+            |seed: usize| -> [u32; 16] { array::from_fn(|lane| EDGE[(lane + seed) % EDGE.len()]) };
+
+        for len in [0usize, 1, 2, 3, 4, 5, 97] {
+            let coeffs: Vec<QM31> = (0..len).map(|_| rng.gen()).collect();
+            let values: Vec<PackedM31> = (0..len).map(|j| packed_from_raw(mixed(j))).collect();
+            assert_eq!(
+                dot_delayed_qm31_scalar(&coeffs, &values).to_array(),
+                naive_qm31_dot(&coeffs, &values).to_array(),
+                "len={len}"
+            );
+        }
+    }
+
+    #[test]
+    fn dot_delayed_qm31_scalar_empty_is_zero() {
+        assert_eq!(
+            dot_delayed_qm31_scalar(&[], &[]).to_array(),
+            PackedQM31::zero().to_array()
+        );
     }
 }

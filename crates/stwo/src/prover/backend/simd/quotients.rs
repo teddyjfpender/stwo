@@ -5,10 +5,10 @@ use num_traits::Zero;
 #[cfg(feature = "parallel")]
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 
-use super::column::CM31Column;
+use super::column::{CM31Column, SecureColumnByCoordsMutSlice};
 use super::domain::CircleDomainBitRevIterator;
 use super::m31::{PackedBaseField, LOG_N_LANES};
-use super::qm31::PackedSecureField;
+use super::qm31::{PackedQM31DelayedDot, PackedSecureField};
 use super::SimdBackend;
 use crate::core::circle::CirclePoint;
 use crate::core::fields::m31::BaseField;
@@ -215,9 +215,6 @@ fn accumulate_numerators_on_subdomain(
     columns: &[&CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>],
     quotient_coeffs: &[(SecureField, SecureField, SecureField)],
 ) -> SecureColumnByCoords<SimdBackend> {
-    // This constant is chosen empirically by benchmarking.
-    const NUMERATORS_CHUNK_SIZE: usize = 1 << 6;
-
     let mut values =
         unsafe { SecureColumnByCoords::<SimdBackend>::uninitialized(subdomain.size()) };
 
@@ -234,31 +231,72 @@ fn accumulate_numerators_on_subdomain(
     let iter = values.par_chunks_mut(NUMERATORS_CHUNK_SIZE);
 
     iter.enumerate().for_each(|(chunk_idx, mut values_dst)| {
-        let chunk_start = chunk_idx * NUMERATORS_CHUNK_SIZE;
-        // Initialize accumulators for the chunk.
-        let mut accumulators = [PackedSecureField::zero(); NUMERATORS_CHUNK_SIZE];
-        // This is needed because the last chunk may be smaller than
-        // `NUMERATORS_CHUNK_SIZE`.
-        let packed_chunk_len = values_dst.0[0].0.len();
-        let accumulators = &mut accumulators[..packed_chunk_len];
-
-        for (numerator_data, (_, _, c)) in zip_eq(&sample_batch.cols_vals_randpows, quotient_coeffs)
-        {
-            let col_data = &columns[numerator_data.column_index].data;
-            let c_broadcast = PackedSecureField::broadcast(*c);
-            for (i, acc) in accumulators.iter_mut().enumerate() {
-                let val = col_data[chunk_start + i];
-                *acc += c_broadcast * val;
-            }
-        }
-
-        for (i, acc) in accumulators.iter().enumerate() {
-            unsafe {
-                values_dst.set_packed(i, *acc - b_sum_broadcast);
-            }
-        }
+        accumulate_numerators_chunk(
+            chunk_idx * NUMERATORS_CHUNK_SIZE,
+            &mut values_dst,
+            sample_batch,
+            columns,
+            quotient_coeffs,
+            b_sum_broadcast,
+        );
     });
     values
+}
+
+// This constant is chosen empirically by benchmarking.
+const NUMERATORS_CHUNK_SIZE: usize = 1 << 6;
+
+/// Processes one chunk of [`accumulate_numerators_on_subdomain`].
+///
+/// `#[inline(never)]` is load-bearing: under the `parallel` feature this body runs inside
+/// rayon's recursive producer/consumer splitter (`bridge_producer_consumer::helper`). The
+/// chunk's delayed-reduction accumulator array (`NUMERATORS_CHUNK_SIZE` ×
+/// `PackedQM31DelayedDot` ≈ 33 KiB, plus SIMD register spills) must stay out of that
+/// recursive frame — inlined, it is replicated once per split level (~log2(n_chunks) deep)
+/// and overflows the 2 MiB rayon worker stack on large domains (observed: SIGABRT at 2^21).
+/// As a leaf call the large frame exists exactly once per worker.
+#[inline(never)]
+fn accumulate_numerators_chunk(
+    chunk_start: usize,
+    values_dst: &mut SecureColumnByCoordsMutSlice<'_>,
+    sample_batch: &ColumnSampleBatch,
+    columns: &[&CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>],
+    quotient_coeffs: &[(SecureField, SecureField, SecureField)],
+    b_sum_broadcast: PackedSecureField,
+) {
+    // This is needed because the last chunk may be smaller than
+    // `NUMERATORS_CHUNK_SIZE`.
+    let packed_chunk_len = values_dst.0[0].0.len();
+
+    // Delayed-reduction accumulators, one per point in the chunk. Each accumulates the
+    // dot product `Σ_j c_j · val_j` over the sample batch's columns with the modular
+    // reduction deferred to `finalize` (strategy 2: per-product `hi + lo` partial
+    // reduction), instead of reducing every `PackedSecureField * PackedM31` product as
+    // the previous `*acc += c_broadcast * val` did. This computes the identical field
+    // element — a re-association of exact integer arithmetic. The number of accumulated
+    // terms equals the number of columns in the batch (`quotient_coeffs.len()`), far
+    // below the accumulator's `DOT_DELAYED_MAX_LEN` bound; `accumulate` debug-asserts it.
+    // Initialize accumulators for the chunk.
+    let mut accumulators = [(); NUMERATORS_CHUNK_SIZE].map(|()| PackedQM31DelayedDot::new());
+    let accumulators = &mut accumulators[..packed_chunk_len];
+
+    for (numerator_data, (_, _, c)) in zip_eq(&sample_batch.cols_vals_randpows, quotient_coeffs) {
+        let col_data = &columns[numerator_data.column_index].data;
+        // The coefficient `c` is a scalar `QM31`, constant across the chunk; decompose it
+        // into its four M31 coordinates once per column.
+        let c_coords = c.to_m31_array();
+        for (i, acc) in accumulators.iter_mut().enumerate() {
+            let val = col_data[chunk_start + i];
+            acc.accumulate(&c_coords, val);
+        }
+    }
+
+    for (i, acc) in accumulators.iter().enumerate() {
+        // Reduce once, then hoist out the constant `- b_sum` (same as before).
+        unsafe {
+            values_dst.set_packed(i, acc.finalize() - b_sum_broadcast);
+        }
+    }
 }
 
 fn denominator_inverses(

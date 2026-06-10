@@ -4,8 +4,8 @@ use bytemuck::{Pod, Zeroable};
 use num_traits::{One, Zero};
 
 use super::cm31::PackedCM31;
-use super::m31::{PackedM31, N_LANES};
-use super::qm31::PackedQM31;
+use super::m31::{PackedM31, DOT_DELAYED_MAX_LEN, N_LANES};
+use super::qm31::{PackedQM31, PackedQM31DelayedDot};
 use crate::core::fields::cm31::CM31;
 use crate::core::fields::m31::M31;
 use crate::core::fields::qm31::QM31;
@@ -91,6 +91,80 @@ impl VeryPackedQM31 {
         std::array::from_fn(|i| VeryPackedM31::from(self.0.map(|v| v.into_packed_m31s()[i])))
     }
 }
+
+/// Dot product `Σ coeffs_j · values_j` where each `coeffs_j` is a scalar [`QM31`] constant
+/// (broadcast across all lanes) and each `values_j` is a [`VeryPackedM31`], with delayed
+/// modular reduction. Each output coordinate is in the `PackedM31` `[0, P]` representation.
+///
+/// # Why this exists (R1 follow-up)
+///
+/// This is the `VeryPacked` analogue of [`super::qm31::dot_delayed_qm31_scalar`]. The
+/// composition phase calls `LookupElements::combine` through `SimdDomainEvaluator`, whose
+/// associated types are `VeryPackedM31` / `VeryPackedQM31`; the `(PackedM31, PackedQM31)`
+/// specialization does not fire there. This function gives that path the same
+/// delayed-reduction fast path.
+///
+/// # Shape: per-sub-lane reuse, not new math
+///
+/// `VeryPackedM31 = Vectorized<PackedM31, N_VERY_PACKED_ELEMS>` is simply `N_VERY_PACKED_ELEMS`
+/// (= 2) independent `PackedM31` sub-lanes, and `VeryPackedQM31` is likewise
+/// `N_VERY_PACKED_ELEMS` independent `PackedQM31` sub-lanes. The generic `VeryPacked` fold
+/// computes the result sub-lane `i` purely from input sub-lane `i` (`Vectorized` ops are
+/// element-wise — see the `Mul`/`Add` impls below). So we keep one
+/// [`PackedQM31DelayedDot`] per sub-lane and route sub-lane `i` of every term into
+/// accumulator `i`, then finalize each and reassemble. There is **no new arithmetic**: each
+/// sub-lane is exactly the existing `PackedM31`-granularity delayed dot, so the soundness and
+/// bound analysis of [`PackedQM31DelayedDot`] applies unchanged, per sub-lane.
+///
+/// # Bound
+///
+/// Unchanged from [`PackedQM31DelayedDot`]: the bound is per `PackedM31` sub-lane accumulator
+/// and depends only on the number of terms `k` (`lane < k · 2^32`), not on the `VeryPacked`
+/// width. `k = coeffs.len()`, capped by [`DOT_DELAYED_MAX_LEN`] and `debug_assert!`ed inside
+/// each sub-lane accumulator's `accumulate`. The single reduction per coordinate per sub-lane
+/// happens in `finalize`, exactly as in the `Packed` case, and yields the *identical* field
+/// element the generic `VeryPacked` fold produces (a re-association of exact integer
+/// arithmetic).
+///
+/// # Stack frame / rayon (R1 round-1 lesson, binding)
+///
+/// This is marked `#[inline(never)]`. Composition's `SimdDomainEvaluator` runs inside a rayon
+/// `par_chunks_mut` closure (see `component_prover.rs`), and `combine` is called many times
+/// per row from that closure. The accumulator array here is `N_VERY_PACKED_ELEMS`
+/// `PackedQM31DelayedDot`s (4 coords × 2 sub-lanes × `u64x16` ≈ 1 KiB). Forcing this off the
+/// inline path keeps that ~1 KiB frame from being inlined (and potentially replicated) into
+/// the composition closure's frame, mirroring the `accumulate_numerators_chunk` fix.
+///
+/// The slices must have equal length, which must not exceed [`DOT_DELAYED_MAX_LEN`].
+#[inline(never)]
+pub fn dot_delayed_very_packed_qm31_scalar(
+    coeffs: &[QM31],
+    values: &[VeryPackedM31],
+) -> VeryPackedQM31 {
+    assert_eq!(
+        coeffs.len(),
+        values.len(),
+        "dot_delayed_very_packed_qm31_scalar: length mismatch"
+    );
+    assert!(
+        coeffs.len() <= DOT_DELAYED_MAX_LEN,
+        "dot_delayed_very_packed_qm31_scalar: length {} exceeds DOT_DELAYED_MAX_LEN",
+        coeffs.len()
+    );
+
+    // One delayed-reduction accumulator per `VeryPacked` sub-lane. Each is independent and
+    // sees only its own sub-lane's `PackedM31` values, exactly as the generic element-wise
+    // `Vectorized` fold would; this is pure per-sub-lane reuse of the `Packed` primitive.
+    let mut dots = [(); N_VERY_PACKED_ELEMS].map(|()| PackedQM31DelayedDot::new());
+    for (coeff, value) in coeffs.iter().zip(values.iter()) {
+        let coeff_coords = coeff.to_m31_array();
+        for (dot, sub_lane) in dots.iter_mut().zip(value.0.iter()) {
+            dot.accumulate(&coeff_coords, *sub_lane);
+        }
+    }
+    VeryPackedQM31::from_fn(|i| dots[i].finalize())
+}
+
 impl From<M31> for VeryPackedM31 {
     fn from(v: M31) -> Self {
         Self::broadcast(v)

@@ -340,4 +340,44 @@ mod tests {
 
         verify(&[&component], channel, commitment_scheme, proof).unwrap();
     }
+
+    /// Proof-byte regression pin for the R1 delayed-reduction change (spec gate 3).
+    ///
+    /// The plonk prover is fully deterministic (fixed circuit, `Blake2sChannel::default()`, no
+    /// RNG) and exercises both R1 sites: `LookupElements::combine` (Site A, via the LogUp
+    /// interaction trace) and the FRI quotient numerator accumulation (Site B). Because the
+    /// R1 change is a pure re-association of exact field arithmetic, the emitted proof must be
+    /// byte-for-byte identical to the pre-R1 proof.
+    ///
+    /// The expected hash below was captured on the pre-R1 working tree (commit 7b19459f, this
+    /// branch with the R1 changes stashed) with the project's pinned toolchain. It is a
+    /// `DefaultHasher` digest of the proof's `Debug` serialization; deterministic for a fixed
+    /// toolchain. If the prover output legitimately changes for an unrelated reason, recapture
+    /// it the same way. A mismatch here means the R1 change altered the proof — a hard failure.
+    #[test_log::test]
+    fn test_plonk_proof_bytes_unchanged_by_r1() {
+        use std::hash::{Hash, Hasher};
+
+        const LOG_N_ROWS: u32 = 7;
+        let config = PcsConfig {
+            pow_bits: 5,
+            fri_config: FriConfig::new(0, 2, 3, 1),
+            lifting_log_size: None,
+        };
+
+        let (_component, proof) = prove_fibonacci_plonk(LOG_N_ROWS, config);
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        format!("{proof:?}").hash(&mut hasher);
+        let digest = hasher.finish();
+
+        assert_eq!(
+            digest, R1_PLONK_PROOF_DEBUG_HASH,
+            "plonk proof changed (digest {digest:#018x}); R1 must not alter proof bytes"
+        );
+    }
+
+    /// Captured on the pre-R1 working tree (commit 7b19459f) with the pinned toolchain; see
+    /// `test_plonk_proof_bytes_unchanged_by_r1`.
+    const R1_PLONK_PROOF_DEBUG_HASH: u64 = 0x6273f6ee51c0e4a1;
 }
