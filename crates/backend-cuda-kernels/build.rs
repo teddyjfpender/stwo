@@ -83,6 +83,8 @@ fn main() {
                 .arg("--expt-relaxed-constexpr")
                 .arg("-I")
                 .arg("cuda")
+                .arg("-I")
+                .arg("cuda/constraints")
                 .arg("-Xcompiler")
                 .arg("-fPIC")
                 .arg(format!("-arch={arch}"))
