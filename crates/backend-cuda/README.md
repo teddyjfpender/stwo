@@ -111,6 +111,24 @@ SIMD backend's proof. Note from reviewing NitrooZK's production fork: their base
 interaction traces are also CPU/SIMD-generated — their GPU witness advantage is
 preprocessed-column generation and batched NTT, both incremental follow-ups here.
 
+## Per-component constraint kernels (opt-in)
+
+The NitrooZK constraint lane is ported: ~250 generated per-component kernels with
+FNV1a-name dispatch, a driver that derives each component's dispatch name from its type
+path (no stwo-cairo edits needed), CPU fallback **on the same accumulator claim**, and a
+differential-verify harness (`STWO_CUDA_CONSTRAINT_VERIFY=1`) that runs both lanes and
+reports per-component mismatch fingerprints while keeping the CPU result.
+
+**Verdict on this stack**: all 44 dispatched components mismatch on 100% of rows from
+row 0 — the eval-struct-layout / AIR-revision skew fingerprint. The kernels were
+generated against NitrooZK's stwo v2.1.1 and their stwo-cairo AIR, and read raw Rust
+struct layouts from that build; our stack is current-upstream stwo with a regenerated
+AIR. The lane is therefore **opt-in** (`STWO_CUDA_ENABLE_CONSTRAINT_KERNELS` or
+`STWO_CUDA_CONSTRAINT_ALLOWLIST`) until kernels are regenerated against this AIR
+revision; the verify harness is the qualification gate (0 mismatches = promotable).
+The dispatch infrastructure and harness are the durable parts: regenerated kernels are
+drop-in testable per component.
+
 ## Testing
 
 ```bash
