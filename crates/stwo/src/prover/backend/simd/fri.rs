@@ -25,7 +25,11 @@ use crate::prover::poly::twiddles::TwiddleTree;
 use crate::prover::poly::BitReversedOrder;
 use crate::prover::secure_column::SecureColumnByCoords;
 
-const FOLD_CHUNK_SIZE: usize = 128;
+// Empirical task-granularity constant for the parallel fold loops below (does not size any
+// stack array — the per-chunk `layer_values` is heap-allocated, sized by `fold_step`). Retuned
+// 128 -> 256 on Apple M4 Pro (R2): `simd_fold_line 2^20` ~-3%, `simd_fold_circle_into_line 2^20`
+// ~-3% vs 128; 512 regressed (fold_line +11%) — too few chunks to fill 14 cores at 2^20.
+const FOLD_CHUNK_SIZE: usize = 256;
 
 // TODO(andrew) Is this optimized?
 impl FriOps for SimdBackend {

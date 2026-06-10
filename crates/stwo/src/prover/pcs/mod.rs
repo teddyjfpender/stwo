@@ -326,14 +326,34 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
                 .collect::<Vec<_>>(),
         );
         let commitments = self.roots();
-        let (queried_values, decommitments, aux): (Vec<_>, Vec<_>, Vec<_>) = self
+
+        // Per-tree decommit inputs, in commit order. Decommitting a `commit_pruned` tree
+        // recomputes that tree's unretained bottom Merkle layers (real hash work), so the four
+        // trees are independent units of work. Materialize the inputs so the (optionally
+        // parallel) map below preserves the exact tree-by-tree output order — the proof layout
+        // (and thus the proof bytes) must be unchanged from the sequential path.
+        let decommit_inputs: Vec<_> = self
             .trees
             .as_ref()
             .zip_eq(query_positions_tree)
             .0
             .into_iter()
             .zip(compact_trees.drain(..))
-            .map(|((tree, query_positions), compact)| match compact {
+            .collect();
+
+        // Decommit one tree. Captured shared state (`self.twiddles`, `self.base_column_pool`)
+        // is `Sync`: `TwiddleTree` declares `unsafe impl Sync`, `BaseColumnPool` is backed by a
+        // `DashMap` (concurrent), and `&CommitmentTreeProver` is read-only here. Each call's
+        // `node_memo` (in `decommit_inner`) is a fresh per-call local, so trees never share
+        // mutable decommit state.
+        // Per-tree decommit input: (committed tree, that tree's query positions, optional
+        // low-memory compacted columns). Aliased to keep the closure signature readable.
+        type DecommitInput<'t, 'q, B, MC> = (
+            (&'t MaybeOwned<'t, CommitmentTreeProver<B, MC>>, &'q [usize]),
+            Option<CompactTreeColumns<B>>,
+        );
+        let decommit_one = |((tree, query_positions), compact): DecommitInput<'_, '_, B, MC>| {
+            let (v, x) = match compact {
                 Some(compact) => decommit_compact_tree(
                     tree,
                     compact,
@@ -342,8 +362,23 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
                     &self.base_column_pool,
                 ),
                 None => tree.decommit(query_positions),
-            })
-            .map(|(v, x)| (v, x.decommitment, x.aux))
+            };
+            (v, x.decommitment, x.aux)
+        };
+
+        #[cfg(not(feature = "parallel"))]
+        let (queried_values, decommitments, aux): (Vec<_>, Vec<_>, Vec<_>) =
+            decommit_inputs.into_iter().map(decommit_one).multiunzip();
+
+        // `into_par_iter` over a `Vec` is an `IndexedParallelIterator`; `collect` preserves
+        // input (tree) order, so the subsequent unzip yields per-tree results in commit order
+        // identical to the sequential path.
+        #[cfg(feature = "parallel")]
+        let (queried_values, decommitments, aux): (Vec<_>, Vec<_>, Vec<_>) = decommit_inputs
+            .into_par_iter()
+            .map(decommit_one)
+            .collect::<Vec<_>>()
+            .into_iter()
             .multiunzip();
 
         // Return evaluation buffers to the memory pool for reuse (owned trees only).

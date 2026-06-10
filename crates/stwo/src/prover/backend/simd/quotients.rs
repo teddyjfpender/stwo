@@ -85,8 +85,13 @@ impl QuotientOps for SimdBackend {
         log_blowup_factor: u32,
         twiddles: &TwiddleTree<Self>,
     ) -> SecureEvaluation<Self, BitReversedOrder> {
-        // This constant is chosen empirically by benchmarking.
-        const COMBINE_CHUNK_SIZE: usize = 16;
+        // This constant is chosen empirically by benchmarking. Retuned 16 -> 32 on Apple M4 Pro
+        // (R2): `compute_quotients_and_combine 2^21` ~-3% vs 16; 64/128 were within noise and no
+        // better. `chunk_acc` is a stack array of `COMBINE_CHUNK_SIZE` `PackedSecureField`
+        // (256 B each = 8 KiB at 32). Inlined into the rayon split (`par_chunks_mut`), it is
+        // replicated per split level (~log2(n_chunks) deep); 8 KiB x depth stays far under the
+        // 2 MiB worker stack even at 2^21.
+        const COMBINE_CHUNK_SIZE: usize = 32;
 
         let eval_domain = CanonicCoset::new(lifting_log_size).circle_domain();
         let (eval_subdomain, _) = eval_domain.split(log_blowup_factor);
@@ -243,7 +248,15 @@ fn accumulate_numerators_on_subdomain(
     values
 }
 
-// This constant is chosen empirically by benchmarking.
+// This constant is chosen empirically by benchmarking. R2 re-tuning on Apple M4 Pro kept 1<<6
+// (64): vs 64, 1<<7 (128) measured flat (three warm runs of `accumulate_numerators 2^21 x 100
+// cols`: -1.0%, +0.9%, +0.9% — all within run-to-run noise), and 1<<8 (256) clearly regressed
+// (+19%) as the leaf accumulator frame crosses ~130 KiB and cache/alloc pressure dominates. The
+// `accumulators` array in `accumulate_numerators_chunk` is `NUMERATORS_CHUNK_SIZE` x
+// `PackedQM31DelayedDot` (520 B each): ~33 KiB at 64, ~67 KiB at 128, ~130 KiB at 256. Because
+// that function is `#[inline(never)]` the frame exists once per worker (not per rayon split
+// level), so 64 stays comfortably within bounds; see the doc comment on
+// `accumulate_numerators_chunk`.
 const NUMERATORS_CHUNK_SIZE: usize = 1 << 6;
 
 /// Processes one chunk of [`accumulate_numerators_on_subdomain`].
@@ -251,10 +264,10 @@ const NUMERATORS_CHUNK_SIZE: usize = 1 << 6;
 /// `#[inline(never)]` is load-bearing: under the `parallel` feature this body runs inside
 /// rayon's recursive producer/consumer splitter (`bridge_producer_consumer::helper`). The
 /// chunk's delayed-reduction accumulator array (`NUMERATORS_CHUNK_SIZE` ×
-/// `PackedQM31DelayedDot` ≈ 33 KiB, plus SIMD register spills) must stay out of that
-/// recursive frame — inlined, it is replicated once per split level (~log2(n_chunks) deep)
-/// and overflows the 2 MiB rayon worker stack on large domains (observed: SIGABRT at 2^21).
-/// As a leaf call the large frame exists exactly once per worker.
+/// `PackedQM31DelayedDot`, 520 B each ≈ 33 KiB at the current `1 << 6`, plus SIMD register
+/// spills) must stay out of that recursive frame — inlined, it is replicated once per split
+/// level (~log2(n_chunks) deep) and overflows the 2 MiB rayon worker stack on large domains
+/// (observed: SIGABRT at 2^21). As a leaf call the large frame exists exactly once per worker.
 #[inline(never)]
 fn accumulate_numerators_chunk(
     chunk_start: usize,

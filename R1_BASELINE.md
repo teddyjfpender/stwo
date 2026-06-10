@@ -100,6 +100,22 @@ Verdict: acceptance criteria met in substance — the gain is exactly where the 
 (composition + quotients), e2e at-or-above the 8% bar after outlier handling, proof bytes
 unchanged, no gate regressions.
 
+### R2: parallelism basket (same day)
+
+Parallel decommit across the 4 commitment trees (order-preserving `into_par_iter`;
+Send/Sync analysis in the code comment — `TwiddleTree` is `unsafe impl Sync`, the column
+pool is DashMap-backed, per-call decommit state is local), chunk retuning
+(`COMBINE_CHUNK_SIZE` 16→32 ~−3%, `FOLD_CHUNK_SIZE` 128→256 ~−3% with 512 regressing +11%,
+`NUMERATORS_CHUNK_SIZE` kept at 64 — incumbent won), `with_min_len(1<<13)` guards on the
+small barycentric-weights loops, and new SIMD fold benches in `benches/fri.rs`.
+
+| Metric | pre-R1 | post-R1 | post-R2 |
+|---|---|---|---|
+| e2e blake 2^18 wall (median of 3) | 14.57 s | 13.54 s | **11.90 s** |
+
+R2 alone: **−12%**; branch cumulative this session: **−18%**. Proof bytes verified
+unchanged (golden-hash test) and the full gate set re-verified after implementation.
+
 Incident note: the first post-R1 `fri_quotients` bench run crashed with a rayon-worker
 stack overflow — the enlarged per-chunk accumulator array (~33 KiB) was inlined into
 rayon's recursive splitter frame and replicated per split level at 2^21. Fixed by

@@ -281,9 +281,14 @@ impl PolyOps for SimdBackend {
             })
             .collect_vec();
 
+        // `with_min_len` keeps small weight columns on a single thread: each item is a handful of
+        // `point_vanishing`s (the second loop below is a single packed multiply), so rayon
+        // dispatch dominates for small `weights_vec_len`. Same threshold as `interpolate`'s
+        // normalization loop above.
         #[cfg(feature = "parallel")]
         let vi_p: Vec<PackedSecureField> = (0..weights_vec_len)
             .into_par_iter()
+            .with_min_len(1 << 13)
             .map(|i| {
                 PackedSecureField::from_array(std::array::from_fn(|j| {
                     point_vanishing(
@@ -318,9 +323,11 @@ impl PolyOps for SimdBackend {
             .map(|i| vi_p_inverse[i] * si_i_vn_p)
             .collect_vec();
 
+        // One packed multiply per item — keep small columns single-threaded (see `vi_p` above).
         #[cfg(feature = "parallel")]
         let weights: Vec<PackedSecureField> = (0..weights_vec_len)
             .into_par_iter()
+            .with_min_len(1 << 13)
             .map(|i| vi_p_inverse[i] * si_i_vn_p)
             .collect();
 
