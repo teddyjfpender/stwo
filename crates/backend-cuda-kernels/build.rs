@@ -43,7 +43,24 @@ fn main() {
     }
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR must be set"));
-    let arch = env::var("STWO_CUDA_ARCH").unwrap_or_else(|_| detect_arch());
+    // STWO_CUDA_ARCH accepts a comma list (e.g. "sm_86,sm_90") to build a fat binary
+    // that runs on multiple GPU generations — one release artifact for 3090 and H100.
+    let archs: Vec<String> = env::var("STWO_CUDA_ARCH")
+        .unwrap_or_else(|_| detect_arch())
+        .split(',')
+        .map(|a| a.trim().to_string())
+        .filter(|a| !a.is_empty())
+        .collect();
+    let gencode_flags: Vec<String> = archs
+        .iter()
+        .flat_map(|arch| {
+            let num = arch.trim_start_matches("sm_");
+            [
+                "-gencode".to_string(),
+                format!("arch=compute_{num},code=sm_{num}"),
+            ]
+        })
+        .collect();
     let extra_flags: Vec<String> = env::var("STWO_CUDA_NVCC_FLAGS")
         .map(|flags| flags.split_whitespace().map(str::to_string).collect())
         .unwrap_or_default();
@@ -94,7 +111,7 @@ fn main() {
                 )
                 .arg("-Xcompiler")
                 .arg("-fPIC")
-                .arg(format!("-arch={arch}"))
+                .args(&gencode_flags)
                 .args(&extra_flags)
                 .arg(source)
                 .arg("-o")
@@ -108,7 +125,7 @@ fn main() {
             .arg("-dlink")
             .arg("-Xcompiler")
             .arg("-fPIC")
-            .arg(format!("-arch={arch}"))
+            .args(&gencode_flags)
             .args(&objects)
             .arg("-o")
             .arg(&dlink),
