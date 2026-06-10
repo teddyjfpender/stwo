@@ -111,6 +111,24 @@ SIMD backend's proof. Note from reviewing NitrooZK's production fork: their base
 interaction traces are also CPU/SIMD-generated — their GPU witness advantage is
 preprocessed-column generation and batched NTT, both incremental follow-ups here.
 
+## JIT constraint lane (default GPU path)
+
+Constraint kernels are **generated from this build's own AIR**: the component's
+constraint tree is recorded once to bytecode (the same recording-evaluator lane as the
+Metal JIT, logup included), emitted as self-contained CUDA C with an **explicit C ABI**
+(no Rust struct reads — the failure mode that disqualified the precompiled kernel set
+below is impossible by construction), compiled via NVRTC at first use, and cached by
+the bytecode's **content semantic hash** (never pointers). Validated on RTX 3090:
+conformance byte-equal with the lane engaged, and the Cairo all-opcode e2e passes with
+**all 46 components on the JIT lane** and the proof byte-identical to SIMD.
+
+- Lane order per component: precompiled kernels (opt-in) → JIT → CPU pointwise, all on
+  one accumulator claim. `STWO_CUDA_DISABLE_JIT` forces CPU;
+  `STWO_CUDA_CONSTRAINT_VERIFY=1` differentially checks the JIT lane per component.
+- Known cost: logup components bake `claimed_sum` into the bytecode, so first proves of
+  a new statement pay NVRTC compiles (~100 ms/component); parameterizing the cumsum
+  shift is the queued follow-up.
+
 ## Per-component constraint kernels (opt-in)
 
 The NitrooZK constraint lane is ported: ~250 generated per-component kernels with
