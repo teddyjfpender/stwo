@@ -67,7 +67,10 @@ fn main() {
     for source in &sources {
         let object = out_dir.join(format!(
             "{}.o",
-            source.file_stem().expect("kernel file stem").to_string_lossy()
+            source
+                .file_stem()
+                .expect("kernel file stem")
+                .to_string_lossy()
         ));
         run_nvcc(
             Command::new(&nvcc)
