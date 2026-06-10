@@ -1346,6 +1346,7 @@ dependencies = [
  "itertools 0.12.1",
  "num-traits",
  "rand",
+ "rayon",
  "serde",
  "stwo",
  "stwo-backend-cuda-kernels",

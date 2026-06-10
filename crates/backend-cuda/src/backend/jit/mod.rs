@@ -86,6 +86,13 @@ pub(crate) fn try_jit_constraint_quotients<E: FrameworkEval>(
     let source_c = CString::new(source).ok()?;
     let name_c = CString::new(kernel_name).ok()?;
     let empty = BaseFieldVec::new_zeroes(1);
+    // Ext param slot 0 = the logup cumsum shift (see the lowering's statement-
+    // independence rewrite). Harmless when the program doesn't read it.
+    let cumsum_shift = component.claimed_sum()
+        / stwo::core::fields::m31::BaseField::from_u32_unchecked(
+            1u32 << component.evaluator().log_size(),
+        );
+    let ext_params = SecureFieldVec::from_vec(vec![cumsum_shift]);
 
     crate::columns::bindings::ensure_mem_pool_init();
     let ok = unsafe {
@@ -96,7 +103,7 @@ pub(crate) fn try_jit_constraint_quotients<E: FrameworkEval>(
             flat.device_ptr,
             offsets_dev.device_ptr,
             empty.device_ptr,
-            empty.device_ptr,
+            ext_params.device_ptr,
             inputs.random_coeff_powers.device_ptr,
             inputs.denom_inv.device_ptr,
             scratch[0].device_ptr.cast_mut(),

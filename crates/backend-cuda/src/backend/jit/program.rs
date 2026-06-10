@@ -726,7 +726,33 @@ pub fn lower_framework_eval_to_v1_with_logup<F: FrameworkEval>(
         log_size,
     );
     let recorder = eval.evaluate(recorder);
-    let state = recorder.finish();
+    let mut state = recorder.finish();
+
+    // Statement-independence: the logup cumsum shift (claimed_sum / 2^log_size) gets
+    // recorded as an ext CONSTANT, which would change the bytecode — and therefore the
+    // semantic hash and the NVRTC-compiled kernel — for every new statement. Rewrite
+    // any ext const matching the shift into a Param read (slot 0); the dispatcher
+    // passes the value through the ext_params buffer instead. Zero shifts are left
+    // alone (they'd collide with legitimate zero constants and are already stable).
+    let cumsum_shift =
+        claimed_sum / stwo::core::fields::m31::BaseField::from_u32_unchecked(1u32 << log_size);
+    let mut shift_parameterized = false;
+    if !num_traits::Zero::is_zero(&cumsum_shift) {
+        let limbs = cumsum_shift.to_m31_array().map(|l| l.0);
+        for inst in state.ext_insts.iter_mut() {
+            if inst.op == MetalEvaluationProgramExtOpcodeV1::Const as u8
+                && [inst.a, inst.b, inst.c, inst.d] == limbs
+            {
+                inst.op = MetalEvaluationProgramExtOpcodeV1::Param as u8;
+                inst.a = 0; // ext param slot 0
+                inst.b = 0;
+                inst.c = 0;
+                inst.d = 0;
+                shift_parameterized = true;
+            }
+        }
+    }
+    let n_ext_params = n_ext_params.max(if shift_parameterized { 1 } else { 0 });
 
     // Sanity check: every ext instruction's registers must be valid.
     let max_er = state.max_ext_regs();
