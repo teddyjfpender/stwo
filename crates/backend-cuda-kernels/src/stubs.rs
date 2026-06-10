@@ -707,3 +707,26 @@ pub unsafe extern "C" fn stwo_cuda_jit_eval_fused(
 ) -> bool {
     no_cuda_symbol("stwo_cuda_jit_eval_fused")
 }
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gen_seq_column_on_gpu(_output: *mut u32, _log_size: u32) {
+    no_cuda_symbol("gen_seq_column_on_gpu")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gen_range_check_columns_on_gpu(
+    _output_columns: *const *mut u32,
+    _n_columns: u32,
+    _bits_per_segment: *const u32,
+    _n_segments: u32,
+) {
+    no_cuda_symbol("gen_range_check_columns_on_gpu")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gen_bitwise_xor_columns_on_gpu(
+    _output_columns: *const *mut u32,
+    _n_bits: u32,
+) {
+    no_cuda_symbol("gen_bitwise_xor_columns_on_gpu")
+}

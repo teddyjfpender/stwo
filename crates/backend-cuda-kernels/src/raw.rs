@@ -52,6 +52,16 @@ extern "C" {
     /// Chunked atomicMin nonce search; returns the LOWEST valid nonce, matching the
     /// SIMD grind's search order byte-exactly (non-M31 Blake2s channel only).
     pub fn grind_blake2s(host_prefixed_digest: *const u32, pow_bits: u32) -> u64;
+    /// GPU generation of preprocessed columns (values identical to the CPU
+    /// constructors; commitment roots must be byte-equal).
+    pub fn gen_seq_column_on_gpu(output: *mut u32, log_size: u32);
+    pub fn gen_range_check_columns_on_gpu(
+        output_columns: *const *mut u32,
+        n_columns: u32,
+        bits_per_segment: *const u32,
+        n_segments: u32,
+    );
+    pub fn gen_bitwise_xor_columns_on_gpu(output_columns: *const *mut u32, n_bits: u32);
     /// JIT-compile (NVRTC; cached by the CONTENT semantic hash, never pointers) and
     /// launch a generated fused constraint kernel. Returns false on any compile or
     /// launch failure; the caller falls back to the CPU lane.
