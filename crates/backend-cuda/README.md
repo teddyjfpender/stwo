@@ -117,11 +117,15 @@ the true in-flight peak; a high-water-mark probe is future work.
 
 ## stwo-cairo
 
-Full Cairo e2e proving benchmarks in the stwo-book format (H100 SXM, secure config,
-with same-host SIMD and stwo-book CPU references) live in the stwo-cairo fork at
-`gpu_benchmarks/RESULTS.md` — honest verdict: the v1 lane scales with size but does
-not yet beat strong CPUs on real many-component Cairo proofs; the headroom items are
-listed there.
+Full Cairo e2e proving benchmarks in the stwo-book format live in the stwo-cairo fork
+at `gpu_benchmarks/RESULTS.md`, including the optimization journey: after register
+compaction, the pointer-table trace ABI, explicit-key prove-cycle caches, the OODS
+weights fix, and statement-independent NVRTC kernels, **the GPU wins every
+multi-million-cycle workload on the same host** (fib 1M: 13.2 s vs 24.3 s SIMD, 1.84×;
+≈1.8 s per 1M VM steps on an RTX 3090 — at NitrooZK's published 5090 base adjusted for
+GPU generation). Small workloads remain SIMD's (the ~7 s GPU floor = per-launch
+synchronization, per-column OODS launches, CPU witness transfer); the launch/sync
+re-architecture analysis for the next 5-10× is in progress.
 
 The fork at `teddyjfpender/stwo-cairo` (branch `generic-backend`) proves real Cairo
 programs on this backend: `prove_cairo::<CudaBackend, Blake2sMerkleChannel>` with the
