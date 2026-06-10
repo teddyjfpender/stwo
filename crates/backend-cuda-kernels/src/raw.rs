@@ -44,7 +44,7 @@ pub struct LayerIndexPair {
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 pub struct Blake2sHash(pub [u8; 32]);
 
-#[cfg_attr(stwo_cuda_link, link(name = "stwo_cuda"))]
+#[cfg_attr(stwo_cuda_link, link(name = "stwo_cuda_kernels", kind = "static"))]
 extern "C" {
     pub fn copy_uint32_t_vec_from_device_to_host(
         device_ptr: *const u32,
