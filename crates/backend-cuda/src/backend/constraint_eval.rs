@@ -207,8 +207,8 @@ pub fn evaluate_constraint_quotients<E: FrameworkEval + Sync>(
                 );
                 let mut mismatches = 0usize;
                 let mut first: Option<(usize, usize)> = None;
-                for coord in 0..4 {
-                    for (row, (gpu, cpu)) in gpu_result[coord]
+                for (coord, gpu_column) in gpu_result.iter().enumerate() {
+                    for (row, (gpu, cpu)) in gpu_column
                         .iter()
                         .zip(cpu_result.columns[coord].iter())
                         .enumerate()
