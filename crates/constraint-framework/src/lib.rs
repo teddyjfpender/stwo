@@ -28,8 +28,8 @@ pub use prover::{
     constraint_quotient_inputs, evaluate_constraint_quotients_via_cpu, relation_tracker,
     AssertEvaluator, ConstraintQuotientInputs, CpuDomainEvaluator, FractionWriter,
     FrameworkBackend, LogupColGenerator, LogupFinalizeBackend, LogupTraceGenerator,
-    RawLogupColGenerator, RawLogupColumn,
-    RawLogupTrace, RawLogupTraceGenerator, SimdDomainEvaluator,
+    RawLogupColGenerator, RawLogupColumn, RawLogupTrace, RawLogupTraceGenerator,
+    SimdDomainEvaluator,
 };
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::{SecureField, SECURE_EXTENSION_DEGREE};

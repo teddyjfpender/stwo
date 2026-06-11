@@ -31,7 +31,7 @@ use stwo::prover::poly::circle::CircleEvaluation;
 use stwo::prover::poly::BitReversedOrder;
 use stwo::prover::secure_column::SecureColumnByCoords;
 
-use super::logup::LogupTraceGenerator;
+use super::logup::{FractionWriter, LogupTraceGenerator};
 
 /// One logup column's raw inputs: per packed row, the numerator (a `SecureField` in
 /// coordinate layout) and the denominator.
@@ -156,6 +156,36 @@ impl RawLogupColGenerator<'_> {
             self.numerator.set_packed(vec_row, numerator);
             *self.denominator.data.get_unchecked_mut(vec_row) = denominator;
         }
+    }
+
+    /// Per-row fraction writers, mirroring [`super::LogupColGenerator::iter_mut`].
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = FractionWriter<'_>> {
+        let denom = self.denominator.data.iter_mut();
+        let [coord0, coord1, coord2, coord3] =
+            self.numerator.columns.each_mut().map(|s| &mut s.data);
+        itertools::multizip((coord0, coord1, coord2, coord3, denom)).map(|(n0, n1, n2, n3, d)| {
+            FractionWriter {
+                numerator: [n0, n1, n2, n3],
+                denom: d,
+            }
+        })
+    }
+
+    /// Parallel per-row fraction writers, mirroring
+    /// [`super::LogupColGenerator::par_iter_mut`].
+    #[cfg(feature = "parallel")]
+    pub fn par_iter_mut(
+        &mut self,
+    ) -> impl rayon::iter::IndexedParallelIterator<Item = FractionWriter<'_>> {
+        use rayon::prelude::*;
+        let [coord0, coord1, coord2, coord3] =
+            self.numerator.columns.each_mut().map(|s| &mut s.data);
+        (coord0, coord1, coord2, coord3, &mut self.denominator.data)
+            .into_par_iter()
+            .map(|(n0, n1, n2, n3, d)| FractionWriter {
+                numerator: [n0, n1, n2, n3],
+                denom: d,
+            })
     }
 
     /// Store the raw column; no math happens until the backend finalize.

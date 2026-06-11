@@ -273,8 +273,8 @@ impl LogupColGenerator<'_> {
 /// Exposes a writer for writing a fraction to a single index in a column.
 // TODO(Ohad): iterate in chunks, consider VeryPacked.
 pub struct FractionWriter<'a> {
-    numerator: [&'a mut PackedBaseField; SECURE_EXTENSION_DEGREE],
-    denom: &'a mut PackedSecureField,
+    pub(super) numerator: [&'a mut PackedBaseField; SECURE_EXTENSION_DEGREE],
+    pub(super) denom: &'a mut PackedSecureField,
 }
 impl FractionWriter<'_> {
     pub fn write_frac(self, numerator: PackedSecureField, denom: PackedSecureField) {
