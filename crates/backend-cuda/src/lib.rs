@@ -7,7 +7,7 @@
 mod backend;
 mod columns;
 
-pub use backend::CudaBackend;
+pub use backend::{finalize_raw_logup, CudaBackend};
 pub use columns::{BaseFieldVec, Blake2sHashVec, SecureFieldVec};
 
 /// (free_bytes, total_bytes) of GPU memory; (0, 0) without CUDA.

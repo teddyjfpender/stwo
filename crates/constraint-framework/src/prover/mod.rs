@@ -2,6 +2,7 @@ mod assert;
 mod component_prover;
 mod cpu_domain;
 mod logup;
+mod logup_raw;
 pub mod relation_tracker;
 mod simd_domain;
 
@@ -12,4 +13,5 @@ pub use component_prover::{
 };
 pub use cpu_domain::CpuDomainEvaluator;
 pub use logup::{FractionWriter, LogupColGenerator, LogupTraceGenerator};
+pub use logup_raw::{RawLogupColGenerator, RawLogupColumn, RawLogupTrace, RawLogupTraceGenerator};
 pub use simd_domain::SimdDomainEvaluator;

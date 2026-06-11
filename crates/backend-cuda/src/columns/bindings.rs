@@ -140,7 +140,8 @@ pub use sys_raw::{
     cuda_alloc_pinned_host_u32, cuda_alloc_zeroes_uint32_t, cuda_free_memory,
     cuda_free_pinned_host_u32, cuda_gather_uint32_t, cuda_get_memory_info, cuda_get_uint32_t,
     cuda_increase_at, cuda_malloc_uint32_t, cuda_release_uploaded_pointer_vec, cuda_set_uint32_t,
-    cuda_zero_device_region, lift_accumulate_secure_columns, ntt_b2n_column, ntt_n2b_columns,
+    cuda_zero_device_region, inclusive_prefix_sum, lift_accumulate_secure_columns,
+    logup_fraction_chain, ntt_b2n_column, ntt_n2b_columns,
 };
 
 pub unsafe fn cuda_get_secure_field(device_ptr: *const c_void, index: usize) -> CudaSecureField {
@@ -193,6 +194,27 @@ pub unsafe fn batch_eval_at_points(
         point_y.into_raw(),
         results.cast(),
     );
+}
+
+pub unsafe fn logup_sum_secure_coords(
+    c0: *const u32,
+    c1: *const u32,
+    c2: *const u32,
+    c3: *const u32,
+    size: u32,
+) -> CudaSecureField {
+    CudaSecureField::from_raw(sys_raw::logup_sum_secure_coords(c0, c1, c2, c3, size))
+}
+
+pub unsafe fn logup_shift_secure_coords(
+    c0: *const u32,
+    c1: *const u32,
+    c2: *const u32,
+    c3: *const u32,
+    shift: CudaSecureField,
+    size: u32,
+) {
+    sys_raw::logup_shift_secure_coords(c0, c1, c2, c3, shift.into_raw(), size);
 }
 
 pub unsafe fn barycentric_point_vanishings(

@@ -509,10 +509,37 @@ extern "C" {
         eval_domain_size: u32,
     );
 
-    // pub fn inclusive_prefix_sum(
-    //     device_bit_rev_circle_domain_evals:  *const u32,
-    //     len: u32,
-    // );
+    pub fn inclusive_prefix_sum(device_bit_rev_circle_domain_evals: *const u32, len: u32);
+
+    pub fn logup_fraction_chain(
+        num0: *const u32,
+        num1: *const u32,
+        num2: *const u32,
+        num3: *const u32,
+        denom_packed: *const u32,
+        prev0: *const u32,
+        prev1: *const u32,
+        prev2: *const u32,
+        prev3: *const u32,
+        size: u32,
+    );
+
+    pub fn logup_sum_secure_coords(
+        c0: *const u32,
+        c1: *const u32,
+        c2: *const u32,
+        c3: *const u32,
+        size: u32,
+    ) -> CudaSecureField;
+
+    pub fn logup_shift_secure_coords(
+        c0: *const u32,
+        c1: *const u32,
+        c2: *const u32,
+        c3: *const u32,
+        shift: CudaSecureField,
+        size: u32,
+    );
 
     // Poseidon252 CUDA acceleration functions
     // Note: FieldElement252 is represented as 32 bytes (8 x u32)

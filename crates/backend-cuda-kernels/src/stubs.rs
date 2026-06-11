@@ -80,6 +80,68 @@ pub unsafe extern "C" fn copy_uint32_t_vec_from_host_to_device_into(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn inclusive_prefix_sum(
+    device_bit_rev_circle_domain_evals: *const u32,
+    len: u32,
+) {
+    let _ = (device_bit_rev_circle_domain_evals, len);
+    no_cuda_symbol("inclusive_prefix_sum")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn logup_fraction_chain(
+    num0: *const u32,
+    num1: *const u32,
+    num2: *const u32,
+    num3: *const u32,
+    denom_packed: *const u32,
+    prev0: *const u32,
+    prev1: *const u32,
+    prev2: *const u32,
+    prev3: *const u32,
+    size: u32,
+) {
+    let _ = (
+        num0,
+        num1,
+        num2,
+        num3,
+        denom_packed,
+        prev0,
+        prev1,
+        prev2,
+        prev3,
+        size,
+    );
+    no_cuda_symbol("logup_fraction_chain")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn logup_sum_secure_coords(
+    c0: *const u32,
+    c1: *const u32,
+    c2: *const u32,
+    c3: *const u32,
+    size: u32,
+) -> CudaSecureField {
+    let _ = (c0, c1, c2, c3, size);
+    no_cuda_symbol("logup_sum_secure_coords")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn logup_shift_secure_coords(
+    c0: *const u32,
+    c1: *const u32,
+    c2: *const u32,
+    c3: *const u32,
+    shift: CudaSecureField,
+    size: u32,
+) {
+    let _ = (c0, c1, c2, c3, shift, size);
+    no_cuda_symbol("logup_shift_secure_coords")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn cuda_gather_uint32_t(
     device_src: *const u32,
     host_indices: *const u32,

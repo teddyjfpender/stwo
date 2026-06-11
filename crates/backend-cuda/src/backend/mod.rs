@@ -7,6 +7,7 @@ mod constraint_eval;
 mod field;
 mod fri;
 mod jit;
+mod logup;
 mod lookups;
 mod pointer_vec;
 mod poly;
@@ -14,6 +15,7 @@ mod quotient;
 mod secure_column;
 
 pub use backend::CudaBackend;
+pub use logup::finalize_raw_logup;
 pub(crate) use pointer_vec::{UploadedDevicePointerVec, UploadedUint32Vec};
 
 pub(crate) use crate::columns::{BaseFieldVec, SecureFieldVec};
