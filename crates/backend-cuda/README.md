@@ -133,8 +133,19 @@ cheap stream-ordered memset) because flipping it to true uninitialized memory wo
 turn any not-fully-written buffer into nondeterminism — that flip needs the
 conformance gate per call site.
 
-**Validated (RTX 3090, same-host interleaved A/B vs the round-2 code, all gates
-byte-equal at every step):** cold proves are **2–4.7× faster** (fib 1M 37.4→18.7 s,
+**Round 4 (trace-driven, same 3090):** a phase-trace profile found the GPU idle
+75-93% of the warm prove, dominated by an uninstrumented decommit phase doing ~100k
+per-element 4-byte PCIe readbacks (`Column::at` per column x query — the long-standing
+"GPU floor", nearly size-independent at 6.7-9.7 s), with OODS host-side weight
+computation second (3.8 s). Fixes: `Column::gather_unreduced` (one gather kernel + one
+D2H per column, feeding the existing sparse `decommit_gathered` path) and device-side
+barycentric point vanishings (reusing the quotient kernels' point generator). Result:
+fib 1M warm 14.7 -> **5.37 s (1.37 MHz, 2.1x same-host SIMD; 0.73 s/1M steps on a 3090
+clears NitrooZK's published 5090 number)**; fib 65k 8.1 -> 0.87 s; ec 1024 11.2 ->
+1.36 s. The Prove STARKs core is 10.7 s -> 813 ms; the prove is now witness-bound.
+
+**Round 3 validation (RTX 3090, same-host interleaved A/B vs the round-2 code, all
+gates byte-equal at every step):** cold proves are **2–4.7× faster** (fib 1M 37.4→18.7 s,
 fib 65k 36.7→10.2 s, ec 1024 47.7→13.5 s) — first-prove latency is now warm+1–3 s
 because the disk PTX cache turns per-statement NVRTC compiles (~1.8 s/kernel) into
 1–3 ms loads, across processes and inputs. Warm proves improved 2–9%: at these sizes
