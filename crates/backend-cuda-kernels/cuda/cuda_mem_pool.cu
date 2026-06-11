@@ -40,6 +40,41 @@ extern "C" cudaError_t cuda_mem_pool_destroy() {
     return cudaSuccess;
 }
 
+namespace {
+struct StreamPool {
+    cudaStream_t streams[STWO_N_POOL_STREAMS];
+    cudaEvent_t events[STWO_N_POOL_STREAMS];
+};
+StreamPool &stream_pool() {
+    static StreamPool pool = [] {
+        StreamPool p{};
+        for (int i = 0; i < STWO_N_POOL_STREAMS; ++i) {
+            cudaStreamCreateWithFlags(&p.streams[i], cudaStreamNonBlocking);
+            cudaEventCreateWithFlags(&p.events[i], cudaEventDisableTiming);
+        }
+        return p;
+    }();
+    return pool;
+}
+}  // namespace
+
+cudaStream_t stwo_pool_stream(int i) { return stream_pool().streams[i % STWO_N_POOL_STREAMS]; }
+
+void stwo_stream_wait_legacy(int i) {
+    StreamPool &p = stream_pool();
+    int k = i % STWO_N_POOL_STREAMS;
+    // Record the legacy stream's current frontier and make stream k wait on it.
+    cudaEventRecord(p.events[k], (cudaStream_t)0);
+    cudaStreamWaitEvent(p.streams[k], p.events[k], 0);
+}
+
+void stwo_legacy_wait_stream(int i) {
+    StreamPool &p = stream_pool();
+    int k = i % STWO_N_POOL_STREAMS;
+    cudaEventRecord(p.events[k], p.streams[k]);
+    cudaStreamWaitEvent((cudaStream_t)0, p.events[k], 0);
+}
+
 extern "C" uint32_t* cuda_mem_pool_allocate_uint32(size_t count) {
     return cuda_mem_pool_allocate<uint32_t>(count);
 }

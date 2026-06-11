@@ -256,9 +256,15 @@ pub fn finalize_device_raw_logup(
             cumsum_shift.into(),
             size as u32,
         );
-        for coord in last.iter() {
-            bindings::inclusive_prefix_sum(coord.device_ptr, size as u32);
-        }
+        // P3: the four coordinate scans are independent — they run on the pool
+        // streams with event bridges to the legacy stream on both sides.
+        stwo_backend_cuda_kernels::raw::inclusive_prefix_sum_x4(
+            last[0].device_ptr,
+            last[1].device_ptr,
+            last[2].device_ptr,
+            last[3].device_ptr,
+            size as u32,
+        );
     }
 
     let trace = finalized

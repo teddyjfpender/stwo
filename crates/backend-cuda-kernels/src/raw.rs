@@ -511,6 +511,14 @@ extern "C" {
 
     pub fn inclusive_prefix_sum(device_bit_rev_circle_domain_evals: *const u32, len: u32);
 
+    pub fn inclusive_prefix_sum_x4(
+        c0: *const u32,
+        c1: *const u32,
+        c2: *const u32,
+        c3: *const u32,
+        len: u32,
+    );
+
     pub fn logup_fraction_chain(
         num0: *const u32,
         num1: *const u32,

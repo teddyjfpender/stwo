@@ -140,8 +140,8 @@ pub use sys_raw::{
     cuda_alloc_pinned_host_u32, cuda_alloc_zeroes_uint32_t, cuda_free_memory,
     cuda_free_pinned_host_u32, cuda_gather_uint32_t, cuda_get_memory_info, cuda_get_uint32_t,
     cuda_increase_at, cuda_malloc_uint32_t, cuda_release_uploaded_pointer_vec, cuda_set_uint32_t,
-    cuda_zero_device_region, inclusive_prefix_sum, lift_accumulate_secure_columns,
-    logup_fraction_chain, ntt_b2n_column, ntt_n2b_columns,
+    cuda_zero_device_region, lift_accumulate_secure_columns, logup_fraction_chain, ntt_b2n_column,
+    ntt_n2b_columns,
 };
 
 pub unsafe fn cuda_get_secure_field(device_ptr: *const c_void, index: usize) -> CudaSecureField {

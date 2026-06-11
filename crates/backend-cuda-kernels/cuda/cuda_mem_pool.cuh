@@ -107,6 +107,23 @@ void cuda_mem_pool_free(T* ptr) {
     cuda_allocator_free_for_proving(ptr);
 }
 
+// ---------------------------------------------------------------------------
+// P3 stream pool (multi-stream overlap; see ROAD_TO_10MHZ.md program P3).
+//
+// CONTRACT: work on a pool stream is only correct between a pair of bridges:
+//   stwo_stream_wait_legacy(i)  — pool stream i waits for everything enqueued on
+//                                 the legacy stream so far (its inputs);
+//   stwo_legacy_wait_stream(i)  — the legacy stream waits for stream i's work
+//                                 (before any consumer or host read).
+// Never read pool-stream results from the host or from the legacy stream
+// without the closing bridge. Allocations remain legacy-stream-ordered, so pool
+// streams must not free buffers they used until after the closing bridge.
+// ---------------------------------------------------------------------------
+constexpr int STWO_N_POOL_STREAMS = 4;
+cudaStream_t stwo_pool_stream(int i);
+void stwo_stream_wait_legacy(int i);
+void stwo_legacy_wait_stream(int i);
+
 // C-style wrappers for specific types
 extern "C" uint32_t* cuda_mem_pool_allocate_uint32(size_t count);
 extern "C" uint32_t* cuda_mem_pool_allocate_zeroes_uint32(size_t count);

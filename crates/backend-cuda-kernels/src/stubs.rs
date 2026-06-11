@@ -80,6 +80,18 @@ pub unsafe extern "C" fn copy_uint32_t_vec_from_host_to_device_into(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn inclusive_prefix_sum_x4(
+    c0: *const u32,
+    c1: *const u32,
+    c2: *const u32,
+    c3: *const u32,
+    len: u32,
+) {
+    let _ = (c0, c1, c2, c3, len);
+    no_cuda_symbol("inclusive_prefix_sum_x4")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn inclusive_prefix_sum(
     device_bit_rev_circle_domain_evals: *const u32,
     len: u32,
