@@ -203,7 +203,11 @@ impl stwo::prover::backend::FromSimdColumns for CudaBackend {
                 .par_iter()
                 .zip(chunks.par_iter_mut())
                 .for_each(|(eval, chunk)| {
-                    let host = eval.values.to_cpu();
+                    // `as_slice` is a zero-copy view over the SIMD column's packed
+                    // lanes (PackedM31 is a transparent [u32; 16]), truncated to the
+                    // logical length — one copy straight into pinned staging, no
+                    // intermediate Vec per column.
+                    let host = eval.values.as_slice();
                     // BaseField is repr(transparent) over u32.
                     let words: &[u32] =
                         unsafe { std::slice::from_raw_parts(host.as_ptr().cast(), host.len()) };

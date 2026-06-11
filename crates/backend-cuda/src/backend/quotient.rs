@@ -170,9 +170,16 @@ impl QuotientOps for CudaBackend {
                 .itwiddles
                 .extract_subdomain_twiddles(eval_domain.log_size(), eval_subdomain.log_size()),
         };
+        // Borrow the forward twiddles instead of cloning: `clone` on a device column
+        // is a fresh allocation plus a full D2D copy of the entire twiddle buffer.
+        // The borrow is safe — `full_twiddles` lives only within this call and
+        // `twiddles` (the argument) outlives it; the borrowed column never frees.
         let full_twiddles = TwiddleTree {
             root_coset: eval_domain.half_coset,
-            twiddles: twiddles.twiddles.clone(),
+            twiddles: crate::columns::base_field_vec::BaseFieldVec::from_borrowed_ptr(
+                twiddles.twiddles.device_ptr,
+                twiddles.twiddles.size,
+            ),
             itwiddles: TwiddleBuffer::empty(),
         };
 
