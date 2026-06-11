@@ -26,7 +26,7 @@ use stwo::core::ColumnVec;
 use stwo::prover::backend::simd::column::SecureColumn;
 use stwo::prover::backend::simd::qm31::PackedSecureField;
 use stwo::prover::backend::simd::SimdBackend;
-use stwo::prover::backend::Column;
+use stwo::prover::backend::{Backend, Column};
 use stwo::prover::poly::circle::CircleEvaluation;
 use stwo::prover::poly::BitReversedOrder;
 use stwo::prover::secure_column::SecureColumnByCoords;
@@ -65,6 +65,34 @@ impl RawLogupTrace {
             col_gen.finalize_col();
         }
         gen.finalize_last()
+    }
+}
+
+/// Backend hook for finalizing raw logup traces: the seam between host-written raw
+/// fractions and backend-resident interaction columns (the FromSimdColumns pattern).
+///
+/// Implementations MUST produce, for identical raw inputs, columns and claimed sums
+/// element-for-element identical to [`RawLogupTrace::finalize_on_simd`] — proof
+/// byte-equality is the gate. GPU backends return device-resident columns, so the
+/// interaction tree commits without a host-to-device transfer of the finalized
+/// trace.
+pub trait LogupFinalizeBackend: Backend {
+    fn finalize_raw_logup(
+        raw: RawLogupTrace,
+    ) -> (
+        ColumnVec<CircleEvaluation<Self, BaseField, BitReversedOrder>>,
+        SecureField,
+    );
+}
+
+impl LogupFinalizeBackend for SimdBackend {
+    fn finalize_raw_logup(
+        raw: RawLogupTrace,
+    ) -> (
+        ColumnVec<CircleEvaluation<Self, BaseField, BitReversedOrder>>,
+        SecureField,
+    ) {
+        raw.finalize_on_simd()
     }
 }
 
@@ -145,7 +173,7 @@ mod tests {
     use rand::{Rng, SeedableRng};
     use stwo::prover::backend::simd::m31::LOG_N_LANES;
     use stwo::prover::backend::simd::qm31::PackedSecureField;
-    use stwo::prover::backend::Column;
+    use stwo::prover::backend::{Backend, Column};
 
     use super::RawLogupTraceGenerator;
     use crate::prover::logup::LogupTraceGenerator;

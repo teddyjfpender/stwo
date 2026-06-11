@@ -13,5 +13,8 @@ pub use component_prover::{
 };
 pub use cpu_domain::CpuDomainEvaluator;
 pub use logup::{FractionWriter, LogupColGenerator, LogupTraceGenerator};
-pub use logup_raw::{RawLogupColGenerator, RawLogupColumn, RawLogupTrace, RawLogupTraceGenerator};
+pub use logup_raw::{
+    LogupFinalizeBackend, RawLogupColGenerator, RawLogupColumn, RawLogupTrace,
+    RawLogupTraceGenerator,
+};
 pub use simd_domain::SimdDomainEvaluator;

@@ -25,7 +25,7 @@ use stwo::core::poly::circle::CanonicCoset;
 use stwo::prover::backend::Column;
 use stwo::prover::poly::circle::CircleEvaluation;
 use stwo::prover::poly::BitReversedOrder;
-use stwo_constraint_framework::RawLogupTrace;
+use stwo_constraint_framework::{LogupFinalizeBackend, RawLogupTrace};
 
 use crate::backend::CudaBackend;
 use crate::columns::base_field_vec::BaseFieldVec;
@@ -125,4 +125,15 @@ pub fn finalize_raw_logup(
         .flat_map(|coords| coords.map(|col| CircleEvaluation::new(domain, col)))
         .collect();
     (trace, claimed_sum)
+}
+
+impl LogupFinalizeBackend for CudaBackend {
+    fn finalize_raw_logup(
+        raw: RawLogupTrace,
+    ) -> (
+        Vec<CircleEvaluation<Self, BaseField, BitReversedOrder>>,
+        SecureField,
+    ) {
+        finalize_raw_logup(raw)
+    }
 }
