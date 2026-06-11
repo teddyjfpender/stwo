@@ -41,7 +41,7 @@ impl CudaSecureField {
         }
     }
 
-    fn into_raw(self) -> sys_raw::CudaSecureField {
+    pub(crate) fn into_raw(self) -> sys_raw::CudaSecureField {
         sys_raw::CudaSecureField {
             a: self.a.0,
             b: self.b.0,

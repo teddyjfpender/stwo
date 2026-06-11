@@ -114,6 +114,29 @@ __global__ void sub_broadcast_m31_kernel(m31 *values, m31 shift, uint32_t size) 
 
 }  // namespace
 
+// Element-major variant: denominators already on device in qm31 element order
+// (device-generated witness lanes) — no de-interleave, no H2D.
+extern "C" void logup_fraction_chain_dense(
+    uint32_t *num0, uint32_t *num1, uint32_t *num2, uint32_t *num3,
+    const uint32_t *denoms_dense,
+    const uint32_t *prev0, const uint32_t *prev1,
+    const uint32_t *prev2, const uint32_t *prev3,
+    uint32_t size
+) {
+    qm31 *inverses = cuda_proving_malloc<qm31>(size);
+    batch_inverse_secure_field(
+        const_cast<qm31 *>(reinterpret_cast<const qm31 *>(denoms_dense)), inverses, size);
+    uint32_t num_blocks = (size + LOGUP_BLOCK_DIM - 1) / LOGUP_BLOCK_DIM;
+    logup_fraction_chain_kernel<<<num_blocks, LOGUP_BLOCK_DIM>>>(
+        num0, num1, num2, num3,
+        inverses,
+        prev0, prev1, prev2, prev3,
+        size);
+    stwo_maybe_debug_sync();
+    ASSERT_CUDA_SUCCESS(cudaGetLastError());
+    cuda_proving_free(inverses);
+}
+
 // One logup column's chain step: de-interleave + batch-invert the packed-lane
 // denominators, then value = num * inv + prev in place over the numerator coords.
 extern "C" void logup_fraction_chain(

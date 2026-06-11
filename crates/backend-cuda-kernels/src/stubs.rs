@@ -117,6 +117,34 @@ pub unsafe extern "C" fn logup_fraction_chain(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn logup_fraction_chain_dense(
+    num0: *const u32,
+    num1: *const u32,
+    num2: *const u32,
+    num3: *const u32,
+    denoms_dense: *const u32,
+    prev0: *const u32,
+    prev1: *const u32,
+    prev2: *const u32,
+    prev3: *const u32,
+    size: u32,
+) {
+    let _ = (
+        num0,
+        num1,
+        num2,
+        num3,
+        denoms_dense,
+        prev0,
+        prev1,
+        prev2,
+        prev3,
+        size,
+    );
+    no_cuda_symbol("logup_fraction_chain_dense")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn logup_sum_secure_coords(
     c0: *const u32,
     c1: *const u32,
@@ -126,6 +154,108 @@ pub unsafe extern "C" fn logup_sum_secure_coords(
 ) -> CudaSecureField {
     let _ = (c0, c1, c2, c3, size);
     no_cuda_symbol("logup_sum_secure_coords")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn memory_limb_split_big(
+    values: *const u32,
+    n_values: u32,
+    column_length: u32,
+    limb_cols: *const *const u32,
+) {
+    let _ = (values, n_values, column_length, limb_cols);
+    no_cuda_symbol("memory_limb_split_big")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn memory_limb_split_small(
+    values: *const u32,
+    n_values: u32,
+    column_length: u32,
+    limb_cols: *const *const u32,
+) {
+    let _ = (values, n_values, column_length, limb_cols);
+    no_cuda_symbol("memory_limb_split_small")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn memory_rc99_count(
+    limb_cols: *const *const u32,
+    n_pairs: u32,
+    column_length: u32,
+    input_to_row_lut: *const u32,
+    rc_table_size: u32,
+    counts: *mut u32,
+) {
+    let _ = (
+        limb_cols,
+        n_pairs,
+        column_length,
+        input_to_row_lut,
+        rc_table_size,
+        counts,
+    );
+    no_cuda_symbol("memory_rc99_count")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn memory_logup_inputs(
+    limb_cols: *const *const u32,
+    n_limbs: u32,
+    mults: *const u32,
+    relation_id: u32,
+    id_offset: u32,
+    id_tag: u32,
+    column_length: u32,
+    alpha_powers: *const u32,
+    z: CudaSecureField,
+    denoms: *const u32,
+    num0: *const u32,
+    num1: *const u32,
+    num2: *const u32,
+    num3: *const u32,
+) {
+    let _ = (
+        limb_cols,
+        n_limbs,
+        mults,
+        relation_id,
+        id_offset,
+        id_tag,
+        column_length,
+    );
+    let _ = (alpha_powers, z, denoms, num0, num1, num2, num3);
+    no_cuda_symbol("memory_logup_inputs")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn memory_rc_pair_logup(
+    limb_a: *const u32,
+    limb_b: *const u32,
+    limb_c: *const u32,
+    limb_d: *const u32,
+    rel_id0: u32,
+    rel_id1: u32,
+    column_length: u32,
+    alpha_powers: *const u32,
+    z: CudaSecureField,
+    denoms: *const u32,
+    num0: *const u32,
+    num1: *const u32,
+    num2: *const u32,
+    num3: *const u32,
+) {
+    let _ = (
+        limb_a,
+        limb_b,
+        limb_c,
+        limb_d,
+        rel_id0,
+        rel_id1,
+        column_length,
+    );
+    let _ = (alpha_powers, z, denoms, num0, num1, num2, num3);
+    no_cuda_symbol("memory_rc_pair_logup")
 }
 
 #[unsafe(no_mangle)]

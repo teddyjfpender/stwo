@@ -9,6 +9,7 @@ mod fri;
 mod jit;
 mod logup;
 mod lookups;
+pub mod memory_witness;
 mod pointer_vec;
 mod poly;
 mod quotient;

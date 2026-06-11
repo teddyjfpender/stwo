@@ -524,6 +524,19 @@ extern "C" {
         size: u32,
     );
 
+    pub fn logup_fraction_chain_dense(
+        num0: *const u32,
+        num1: *const u32,
+        num2: *const u32,
+        num3: *const u32,
+        denoms_dense: *const u32,
+        prev0: *const u32,
+        prev1: *const u32,
+        prev2: *const u32,
+        prev3: *const u32,
+        size: u32,
+    );
+
     pub fn logup_sum_secure_coords(
         c0: *const u32,
         c1: *const u32,
@@ -531,6 +544,63 @@ extern "C" {
         c3: *const u32,
         size: u32,
     ) -> CudaSecureField;
+
+    pub fn memory_limb_split_big(
+        values: *const u32,
+        n_values: u32,
+        column_length: u32,
+        limb_cols: *const *const u32,
+    );
+
+    pub fn memory_limb_split_small(
+        values: *const u32,
+        n_values: u32,
+        column_length: u32,
+        limb_cols: *const *const u32,
+    );
+
+    pub fn memory_rc99_count(
+        limb_cols: *const *const u32,
+        n_pairs: u32,
+        column_length: u32,
+        input_to_row_lut: *const u32,
+        rc_table_size: u32,
+        counts: *mut u32,
+    );
+
+    pub fn memory_logup_inputs(
+        limb_cols: *const *const u32,
+        n_limbs: u32,
+        mults: *const u32,
+        relation_id: u32,
+        id_offset: u32,
+        id_tag: u32,
+        column_length: u32,
+        alpha_powers: *const u32,
+        z: CudaSecureField,
+        denoms: *const u32,
+        num0: *const u32,
+        num1: *const u32,
+        num2: *const u32,
+        num3: *const u32,
+    );
+
+    pub fn memory_rc_pair_logup(
+        limb_a: *const u32,
+        limb_b: *const u32,
+        limb_c: *const u32,
+        limb_d: *const u32,
+        rel_id0: u32,
+        rel_id1: u32,
+        column_length: u32,
+        alpha_powers: *const u32,
+        z: CudaSecureField,
+        denoms: *const u32,
+        num0: *const u32,
+        num1: *const u32,
+        num2: *const u32,
+        num3: *const u32,
+    );
 
     pub fn logup_shift_secure_coords(
         c0: *const u32,
