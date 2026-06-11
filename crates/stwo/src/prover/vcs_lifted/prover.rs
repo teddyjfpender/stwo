@@ -10,17 +10,34 @@ use crate::core::vcs_lifted::verifier::{
     ExtendedMerkleDecommitmentLifted, MerkleDecommitmentLifted, MerkleDecommitmentLiftedAux,
 };
 use crate::core::ColumnVec;
-use crate::prover::backend::{Col, Column};
+use crate::prover::backend::{Col, Column, ColumnOps};
+
+/// The number of bottom tree layers (leaves upwards) that [`MerkleProverLifted::commit_pruned`]
+/// does not retain. The unretained nodes are recomputed from the committed columns at decommit
+/// time. Each successive dropped layer halves in size, so dropping `k` layers saves
+/// `(2 - 2^{1-k})` times the leaf layer's memory; the decommit-time recomputation cost grows as
+/// `2^k` leaf hashes per query and stays negligible for small `k`.
+const N_UNRETAINED_BOTTOM_LAYERS: u32 = 4;
 
 /// Represents the prover side of a Merkle commitment scheme.
 #[derive(Debug)]
 pub struct MerkleProverLifted<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> {
     /// Layers of the Merkle tree, sorted by increasing length.
     /// The first layer is a column of length 1, containing the root commitment.
+    ///
+    /// Trees built with [`Self::commit_pruned`] do not retain the bottom
+    /// [`N_UNRETAINED_BOTTOM_LAYERS`] layers; those nodes are recomputed from the committed
+    /// columns during decommit.
     pub layers: Vec<Col<B, H::Hash>>,
+    /// Log size of the leaf layer (i.e. the height of the tree).
+    leaf_log_size: u32,
 }
 
 impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
+    /// Returns the log size of the leaf layer of the tree.
+    pub const fn log_size(&self) -> u32 {
+        self.leaf_log_size
+    }
     /// Commits to columns.
     /// Columns must be of power of 2 sizes, not necessarily sorted by length.
     ///
@@ -36,17 +53,45 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
         lifting_log_size: u32,
         log_rows_per_leaf: u32,
     ) -> Self {
+        Self::commit_inner(columns, lifting_log_size, log_rows_per_leaf, 0)
+    }
+
+    /// Same as [`Self::commit`], but does not retain the bottom
+    /// [`N_UNRETAINED_BOTTOM_LAYERS`] layers of the tree, reducing the memory held between
+    /// commitment and decommitment by almost 2x the leaf layer's size. The unretained nodes are
+    /// recomputed from the committed columns at decommit time, so callers must pass the same
+    /// columns to [`Self::decommit`].
+    ///
+    /// Not supported for packed leaves (`log_rows_per_leaf > 0`), where decommit does not
+    /// receive the packed columns.
+    pub fn commit_pruned(columns: Vec<&Col<B, BaseField>>, lifting_log_size: u32) -> Self {
+        Self::commit_inner(columns, lifting_log_size, 0, N_UNRETAINED_BOTTOM_LAYERS)
+    }
+
+    fn commit_inner(
+        columns: Vec<&Col<B, BaseField>>,
+        lifting_log_size: u32,
+        log_rows_per_leaf: u32,
+        n_unretained_layers: u32,
+    ) -> Self {
+        // Pruned trees recompute leaf hashes from the committed columns at decommit time;
+        // the packed-leaves path does not pass its (packed) columns to decommit, so the two
+        // must not be combined.
+        assert!(
+            log_rows_per_leaf == 0 || n_unretained_layers == 0,
+            "Layer pruning is not supported for packed leaves."
+        );
         let _span = span!(Level::TRACE, "Merkle", class = "MerkleCommitment").entered();
         if columns.is_empty() {
             return Self {
                 layers: vec![B::build_leaves(&[], lifting_log_size)],
+                leaf_log_size: 0,
             };
         }
 
-        let mut layers: Vec<Col<B, H::Hash>> = Vec::new();
         // We enter this branch only during FRI commit phase, in which we commit 4 columns of the
         // same size. In particular, we don't need to sort the columns by size.
-        if log_rows_per_leaf > 0 {
+        let leaves = if log_rows_per_leaf > 0 {
             // TODO(Leo): add support for higher log_rows_per_leaf sizes.
             assert_eq!(
                 log_rows_per_leaf, 2,
@@ -57,23 +102,35 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
             let packed_columns = B::pack_leaves_input(&columns);
             let max_log_size = packed_columns[0].len().ilog2();
             assert!(lifting_log_size >= max_log_size);
-            layers.push(B::build_leaves(
-                &packed_columns.iter().collect_vec(),
-                lifting_log_size,
-            ));
+            B::build_leaves(&packed_columns.iter().collect_vec(), lifting_log_size)
         } else {
             let sorted_columns = columns.into_iter().sorted_by_key(|c| c.len()).collect_vec();
             let max_log_size = sorted_columns.last().unwrap().len().ilog2();
             assert!(lifting_log_size >= max_log_size);
-            layers.push(B::build_leaves(&sorted_columns, lifting_log_size));
+            B::build_leaves(&sorted_columns, lifting_log_size)
+        };
+
+        // Build the layers from the leaves up, dropping unretained bottom layers eagerly to
+        // also reduce the transient memory of the commitment itself.
+        let min_retained_log_size = lifting_log_size.saturating_sub(n_unretained_layers);
+        let mut layers_top_down: Vec<Col<B, H::Hash>> = Vec::new();
+        let mut current = leaves;
+        for log_size in (0..lifting_log_size).rev() {
+            let next = B::build_next_layer(&current);
+            // `current` has log size `log_size + 1`.
+            if log_size < min_retained_log_size {
+                layers_top_down.push(current);
+            }
+            current = next;
         }
+        // The root (log size 0) is always retained.
+        layers_top_down.push(current);
+        layers_top_down.reverse();
 
-        (0..lifting_log_size).for_each(|_| {
-            layers.push(B::build_next_layer(layers.last().unwrap()));
-        });
-        layers.reverse();
-
-        Self { layers }
+        Self {
+            layers: layers_top_down,
+            leaf_log_size: lifting_log_size,
+        }
     }
 
     /// Decommits to columns on the given queries.
@@ -98,29 +155,68 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
         ColumnVec<Vec<BaseField>>,
         ExtendedMerkleDecommitmentLifted<H>,
     ) {
+        self.decommit_inner(query_positions, &DenseColumns::<B>(&columns))
+    }
+
+    /// Same as [`Self::decommit`], but reads column values from a sparse, row-gathered view
+    /// instead of the full columns. The view must contain every queried row and, for trees
+    /// committed with [`Self::commit_pruned`], every row of the leaves returned by
+    /// [`Self::unretained_leaf_indices`] (mapped per column).
+    pub fn decommit_gathered(
+        &self,
+        query_positions: &[usize],
+        gathered: &GatheredColumns,
+    ) -> (
+        ColumnVec<Vec<BaseField>>,
+        ExtendedMerkleDecommitmentLifted<H>,
+    ) {
+        self.decommit_inner(query_positions, gathered)
+    }
+
+    fn decommit_inner(
+        &self,
+        query_positions: &[usize],
+        columns: &impl ColumnAccess,
+    ) -> (
+        ColumnVec<Vec<BaseField>>,
+        ExtendedMerkleDecommitmentLifted<H>,
+    ) {
         // Prepare output buffers.
         let mut queried_values: ColumnVec<Vec<BaseField>> = vec![];
         let mut decommitment = MerkleDecommitmentLifted::<H>::default();
         let mut all_node_values: Vec<HashMap<usize, <H as MerkleHasherLifted>::Hash>> = vec![];
 
         // Compute the queried values.
-        let max_log_size = self.layers.len() - 1;
-        for col in columns.iter() {
-            let log_size = col.len().ilog2() as usize;
+        let max_log_size = self.leaf_log_size as usize;
+        for col in 0..columns.n_columns() {
+            let log_size = columns.column_log_size(col) as usize;
             let shift = max_log_size - log_size;
             let res: Vec<_> = query_positions
                 .iter()
-                .map(|pos| col.at((pos >> (shift + 1) << 1) + (pos & 1)))
+                .map(|pos| columns.value(col, (pos >> (shift + 1) << 1) + (pos & 1)))
                 .collect();
             queried_values.push(res);
         }
 
+        // Used to recompute nodes of unretained bottom layers (trees committed with
+        // `commit_pruned`). Sorted by length exactly like in `commit_inner`. Skipped for
+        // fully-retained trees (e.g. the FRI layer trees), where every node is read from a
+        // stored layer.
+        let is_pruned = self.layers.len() <= self.leaf_log_size as usize;
+        let sorted_columns = if is_pruned {
+            (0..columns.n_columns())
+                .sorted_by_key(|&col| columns.column_log_size(col))
+                .collect_vec()
+        } else {
+            vec![]
+        };
+        let mut node_memo = HashMap::<(usize, usize), H::Hash>::new();
+
         let mut prev_layer_queries = query_positions.to_vec();
         prev_layer_queries.dedup();
-        // The largest log size of a layer is equal to `self.layers.len() - 1`. We start iterating
-        // from the layer of log size `self.layers.len() - 2` so that we always have a previous
-        // layer available for the computation.
-        for layer_log_size in (0..self.layers.len() - 1).rev() {
+        // We start iterating from the layer of log size `self.leaf_log_size - 1`, reading the
+        // hashes of the previous (one larger) layer.
+        for layer_log_size in (0..self.leaf_log_size as usize).rev() {
             let mut all_node_values_for_layer =
                 HashMap::<usize, <H as MerkleHasherLifted>::Hash>::new();
             // Prepare write buffer for queries to the current layer. This will propagate to the
@@ -128,26 +224,45 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
             let mut curr_layer_queries: Vec<usize> = vec![];
 
             // Each layer node is a hash of column values as previous layer hashes.
-            // Prepare the previous layer hashes to read from.
-            let prev_layer_hashes = self.layers.get(layer_log_size + 1).unwrap();
+            let prev_level = layer_log_size + 1;
             // All chunks have either length 1 (only one child is present) or 2 (both children are
             // present).
             for queries_chunk in prev_layer_queries.as_slice().chunk_by(|a, b| a ^ 1 == *b) {
                 let first = queries_chunk[0];
                 // If the brother of `first` was not queried before, add its hash to the witness.
                 if queries_chunk.len() == 1 {
-                    decommitment
-                        .hash_witness
-                        .push(prev_layer_hashes.at(first ^ 1))
+                    decommitment.hash_witness.push(self.node_hash(
+                        columns,
+                        &sorted_columns,
+                        &mut node_memo,
+                        prev_level,
+                        first ^ 1,
+                    ))
                 }
                 let curr_index = first >> 1;
                 curr_layer_queries.push(curr_index);
 
                 // Add the previous layer hashes to all_node_values.
-                all_node_values_for_layer
-                    .insert(2 * curr_index, prev_layer_hashes.at(2 * curr_index));
-                all_node_values_for_layer
-                    .insert(2 * curr_index + 1, prev_layer_hashes.at(2 * curr_index + 1));
+                all_node_values_for_layer.insert(
+                    2 * curr_index,
+                    self.node_hash(
+                        columns,
+                        &sorted_columns,
+                        &mut node_memo,
+                        prev_level,
+                        2 * curr_index,
+                    ),
+                );
+                all_node_values_for_layer.insert(
+                    2 * curr_index + 1,
+                    self.node_hash(
+                        columns,
+                        &sorted_columns,
+                        &mut node_memo,
+                        prev_level,
+                        2 * curr_index + 1,
+                    ),
+                );
             }
             // Propagate queries to the next layer.
             prev_layer_queries = curr_layer_queries;
@@ -163,9 +278,164 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
         )
     }
 
+    /// Returns the hash of the tree node at the layer of log size `level`, index `idx`.
+    ///
+    /// Retained layers are read directly; nodes of unretained bottom layers are recomputed from
+    /// the committed columns (and memoized, as decommit paths of nearby queries share subtrees).
+    fn node_hash(
+        &self,
+        columns: &impl ColumnAccess,
+        sorted_columns: &[usize],
+        memo: &mut HashMap<(usize, usize), H::Hash>,
+        level: usize,
+        idx: usize,
+    ) -> H::Hash {
+        if let Some(layer) = self.layers.get(level) {
+            return layer.at(idx);
+        }
+        if let Some(hash) = memo.get(&(level, idx)) {
+            return *hash;
+        }
+        let hash = if level == self.leaf_log_size as usize {
+            leaf_hash::<H>(columns, sorted_columns, self.leaf_log_size, idx)
+        } else {
+            H::hash_children((
+                self.node_hash(columns, sorted_columns, memo, level + 1, 2 * idx),
+                self.node_hash(columns, sorted_columns, memo, level + 1, 2 * idx + 1),
+            ))
+        };
+        memo.insert((level, idx), hash);
+        hash
+    }
+
+    /// Returns the (sorted, deduplicated) leaf indices covered by tree nodes that
+    /// [`Self::decommit`] will need to recompute for the given queries — i.e. the nodes it
+    /// reads from unretained bottom layers. Empty for fully-retained trees.
+    ///
+    /// Mirrors the index arithmetic of the decommit walk.
+    pub fn unretained_leaf_indices(&self, query_positions: &[usize]) -> Vec<usize> {
+        let leaf_log_size = self.leaf_log_size as usize;
+        let mut needed = std::collections::BTreeSet::new();
+
+        let mut prev_layer_queries = query_positions.to_vec();
+        prev_layer_queries.dedup();
+        for layer_log_size in (0..leaf_log_size).rev() {
+            let prev_level = layer_log_size + 1;
+            let prev_level_unretained = self.layers.get(prev_level).is_none();
+            // Log of the number of leaves under one node of `prev_level`.
+            let span_log = leaf_log_size - prev_level;
+            let mut curr_layer_queries: Vec<usize> = vec![];
+
+            for queries_chunk in prev_layer_queries.as_slice().chunk_by(|a, b| a ^ 1 == *b) {
+                let curr_index = queries_chunk[0] >> 1;
+                curr_layer_queries.push(curr_index);
+                if prev_level_unretained {
+                    // The walk reads nodes `first ^ 1` (witness), `2 * curr_index` and
+                    // `2 * curr_index + 1` (aux) — together exactly this pair of nodes.
+                    for node in [2 * curr_index, 2 * curr_index + 1] {
+                        needed.extend((node << span_log)..((node + 1) << span_log));
+                    }
+                }
+            }
+            prev_layer_queries = curr_layer_queries;
+        }
+        needed.into_iter().collect()
+    }
+
     pub fn root(&self) -> H::Hash {
         self.layers.first().unwrap().at(0)
     }
+}
+
+/// Read access to the committed column values of a tree during decommit, in commit order.
+trait ColumnAccess {
+    fn n_columns(&self) -> usize;
+    fn column_log_size(&self, col: usize) -> u32;
+    /// The canonical field value at `row`; used for the queried values returned to the
+    /// verifier.
+    fn value(&self, col: usize, row: usize) -> BaseField;
+    /// The raw stored representation at `row` (possibly the unreduced value `P`); used when
+    /// recomputing leaf hashes, which must reproduce the exact bytes that
+    /// [`MerkleOpsLifted::build_leaves`] committed.
+    fn raw_value(&self, col: usize, row: usize) -> BaseField;
+}
+
+/// Dense access: the full committed columns.
+struct DenseColumns<'a, B: ColumnOps<BaseField>>(&'a [&'a Col<B, BaseField>]);
+
+impl<B: ColumnOps<BaseField>> ColumnAccess for DenseColumns<'_, B> {
+    fn n_columns(&self) -> usize {
+        self.0.len()
+    }
+    fn column_log_size(&self, col: usize) -> u32 {
+        self.0[col].len().ilog2()
+    }
+    fn value(&self, col: usize, row: usize) -> BaseField {
+        self.0[col].at(row)
+    }
+    fn raw_value(&self, col: usize, row: usize) -> BaseField {
+        self.0[col].at_unreduced(row)
+    }
+}
+
+/// A sparse, row-gathered view of a tree's committed columns, sufficient for decommitting a
+/// given set of queries. Used by the low-memory mode, which does not retain the full column
+/// evaluations between commitment and decommitment.
+pub struct GatheredColumns {
+    /// Per column, in commit order: the column's log size.
+    pub log_sizes: Vec<u32>,
+    /// Per column, in commit order: the (row -> raw stored value) entries needed for the
+    /// decommit. Values are gathered with [`Column::at_unreduced`].
+    pub rows: Vec<HashMap<usize, BaseField>>,
+}
+
+impl ColumnAccess for GatheredColumns {
+    fn n_columns(&self) -> usize {
+        self.log_sizes.len()
+    }
+    fn column_log_size(&self, col: usize) -> u32 {
+        self.log_sizes[col]
+    }
+    fn value(&self, col: usize, row: usize) -> BaseField {
+        // The gathered entries hold raw representations; canonicalize like `Column::at` does.
+        BaseField::reduce(self.rows[col][&row].0 as u64)
+    }
+    fn raw_value(&self, col: usize, row: usize) -> BaseField {
+        self.rows[col][&row]
+    }
+}
+
+/// Computes the hash of the single leaf at index `idx` from the committed columns.
+///
+/// Replicates the leaf stream of [`MerkleOpsLifted::build_leaves`]: columns are processed in
+/// ascending size order, in chunks of 16 values per equal-size group, reading each column at
+/// its lift-mapped index.
+fn leaf_hash<H: MerkleHasherLifted>(
+    columns: &impl ColumnAccess,
+    sorted_columns: &[usize],
+    lifting_log_size: u32,
+    idx: usize,
+) -> H::Hash {
+    let mut hasher = H::default();
+    for (log_size, group) in &sorted_columns
+        .iter()
+        .group_by(|&&col| columns.column_log_size(col))
+    {
+        let shift = lifting_log_size - log_size;
+        let group_idx = (idx >> (shift + 1) << 1) + (idx & 1);
+        let group = group.collect_vec();
+        for chunk in group.chunks(16) {
+            // Hash the raw stored representations: the leaf hash must reproduce the exact
+            // bytes `build_leaves` committed, which are not canonicalized.
+            hasher.update_leaf(
+                &chunk
+                    .iter()
+                    .map(|&&col| columns.raw_value(col, group_idx))
+                    .collect_vec(),
+            );
+        }
+    }
+    hasher.finalize()
 }
 
 #[cfg(test)]
@@ -303,6 +573,100 @@ mod test {
         assert_eq!(
             mixed_degree_merkle_prover.root(),
             lifted_merkle_prover_1.root()
+        );
+    }
+
+    /// A pruned tree must produce the exact same root, queried values, hash witness and aux
+    /// node values as a fully-retained tree.
+    #[test]
+    fn test_pruned_commit_decommit_equivalence() {
+        let max_log_size: u32 = 7;
+        // Lift beyond the largest column to also exercise the trailing lift.
+        let lifting_log_size = max_log_size + 1;
+        let columns: Vec<Vec<BaseField>> = (2..=max_log_size)
+            .map(|i| {
+                (0..1u32 << i)
+                    .map(|j| M31::from_u32_unchecked(j * i + 1))
+                    .collect()
+            })
+            .collect();
+
+        let full = MerkleProverLifted::<CpuBackend, Blake2sMerkleHasher>::commit(
+            columns.iter().collect(),
+            lifting_log_size,
+            0,
+        );
+        let pruned = MerkleProverLifted::<CpuBackend, Blake2sMerkleHasher>::commit_pruned(
+            columns.iter().collect(),
+            lifting_log_size,
+        );
+
+        assert_eq!(full.root(), pruned.root());
+        assert_eq!(full.log_size(), pruned.log_size());
+        assert!(pruned.layers.len() < full.layers.len());
+
+        let queries: Vec<usize> = vec![0, 5, 6, 7, 100, 201, 255];
+        let (values_full, dec_full) = full.decommit(&queries, columns.iter().collect_vec());
+        let (values_pruned, dec_pruned) = pruned.decommit(&queries, columns.iter().collect_vec());
+
+        assert_eq!(values_full, values_pruned);
+        assert_eq!(
+            dec_full.decommitment.hash_witness,
+            dec_pruned.decommitment.hash_witness
+        );
+        assert_eq!(dec_full.aux.all_node_values, dec_pruned.aux.all_node_values);
+    }
+
+    /// Decommitting from a sparse row-gathered view (queried rows + the rows of unretained
+    /// leaves) must produce exactly the same output as decommitting from the full columns.
+    #[test]
+    fn test_gathered_decommit_equivalence() {
+        let max_log_size: u32 = 7;
+        let lifting_log_size = max_log_size + 1;
+        let columns: Vec<Vec<BaseField>> = (2..=max_log_size)
+            .map(|i| {
+                (0..1u32 << i)
+                    .map(|j| M31::from_u32_unchecked(j * i + 3))
+                    .collect()
+            })
+            .collect();
+
+        let pruned = MerkleProverLifted::<CpuBackend, Blake2sMerkleHasher>::commit_pruned(
+            columns.iter().collect(),
+            lifting_log_size,
+        );
+
+        let queries: Vec<usize> = vec![1, 2, 3, 77, 140, 254];
+        let (values_dense, dec_dense) = pruned.decommit(&queries, columns.iter().collect_vec());
+
+        // Gather exactly the rows the decommit needs: the queried rows and the rows of the
+        // unretained leaves, mapped per column.
+        let leaf_indices = pruned.unretained_leaf_indices(&queries);
+        let log_sizes = columns.iter().map(|c| c.len().ilog2()).collect_vec();
+        let rows = columns
+            .iter()
+            .map(|col| {
+                let shift = lifting_log_size - col.len().ilog2();
+                let mut gathered = HashMap::new();
+                for pos in queries.iter().chain(leaf_indices.iter()) {
+                    let row = (pos >> (shift + 1) << 1) + (pos & 1);
+                    gathered.insert(row, col[row]);
+                }
+                gathered
+            })
+            .collect_vec();
+        let gathered = GatheredColumns { log_sizes, rows };
+
+        let (values_gathered, dec_gathered) = pruned.decommit_gathered(&queries, &gathered);
+
+        assert_eq!(values_dense, values_gathered);
+        assert_eq!(
+            dec_dense.decommitment.hash_witness,
+            dec_gathered.decommitment.hash_witness
+        );
+        assert_eq!(
+            dec_dense.aux.all_node_values,
+            dec_gathered.aux.all_node_values
         );
     }
 

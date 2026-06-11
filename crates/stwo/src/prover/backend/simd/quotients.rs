@@ -5,10 +5,10 @@ use num_traits::Zero;
 #[cfg(feature = "parallel")]
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 
-use super::column::CM31Column;
+use super::column::{CM31Column, SecureColumnByCoordsMutSlice};
 use super::domain::CircleDomainBitRevIterator;
 use super::m31::{PackedBaseField, LOG_N_LANES};
-use super::qm31::PackedSecureField;
+use super::qm31::{PackedQM31DelayedDot, PackedSecureField};
 use super::SimdBackend;
 use crate::core::circle::CirclePoint;
 use crate::core::fields::m31::BaseField;
@@ -85,8 +85,13 @@ impl QuotientOps for SimdBackend {
         log_blowup_factor: u32,
         twiddles: &TwiddleTree<Self>,
     ) -> SecureEvaluation<Self, BitReversedOrder> {
-        // This constant is chosen empirically by benchmarking.
-        const COMBINE_CHUNK_SIZE: usize = 16;
+        // This constant is chosen empirically by benchmarking. Retuned 16 -> 32 on Apple M4 Pro
+        // (R2): `compute_quotients_and_combine 2^21` ~-3% vs 16; 64/128 were within noise and no
+        // better. `chunk_acc` is a stack array of `COMBINE_CHUNK_SIZE` `PackedSecureField`
+        // (256 B each = 8 KiB at 32). Inlined into the rayon split (`par_chunks_mut`), it is
+        // replicated per split level (~log2(n_chunks) deep); 8 KiB x depth stays far under the
+        // 2 MiB worker stack even at 2^21.
+        const COMBINE_CHUNK_SIZE: usize = 32;
 
         let eval_domain = CanonicCoset::new(lifting_log_size).circle_domain();
         let (eval_subdomain, _) = eval_domain.split(log_blowup_factor);
@@ -113,8 +118,12 @@ impl QuotientOps for SimdBackend {
                 SecureColumnByCoords::from_cpu(cpu_result.values),
             );
         }
-        let subdomain_points: Vec<CirclePoint<PackedBaseField>> =
-            CircleDomainBitRevIterator::new(eval_subdomain).collect();
+        // Only the y coordinates are used in the combine loop below; storing just them halves
+        // this buffer and improves its cache locality.
+        let subdomain_points_y: Vec<PackedBaseField> =
+            CircleDomainBitRevIterator::new(eval_subdomain)
+                .map(|points| points.y)
+                .collect();
         let subdomain_log_size = eval_subdomain.log_size();
         let mut quotients: SecureColumnByCoords<SimdBackend> =
             unsafe { SecureColumnByCoords::uninitialized(1 << subdomain_log_size) };
@@ -166,7 +175,7 @@ impl QuotientOps for SimdBackend {
                         }));
 
                     let numerator = lifted_partial_numerator
-                        - *first_linear_term * subdomain_points[domain_idx].y;
+                        - *first_linear_term * subdomain_points_y[domain_idx];
                     *accumulator += numerator * den_inv[domain_idx];
                 }
             }
@@ -211,11 +220,14 @@ fn accumulate_numerators_on_subdomain(
     columns: &[&CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>],
     quotient_coeffs: &[(SecureField, SecureField, SecureField)],
 ) -> SecureColumnByCoords<SimdBackend> {
-    // This constant is chosen empirically by benchmarking.
-    const NUMERATORS_CHUNK_SIZE: usize = 1 << 6;
-
     let mut values =
         unsafe { SecureColumnByCoords::<SimdBackend>::uninitialized(subdomain.size()) };
+
+    // The `b` terms are constant across the domain: sum_j (c_j * val_j - b_j) =
+    // (sum_j c_j * val_j) - sum_j b_j. Hoisting the `- b` out of the inner loop saves one
+    // secure-field subtraction per column per point (exact field arithmetic, same result).
+    let b_sum_broadcast =
+        PackedSecureField::broadcast(quotient_coeffs.iter().map(|(_, b, _)| *b).sum());
 
     #[cfg(not(feature = "parallel"))]
     let iter = values.chunks_mut(NUMERATORS_CHUNK_SIZE);
@@ -224,45 +236,99 @@ fn accumulate_numerators_on_subdomain(
     let iter = values.par_chunks_mut(NUMERATORS_CHUNK_SIZE);
 
     iter.enumerate().for_each(|(chunk_idx, mut values_dst)| {
-        let chunk_start = chunk_idx * NUMERATORS_CHUNK_SIZE;
-        // Initialize accumulators for the chunk.
-        let mut accumulators = [PackedSecureField::zero(); NUMERATORS_CHUNK_SIZE];
-        // This is needed because the last chunk may be smaller than
-        // `NUMERATORS_CHUNK_SIZE`.
-        let packed_chunk_len = values_dst.0[0].0.len();
-        let accumulators = &mut accumulators[..packed_chunk_len];
-
-        for (numerator_data, (_, b, c)) in zip_eq(&sample_batch.cols_vals_randpows, quotient_coeffs)
-        {
-            let col_data = &columns[numerator_data.column_index].data;
-            let b_broadcast = PackedSecureField::broadcast(*b);
-            let c_broadcast = PackedSecureField::broadcast(*c);
-            for (i, acc) in accumulators.iter_mut().enumerate() {
-                let val = col_data[chunk_start + i];
-                *acc += c_broadcast * val - b_broadcast;
-            }
-        }
-
-        for (i, acc) in accumulators.iter().enumerate() {
-            unsafe {
-                values_dst.set_packed(i, *acc);
-            }
-        }
+        accumulate_numerators_chunk(
+            chunk_idx * NUMERATORS_CHUNK_SIZE,
+            &mut values_dst,
+            sample_batch,
+            columns,
+            quotient_coeffs,
+            b_sum_broadcast,
+        );
     });
     values
+}
+
+// This constant is chosen empirically by benchmarking. R2 re-tuning on Apple M4 Pro kept 1<<6
+// (64): vs 64, 1<<7 (128) measured flat (three warm runs of `accumulate_numerators 2^21 x 100
+// cols`: -1.0%, +0.9%, +0.9% — all within run-to-run noise), and 1<<8 (256) clearly regressed
+// (+19%) as the leaf accumulator frame crosses ~130 KiB and cache/alloc pressure dominates. The
+// `accumulators` array in `accumulate_numerators_chunk` is `NUMERATORS_CHUNK_SIZE` x
+// `PackedQM31DelayedDot` (520 B each): ~33 KiB at 64, ~67 KiB at 128, ~130 KiB at 256. Because
+// that function is `#[inline(never)]` the frame exists once per worker (not per rayon split
+// level), so 64 stays comfortably within bounds; see the doc comment on
+// `accumulate_numerators_chunk`.
+const NUMERATORS_CHUNK_SIZE: usize = 1 << 6;
+
+/// Processes one chunk of [`accumulate_numerators_on_subdomain`].
+///
+/// `#[inline(never)]` is load-bearing: under the `parallel` feature this body runs inside
+/// rayon's recursive producer/consumer splitter (`bridge_producer_consumer::helper`). The
+/// chunk's delayed-reduction accumulator array (`NUMERATORS_CHUNK_SIZE` ×
+/// `PackedQM31DelayedDot`, 520 B each ≈ 33 KiB at the current `1 << 6`, plus SIMD register
+/// spills) must stay out of that recursive frame — inlined, it is replicated once per split
+/// level (~log2(n_chunks) deep) and overflows the 2 MiB rayon worker stack on large domains
+/// (observed: SIGABRT at 2^21). As a leaf call the large frame exists exactly once per worker.
+#[inline(never)]
+fn accumulate_numerators_chunk(
+    chunk_start: usize,
+    values_dst: &mut SecureColumnByCoordsMutSlice<'_>,
+    sample_batch: &ColumnSampleBatch,
+    columns: &[&CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>],
+    quotient_coeffs: &[(SecureField, SecureField, SecureField)],
+    b_sum_broadcast: PackedSecureField,
+) {
+    // This is needed because the last chunk may be smaller than
+    // `NUMERATORS_CHUNK_SIZE`.
+    let packed_chunk_len = values_dst.0[0].0.len();
+
+    // Delayed-reduction accumulators, one per point in the chunk. Each accumulates the
+    // dot product `Σ_j c_j · val_j` over the sample batch's columns with the modular
+    // reduction deferred to `finalize` (strategy 2: per-product `hi + lo` partial
+    // reduction), instead of reducing every `PackedSecureField * PackedM31` product as
+    // the previous `*acc += c_broadcast * val` did. This computes the identical field
+    // element — a re-association of exact integer arithmetic. The number of accumulated
+    // terms equals the number of columns in the batch (`quotient_coeffs.len()`), far
+    // below the accumulator's `DOT_DELAYED_MAX_LEN` bound; `accumulate` debug-asserts it.
+    // Initialize accumulators for the chunk.
+    let mut accumulators = [(); NUMERATORS_CHUNK_SIZE].map(|()| PackedQM31DelayedDot::new());
+    let accumulators = &mut accumulators[..packed_chunk_len];
+
+    for (numerator_data, (_, _, c)) in zip_eq(&sample_batch.cols_vals_randpows, quotient_coeffs) {
+        let col_data = &columns[numerator_data.column_index].data;
+        // The coefficient `c` is a scalar `QM31`, constant across the chunk; decompose it
+        // into its four M31 coordinates once per column.
+        let c_coords = c.to_m31_array();
+        for (i, acc) in accumulators.iter_mut().enumerate() {
+            let val = col_data[chunk_start + i];
+            acc.accumulate(&c_coords, val);
+        }
+    }
+
+    for (i, acc) in accumulators.iter().enumerate() {
+        // Reduce once, then hoist out the constant `- b_sum` (same as before).
+        unsafe {
+            values_dst.set_packed(i, acc.finalize() - b_sum_broadcast);
+        }
+    }
 }
 
 fn denominator_inverses(
     sample_points: &[CirclePoint<SecureField>],
     domain: CircleDomain,
 ) -> Vec<Vec<PackedCM31>> {
-    let domain_points = CircleDomainBitRevIterator::new(domain);
+    // Materialize the domain points once; they are shared by all sample points. This avoids
+    // regenerating the (relatively expensive) bit-reversed domain iteration per sample point.
+    #[cfg(not(feature = "parallel"))]
+    let domain_points: Vec<CirclePoint<PackedBaseField>> =
+        CircleDomainBitRevIterator::new(domain).collect();
+    #[cfg(feature = "parallel")]
+    let domain_points: Vec<CirclePoint<PackedBaseField>> =
+        CircleDomainBitRevIterator::new(domain).par_iter().collect();
 
     #[cfg(not(feature = "parallel"))]
-    let (domain_points_iter, sample_points_iter) = (domain_points, sample_points.iter());
+    let sample_points_iter = sample_points.iter();
     #[cfg(feature = "parallel")]
-    let (domain_points_iter, sample_points_iter) =
-        (domain_points.par_iter(), sample_points.par_iter());
+    let sample_points_iter = sample_points.par_iter();
 
     sample_points_iter
         .map(|sample_point| {
@@ -272,9 +338,8 @@ fn denominator_inverses(
             let pix = PackedCM31::broadcast(sample_point.x.1);
             let piy = PackedCM31::broadcast(sample_point.y.1);
 
-            // The iter itself is cloned for each sample batch.
-            let denominators = domain_points_iter
-                .clone()
+            let denominators = domain_points
+                .iter()
                 .map(|points| (prx - points.x) * piy - (pry - points.y) * pix)
                 .collect::<Vec<_>>();
             PackedCM31::batch_inverse(&denominators)

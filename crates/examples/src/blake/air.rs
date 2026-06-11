@@ -306,6 +306,10 @@ where
     // Setup protocol.
     let channel = &mut MC::C::default();
     let mut commitment_scheme = CommitmentSchemeProver::new(config, &twiddles);
+    // Benchmarking hook: LOW_MEMORY=1 enables the low-memory proving mode (identical proof).
+    if std::env::var("LOW_MEMORY").is_ok() {
+        commitment_scheme.set_low_memory();
+    }
     // Preprocessed trace.
     // TODO(ShaharS): share is_first column between components when constant columns support this.
     let span = span!(Level::INFO, "Preprocessed Trace").entered();

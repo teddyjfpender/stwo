@@ -1,4 +1,8 @@
 #![cfg_attr(feature = "prover", feature(portable_simd))]
+// `min_specialization` powers the additive SIMD fast path for `LookupElements::combine`
+// (see `logup.rs`). It is only needed when the prover (and thus the packed field types) is
+// compiled in; the generic combine path is untouched.
+#![cfg_attr(feature = "prover", feature(min_specialization))]
 #![cfg_attr(not(feature = "std"), no_std)]
 
 /// ! This module contains helpers to express and use constraints for components.

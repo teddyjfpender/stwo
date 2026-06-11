@@ -160,7 +160,16 @@ impl PolyOps for SimdBackend {
 
         // TODO(alont): Cache this inversion.
         let inv = PackedBaseField::broadcast(BaseField::from(eval.domain.size()).inverse());
+        #[cfg(not(feature = "parallel"))]
         values.data.iter_mut().for_each(|x| *x *= inv);
+        // `with_min_len` keeps small columns on a single thread, avoiding rayon dispatch
+        // overhead when many small columns are interpolated in a parallel outer loop.
+        #[cfg(feature = "parallel")]
+        values
+            .data
+            .par_iter_mut()
+            .with_min_len(1 << 13)
+            .for_each(|x| *x *= inv);
 
         CircleCoefficients::new(values)
     }
@@ -272,9 +281,14 @@ impl PolyOps for SimdBackend {
             })
             .collect_vec();
 
+        // `with_min_len` keeps small weight columns on a single thread: each item is a handful of
+        // `point_vanishing`s (the second loop below is a single packed multiply), so rayon
+        // dispatch dominates for small `weights_vec_len`. Same threshold as `interpolate`'s
+        // normalization loop above.
         #[cfg(feature = "parallel")]
         let vi_p: Vec<PackedSecureField> = (0..weights_vec_len)
             .into_par_iter()
+            .with_min_len(1 << 13)
             .map(|i| {
                 PackedSecureField::from_array(std::array::from_fn(|j| {
                     point_vanishing(
@@ -309,9 +323,11 @@ impl PolyOps for SimdBackend {
             .map(|i| vi_p_inverse[i] * si_i_vn_p)
             .collect_vec();
 
+        // One packed multiply per item — keep small columns single-threaded (see `vi_p` above).
         #[cfg(feature = "parallel")]
         let weights: Vec<PackedSecureField> = (0..weights_vec_len)
             .into_par_iter()
+            .with_min_len(1 << 13)
             .map(|i| vi_p_inverse[i] * si_i_vn_p)
             .collect();
 
@@ -408,9 +424,16 @@ impl PolyOps for SimdBackend {
         let twiddles = domain_line_twiddles_from_tree(domain, &twiddles.twiddles);
 
         // Evaluate on big domains by evaluating on several subdomains.
-        let log_subdomains = log_size - fft_log_size;
+        // Each subdomain FFT reads the shared coefficients and writes a disjoint chunk of the
+        // output buffer, so the subdomains can be processed in parallel.
+        let subdomain_n_vecs = 1 << (fft_log_size - LOG_N_LANES);
 
-        for i in 0..(1 << log_subdomains) {
+        #[cfg(not(feature = "parallel"))]
+        let iter = buffer.data.chunks_mut(subdomain_n_vecs).enumerate();
+        #[cfg(feature = "parallel")]
+        let iter = buffer.data.par_chunks_mut(subdomain_n_vecs).enumerate();
+
+        iter.for_each(|(i, chunk)| {
             // The subdomain twiddles are a slice of the large domain twiddles.
             let subdomain_twiddles = (0..(fft_log_size - 1))
                 .map(|layer_i| {
@@ -419,20 +442,16 @@ impl PolyOps for SimdBackend {
                 })
                 .collect::<Vec<_>>();
 
-            // FFT from the coefficients buffer directly into the provided buffer.
+            // FFT from the coefficients buffer directly into the corresponding output chunk.
             unsafe {
                 rfft::fft(
                     transmute::<*const PackedBaseField, *const u32>(poly.coeffs.data.as_ptr()),
-                    transmute::<*mut PackedBaseField, *mut u32>(
-                        buffer.data[i << (fft_log_size - LOG_N_LANES)
-                            ..(i + 1) << (fft_log_size - LOG_N_LANES)]
-                            .as_mut_ptr(),
-                    ),
+                    transmute::<*mut PackedBaseField, *mut u32>(chunk.as_mut_ptr()),
                     &subdomain_twiddles,
                     fft_log_size as usize,
                 );
             }
-        }
+        });
 
         CircleEvaluation::new(domain, buffer)
     }
@@ -541,6 +560,58 @@ impl PolyOps for SimdBackend {
             }),
         )
     }
+
+    /// The exact inverse of [`Self::split_at_mid`]: undoes the per-half transposes, concatenates,
+    /// and re-applies the full-size transpose ([`transpose_vecs`] is an involution).
+    fn join_at_mid(
+        left: CircleCoefficients<Self>,
+        right: CircleCoefficients<Self>,
+    ) -> CircleCoefficients<Self> {
+        assert_eq!(left.coeffs.length, right.coeffs.length);
+        let length = left.coeffs.length + right.coeffs.length;
+
+        // If the result fits in one SIMD vector, join on the CPU.
+        if length <= 1 << LOG_N_LANES {
+            let mut cpu_vec = left.coeffs.to_cpu();
+            cpu_vec.extend(right.coeffs.to_cpu());
+            return CircleCoefficients::new(cpu_vec.into_iter().collect());
+        }
+
+        let log_length = length.ilog2();
+        let log_n_vecs = log_length - LOG_N_LANES;
+
+        let mut data = left.coeffs.data;
+        let mut right_data = right.coeffs.data;
+
+        // Undo the per-half transposes that `split_at_mid` applies when the halves are large.
+        if log_length - 1 > CACHED_FFT_LOG_SIZE {
+            unsafe {
+                transpose_vecs(
+                    transmute::<*mut PackedBaseField, *mut u32>(data.as_mut_ptr()),
+                    (log_n_vecs - 1) as usize,
+                );
+                transpose_vecs(
+                    transmute::<*mut PackedBaseField, *mut u32>(right_data.as_mut_ptr()),
+                    (log_n_vecs - 1) as usize,
+                );
+            }
+        }
+
+        data.append(&mut right_data);
+
+        // Re-apply the full-size transpose: for large polynomials the FFT expects the
+        // coefficients in transposed order.
+        if log_length > CACHED_FFT_LOG_SIZE {
+            unsafe {
+                transpose_vecs(
+                    transmute::<*mut PackedBaseField, *mut u32>(data.as_mut_ptr()),
+                    log_n_vecs as usize,
+                );
+            }
+        }
+
+        CircleCoefficients::new(BaseColumn { data, length })
+    }
 }
 
 fn compute_small_coset_twiddles(coset: Coset) -> TwiddleTree<SimdBackend> {
@@ -634,7 +705,9 @@ mod tests {
 
     #[test]
     fn test_interpolate_and_eval() {
-        for log_size in MIN_FFT_LOG_SIZE..CACHED_FFT_LOG_SIZE + 4 {
+        // Covers past 2^20: the low-memory mode's bit-exact regeneration relies on this
+        // round-trip identity, including in the transposed-coefficients regime.
+        for log_size in MIN_FFT_LOG_SIZE..=CACHED_FFT_LOG_SIZE + 5 {
             let domain = CanonicCoset::new(log_size).circle_domain();
             let evaluation = CircleEvaluation::<SimdBackend, BaseField, BitReversedOrder>::new(
                 domain,
@@ -820,6 +893,30 @@ mod tests {
                 + random_point.repeated_double(log_size - 2).x * right.eval_at_point(random_point),
             poly.eval_at_point(random_point)
         );
+    }
+
+    /// `join_at_mid` must be the bit-exact inverse of `split_at_mid` across all layout regimes
+    /// (CPU fallback, plain order, transposed whole, transposed halves).
+    #[test]
+    fn test_join_at_mid_inverts_split_at_mid() {
+        let mut rng = SmallRng::seed_from_u64(0);
+        for log_size in [
+            3,
+            LOG_N_LANES,
+            10,
+            CACHED_FFT_LOG_SIZE,
+            CACHED_FFT_LOG_SIZE + 1,
+            CACHED_FFT_LOG_SIZE + 2,
+            CACHED_FFT_LOG_SIZE + 3,
+        ] {
+            let coeffs: Vec<BaseField> = (0..1 << log_size).map(|_| rng.gen()).collect();
+            let poly = CircleCoefficients::<SimdBackend>::new(coeffs.iter().copied().collect());
+
+            let (left, right) = poly.split_at_mid();
+            let joined = SimdBackend::join_at_mid(left, right);
+
+            assert_eq!(joined.coeffs.to_cpu(), coeffs, "log_size = {log_size}");
+        }
     }
 
     #[test]

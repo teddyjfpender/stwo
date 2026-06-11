@@ -59,8 +59,19 @@ pub trait Column<T>: Clone + Debug + FromIterator<T> + Send + Sync {
     }
     /// Retrieves the element at the given index.
     fn at(&self, index: usize) -> T;
+    /// Retrieves the element at the given index without canonicalizing its representation.
+    ///
+    /// Backends whose stored representation may be unreduced (e.g. SIMD columns holding
+    /// `[0, P]`) return the raw stored value; the default forwards to [`Self::at`]. Used where
+    /// the exact stored bytes matter, such as recomputing Merkle leaf hashes.
+    fn at_unreduced(&self, index: usize) -> T {
+        self.at(index)
+    }
     /// Sets the element at the given index.
     fn set(&mut self, index: usize, value: T);
     /// Splits the column into two halves.
     fn split_at_mid(self) -> (Self, Self);
+    /// Shrinks the column's backing allocation to fit its length. Backends without a
+    /// meaningful implementation may leave this as a no-op.
+    fn shrink_to_fit(&mut self) {}
 }

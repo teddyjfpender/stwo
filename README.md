@@ -183,6 +183,22 @@ cargo test --no-default-features --package stwo
 (cd ensure-verifier-no_std && cargo build --release)
 ```
 
+### Performance builds (important on x86_64)
+
+The SIMD backend selects its M31 multiplication and FFT kernels at **compile time** from the
+enabled target features. On `aarch64`, NEON is part of the baseline target, so release builds
+get the optimized kernels automatically. On `x86_64`, the baseline target does **not** include
+AVX2/AVX-512 — a plain `cargo build --release` silently falls back to the portable kernels and
+leaves substantial prover throughput on the table. Enable the features explicitly:
+
+```bash
+# Best for binaries that run on the build machine:
+RUSTFLAGS="-C target-cpu=native" cargo build --release --features "prover,parallel"
+
+# For distributable binaries, pick an explicit feature baseline instead, e.g.:
+RUSTFLAGS="-C target-feature=+avx2" cargo build --release --features "prover,parallel"
+```
+
 ### Lint and format
 
 ```bash

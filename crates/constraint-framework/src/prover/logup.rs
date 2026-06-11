@@ -114,10 +114,20 @@ impl LogupTraceGenerator {
     ) {
         let mut last_col_coords = self.trace.pop().unwrap().columns;
 
-        // Compute cumsum_shift.
+        // Compute cumsum_shift. Field addition is associative and commutative, so the parallel
+        // sum yields the exact same value.
+        #[cfg(not(feature = "parallel"))]
         let coordinate_sums = last_col_coords.each_ref().map(|c| {
             c.data
                 .iter()
+                .copied()
+                .sum::<PackedBaseField>()
+                .pointwise_sum()
+        });
+        #[cfg(feature = "parallel")]
+        let coordinate_sums = last_col_coords.each_ref().map(|c| {
+            c.data
+                .par_iter()
                 .copied()
                 .sum::<PackedBaseField>()
                 .pointwise_sum()
@@ -126,12 +136,29 @@ impl LogupTraceGenerator {
         let cumsum_shift = claimed_sum / BaseField::from_u32_unchecked(1 << self.log_size);
         let packed_cumsum_shift = PackedSecureField::broadcast(cumsum_shift);
 
+        let shift_coords = packed_cumsum_shift.into_packed_m31s();
         last_col_coords.iter_mut().enumerate().for_each(|(i, c)| {
+            #[cfg(not(feature = "parallel"))]
+            c.data.iter_mut().for_each(|x| *x -= shift_coords[i]);
+            #[cfg(feature = "parallel")]
             c.data
-                .iter_mut()
-                .for_each(|x| *x -= packed_cumsum_shift.into_packed_m31s()[i])
+                .par_iter_mut()
+                .with_min_len(1 << 12)
+                .for_each(|x| *x -= shift_coords[i]);
         });
+
+        // The prefix sum of each coordinate column is independent; run the four in parallel.
+        #[cfg(not(feature = "parallel"))]
         let coord_prefix_sum = last_col_coords.map(inclusive_prefix_sum);
+        #[cfg(feature = "parallel")]
+        let coord_prefix_sum = {
+            let [c0, c1, c2, c3] = last_col_coords;
+            let ((p0, p1), (p2, p3)) = rayon::join(
+                || rayon::join(|| inclusive_prefix_sum(c0), || inclusive_prefix_sum(c1)),
+                || rayon::join(|| inclusive_prefix_sum(c2), || inclusive_prefix_sum(c3)),
+            );
+            [p0, p1, p2, p3]
+        };
         let secure_prefix_sum = SecureColumnByCoords {
             columns: coord_prefix_sum,
         };
@@ -176,8 +203,9 @@ impl LogupColGenerator<'_> {
 
     /// Finalizes generating the column.
     pub fn finalize_col(mut self) {
-        // Column size is a power of 2.
-        let chunk_size = std::cmp::min(4, self.gen.denom.data.len());
+        // Column size is a power of 2. The chunk size balances task-scheduling overhead
+        // against load balancing; at 4 packed rows per task the rayon overhead dominated.
+        let chunk_size = std::cmp::min(1 << 7, self.gen.denom.data.len());
         batch_inverse_packed_qm31(&self.gen.denom.data, &mut self.gen.batch_inverse_buffer);
 
         #[cfg(feature = "parallel")]

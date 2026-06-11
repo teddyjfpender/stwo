@@ -2,6 +2,7 @@ use std::iter::Sum;
 use std::mem::transmute;
 use std::ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign};
 use std::ptr;
+use std::simd::num::SimdUint;
 use std::simd::{u32x16, Simd};
 
 use bytemuck::{Pod, Zeroable};
@@ -335,77 +336,65 @@ impl Sum for PackedM31 {
 
 cfg_if::cfg_if! {
     if #[cfg(all(target_arch = "aarch64", target_feature = "neon"))] {
-        use core::arch::aarch64::{uint32x2_t, vmull_u32, int32x2_t, vqdmull_s32};
-        use std::simd::u32x4;
+        use core::arch::aarch64::{
+            uint32x4_t, vandq_u32, vdupq_n_u32, vmulq_u32, vqdmulhq_s32, vreinterpretq_s32_u32,
+            vreinterpretq_u32_s32, vshrq_n_u32,
+        };
 
         /// Returns `a * b`.
+        ///
+        /// Decomposes `a * b = hi * 2^31 + lo` (with `lo < 2^31`); since `2^31 = 1 (mod P)`,
+        /// `a * b = hi + lo (mod P)`:
+        /// - `hi = (a * b) >> 31 = (2ab) >> 32`, which is exactly `vqdmulhq_s32(a, b)`. The
+        ///   inputs are in `[0, P]` so they are non-negative as `i32`, and
+        ///   `2ab <= 2 * P^2 < 2^63` so the doubling multiply never saturates.
+        /// - `lo = (a * b) mod 2^31`, the low 32 bits of the product with the top bit cleared.
         pub(crate) fn mul_neon(a: PackedM31, b: PackedM31) -> PackedM31 {
-            let [a0, a1, a2, a3, a4, a5, a6, a7]: [int32x2_t; 8] = unsafe { transmute(a) };
-            let [b0, b1, b2, b3, b4, b5, b6, b7]: [int32x2_t; 8] = unsafe { transmute(b) };
+            let a4: [uint32x4_t; 4] = unsafe { transmute(a) };
+            let b4: [uint32x4_t; 4] = unsafe { transmute(b) };
 
-            // Each c_i contains |0|prod_lo|prod_hi|0|0|prod_lo|prod_hi|0|
-            let c0: u32x4 = unsafe { transmute(vqdmull_s32(a0, b0)) };
-            let c1: u32x4 = unsafe { transmute(vqdmull_s32(a1, b1)) };
-            let c2: u32x4 = unsafe { transmute(vqdmull_s32(a2, b2)) };
-            let c3: u32x4 = unsafe { transmute(vqdmull_s32(a3, b3)) };
-            let c4: u32x4 = unsafe { transmute(vqdmull_s32(a4, b4)) };
-            let c5: u32x4 = unsafe { transmute(vqdmull_s32(a5, b5)) };
-            let c6: u32x4 = unsafe { transmute(vqdmull_s32(a6, b6)) };
-            let c7: u32x4 = unsafe { transmute(vqdmull_s32(a7, b7)) };
+            let hi4: [uint32x4_t; 4] = std::array::from_fn(|i| unsafe {
+                vreinterpretq_u32_s32(vqdmulhq_s32(
+                    vreinterpretq_s32_u32(a4[i]),
+                    vreinterpretq_s32_u32(b4[i]),
+                ))
+            });
+            let lo4: [uint32x4_t; 4] = std::array::from_fn(|i| unsafe {
+                vandq_u32(vmulq_u32(a4[i], b4[i]), vdupq_n_u32((1 << 31) - 1))
+            });
 
-            // *_lo contain `|prod_lo|0|prod_lo|0|prod_lo0|0|prod_lo|0|`.
-            // *_hi contain `|0|prod_hi|0|prod_hi|0|prod_hi|0|prod_hi|`.
-            let (mut c0_c1_lo, c0_c1_hi) = c0.deinterleave(c1);
-            let (mut c2_c3_lo, c2_c3_hi) = c2.deinterleave(c3);
-            let (mut c4_c5_lo, c4_c5_hi) = c4.deinterleave(c5);
-            let (mut c6_c7_lo, c6_c7_hi) = c6.deinterleave(c7);
-
-            // *_lo contain `|0|prod_lo|0|prod_lo|0|prod_lo|0|prod_lo|`.
-            c0_c1_lo >>= 1;
-            c2_c3_lo >>= 1;
-            c4_c5_lo >>= 1;
-            c6_c7_lo >>= 1;
-
-            let lo: PackedM31 = unsafe { transmute([c0_c1_lo, c2_c3_lo, c4_c5_lo, c6_c7_lo]) };
-            let hi: PackedM31 = unsafe { transmute([c0_c1_hi, c2_c3_hi, c4_c5_hi, c6_c7_hi]) };
-
-            lo + hi
+            // `hi <= P - 1` and `lo <= P`, so both are valid (unreduced) PackedM31 values and
+            // the field addition reduces the result to `[0, P]`.
+            let hi: PackedM31 = unsafe { transmute(hi4) };
+            let lo: PackedM31 = unsafe { transmute(lo4) };
+            hi + lo
         }
 
         /// Returns `a * b`.
         ///
-        /// `b_double` should be in the range `[0, 2P]`.
+        /// `b_double` must equal `2 * b` for `b` in the range `[0, P]` (in particular, it is
+        /// even). See [`mul_neon`] for the decomposition; here
+        /// `hi = vqdmulhq_s32(a, b_double >> 1)` and `lo` is the low 32 bits of
+        /// `a * b_double = 2ab`, shifted right once (bits `1..32` of `2ab` are bits `0..31`
+        /// of `ab`, of which the top one belongs to `hi`).
         pub(crate) fn mul_doubled_neon(a: PackedM31, b_double: u32x16) -> PackedM31 {
-            let [a0, a1, a2, a3, a4, a5, a6, a7]: [uint32x2_t; 8] = unsafe { transmute(a) };
-            let [b0, b1, b2, b3, b4, b5, b6, b7]: [uint32x2_t; 8] = unsafe { transmute(b_double) };
+            let a4: [uint32x4_t; 4] = unsafe { transmute(a) };
+            let b_double4: [uint32x4_t; 4] = unsafe { transmute(b_double) };
 
-            // Each c_i contains |0|prod_lo|prod_hi|0|0|prod_lo|prod_hi|0|
-            let c0: u32x4 = unsafe { transmute(vmull_u32(a0, b0)) };
-            let c1: u32x4 = unsafe { transmute(vmull_u32(a1, b1)) };
-            let c2: u32x4 = unsafe { transmute(vmull_u32(a2, b2)) };
-            let c3: u32x4 = unsafe { transmute(vmull_u32(a3, b3)) };
-            let c4: u32x4 = unsafe { transmute(vmull_u32(a4, b4)) };
-            let c5: u32x4 = unsafe { transmute(vmull_u32(a5, b5)) };
-            let c6: u32x4 = unsafe { transmute(vmull_u32(a6, b6)) };
-            let c7: u32x4 = unsafe { transmute(vmull_u32(a7, b7)) };
+            let hi4: [uint32x4_t; 4] = std::array::from_fn(|i| unsafe {
+                vreinterpretq_u32_s32(vqdmulhq_s32(
+                    vreinterpretq_s32_u32(a4[i]),
+                    vreinterpretq_s32_u32(vshrq_n_u32::<1>(b_double4[i])),
+                ))
+            });
+            // The logical shift right already clears the top bit, so no mask is needed.
+            let lo4: [uint32x4_t; 4] = std::array::from_fn(|i| unsafe {
+                vshrq_n_u32::<1>(vmulq_u32(a4[i], b_double4[i]))
+            });
 
-            // *_lo contain `|prod_lo|0|prod_lo|0|prod_lo0|0|prod_lo|0|`.
-            // *_hi contain `|0|prod_hi|0|prod_hi|0|prod_hi|0|prod_hi|`.
-            let (mut c0_c1_lo, c0_c1_hi) = c0.deinterleave(c1);
-            let (mut c2_c3_lo, c2_c3_hi) = c2.deinterleave(c3);
-            let (mut c4_c5_lo, c4_c5_hi) = c4.deinterleave(c5);
-            let (mut c6_c7_lo, c6_c7_hi) = c6.deinterleave(c7);
-
-            // *_lo contain `|0|prod_lo|0|prod_lo|0|prod_lo|0|prod_lo|`.
-            c0_c1_lo >>= 1;
-            c2_c3_lo >>= 1;
-            c4_c5_lo >>= 1;
-            c6_c7_lo >>= 1;
-
-            let lo: PackedM31 = unsafe { transmute([c0_c1_lo, c2_c3_lo, c4_c5_lo, c6_c7_lo]) };
-            let hi: PackedM31 = unsafe { transmute([c0_c1_hi, c2_c3_hi, c4_c5_hi, c6_c7_hi]) };
-
-            lo + hi
+            let hi: PackedM31 = unsafe { transmute(hi4) };
+            let lo: PackedM31 = unsafe { transmute(lo4) };
+            hi + lo
         }
     } else if #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))] {
         use core::arch::wasm32::{i64x2_extmul_high_u32x4, i64x2_extmul_low_u32x4, v128};
@@ -418,7 +407,9 @@ cfg_if::cfg_if! {
 
         /// Returns `a * b`.
         ///
-        /// `b_double` should be in the range `[0, 2P]`.
+        /// `b_double` must equal `2 * b` for `b` in the range `[0, P]` (in particular, it is
+        /// even). The aarch64 kernel relies on the evenness; treat it as the contract of the
+        /// whole `mul_doubled_*` family.
         pub(crate) fn mul_doubled_wasm(a: PackedM31, b_double: u32x16) -> PackedM31 {
             let [a0, a1, a2, a3]: [v128; 4] = unsafe { transmute(a) };
             let [b_double0, b_double1, b_double2, b_double3]: [v128; 4] = unsafe { transmute(b_double) };
@@ -459,7 +450,9 @@ cfg_if::cfg_if! {
 
         /// Returns `a * b`.
         ///
-        /// `b_double` should be in the range `[0, 2P]`.
+        /// `b_double` must equal `2 * b` for `b` in the range `[0, P]` (in particular, it is
+        /// even). The aarch64 kernel relies on the evenness; treat it as the contract of the
+        /// whole `mul_doubled_*` family.
         pub(crate) fn mul_doubled_avx512(a: PackedM31, b_double: u32x16) -> PackedM31 {
             let a: __m512i = unsafe { transmute(a) };
             let b_double: __m512i = unsafe { transmute(b_double) };
@@ -510,7 +503,9 @@ cfg_if::cfg_if! {
 
         /// Returns `a * b`.
         ///
-        /// `b_double` should be in the range `[0, 2P]`.
+        /// `b_double` must equal `2 * b` for `b` in the range `[0, P]` (in particular, it is
+        /// even). The aarch64 kernel relies on the evenness; treat it as the contract of the
+        /// whole `mul_doubled_*` family.
         pub(crate) fn mul_doubled_avx2(a: PackedM31, b_double: u32x16) -> PackedM31 {
             let [a0, a1]: [__m256i; 2] = unsafe { transmute::<PackedM31, [__m256i; 2]>(a) };
             let [b0_dbl, b1_dbl]: [__m256i; 2] = unsafe { transmute::<u32x16, [__m256i; 2]>(b_double) };
@@ -575,7 +570,9 @@ cfg_if::cfg_if! {
         ///
         /// Should only be used in the absence of a platform specific implementation.
         ///
-        /// `b_double` should be in the range `[0, 2P]`.
+        /// `b_double` must equal `2 * b` for `b` in the range `[0, P]` (in particular, it is
+        /// even). The aarch64 kernel relies on the evenness; treat it as the contract of the
+        /// whole `mul_doubled_*` family.
         pub(crate) fn mul_doubled_simd(a: PackedM31, b_double: u32x16) -> PackedM31 {
             const MASK_EVENS: Simd<u64, { N_LANES / 2 }> = Simd::from_array([0xFFFFFFFF; { N_LANES / 2 }]);
 
@@ -633,6 +630,148 @@ pub fn reduce_to_m31_simd(val: u32x16) -> u32x16 {
     ((((val >> MODULUS_BITS) + val + u32x16::splat(1)) >> MODULUS_BITS) + val) & u32x16::splat(P)
 }
 
+// ---------------------------------------------------------------------------
+// Delayed-reduction dot products (R1).
+//
+// These primitives compute Σ a_i · b_i over `PackedM31` lanes while deferring the
+// modular reduction to the very end of the loop, instead of reducing each product
+// individually as `PackedM31::mul` does. They compute the *identical* field element a
+// naive reduced fold would, but with fewer reductions; this is a pure re-association of
+// exact integer arithmetic, no rounding or probabilistic argument.
+//
+// ## Mathematical basis
+//
+// Work in M31, p = 2^31 − 1, so 2^31 ≡ 1 (mod p). Inputs are `PackedM31` values, which
+// per the representation invariant lie in `[0, P]` (the boundary value `P` is allowed,
+// see `PackedM31`'s doc comment). For inputs a, b ∈ [0, P]:
+//   - full product a·b ≤ P² = 2^62 − 2^32 + 1 < 2^62, and
+//   - the Mersenne split a·b = hi·2^31 + lo with hi, lo < 2^31 satisfies a·b ≡ hi + lo (mod p),
+//     where hi + lo < 2^32.
+//
+// ## Accumulation strategy (strategy 2 from the spec: per-product partial reduction)
+//
+// For each term we fold the full 64-bit product into `hi + lo < 2^32` and accumulate that
+// in a per-lane u64. After `k` terms the accumulator is `< k · 2^32`. The final
+// single-pass Mersenne reduction (see [`reduce_u64_lanes_to_m31`]) is the same one the
+// scalar `M31::reduce` uses, which is exact for accumulators `< 2^62`. We therefore cap the
+// supported length at [`DOT_DELAYED_MAX_LEN`] = 2^30 so that `len · 2^32 ≤ 2^62`, and
+// `debug_assert!` it. Real call sites are orders of magnitude shorter (≤ a few thousand), so
+// the cap never binds in practice.
+//
+// Strategy 2 is chosen over strategy 1 (accumulating full < 2^62 products, which overflows
+// u64 after only 3 adds and needs a fold every ≤ 3 terms) because the per-term cost is one
+// extra add but no fold bookkeeping, and the loop lengths here are tiny relative to the
+// 2^30 cap. The benefit over the naive fold is removing the per-product compare/min/select
+// reduction (and, for the QM31 sites, the cross-coordinate adds).
+//
+// ## Output representation
+//
+// The single-pass reduction returns a value in `[0, P]` — like every other `PackedM31` op,
+// it may return the boundary `P` (the unreduced representative of 0) rather than 0. This
+// matches the representation the naive `PackedM31` fold produces for the same inputs, so the
+// result is byte-identical to the naive path, and `[0, P]` satisfies the `PackedM31`
+// invariant. (Empirically, for the inputs and lengths these primitives see, both paths
+// produce the identical raw representative; see the equivalence tests.)
+
+/// Maximum dot-product length these primitives accept.
+///
+/// Bound derivation (strategy 2): each accumulated term is `hi + lo < 2^32`, so after `len`
+/// terms each lane accumulator is `< len · 2^32`. The final Mersenne reduction
+/// ([`reduce_u64_lanes_to_m31`]) is exact only for accumulators `< 2^62`, so we require
+/// `len · 2^32 ≤ 2^62`, i.e. `len ≤ 2^30`. Real call sites are orders of magnitude shorter
+/// (≤ a few thousand), so this cap never binds.
+pub const DOT_DELAYED_MAX_LEN: usize = 1 << 30;
+
+/// Mask selecting the low 31 bits (i.e. `lo = (a·b) mod 2^31`).
+const LOW_31_MASK_U64: u64 = (1 << 31) - 1;
+
+/// Reduces 16 independent u64 lane accumulators modulo P, each assumed `< 2^62`.
+///
+/// Identical algorithm to [`M31::reduce`], applied per lane. `M31::reduce(v)` computes
+/// `((((v >> 31) + v + 1) >> 31) + v) & P`, which is the exact two-limb Mersenne reduction
+/// for any `v < 2^62`. Within `[0, P]` the output may be the boundary representative `P`
+/// (the unreduced form of 0), exactly as the scalar `M31::reduce` and `PackedM31` ops do, so
+/// the result satisfies the `PackedM31` `[0, P]` invariant and matches the naive path.
+#[inline]
+pub(crate) fn reduce_u64_lanes_to_m31(acc: Simd<u64, N_LANES>) -> PackedM31 {
+    debug_assert!(
+        acc.to_array().iter().all(|&v| v < (1 << 62)),
+        "delayed-reduction accumulator exceeded its 2^62 bound (reduction would be inexact)"
+    );
+    let shift = Simd::<u64, N_LANES>::splat(MODULUS_BITS as u64);
+    let one = Simd::<u64, N_LANES>::splat(1);
+    let p = Simd::<u64, N_LANES>::splat(P as u64);
+    let reduced = (((((acc >> shift) + acc + one) >> shift) + acc) & p).cast::<u32>();
+    // Each reduced lane is in [0, P], satisfying the `PackedM31` invariant.
+    unsafe { PackedM31::from_simd_unchecked(reduced) }
+}
+
+/// Folds one product vector `prod = a · b` (held as full 64-bit lane products) into its
+/// partially-reduced `hi + lo` form, where `hi = prod >> 31` and `lo = prod & (2^31 - 1)`.
+///
+/// Since `2^31 ≡ 1 (mod p)`, `prod ≡ hi + lo (mod p)`. With `prod < 2^62` we have
+/// `hi < 2^31` and `lo < 2^31`, so `hi + lo < 2^32`.
+#[inline]
+fn product_hi_plus_lo(prod: Simd<u64, N_LANES>) -> Simd<u64, N_LANES> {
+    let lo = prod & Simd::splat(LOW_31_MASK_U64);
+    let hi = prod >> Simd::splat(MODULUS_BITS as u64);
+    hi + lo
+}
+
+/// Dot product `Σ a_i · b_i` over `PackedM31` lanes with delayed modular reduction.
+///
+/// Output is reduced to the `PackedM31` `[0, P]` representation (matching the naive fold).
+/// Inputs may be in the unreduced `[0, P]` representation. The two slices must have equal
+/// length, which must not exceed [`DOT_DELAYED_MAX_LEN`]. See the module-level R1 comment for
+/// the bound derivation.
+pub fn dot_delayed(a: &[PackedM31], b: &[PackedM31]) -> PackedM31 {
+    assert_eq!(a.len(), b.len(), "dot_delayed: length mismatch");
+    assert!(
+        a.len() <= DOT_DELAYED_MAX_LEN,
+        "dot_delayed: length {} exceeds DOT_DELAYED_MAX_LEN",
+        a.len()
+    );
+
+    // Per-lane accumulator. After `k` terms each lane is `< k · 2^32 ≤ len · 2^32`.
+    let mut acc = Simd::<u64, N_LANES>::splat(0);
+    for (ai, bi) in a.iter().zip(b.iter()) {
+        // a_i, b_i ∈ [0, P] ⇒ each lane product < P² < 2^62.
+        let prod = ai.0.cast::<u64>() * bi.0.cast::<u64>();
+        acc += product_hi_plus_lo(prod);
+    }
+    reduce_u64_lanes_to_m31(acc)
+}
+
+/// Dot product `Σ coeffs_i · values_i` where each `coeffs_i` is a scalar `M31` constant
+/// broadcast across all lanes, and `values_i` is a `PackedM31`, with delayed reduction.
+///
+/// Output is reduced to the `PackedM31` `[0, P]` representation (matching the naive fold).
+/// Values may be in the unreduced `[0, P]` representation; the scalar coefficients are
+/// reduced `M31` (always `< P`). The slices must have equal length, which must not exceed
+/// [`DOT_DELAYED_MAX_LEN`]. See the module-level R1 comment for the bound derivation (same as
+/// [`dot_delayed`]: each term `< 2^32`, accumulator `< len · 2^32`).
+pub fn dot_delayed_scalar(coeffs: &[M31], values: &[PackedM31]) -> PackedM31 {
+    assert_eq!(
+        coeffs.len(),
+        values.len(),
+        "dot_delayed_scalar: length mismatch"
+    );
+    assert!(
+        coeffs.len() <= DOT_DELAYED_MAX_LEN,
+        "dot_delayed_scalar: length {} exceeds DOT_DELAYED_MAX_LEN",
+        coeffs.len()
+    );
+
+    let mut acc = Simd::<u64, N_LANES>::splat(0);
+    for (coeff, val) in coeffs.iter().zip(values.iter()) {
+        // coeff ∈ [0, P) (reduced M31), val ∈ [0, P] ⇒ each lane product < P² < 2^62.
+        let coeff_lane = Simd::<u64, N_LANES>::splat(coeff.0 as u64);
+        let prod = coeff_lane * val.0.cast::<u64>();
+        acc += product_hi_plus_lo(prod);
+    }
+    reduce_u64_lanes_to_m31(acc)
+}
+
 #[cfg(test)]
 mod tests {
     use std::array;
@@ -686,6 +825,101 @@ mod tests {
         assert_eq!(res.to_array(), array::from_fn(|i| lhs[i] * rhs[i]));
     }
 
+    /// Values that exercise the boundaries of the unreduced `[0, P]` representation
+    /// (inclusive!), including `P` itself, which random tests never hit.
+    const EDGE_VALUES: [u32; 6] = [
+        0,
+        1,
+        2,
+        (1 << 30) - 1,
+        crate::core::fields::m31::P - 1,
+        crate::core::fields::m31::P,
+    ];
+
+    /// `PackedM31` holds unreduced values in `[0, P]`, so the multiplication kernels must be
+    /// correct for the boundary values as well. Tests the full grid of edge values against
+    /// scalar arithmetic.
+    #[test]
+    fn multiplication_edge_cases_work() {
+        for &a in &EDGE_VALUES {
+            for &b in &EDGE_VALUES {
+                let packed_a = unsafe { PackedM31::from_simd_unchecked(u32x16::splat(a)) };
+                let packed_b = unsafe { PackedM31::from_simd_unchecked(u32x16::splat(b)) };
+
+                let res = (packed_a * packed_b).to_array();
+
+                let expected = M31::reduce(a as u64 * b as u64);
+                assert_eq!(res, [expected; 16], "a={a}, b={b}");
+            }
+        }
+    }
+
+    /// Distinct per-lane values (including the `[0, P]` boundary) to catch lane-mapping
+    /// errors in the arch-specific kernels, which splat-based tests cannot detect.
+    #[test]
+    fn multiplication_lane_order_works() {
+        use crate::core::fields::m31::P;
+        let a_vals: [u32; 16] = std::array::from_fn(|i| {
+            if i.is_multiple_of(3) {
+                P - i as u32
+            } else {
+                (i as u32 + 1) * 123_456_789 % P
+            }
+        });
+        let b_vals: [u32; 16] = std::array::from_fn(|i| {
+            if i.is_multiple_of(4) {
+                P
+            } else {
+                ((i as u64) * 987_654_321 % P as u64) as u32
+            }
+        });
+        let a = unsafe { PackedM31::from_simd_unchecked(u32x16::from_array(a_vals)) };
+        let b = unsafe { PackedM31::from_simd_unchecked(u32x16::from_array(b_vals)) };
+
+        let res = (a * b).to_array();
+
+        for i in 0..16 {
+            assert_eq!(
+                res[i],
+                M31::reduce(a_vals[i] as u64 * b_vals[i] as u64),
+                "lane {i}"
+            );
+        }
+
+        #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+        {
+            let b_double = u32x16::from_array(b_vals.map(|v| 2 * v));
+            let res = super::mul_doubled_neon(a, b_double).to_array();
+            for i in 0..16 {
+                assert_eq!(
+                    res[i],
+                    M31::reduce(a_vals[i] as u64 * b_vals[i] as u64),
+                    "doubled lane {i}"
+                );
+            }
+        }
+    }
+
+    /// Tests the doubled-twiddle multiplication used by the FFT against scalar arithmetic on
+    /// the same edge-value grid.
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    #[test]
+    fn mul_doubled_neon_edge_cases_work() {
+        use super::mul_doubled_neon;
+
+        for &a in &EDGE_VALUES {
+            for &b in &EDGE_VALUES {
+                let packed_a = unsafe { PackedM31::from_simd_unchecked(u32x16::splat(a)) };
+                let b_double = u32x16::splat(2 * b);
+
+                let res = mul_doubled_neon(packed_a, b_double).to_array();
+
+                let expected = M31::reduce(a as u64 * b as u64);
+                assert_eq!(res, [expected; 16], "a={a}, b={b}");
+            }
+        }
+    }
+
     #[test]
     fn negation_works() {
         let mut rng = SmallRng::seed_from_u64(0);
@@ -737,5 +971,131 @@ mod tests {
             reduce_to_m31_simd(simd_val),
             u32x16::from_array(std::array::from_fn(|i| M31::reduce(vals[i] as u64).0))
         );
+    }
+
+    // -- Delayed-reduction dot product tests (R1) ----------------------------------------
+
+    use super::{dot_delayed, dot_delayed_scalar};
+    use crate::core::fields::m31::P;
+
+    /// Builds a `PackedM31` from raw lane values, allowing the unreduced boundary value `P`
+    /// (which the public `from_array` would reduce away), to exercise the `[0, P]` invariant.
+    fn packed_from_raw(lanes: [u32; 16]) -> PackedM31 {
+        unsafe { PackedM31::from_simd_unchecked(u32x16::from_array(lanes)) }
+    }
+
+    /// Naive reference: per lane, `Σ_i a_i · b_i (mod P)` via the existing reduced `M31` ops.
+    fn naive_dot_per_lane(a: &[PackedM31], b: &[PackedM31]) -> [M31; 16] {
+        let a_lanes: Vec<[M31; 16]> = a.iter().map(|p| p.to_array()).collect();
+        let b_lanes: Vec<[M31; 16]> = b.iter().map(|p| p.to_array()).collect();
+        array::from_fn(|lane| {
+            let mut acc = M31::from_u32_unchecked(0);
+            for j in 0..a.len() {
+                acc += a_lanes[j][lane] * b_lanes[j][lane];
+            }
+            acc
+        })
+    }
+
+    #[test]
+    fn dot_delayed_matches_naive_random() {
+        let mut rng = SmallRng::seed_from_u64(11);
+        // 10k+ random instances across an assortment of lengths.
+        for _ in 0..10_001 {
+            let len = rng.gen_range(0..=130);
+            let a: Vec<PackedM31> = (0..len).map(|_| rng.gen()).collect();
+            let b: Vec<PackedM31> = (0..len).map(|_| rng.gen()).collect();
+            assert_eq!(
+                dot_delayed(&a, &b).to_array(),
+                naive_dot_per_lane(&a, &b),
+                "len={len}"
+            );
+        }
+    }
+
+    #[test]
+    fn dot_delayed_scalar_matches_naive_random() {
+        let mut rng = SmallRng::seed_from_u64(12);
+        for _ in 0..10_001 {
+            let len = rng.gen_range(0..=130);
+            let coeffs: Vec<M31> = (0..len).map(|_| rng.gen()).collect();
+            let values: Vec<PackedM31> = (0..len).map(|_| rng.gen()).collect();
+            // Reference: broadcast each scalar coeff to a PackedM31 and reuse the naive fold.
+            let coeffs_packed: Vec<PackedM31> =
+                coeffs.iter().map(|c| PackedM31::broadcast(*c)).collect();
+            assert_eq!(
+                dot_delayed_scalar(&coeffs, &values).to_array(),
+                naive_dot_per_lane(&coeffs_packed, &values),
+                "len={len}"
+            );
+        }
+    }
+
+    /// Boundary lanes including the unreduced representation `P`, and mixtures across lanes,
+    /// at the fold-boundary lengths 0..=5 and a long length matching the largest real call
+    /// site (the longest `LookupElements` tuple, `N_ROUND_INPUT_FELTS = 96`) plus one.
+    #[test]
+    fn dot_delayed_edge_lanes_and_lengths() {
+        const EDGE: [u32; 6] = [0, 1, 2, (1 << 30) - 1, P - 1, P];
+        // Per-lane assignment that mixes the edge values across the 16 lanes.
+        let mixed =
+            |seed: usize| -> [u32; 16] { array::from_fn(|lane| EDGE[(lane + seed) % EDGE.len()]) };
+
+        for len in [0usize, 1, 2, 3, 4, 5, 97] {
+            // Splatted-edge instances: every term is a constant edge value across all lanes.
+            for &av in &EDGE {
+                for &bv in &EDGE {
+                    let a: Vec<PackedM31> = (0..len).map(|_| packed_from_raw([av; 16])).collect();
+                    let b: Vec<PackedM31> = (0..len).map(|_| packed_from_raw([bv; 16])).collect();
+                    assert_eq!(
+                        dot_delayed(&a, &b).to_array(),
+                        naive_dot_per_lane(&a, &b),
+                        "len={len}, a={av}, b={bv}"
+                    );
+                }
+            }
+            // Per-lane-mixed instances: each lane sees a different edge value, and the values
+            // rotate per term so different lanes hit `P` at different positions.
+            let a: Vec<PackedM31> = (0..len).map(|j| packed_from_raw(mixed(j))).collect();
+            let b: Vec<PackedM31> = (0..len).map(|j| packed_from_raw(mixed(j + 3))).collect();
+            assert_eq!(
+                dot_delayed(&a, &b).to_array(),
+                naive_dot_per_lane(&a, &b),
+                "mixed len={len}"
+            );
+
+            // Scalar variant on the same lengths with edge-valued reduced coeffs.
+            let coeffs: Vec<M31> = (0..len)
+                .map(|j| M31::reduce(EDGE[j % EDGE.len()] as u64))
+                .collect();
+            let values: Vec<PackedM31> = (0..len).map(|j| packed_from_raw(mixed(j))).collect();
+            let coeffs_packed: Vec<PackedM31> =
+                coeffs.iter().map(|c| PackedM31::broadcast(*c)).collect();
+            assert_eq!(
+                dot_delayed_scalar(&coeffs, &values).to_array(),
+                naive_dot_per_lane(&coeffs_packed, &values),
+                "scalar len={len}"
+            );
+        }
+    }
+
+    #[test]
+    fn dot_delayed_empty_is_zero() {
+        assert_eq!(
+            dot_delayed(&[], &[]).to_array(),
+            [M31::from_u32_unchecked(0); 16]
+        );
+        assert_eq!(
+            dot_delayed_scalar(&[], &[]).to_array(),
+            [M31::from_u32_unchecked(0); 16]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "length mismatch")]
+    fn dot_delayed_length_mismatch_panics() {
+        let a = vec![PackedM31::broadcast(M31::from_u32_unchecked(1)); 2];
+        let b = vec![PackedM31::broadcast(M31::from_u32_unchecked(1)); 3];
+        let _ = dot_delayed(&a, &b);
     }
 }

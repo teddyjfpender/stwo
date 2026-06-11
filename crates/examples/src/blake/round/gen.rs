@@ -3,6 +3,8 @@ use std::vec;
 
 use itertools::{chain, Itertools};
 use num_traits::One;
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::poly::circle::CanonicCoset;
@@ -14,11 +16,15 @@ use stwo::prover::backend::simd::SimdBackend;
 use stwo::prover::backend::{Col, Column};
 use stwo::prover::poly::circle::CircleEvaluation;
 use stwo::prover::poly::BitReversedOrder;
-use stwo_constraint_framework::{LogupTraceGenerator, Relation, ORIGINAL_TRACE_IDX};
+use stwo_constraint_framework::{
+    FractionWriter, LogupTraceGenerator, Relation, ORIGINAL_TRACE_IDX,
+};
 use tracing::{span, Level};
 
 use super::{BlakeXorElements, RoundElements};
 use crate::blake::round::blake_round_info;
+#[cfg(feature = "parallel")]
+use crate::blake::UnsafeSharedRows;
 use crate::blake::{to_felts, XorAccums, N_ROUND_INPUT_FELTS, STATE_SIZE};
 
 pub struct BlakeRoundLookupData {
@@ -215,12 +221,41 @@ pub fn generate_trace(
 ) {
     let _span = span!(Level::INFO, "Round Generation").entered();
     let mut generator = TraceGenerator::new(log_size);
+    let n_vec_rows = 1usize << (log_size - LOG_N_LANES);
 
-    for vec_row in 0..(1 << (log_size - LOG_N_LANES)) {
+    // Generate the first row on its own: it allocates the lazily-created xor lookup columns.
+    // Every row performs the identical sequence of column writes (input values never affect
+    // control flow), so the column set is complete after this.
+    {
+        let mut row_gen = generator.gen_row(0);
+        let BlakeRoundInput { v, m } = inputs.first().copied().unwrap_or_default();
+        row_gen.generate(v, m);
+    }
+
+    // The remaining rows write disjoint `vec_row` slots of the same columns.
+    #[cfg(not(feature = "parallel"))]
+    for vec_row in 1..n_vec_rows {
         let mut row_gen = generator.gen_row(vec_row);
         let BlakeRoundInput { v, m } = inputs.get(vec_row).copied().unwrap_or_default();
         row_gen.generate(v, m);
-        for (w, [a, b, _c]) in &generator.xor_lookups {
+    }
+    #[cfg(feature = "parallel")]
+    {
+        let generator_ptr = UnsafeSharedRows(&raw mut generator);
+        (1..n_vec_rows).into_par_iter().for_each(|vec_row| {
+            // SAFETY: each row writes only its own `vec_row` index of every column, and the
+            // xor lookup column set was fully allocated by row 0.
+            let generator = unsafe { generator_ptr.get() };
+            let mut row_gen = generator.gen_row(vec_row);
+            let BlakeRoundInput { v, m } = inputs.get(vec_row).copied().unwrap_or_default();
+            row_gen.generate(v, m);
+        });
+    }
+
+    // Accumulate xor multiplicities. Iterating lookup-by-lookup streams each column
+    // sequentially (cache-friendly); the increments are commutative so order doesn't matter.
+    for (w, [a, b, _c]) in &generator.xor_lookups {
+        for vec_row in 0..n_vec_rows {
             let a = a.data[vec_row].into_simd();
             let b = b.data[vec_row].into_simd();
             xor_accum.add_input(*w, a, b);
@@ -255,23 +290,43 @@ pub fn generate_interaction_trace(
     for [(w0, l0), (w1, l1)] in lookup_data.xor_lookups.array_chunks::<2>() {
         let mut col_gen = logup_gen.new_col();
 
-        for vec_row in 0..(1 << (log_size - LOG_N_LANES)) {
+        let write_row = |vec_row: usize, writer: FractionWriter<'_>| {
             let p0: PackedSecureField =
                 xor_lookup_elements.combine(*w0, &l0.each_ref().map(|l| l.data[vec_row]));
             let p1: PackedSecureField =
                 xor_lookup_elements.combine(*w1, &l1.each_ref().map(|l| l.data[vec_row]));
-            col_gen.write_frac(vec_row, p0 + p1, p0 * p1);
-        }
+            writer.write_frac(p0 + p1, p0 * p1);
+        };
+        #[cfg(not(feature = "parallel"))]
+        col_gen
+            .iter_mut()
+            .enumerate()
+            .for_each(|(vec_row, writer)| write_row(vec_row, writer));
+        #[cfg(feature = "parallel")]
+        col_gen
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(vec_row, writer)| write_row(vec_row, writer));
 
         col_gen.finalize_col();
     }
 
     let mut col_gen = logup_gen.new_col();
-    for vec_row in 0..(1 << (log_size - LOG_N_LANES)) {
+    let write_row = |vec_row: usize, writer: FractionWriter<'_>| {
         let p = round_lookup_elements
             .combine(&lookup_data.round_lookup.each_ref().map(|l| l.data[vec_row]));
-        col_gen.write_frac(vec_row, -PackedSecureField::one(), p);
-    }
+        writer.write_frac(-PackedSecureField::one(), p);
+    };
+    #[cfg(not(feature = "parallel"))]
+    col_gen
+        .iter_mut()
+        .enumerate()
+        .for_each(|(vec_row, writer)| write_row(vec_row, writer));
+    #[cfg(feature = "parallel")]
+    col_gen
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(vec_row, writer)| write_row(vec_row, writer));
     col_gen.finalize_col();
 
     logup_gen.finalize_last()

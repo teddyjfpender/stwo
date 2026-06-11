@@ -34,7 +34,7 @@ macro_rules! xor_table_gen {
         pub fn generate_interaction_trace<
             const ELEM_BITS: u32,
             const EXPAND_BITS: u32,
-            X: Relation<PackedBaseField, PackedSecureField>,
+            X: Relation<PackedBaseField, PackedSecureField> + Sync,
         >(
             lookup_data: XorTableLookupData<ELEM_BITS, EXPAND_BITS>,
             lookup_elements: &X,
@@ -66,13 +66,11 @@ macro_rules! xor_table_gen {
                 let bh1 = i1 as u32 & ((1 << EXPAND_BITS) - 1);
 
                 // Each column has 2^(2*LIMB_BITS) rows, packed in N_LANES.
-                for vec_row in
-                    0..(1 << (XorTable::new(ELEM_BITS, EXPAND_BITS, 0).column_bits() - LOG_N_LANES))
-                {
+                let write_row = |vec_row: usize, writer: FractionWriter<'_>| {
                     // vec_row is LIMB_BITS of al and LIMB_BITS - LOG_N_LANES of bl.
                     // Extract al, blh from vec_row.
-                    let al = vec_row >> (limb_bits - LOG_N_LANES);
-                    let blh = vec_row & ((1 << (limb_bits - LOG_N_LANES)) - 1);
+                    let al = vec_row as u32 >> (limb_bits - LOG_N_LANES);
+                    let blh = vec_row as u32 & ((1 << (limb_bits - LOG_N_LANES)) - 1);
 
                     // Construct the 3 vectors a, b, c.
                     let a0 = u32x16::splat((ah0 << limb_bits) | al);
@@ -91,11 +89,20 @@ macro_rules! xor_table_gen {
                         &[a1, b1, c1].map(|x| unsafe { PackedBaseField::from_simd_unchecked(x) }),
                     );
 
-                    let num =
-                        p1 * mults0.data[vec_row as usize] + p0 * mults1.data[vec_row as usize];
+                    let num = p1 * mults0.data[vec_row] + p0 * mults1.data[vec_row];
                     let denom = p0 * p1;
-                    col_gen.write_frac(vec_row as usize, -num, denom);
-                }
+                    writer.write_frac(-num, denom);
+                };
+                #[cfg(not(feature = "parallel"))]
+                col_gen
+                    .iter_mut()
+                    .enumerate()
+                    .for_each(|(vec_row, writer)| write_row(vec_row, writer));
+                #[cfg(feature = "parallel")]
+                col_gen
+                    .par_iter_mut()
+                    .enumerate()
+                    .for_each(|(vec_row, writer)| write_row(vec_row, writer));
                 col_gen.finalize_col();
             }
 

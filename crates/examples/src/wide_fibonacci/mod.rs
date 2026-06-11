@@ -185,6 +185,76 @@ mod tests {
         );
     }
 
+    /// Low-memory mode regenerates committed evaluations at decommit time; the resulting
+    /// proof must be bit-identical to the default mode's.
+    #[test_log::test]
+    fn test_wide_fib_low_memory_proof_is_identical() {
+        const LOG_N_INSTANCES: u32 = 6;
+        // Cover both a blowup-1 config and a larger-blowup config (different lift regimes).
+        let configs = [
+            PcsConfig::default(),
+            PcsConfig {
+                pow_bits: 10,
+                fri_config: FriConfig::new(0, 2, 3, 1),
+                lifting_log_size: None,
+            },
+        ];
+        for config in configs {
+            let twiddles = SimdBackend::precompute_twiddles(
+                CanonicCoset::new(LOG_N_INSTANCES + 1 + config.fri_config.log_blowup_factor)
+                    .circle_domain()
+                    .half_coset,
+            );
+
+            let prove_once = |low_memory: bool| {
+                let prover_channel = &mut Blake2sM31Channel::default();
+                let mut commitment_scheme = CommitmentSchemeProver::<
+                    SimdBackend,
+                    Blake2sM31MerkleChannel,
+                >::new(config, &twiddles);
+                if low_memory {
+                    commitment_scheme.set_low_memory();
+                }
+
+                let mut tree_builder = commitment_scheme.tree_builder();
+                tree_builder.extend_evals(vec![]);
+                tree_builder.commit(prover_channel);
+
+                let trace = generate_trace::<FIB_SEQUENCE_LENGTH, _>(&generate_test_inputs(
+                    LOG_N_INSTANCES,
+                ));
+                let mut tree_builder = commitment_scheme.tree_builder();
+                tree_builder.extend_evals(trace);
+                tree_builder.commit(prover_channel);
+
+                let component = WideFibonacciComponent::new(
+                    &mut TraceLocationAllocator::default(),
+                    WideFibonacciEval::<FIB_SEQUENCE_LENGTH> {
+                        log_n_rows: LOG_N_INSTANCES,
+                    },
+                    SecureField::zero(),
+                );
+
+                prove::<SimdBackend, Blake2sM31MerkleChannel>(
+                    &[&component],
+                    prover_channel,
+                    commitment_scheme,
+                )
+                .unwrap()
+            };
+
+            let proof_default = prove_once(false);
+            let proof_low_memory = prove_once(true);
+
+            assert_eq!(
+                format!("{proof_default:?}"),
+                format!("{proof_low_memory:?}"),
+                "low-memory proof differs (blowup = {})",
+                config.fri_config.log_blowup_factor
+            );
+        }
+    }
+
     #[test_log::test]
     fn test_wide_fib_prove_with_blake() {
         for log_n_instances in 4..=8 {

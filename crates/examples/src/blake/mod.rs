@@ -30,6 +30,31 @@ const N_ROUNDS: usize = 10;
 /// A splitting N_ROUNDS into several powers of 2.
 const ROUND_LOG_SPLIT: [u32; 2] = [3, 1];
 
+/// Shared-mutable pointer used by parallel trace generators whose row tasks write disjoint
+/// `vec_row` slots of the same columns.
+///
+/// NOTE: like the `UnsafeMut` pattern used by the SIMD FFT, concurrent tasks materialize
+/// aliasing `&mut` references whose element-level writes are disjoint. This is not blessed by
+/// Rust's formal aliasing model (the references also cover bytes other tasks read), but
+/// follows the established convention in this codebase; replacing it with per-column raw
+/// pointers would be the strict alternative.
+#[cfg(feature = "parallel")]
+struct UnsafeSharedRows<T>(*mut T);
+#[cfg(feature = "parallel")]
+unsafe impl<T> Send for UnsafeSharedRows<T> {}
+#[cfg(feature = "parallel")]
+unsafe impl<T> Sync for UnsafeSharedRows<T> {}
+#[cfg(feature = "parallel")]
+impl<T> UnsafeSharedRows<T> {
+    /// # Safety
+    ///
+    /// Concurrent users must only perform mutually disjoint writes.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn get(&self) -> &mut T {
+        unsafe { &mut *self.0 }
+    }
+}
+
 #[derive(Default)]
 struct XorAccums {
     xor12: xor12::XorAccumulator<12, 4>,
