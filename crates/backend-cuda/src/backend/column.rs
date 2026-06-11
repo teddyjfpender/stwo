@@ -71,6 +71,31 @@ impl Column<BaseField> for interface::base_field_vec::BaseFieldVec {
         Self::get_data(self, index)
     }
 
+    /// Batched gather: one kernel + one D2H copy for all indices. The default
+    /// (per-element `at`) is one 4-byte PCIe roundtrip per index — the decommit phase
+    /// issues ~queries x columns of those, which measured as the dominant warm-prove
+    /// cost. Device storage is raw u32 words, so the gathered values carry the exact
+    /// stored representation (`at_unreduced` semantics, same as `at` here).
+    fn gather_unreduced(&self, indices: &[usize]) -> Vec<BaseField> {
+        let indices_u32: Vec<u32> = indices
+            .iter()
+            .map(|&index| {
+                debug_assert!(index < self.size);
+                index as u32
+            })
+            .collect();
+        let mut out: Vec<BaseField> = vec![Default::default(); indices.len()];
+        unsafe {
+            bindings::cuda_gather_uint32_t(
+                self.device_ptr,
+                indices_u32.as_ptr(),
+                indices_u32.len() as u32,
+                out.as_mut_ptr().cast(),
+            );
+        }
+        out
+    }
+
     fn set(&mut self, _index: usize, _value: BaseField) {
         Self::set_data(self, _index, _value);
     }

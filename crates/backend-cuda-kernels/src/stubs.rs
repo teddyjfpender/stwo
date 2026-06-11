@@ -80,6 +80,17 @@ pub unsafe extern "C" fn copy_uint32_t_vec_from_host_to_device_into(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn cuda_gather_uint32_t(
+    device_src: *const u32,
+    host_indices: *const u32,
+    n_indices: u32,
+    host_out: *mut u32,
+) {
+    let _ = (device_src, host_indices, n_indices, host_out);
+    no_cuda_symbol("cuda_gather_uint32_t")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn cuda_malloc_uint32_t(size: u32) -> *const u32 {
     no_cuda_symbol("cuda_malloc_uint32_t")
 }

@@ -172,6 +172,53 @@ void cuda_set_blake_2s_hash(Blake2sHash *device_ptr, size_t index, const Blake2s
     ));
 }
 
+// Kernel: gather u32 words by index (decommit row gathers).
+__global__ void gather_uint32_kernel(
+    const uint32_t* src,
+    const uint32_t* indices,
+    uint32_t n_indices,
+    uint32_t* dst
+) {
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n_indices) {
+        dst[idx] = src[indices[idx]];
+    }
+}
+
+// Gather `n_indices` words of `device_src` at `host_indices` into `host_out` with ONE
+// kernel and one D2H copy. Replaces per-element cuda_get_uint32_t readbacks in the
+// decommit phase (one PCIe roundtrip per element, ~100k of them per prove). Runs on
+// the legacy default stream: the gather is ordered after the producer of `device_src`
+// and the final synchronous D2H is the host-read fence.
+void cuda_gather_uint32_t(
+    const uint32_t* device_src,
+    const uint32_t* host_indices,
+    uint32_t n_indices,
+    uint32_t* host_out
+) {
+    if (n_indices == 0) {
+        return;
+    }
+    uint32_t* d_indices = cuda_allocator_allocate_for_proving<uint32_t>(n_indices);
+    uint32_t* d_out = cuda_allocator_allocate_for_proving<uint32_t>(n_indices);
+    if (!d_indices || !d_out) {
+        printf("Failed to allocate buffers in gather_uint32\n");
+        cuda_allocator_free_for_proving(d_indices);
+        cuda_allocator_free_for_proving(d_out);
+        return;
+    }
+    ASSERT_CUDA_SUCCESS(cudaMemcpy(
+        d_indices, host_indices, n_indices * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    const int block_size = 256;
+    const int num_blocks = (n_indices + block_size - 1) / block_size;
+    gather_uint32_kernel<<<num_blocks, block_size>>>(device_src, d_indices, n_indices, d_out);
+    ASSERT_CUDA_SUCCESS(cudaGetLastError());
+    ASSERT_CUDA_SUCCESS(cudaMemcpy(
+        host_out, d_out, n_indices * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    cuda_allocator_free_for_proving(d_indices);
+    cuda_allocator_free_for_proving(d_out);
+}
+
 // Kernel: Batch get Blake2s hashes from device memory by indices
 __global__ void batch_get_blake2s_kernel(
     const Blake2sHash* src,

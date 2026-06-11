@@ -143,6 +143,13 @@ extern "C" {
         n_words: u64,
     );
 
+    pub fn cuda_gather_uint32_t(
+        device_src: *const u32,
+        host_indices: *const u32,
+        n_indices: u32,
+        host_out: *mut u32,
+    );
+
     pub fn cuda_malloc_uint32_t(size: u32) -> *const u32;
 
     pub fn cuda_set_uint32_t(device_ptr: *const c_void, index: usize, val: u32);

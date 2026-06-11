@@ -144,6 +144,19 @@ pub trait Column<T>: Clone + Debug + FromIterator<T> + Send + Sync {
     fn at_unreduced(&self, index: usize) -> T {
         self.at(index)
     }
+    /// Retrieves the elements at the given indices, with [`Self::at_unreduced`] semantics
+    /// element-for-element.
+    ///
+    /// The default reads one element at a time; backends with non-host storage (GPU
+    /// columns, where every `at` is a device readback) override this with a single
+    /// batched gather. The decommit phase reads on the order of queries x columns
+    /// individual values, which is prohibitive at one device roundtrip each.
+    fn gather_unreduced(&self, indices: &[usize]) -> Vec<T> {
+        indices
+            .iter()
+            .map(|&index| self.at_unreduced(index))
+            .collect()
+    }
     /// Sets the element at the given index.
     fn set(&mut self, index: usize, value: T);
     /// Splits the column into two halves.

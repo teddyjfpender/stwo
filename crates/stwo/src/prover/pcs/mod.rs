@@ -466,6 +466,13 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
     /// Returns the values at the queried positions and the decommitment.
     /// The queries are given as a mapping from the log size of the layer size to the queried
     /// positions on each column of that size.
+    ///
+    /// The rows the decommit reads (the queried rows plus the rows of unretained leaves
+    /// whose hashes must be recomputed) are gathered up front with one batched
+    /// [`Column::gather_unreduced`] per column, and the decommit runs over the sparse
+    /// view — the same path the low-memory mode uses. Reading element-by-element during
+    /// the walk costs queries x columns individual `at` calls, each of which is a full
+    /// device readback on GPU backends; the values and output are identical either way.
     fn decommit(
         &self,
         queries: &[usize],
@@ -473,12 +480,40 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
         ColumnVec<Vec<BaseField>>,
         ExtendedMerkleDecommitmentLifted<MC::H>,
     ) {
-        let eval_vec = self
-            .polynomials
-            .iter()
-            .map(|poly| &poly.evals.values)
-            .collect_vec();
-        self.commitment.decommit(queries, eval_vec)
+        let lifting_log_size = self.commitment.log_size();
+        let leaf_indices = self.commitment.unretained_leaf_indices(queries);
+
+        #[cfg(not(feature = "parallel"))]
+        let iter = self.polynomials.iter();
+        #[cfg(feature = "parallel")]
+        let iter = self.polynomials.par_iter();
+
+        let (log_sizes, rows): (Vec<u32>, Vec<HashMap<usize, BaseField>>) = iter
+            .map(|poly| {
+                let log_size = poly.evals.domain.log_size();
+                let shift = lifting_log_size - log_size;
+                // Deduplicated, in deterministic order (BTreeSet), mirroring the row
+                // mapping in `decommit_inner`/`decommit_compact_tree`.
+                let needed_rows: Vec<usize> = queries
+                    .iter()
+                    .chain(leaf_indices.iter())
+                    .map(|pos| (pos >> (shift + 1) << 1) + (pos & 1))
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+                let values = poly.evals.values.gather_unreduced(&needed_rows);
+                (
+                    log_size,
+                    needed_rows
+                        .into_iter()
+                        .zip(values)
+                        .collect::<HashMap<_, _>>(),
+                )
+            })
+            .unzip();
+
+        self.commitment
+            .decommit_gathered(queries, &GatheredColumns { log_sizes, rows })
     }
 }
 

@@ -211,6 +211,9 @@ extern "C"
 void copy_uint32_t_vec_from_host_to_device_into(const uint32_t *host_ptr, uint32_t *device_ptr, uint64_t n_words);
 
 extern "C"
+void cuda_gather_uint32_t(const uint32_t *device_src, const uint32_t *host_indices, uint32_t n_indices, uint32_t *host_out);
+
+extern "C"
 uint32_t* cuda_malloc_uint32_t(int);
 
 extern "C"
