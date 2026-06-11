@@ -1,4 +1,5 @@
 #include <cstdio>
+#include <cstdlib>
 #include <vector>
 #include <array>
 #include "fields.cuh"
@@ -127,7 +128,18 @@ extern "C" void inclusive_prefix_sum_x4(
         tmps[i] = reinterpret_cast<m31 *>(cuda_proving_alloc_zeroes_u32_words(len));
         temps[i] = cuda_proving_malloc<uint8_t>((unsigned)temp_storage_bytes);
     }
+    // Kill switch for stream debugging: serialize on the legacy stream.
+    static int streams_disabled = -1;
+    if (streams_disabled < 0) {
+        const char *env = getenv("STWO_CUDA_DISABLE_STREAMS");
+        streams_disabled = (env != nullptr && env[0] != '\0' && env[0] != '0') ? 1 : 0;
+    }
     for (int i = 0; i < 4; ++i) {
+        if (streams_disabled == 1) {
+            inclusive_prefix_sum_on((cudaStream_t)0, cols[i], tmps[i], temps[i],
+                                    temp_storage_bytes, len);
+            continue;
+        }
         stwo_stream_wait_legacy(i);
         inclusive_prefix_sum_on(stwo_pool_stream(i), cols[i], tmps[i], temps[i],
                                 temp_storage_bytes, len);
