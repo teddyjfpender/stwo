@@ -54,8 +54,14 @@ __global__ void barycentric_point_vanishing_parts_kernel(
     uint32_t domain_index = bit_reverse(i, (int)log_size);
     point d = barycentric_domain_at_index(
         half_coset_initial_index, half_coset_step_size, domain_index, size);
-    qm31 hy = sub(p.y, qm31_from_m31(d.y));
-    qm31 hx = sub(p.x, qm31_from_m31(d.x));
+    // h = p - d under the CIRCLE GROUP LAW (p + (-d), with -d = (d.x, -d.y)):
+    //   h.x = p.x * d.x + p.y * d.y
+    //   h.y = p.y * d.x - p.x * d.y
+    // NOT coordinate-wise subtraction — the conformance differential rejects that.
+    qm31 dx = qm31_from_m31(d.x);
+    qm31 dy = qm31_from_m31(d.y);
+    qm31 hx = add(mul(p.x, dx), mul(p.y, dy));
+    qm31 hy = sub(mul(p.y, dx), mul(p.x, dy));
     numerators[i] = hy;
     denominators[i] = add(qm31_from_m31(1), hx);
 }
