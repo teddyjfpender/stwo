@@ -93,7 +93,7 @@ pub fn rc99_count(
     rc_table_size: usize,
 ) -> Vec<u32> {
     assert_eq!(input_to_row_lut.len(), 1 << 18);
-    assert!(limb_cols.len() % 2 == 0);
+    assert!(limb_cols.len().is_multiple_of(2));
     let n_pairs = limb_cols.len() / 2;
     let ptrs: Vec<*const u32> = limb_cols.iter().map(|c| c.device_ptr).collect();
     let table = UploadedDevicePointerVec::upload(&ptrs);
