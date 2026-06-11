@@ -639,7 +639,6 @@ mod tests {
     use stwo::prover::poly::circle::{CircleCoefficients as CirclePoly, CircleEvaluation, PolyOps};
     use stwo::prover::poly::twiddles::TwiddleTree;
     use stwo::prover::poly::BitReversedOrder;
-    use test_log::test;
 
     // use crate::backend::poly::evaluate_native;
     use crate::backend::CudaBackend;
@@ -1209,7 +1208,7 @@ mod tests {
             eval.values.to_cpu(),
         );
         let cpu_twiddle_tree = TwiddleTree::<CpuBackend> {
-            root_coset: twiddle_tree.root_coset.clone(),
+            root_coset: twiddle_tree.root_coset,
             twiddles: twiddle_tree.twiddles.to_cpu(),
             itwiddles: twiddle_tree.itwiddles.to_cpu(),
         };
@@ -1462,18 +1461,15 @@ mod tests {
 
                 assert_eq!(
                     gpu_single_results, cpu_results,
-                    "single eval_at_point mismatch at log_size {log_size}, point {:?}",
-                    point
+                    "single eval_at_point mismatch at log_size {log_size}, point {point:?}",
                 );
                 assert_eq!(
                     gpu_batch_results, cpu_results,
-                    "batch_eval_at_point mismatch against CPU at log_size {log_size}, point {:?}",
-                    point
+                    "batch_eval_at_point mismatch against CPU at log_size {log_size}, point {point:?}",
                 );
                 assert_eq!(
                     gpu_batch_results, gpu_single_results,
-                    "batch_eval_at_point mismatch against CUDA single-path at log_size {log_size}, point {:?}",
-                    point
+                    "batch_eval_at_point mismatch against CUDA single-path at log_size {log_size}, point {point:?}",
                 );
             }
         }

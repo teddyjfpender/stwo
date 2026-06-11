@@ -1,8 +1,11 @@
 //! Raw FFI declarations for the staged CUDA kernel entry points.
 //!
-//! Link-gated: with `stwo_cuda_link` (set by the build script when nvcc compiled the
-//! kernels) these resolve to the static archive; otherwise `stubs.rs` provides
-//! panicking `no_mangle` definitions so the crate links everywhere.
+//! Link-gated: with `stwo_cuda_archive` (set only by this crate's build script when
+//! nvcc compiled the kernels) these resolve to the static archive; otherwise
+//! `stubs.rs` provides panicking `no_mangle` definitions so the crate links
+//! everywhere — including when `stwo_cuda_link` is forced via `RUSTFLAGS` for
+//! compile-only validation of the downstream link-gated tests without a CUDA
+//! toolkit.
 
 use core::ffi::c_void;
 
@@ -44,7 +47,7 @@ pub struct LayerIndexPair {
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 pub struct Blake2sHash(pub [u8; 32]);
 
-#[cfg_attr(stwo_cuda_link, link(name = "stwo_cuda_kernels", kind = "static"))]
+#[cfg_attr(stwo_cuda_archive, link(name = "stwo_cuda_kernels", kind = "static"))]
 extern "C" {
     /// Returns a CUDA error code (0 = success). Sets the default mem pool's release
     /// threshold to never-release so warm proves reuse allocations.

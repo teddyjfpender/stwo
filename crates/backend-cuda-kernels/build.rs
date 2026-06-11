@@ -20,7 +20,12 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
+    // `stwo_cuda_link` may be forced via RUSTFLAGS for compile-only validation of the
+    // downstream link-gated tests; `stwo_cuda_archive` is private to this crate and is
+    // emitted only when nvcc actually compiled the static archive (the stubs cover
+    // linking otherwise).
     println!("cargo:rustc-check-cfg=cfg(stwo_cuda_link)");
+    println!("cargo:rustc-check-cfg=cfg(stwo_cuda_archive)");
     println!("cargo:rerun-if-env-changed=STWO_CUDA_NVCC");
     println!("cargo:rerun-if-env-changed=STWO_CUDA_ARCH");
     println!("cargo:rerun-if-env-changed=STWO_CUDA_NVCC_FLAGS");
@@ -152,7 +157,7 @@ fn main() {
     );
 
     println!("cargo:rustc-env=STWO_CUDA_BUILD_MODE=cuda");
-    println!("cargo:rustc-cfg=stwo_cuda_link");
+    println!("cargo:rustc-cfg=stwo_cuda_archive");
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     if let Some(lib_dir) = cuda_lib_dir(&nvcc) {
         println!("cargo:rustc-link-search=native={}", lib_dir.display());

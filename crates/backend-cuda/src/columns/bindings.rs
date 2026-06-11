@@ -726,7 +726,7 @@ mod tests {
 
         let mut cuda_results = vec![0u32; N];
         unsafe {
-            test_offset_bit_reversed_indices(
+            sys_raw::test_offset_bit_reversed_indices(
                 cuda_results.as_mut_ptr(),
                 DOMAIN_LOG_SIZE,
                 EVAL_LOG_SIZE,
@@ -744,8 +744,7 @@ mod tests {
 
         assert_eq!(
             mismatch_count, 0,
-            "Found {} mismatches between Rust and CUDA offset computation",
-            mismatch_count
+            "Found {mismatch_count} mismatches between Rust and CUDA offset computation"
         );
     }
 }

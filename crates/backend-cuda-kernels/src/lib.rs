@@ -13,11 +13,16 @@
 //! `stwo-backend-metal`.
 
 pub mod raw;
-#[cfg(not(stwo_cuda_link))]
+#[cfg(not(stwo_cuda_archive))]
 mod stubs;
 
 /// True when the CUDA kernels were compiled and linked into this build.
-pub const CUDA_KERNELS_BUILT: bool = cfg!(stwo_cuda_link);
+///
+/// Gated on `stwo_cuda_archive` (emitted only by this crate's build script when nvcc
+/// compiled the archive), NOT on `stwo_cuda_link`: the latter can be forced through
+/// `RUSTFLAGS` for compile-only validation of the link-gated downstream tests, in
+/// which case the panicking stubs still satisfy linking and this stays `false`.
+pub const CUDA_KERNELS_BUILT: bool = cfg!(stwo_cuda_archive);
 
 /// `"cuda"` when the kernels were compiled, `"no-cuda"` for the stub build.
 pub const BUILD_MODE: &str = env!("STWO_CUDA_BUILD_MODE");

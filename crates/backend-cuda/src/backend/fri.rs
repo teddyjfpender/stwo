@@ -145,22 +145,22 @@ mod tests {
     use crate::backend::CudaBackend;
     use crate::columns::base_field_vec::BaseFieldVec;
 
+    /// One sequential fold per element of `alphas` (the new `FriOps::fold_line` API).
     fn cpu_fold_line(
         eval: &LineEvaluation<CpuBackend>,
-        alpha: SecureField,
+        alphas: &[SecureField],
         twiddles: &TwiddleTree<CpuBackend>,
-        fold_step: u32,
     ) -> LineEvaluation<CpuBackend> {
-        CpuBackend::fold_line(eval, alpha, twiddles, fold_step)
+        CpuBackend::fold_line(eval, alphas, twiddles)
     }
 
+    /// One sequential fold per element of `alphas` (the new `FriOps::fold_line` API).
     fn gpu_fold_line(
         eval: &LineEvaluation<CudaBackend>,
-        alpha: SecureField,
+        alphas: &[SecureField],
         twiddles: &TwiddleTree<CudaBackend>,
-        fold_step: u32,
     ) -> LineEvaluation<CudaBackend> {
-        CudaBackend::fold_line(eval, alpha, twiddles, fold_step)
+        CudaBackend::fold_line(eval, alphas, twiddles)
     }
 
     #[test]
@@ -186,9 +186,8 @@ mod tests {
                     columns: vec.clone(),
                 },
             ),
-            alpha,
+            &[alpha],
             &CpuBackend::precompute_twiddles(domain.coset()),
-            1,
         );
         let vecs = [
             BaseFieldVec::from_vec(vec[0].clone()),
@@ -199,9 +198,8 @@ mod tests {
 
         let gpu_fold = gpu_fold_line(
             &LineEvaluation::new(domain, SecureColumnByCoords { columns: vecs }),
-            alpha,
+            &[alpha],
             &CudaBackend::precompute_twiddles(domain.coset()),
-            1,
         );
 
         assert_eq!(cpu_fold.values.to_vec(), gpu_fold.values.to_cpu().to_vec());
@@ -216,11 +214,6 @@ mod tests {
         let alpha = SecureField::from_u32_unchecked(1, 3, 5, 7);
         let circle_domain = CanonicCoset::new(LOG_SIZE).circle_domain();
         let line_domain = LineDomain::new(circle_domain.half_coset);
-        let mut cpu_fold = LineEvaluation::new(
-            line_domain,
-            SecureColumnByCoords::zeros(1 << (LOG_SIZE - 1)),
-        );
-
         let mut vec: [Vec<BaseField>; 4] = [vec![], vec![], vec![], vec![]];
         values.iter().for_each(|a| {
             vec[0].push(BaseField::from_u32_unchecked(a.0 .0 .0));
@@ -234,8 +227,7 @@ mod tests {
             BaseFieldVec::from_vec(vec[2].clone()),
             BaseFieldVec::from_vec(vec[3].clone()),
         ];
-        CpuBackend::fold_circle_into_line(
-            &mut cpu_fold,
+        let cpu_fold = CpuBackend::fold_circle_into_line(
             &SecureEvaluation::new(
                 circle_domain,
                 SecureColumnByCoords {
@@ -246,12 +238,7 @@ mod tests {
             &CpuBackend::precompute_twiddles(line_domain.coset()),
         );
 
-        let mut cuda_fold = LineEvaluation::new(
-            line_domain,
-            SecureColumnByCoords::zeros(1 << (LOG_SIZE - 1)),
-        );
-        CudaBackend::fold_circle_into_line(
-            &mut cuda_fold,
+        let cuda_fold = CudaBackend::fold_circle_into_line(
             &SecureEvaluation::new(circle_domain, SecureColumnByCoords { columns: vecs }),
             alpha,
             &CudaBackend::precompute_twiddles(line_domain.coset()),
@@ -283,9 +270,8 @@ mod tests {
                     columns: vec.clone(),
                 },
             ),
-            alpha,
+            &[alpha],
             &CpuBackend::precompute_twiddles(domain.coset()),
-            1,
         );
         let vecs = [
             BaseFieldVec::from_vec(vec[0].clone()),
@@ -296,9 +282,8 @@ mod tests {
 
         let gpu_fold = gpu_fold_line(
             &LineEvaluation::new(domain, SecureColumnByCoords { columns: vecs }),
-            alpha,
+            &[alpha],
             &CudaBackend::precompute_twiddles(domain.coset()),
-            1,
         );
 
         assert_eq!(cpu_fold.values.to_vec(), gpu_fold.values.to_cpu().to_vec());
@@ -342,9 +327,8 @@ mod tests {
 
         let drp_evals = gpu_fold_line(
             &evals,
-            alpha,
+            &[alpha],
             &CudaBackend::precompute_twiddles(domain.coset()),
-            1,
         );
         let mut drp_evals = drp_evals.values.to_cpu().into_iter().collect_vec();
         CpuBackend::bit_reverse_column(&mut drp_evals);
@@ -387,40 +371,34 @@ mod tests {
                     columns: vec.clone(),
                 },
             ),
-            alpha,
+            &[alpha],
             &CpuBackend::precompute_twiddles(domain.coset()),
-            1,
         );
         let second_cpu_fold = cpu_fold_line(
             &first_cpu_fold,
-            alpha,
+            &[alpha],
             &CpuBackend::precompute_twiddles(domain.coset()),
-            1,
         );
         let third_cpu_fold = cpu_fold_line(
             &second_cpu_fold,
-            alpha,
+            &[alpha],
             &CpuBackend::precompute_twiddles(domain.coset()),
-            1,
         );
 
         let first_gpu_fold = gpu_fold_line(
             &LineEvaluation::new(domain, SecureColumnByCoords { columns: vecs }),
-            alpha,
+            &[alpha],
             &CudaBackend::precompute_twiddles(domain.coset()),
-            1,
         );
         let second_gpu_fold = gpu_fold_line(
             &first_gpu_fold,
-            alpha,
+            &[alpha],
             &CudaBackend::precompute_twiddles(domain.coset()),
-            1,
         );
         let third_gpu_fold = gpu_fold_line(
             &second_gpu_fold,
-            alpha,
+            &[alpha],
             &CudaBackend::precompute_twiddles(domain.coset()),
-            1,
         );
 
         assert_eq!(
@@ -432,10 +410,11 @@ mod tests {
     #[test]
     fn test_fold_line_with_fold_step_compared_with_cpu() {
         const LOG_SIZE: u32 = 13;
-        const FOLD_STEP: u32 = 3;
+        const FOLD_STEP: usize = 3;
         let mut rng = SmallRng::seed_from_u64(0);
         let values: Vec<SecureField> = (0..1 << LOG_SIZE).map(|_| rng.gen()).collect_vec();
-        let alpha = SecureField::from_u32_unchecked(1, 3, 5, 7);
+        // One distinct alpha per sequential fold step (stronger than repeating one).
+        let alphas: Vec<SecureField> = (0..FOLD_STEP).map(|_| rng.gen()).collect_vec();
         let domain = LineDomain::new(CanonicCoset::new(LOG_SIZE + 1).half_coset());
 
         let mut vec: [Vec<BaseField>; 4] = [vec![], vec![], vec![], vec![]];
@@ -459,15 +438,13 @@ mod tests {
                     columns: vec.clone(),
                 },
             ),
-            alpha,
+            &alphas,
             &CpuBackend::precompute_twiddles(domain.coset()),
-            FOLD_STEP,
         );
         let gpu_fold = gpu_fold_line(
             &LineEvaluation::new(domain, SecureColumnByCoords { columns: vecs }),
-            alpha,
+            &alphas,
             &CudaBackend::precompute_twiddles(domain.coset()),
-            FOLD_STEP,
         );
 
         assert_eq!(cpu_fold.values.to_vec(), gpu_fold.values.to_cpu().to_vec());
@@ -482,11 +459,6 @@ mod tests {
         let alpha = SecureField::from_u32_unchecked(1, 3, 5, 7);
         let circle_domain = CanonicCoset::new(LOG_SIZE).circle_domain();
         let line_domain = LineDomain::new(circle_domain.half_coset);
-        let mut cpu_fold = LineEvaluation::new(
-            line_domain,
-            SecureColumnByCoords::zeros(1 << (LOG_SIZE - 1)),
-        );
-
         let mut vec: [Vec<BaseField>; 4] = [vec![], vec![], vec![], vec![]];
         values.iter().for_each(|a| {
             vec[0].push(BaseField::from_u32_unchecked(a.0 .0 .0));
@@ -500,8 +472,7 @@ mod tests {
             BaseFieldVec::from_vec(vec[2].clone()),
             BaseFieldVec::from_vec(vec[3].clone()),
         ];
-        CpuBackend::fold_circle_into_line(
-            &mut cpu_fold,
+        let cpu_fold = CpuBackend::fold_circle_into_line(
             &SecureEvaluation::new(
                 circle_domain,
                 SecureColumnByCoords {
@@ -512,12 +483,7 @@ mod tests {
             &CpuBackend::precompute_twiddles(line_domain.coset()),
         );
 
-        let mut cuda_fold = LineEvaluation::new(
-            line_domain,
-            SecureColumnByCoords::zeros(1 << (LOG_SIZE - 1)),
-        );
-        CudaBackend::fold_circle_into_line(
-            &mut cuda_fold,
+        let cuda_fold = CudaBackend::fold_circle_into_line(
             &SecureEvaluation::new(circle_domain, SecureColumnByCoords { columns: vecs }),
             alpha,
             &CudaBackend::precompute_twiddles(line_domain.coset()),
@@ -528,161 +494,10 @@ mod tests {
 
     #[test]
     fn test_fold_circle_into_line_fibonacci() {
-        let dst_values = SecureColumnByCoords::<CpuBackend> {
-            columns: [
-                vec![
-                    M31(175232161),
-                    M31(1621852215),
-                    M31(1344284923),
-                    M31(1778156084),
-                    M31(1400400421),
-                    M31(1191304209),
-                    M31(1370890230),
-                    M31(876649922),
-                    M31(298405189),
-                    M31(783573640),
-                    M31(1013810795),
-                    M31(1600595576),
-                    M31(1822272537),
-                    M31(1448770626),
-                    M31(160607333),
-                    M31(1985177603),
-                    M31(1800921154),
-                    M31(34711183),
-                    M31(56534507),
-                    M31(510529825),
-                    M31(1900043069),
-                    M31(1061675418),
-                    M31(1348367098),
-                    M31(5042126),
-                    M31(944964573),
-                    M31(1011034686),
-                    M31(1601450494),
-                    M31(1596148275),
-                    M31(866712268),
-                    M31(478168644),
-                    M31(1430493482),
-                    M31(2077703015),
-                ],
-                vec![
-                    M31(193498252),
-                    M31(1930857823),
-                    M31(1574616603),
-                    M31(1096832869),
-                    M31(1535214166),
-                    M31(242948629),
-                    M31(1169096088),
-                    M31(303351246),
-                    M31(1205776310),
-                    M31(404835605),
-                    M31(717680932),
-                    M31(1116437451),
-                    M31(929009816),
-                    M31(1130918817),
-                    M31(1779189410),
-                    M31(1391495896),
-                    M31(66480840),
-                    M31(371990063),
-                    M31(1865649414),
-                    M31(1802222899),
-                    M31(159552644),
-                    M31(896604672),
-                    M31(1931207970),
-                    M31(283233763),
-                    M31(484330319),
-                    M31(989165768),
-                    M31(406520763),
-                    M31(395010529),
-                    M31(1641089337),
-                    M31(1556631089),
-                    M31(630529731),
-                    M31(1094056465),
-                ],
-                vec![
-                    M31(1137009986),
-                    M31(1382256183),
-                    M31(234426591),
-                    M31(723907790),
-                    M31(110421860),
-                    M31(660239829),
-                    M31(1641100420),
-                    M31(1419769276),
-                    M31(537001295),
-                    M31(1021500262),
-                    M31(1724736086),
-                    M31(1286280744),
-                    M31(1618141633),
-                    M31(948764242),
-                    M31(2026990422),
-                    M31(172738322),
-                    M31(1765374986),
-                    M31(185155195),
-                    M31(2011249762),
-                    M31(311260517),
-                    M31(2101859898),
-                    M31(109156094),
-                    M31(2039976666),
-                    M31(689835282),
-                    M31(1371899564),
-                    M31(1842193228),
-                    M31(1628367468),
-                    M31(807003574),
-                    M31(1505108472),
-                    M31(1906175695),
-                    M31(537245304),
-                    M31(2128390530),
-                ],
-                vec![
-                    M31(1733880617),
-                    M31(850794569),
-                    M31(2030610590),
-                    M31(562233856),
-                    M31(1460771010),
-                    M31(2069111798),
-                    M31(2082486460),
-                    M31(517895090),
-                    M31(591152265),
-                    M31(879189323),
-                    M31(492693465),
-                    M31(1962268963),
-                    M31(1180810278),
-                    M31(1360959609),
-                    M31(1465998969),
-                    M31(579298036),
-                    M31(1042819150),
-                    M31(1472324807),
-                    M31(1088967404),
-                    M31(1996597293),
-                    M31(285959712),
-                    M31(1447284512),
-                    M31(803149008),
-                    M31(1842290266),
-                    M31(861208576),
-                    M31(1949442307),
-                    M31(679820802),
-                    M31(1462843748),
-                    M31(1123289729),
-                    M31(1700666883),
-                    M31(2036502646),
-                    M31(26988055),
-                ],
-            ],
-        };
-
-        let dst_domain = LineDomain::new(Coset {
-            initial_index: CirclePointIndex(16777216),
-            initial: CirclePoint {
-                x: M31(838195206),
-                y: M31(1774253895),
-            },
-            step_size: CirclePointIndex(67108864),
-            step: CirclePoint {
-                x: M31(1179735656),
-                y: M31(1241207368),
-            },
-            log_size: 5,
-        });
-        let mut dst = LineEvaluation::new(dst_domain.clone(), dst_values.clone());
+        // The old FriOps API accumulated into a caller-provided `dst`
+        // (`dst = dst * alpha^2 + f'`); the new API returns the plain fold, so the
+        // hardcoded fibonacci `dst` pre-state is gone and the test checks
+        // CudaBackend == CpuBackend on the returned fold of the same trace.
 
         let src_values = SecureColumnByCoords {
             columns: [
@@ -1124,15 +939,6 @@ mod tests {
         };
 
         // CUDA
-        let dst_values_cuda = SecureColumnByCoords {
-            columns: [
-                BaseFieldVec::from_vec(dst.values.columns[0].clone()),
-                BaseFieldVec::from_vec(dst.values.columns[1].clone()),
-                BaseFieldVec::from_vec(dst.values.columns[2].clone()),
-                BaseFieldVec::from_vec(dst.values.columns[3].clone()),
-            ],
-        };
-        let mut dst_cuda = LineEvaluation::<CudaBackend>::new(dst.domain(), dst_values_cuda);
         let src_cuda_values = SecureColumnByCoords::<CudaBackend> {
             columns: [
                 BaseFieldVec::from_vec(src.columns[0].clone()),
@@ -1150,8 +956,8 @@ mod tests {
             itwiddles: BaseFieldVec::from_vec(itwiddles),
         };
 
-        CpuBackend::fold_circle_into_line(&mut dst, &src, alpha, &twiddle_tree);
-        CudaBackend::fold_circle_into_line(&mut dst_cuda, &src_cuda, alpha, &twiddle_tree_cuda);
+        let dst = CpuBackend::fold_circle_into_line(&src, alpha, &twiddle_tree);
+        let dst_cuda = CudaBackend::fold_circle_into_line(&src_cuda, alpha, &twiddle_tree_cuda);
 
         for i in 0..4 {
             assert_eq!(dst_cuda.values.columns[i].to_cpu(), dst.values.columns[i]);
