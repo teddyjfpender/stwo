@@ -133,6 +133,16 @@ cheap stream-ordered memset) because flipping it to true uninitialized memory wo
 turn any not-fully-written buffer into nondeterminism — that flip needs the
 conformance gate per call site.
 
+**Validated (RTX 3090, same-host interleaved A/B vs the round-2 code, all gates
+byte-equal at every step):** cold proves are **2–4.7× faster** (fib 1M 37.4→18.7 s,
+fib 65k 36.7→10.2 s, ec 1024 47.7→13.5 s) — first-prove latency is now warm+1–3 s
+because the disk PTX cache turns per-statement NVRTC compiles (~1.8 s/kernel) into
+1–3 ms loads, across processes and inputs. Warm proves improved 2–9%: at these sizes
+the warm path is GPU-compute- and host-witness-bound, not launch-latency-bound, so
+the sync removal mostly bought correctness headroom (no fence discipline to maintain
+by hand) rather than wall-clock. Full tables and the cross-host caveat:
+`gpu_benchmarks/RESULTS.md` in the stwo-cairo fork.
+
 ## Grinding
 
 - **GPU for the non-M31 channel** (ported from NitrooZK's `grind_blake2s.cu`): chunked
