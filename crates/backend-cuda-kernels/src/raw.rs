@@ -214,6 +214,16 @@ extern "C" {
         results: *mut CudaSecureField,
     );
 
+    pub fn barycentric_point_vanishings(
+        half_coset_initial_index: u32,
+        half_coset_step_size: u32,
+        size: u32,
+        log_size: u32,
+        point_x: CudaSecureField,
+        point_y: CudaSecureField,
+        result: *const u32,
+    );
+
     pub fn barycentric_weights_from_point_vanishings(
         point_vanishings: *const u32,
         size: u32,

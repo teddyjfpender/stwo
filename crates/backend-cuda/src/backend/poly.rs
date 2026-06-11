@@ -9,7 +9,6 @@ use stwo::core::fields::qm31::SecureField;
 use stwo::core::poly::circle::{CanonicCoset, CircleDomain};
 use stwo::core::poly::line::LineDomain;
 use stwo::core::poly::utils::get_folding_alphas;
-use stwo::core::utils::bit_reverse_index;
 use stwo::prover::backend::{Col, Column, CpuBackend};
 use stwo::prover::fri::FriOps;
 use stwo::prover::poly::circle::{
@@ -364,26 +363,26 @@ impl PolyOps for CudaBackend {
         let log_size = domain.log_size();
         let p = p.into_ef::<SecureField>();
 
-        // `point_vanishing` is h.y / (1 + h.x): one field inversion per domain point.
-        // Computing it directly is single-threaded seconds at 2^21 points and dominated
-        // the whole OODS phase. Split into an inversion-free parallel pass plus ONE
-        // batch inversion — identical values (exact field arithmetic), ~100x faster.
-        use rayon::prelude::*;
-        let (numerators, denominators): (Vec<SecureField>, Vec<SecureField>) = (0..domain.size())
-            .into_par_iter()
-            .map(|i| {
-                let h = p - domain
-                    .at(bit_reverse_index(i, log_size))
-                    .into_ef::<SecureField>();
-                (h.y, SecureField::one() + h.x)
-            })
-            .unzip();
-        let mut inv_denominators = vec![SecureField::one(); denominators.len()];
-        stwo::core::fields::batch_inverse_in_place(&denominators, &mut inv_denominators);
-        let point_vanishings: Vec<SecureField> = (0..domain.size())
-            .into_par_iter()
-            .map(|i| numerators[i] * inv_denominators[i])
-            .collect();
+        // The per-point work — circle-point generation, the inversion-free
+        // `point_vanishing` split (numerator h.y, denominator 1 + h.x), the batched
+        // inversion, and the final multiply — all runs ON DEVICE. The previous host
+        // pass generated and inverted millions of points on the CPU per unique
+        // (log_size, point) pair and uploaded the result; the values are identical
+        // (the device point generator is the quotient kernels' conformance-proven
+        // routine, and field inverses are unique). Only the O(log n) scale factors
+        // stay on the host.
+        let point_vanishings = SecureFieldVec::new_uninitialized(domain.size());
+        unsafe {
+            interface::bindings::barycentric_point_vanishings(
+                domain.half_coset.initial_index.0 as u32,
+                domain.half_coset.step_size.0 as u32,
+                domain.size() as u32,
+                log_size,
+                CudaSecureField::from(p.x),
+                CudaSecureField::from(p.y),
+                point_vanishings.device_ptr,
+            );
+        }
 
         let p_0 = domain.at(0).into_ef::<SecureField>();
         let si_0 = SecureField::one()
@@ -395,12 +394,10 @@ impl PolyOps for CudaBackend {
         let even_scale = si_0 * coset_vanishing(CanonicCoset::new(log_size).coset, p);
         let odd_scale = -even_scale;
 
-        let point_vanishings_device = SecureFieldVec::from_vec(point_vanishings);
         let weights = SecureFieldVec::new_uninitialized(domain.size());
-
         unsafe {
             interface::bindings::barycentric_weights_from_point_vanishings(
-                point_vanishings_device.device_ptr,
+                point_vanishings.device_ptr,
                 domain.size() as u32,
                 CudaSecureField::from(even_scale),
                 CudaSecureField::from(odd_scale),

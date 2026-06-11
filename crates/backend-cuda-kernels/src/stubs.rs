@@ -210,6 +210,28 @@ pub unsafe extern "C" fn batch_eval_at_points(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn barycentric_point_vanishings(
+    half_coset_initial_index: u32,
+    half_coset_step_size: u32,
+    size: u32,
+    log_size: u32,
+    point_x: CudaSecureField,
+    point_y: CudaSecureField,
+    result: *const u32,
+) {
+    let _ = (
+        half_coset_initial_index,
+        half_coset_step_size,
+        size,
+        log_size,
+        point_x,
+        point_y,
+        result,
+    );
+    no_cuda_symbol("barycentric_point_vanishings")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn barycentric_weights_from_point_vanishings(
     point_vanishings: *const u32,
     size: u32,

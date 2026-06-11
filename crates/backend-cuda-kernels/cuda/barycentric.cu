@@ -1,11 +1,76 @@
 #include "barycentric.cuh"
 
 #include "batch_inverse.cuh"
+#include "point.cuh"
 #include "utils.cuh"
 
 namespace {
 
 constexpr uint32_t BARYCENTRIC_BLOCK_DIM = 256;
+
+// Circle-domain point at `index` for the half-coset parameterization. Copied from
+// quotients.cu (where the same routine is byte-equality-proven against the CPU
+// reference by the quotient conformance gates); keep the two in sync.
+DEVICE_FORCEINLINE point barycentric_domain_at_index(
+    uint32_t half_coset_initial_index,
+    uint32_t half_coset_step_size,
+    uint32_t index,
+    uint32_t domain_size
+) {
+    uint32_t half_coset_size = domain_size >> 1;
+    int modulo_u31_mask = 0x7fffffff;
+    if (index < half_coset_size) {
+        uint64_t global_index =
+            (uint64_t)half_coset_initial_index + (uint64_t)half_coset_step_size * (uint64_t)index;
+        return point_pow(m31_circle_gen, (int)(global_index & modulo_u31_mask));
+    } else {
+        uint64_t global_index = (uint64_t)half_coset_initial_index +
+                                (uint64_t)half_coset_step_size * (uint64_t)(index - half_coset_size);
+        return point_pow(m31_circle_gen, (int)((2147483648 - global_index) & modulo_u31_mask));
+    }
+}
+
+DEVICE_FORCEINLINE qm31 qm31_from_m31(m31 value) {
+    return qm31{cm31{value, 0}, cm31{0, 0}};
+}
+
+// Per bit-reversed domain point i: numerator = (p - d_i).y, denominator = 1 + (p - d_i).x —
+// the inversion-free split of `point_vanishing(d_i, p) = h.y / (1 + h.x)`. The division
+// happens through one batched inversion (exact field arithmetic: the inverse is unique,
+// so the values are identical to the per-point CPU computation).
+__global__ void barycentric_point_vanishing_parts_kernel(
+    uint32_t half_coset_initial_index,
+    uint32_t half_coset_step_size,
+    uint32_t size,
+    uint32_t log_size,
+    secure_field_point p,
+    qm31 *numerators,
+    qm31 *denominators
+) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= size) {
+        return;
+    }
+    uint32_t domain_index = bit_reverse(i, (int)log_size);
+    point d = barycentric_domain_at_index(
+        half_coset_initial_index, half_coset_step_size, domain_index, size);
+    qm31 hy = sub(p.y, qm31_from_m31(d.y));
+    qm31 hx = sub(p.x, qm31_from_m31(d.x));
+    numerators[i] = hy;
+    denominators[i] = add(qm31_from_m31(1), hx);
+}
+
+__global__ void qm31_mul_elementwise_kernel(
+    const qm31 *lhs,
+    const qm31 *rhs,
+    qm31 *out,
+    uint32_t size
+) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < size) {
+        out[i] = mul(lhs[i], rhs[i]);
+    }
+}
 
 __global__ void barycentric_scale_weights_kernel(
     const qm31 *point_vanishing_inverses,
@@ -87,6 +152,47 @@ __global__ void reduce_qm31_partial_sums_kernel(
 }
 
 } // namespace
+
+// Computes the per-point `point_vanishing(d_i, p)` values for the whole (bit-reversed)
+// circle domain ON DEVICE: one parts kernel + one batched inversion + one multiply.
+// Replaces a host pass that generated millions of circle points and inverted on the
+// CPU per (log_size, point) pair, then uploaded the result.
+extern "C"
+void barycentric_point_vanishings(
+    uint32_t half_coset_initial_index,
+    uint32_t half_coset_step_size,
+    uint32_t size,
+    uint32_t log_size,
+    qm31 p_x,
+    qm31 p_y,
+    qm31 *result
+) {
+    qm31 *numerators = cuda_proving_malloc<qm31>(size);
+    qm31 *denominators = cuda_proving_malloc<qm31>(size);
+
+    uint32_t num_blocks = (size + BARYCENTRIC_BLOCK_DIM - 1) / BARYCENTRIC_BLOCK_DIM;
+    barycentric_point_vanishing_parts_kernel<<<num_blocks, BARYCENTRIC_BLOCK_DIM>>>(
+        half_coset_initial_index,
+        half_coset_step_size,
+        size,
+        log_size,
+        secure_field_point{p_x, p_y},
+        numerators,
+        denominators
+    );
+    stwo_maybe_debug_sync();
+    ASSERT_CUDA_SUCCESS(cudaGetLastError());
+
+    // result = 1 / denominators, then result = numerators * result.
+    batch_inverse_secure_field(denominators, result, size);
+    qm31_mul_elementwise_kernel<<<num_blocks, BARYCENTRIC_BLOCK_DIM>>>(
+        numerators, result, result, size);
+    stwo_maybe_debug_sync();
+    ASSERT_CUDA_SUCCESS(cudaGetLastError());
+
+    cuda_proving_free(numerators);
+    cuda_proving_free(denominators);
+}
 
 extern "C"
 void barycentric_weights_from_point_vanishings(
