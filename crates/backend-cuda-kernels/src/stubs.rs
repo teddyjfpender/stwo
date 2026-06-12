@@ -1060,3 +1060,14 @@ pub unsafe extern "C" fn stwo_upload_half_sync(half: i32) {
 pub unsafe extern "C" fn stwo_legacy_wait_uploads() {
     no_cuda_symbol("stwo_legacy_wait_uploads")
 }
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn barycentric_eval_base_field_into(
+    eval_values: *const u32,
+    weights: *const u32,
+    size: u32,
+    out_slot: *mut u32,
+) {
+    let _ = (eval_values, weights, size, out_slot);
+    no_cuda_symbol("barycentric_eval_base_field_into")
+}

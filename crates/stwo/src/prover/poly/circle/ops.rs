@@ -63,6 +63,33 @@ pub trait PolyOps: ColumnOps<BaseField> + ColumnOps<SecureField> + Sized {
         weights: &Col<Self, SecureField>,
     ) -> SecureField;
 
+    /// Batched out-of-domain evaluation: one [`Self::barycentric_eval_at_point`]
+    /// per `(evals, weights)` item, results in item order. The default simply
+    /// loops; GPU backends override it to enqueue every item's kernels without
+    /// intermediate synchronization and read all results back in ONE transfer
+    /// (the per-item path costs a full stream drain per column). The values are
+    /// identical by construction — each item's evaluation is independent.
+    fn barycentric_eval_many(
+        items: &[(
+            &CircleEvaluation<Self, BaseField, BitReversedOrder>,
+            &Col<Self, SecureField>,
+        )],
+    ) -> Vec<SecureField> {
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::*;
+            items
+                .par_iter()
+                .map(|(evals, weights)| Self::barycentric_eval_at_point(evals, weights))
+                .collect()
+        }
+        #[cfg(not(feature = "parallel"))]
+        items
+            .iter()
+            .map(|(evals, weights)| Self::barycentric_eval_at_point(evals, weights))
+            .collect()
+    }
+
     /// Evaluates a polynomial, represented by it's evaluations, at a point using folding.
     /// Used by the [`CircleEvaluation::eval_at_point_by_folding()`] function.
     fn eval_at_point_by_folding(

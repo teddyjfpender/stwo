@@ -266,3 +266,47 @@ qm31 barycentric_eval_base_field(
 
     return result;
 }
+
+// Batched-OODS variant: identical math to barycentric_eval_base_field, but the
+// final reduction lands in a DEVICE slot (no per-column D2H synchronization —
+// the per-item readback cost a full stream drain per column; the caller reads
+// all slots back in one transfer).
+extern "C"
+void barycentric_eval_base_field_into(
+    const m31 *eval_values,
+    const qm31 *weights,
+    uint32_t size,
+    qm31 *out_slot
+) {
+    uint32_t num_blocks = (size + BARYCENTRIC_BLOCK_DIM - 1) / BARYCENTRIC_BLOCK_DIM;
+    qm31 *partials = cuda_proving_malloc<qm31>(num_blocks);
+    barycentric_eval_partial_kernel<<<num_blocks, BARYCENTRIC_BLOCK_DIM, sizeof(qm31) * BARYCENTRIC_BLOCK_DIM>>>(
+        eval_values,
+        weights,
+        size,
+        partials
+    );
+    stwo_maybe_debug_sync();
+    ASSERT_CUDA_SUCCESS(cudaGetLastError());
+
+    uint32_t current_size = num_blocks;
+    qm31 *current = partials;
+    while (current_size > 1) {
+        uint32_t next_num_blocks = (current_size + BARYCENTRIC_BLOCK_DIM - 1) / BARYCENTRIC_BLOCK_DIM;
+        qm31 *next = cuda_proving_malloc<qm31>(next_num_blocks);
+        reduce_qm31_partial_sums_kernel<<<next_num_blocks, BARYCENTRIC_BLOCK_DIM, sizeof(qm31) * BARYCENTRIC_BLOCK_DIM>>>(
+            current,
+            current_size,
+            next
+        );
+        stwo_maybe_debug_sync();
+        ASSERT_CUDA_SUCCESS(cudaGetLastError());
+        cuda_proving_free(current);
+        current = next;
+        current_size = next_num_blocks;
+    }
+
+    ASSERT_CUDA_SUCCESS(cudaMemcpyAsync(out_slot, current, sizeof(qm31),
+                                        cudaMemcpyDeviceToDevice, (cudaStream_t)0));
+    cuda_proving_free(current);
+}

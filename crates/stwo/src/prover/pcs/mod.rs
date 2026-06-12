@@ -220,7 +220,8 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         };
 
         // Lambda that evaluates a polynomial on a collection of circle points and returns a vector
-        // of point samples.
+        // of point samples (the stored-coefficients mode; the barycentric mode is
+        // batched below).
         let eval_at_points = |(poly, points): (&Poly<B>, &Vec<CirclePoint<SecureField>>)| {
             points
                 .iter()
@@ -234,16 +235,85 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
                 .collect_vec()
         };
 
-        #[cfg(not(feature = "parallel"))]
-        let samples: TreeVec<Vec<Vec<PointSample>>> = self
-            .polynomials()
-            .zip_cols(&sampled_points)
-            .map_cols(eval_at_points);
-        #[cfg(feature = "parallel")]
-        let samples: TreeVec<Vec<Vec<PointSample>>> = self
-            .polynomials()
-            .zip_cols(&sampled_points)
-            .par_map_cols(eval_at_points);
+        let samples: TreeVec<Vec<Vec<PointSample>>> = if let Some(weights_map) =
+            weights_hash_map.as_ref()
+        {
+            // Barycentric mode, batched: flatten every (column, point) job and
+            // evaluate them in one backend call — on GPU backends that means no
+            // per-column synchronization and a single results readback. Each
+            // job is independent, so values and their channel order are
+            // identical to the per-column path.
+            let polys = self.polynomials();
+            let mut guards = Vec::new();
+            let mut job_meta = Vec::new();
+            for (tree_idx, (tree_polys, tree_points)) in
+                polys.iter().zip(sampled_points.iter()).enumerate()
+            {
+                for (col_idx, (poly, points)) in
+                    tree_polys.iter().zip(tree_points.iter()).enumerate()
+                {
+                    let log_size = poly.evals.domain.log_size();
+                    for &point in points.iter() {
+                        let folded = point.repeated_double(lifting_log_size - log_size);
+                        guards.push(
+                            weights_map
+                                .get(&(log_size, folded))
+                                .expect("weights should exist for all sampled points"),
+                        );
+                        job_meta.push((tree_idx, col_idx, point));
+                    }
+                }
+            }
+            let items: Vec<_> = job_meta
+                .iter()
+                .zip(guards.iter())
+                .map(|(&(tree_idx, col_idx, _), guard)| {
+                    (&polys[tree_idx][col_idx].evals, guard.value())
+                })
+                .collect();
+            let values = B::barycentric_eval_many(&items);
+            drop(items);
+            drop(guards);
+
+            let mut value_iter = values.into_iter();
+            let mut job_iter = job_meta.into_iter();
+            TreeVec::new(
+                sampled_points
+                    .iter()
+                    .map(|tree_points| {
+                        tree_points
+                            .iter()
+                            .map(|points| {
+                                points
+                                    .iter()
+                                    .map(|&point| {
+                                        let (_, _, job_point) = job_iter.next().expect("job order");
+                                        debug_assert_eq!(job_point, point);
+                                        PointSample {
+                                            point,
+                                            value: value_iter.next().expect("value order"),
+                                        }
+                                    })
+                                    .collect_vec()
+                            })
+                            .collect_vec()
+                    })
+                    .collect_vec(),
+            )
+        } else {
+            #[cfg(not(feature = "parallel"))]
+            {
+                self.polynomials()
+                    .zip_cols(&sampled_points)
+                    .map_cols(eval_at_points)
+            }
+            #[cfg(feature = "parallel")]
+            {
+                self.polynomials()
+                    .zip_cols(&sampled_points)
+                    .par_map_cols(eval_at_points)
+            }
+        };
 
         span.exit();
         // The barycentric weights are only needed for the out-of-domain evaluations above.

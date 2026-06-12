@@ -58,6 +58,13 @@ extern "C" {
     pub fn stwo_upload_record_half(half: i32);
     pub fn stwo_upload_half_sync(half: i32);
     pub fn stwo_legacy_wait_uploads();
+    /// Batched-OODS barycentric eval: result lands in a device slot (no D2H).
+    pub fn barycentric_eval_base_field_into(
+        eval_values: *const u32,
+        weights: *const u32,
+        size: u32,
+        out_slot: *mut u32,
+    );
     /// Chunked atomicMin nonce search; returns the LOWEST valid nonce, matching the
     /// SIMD grind's search order byte-exactly (non-M31 Blake2s channel only).
     pub fn grind_blake2s(host_prefixed_digest: *const u32, pow_bits: u32) -> u64;

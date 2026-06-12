@@ -424,6 +424,43 @@ impl PolyOps for CudaBackend {
         }
     }
 
+    /// Batched OODS evaluation: every item's partial+reduce chain is enqueued
+    /// without intermediate synchronization, results land in one device buffer,
+    /// and a single D2H readback returns them all — the per-item path costs a
+    /// full legacy-stream drain per column (M1: 1,780 launches + as many
+    /// 16-byte fenced readbacks per prove). Values are identical: the kernels
+    /// are the same; only the synchronization points moved.
+    fn barycentric_eval_many(
+        items: &[(
+            &CircleEvaluation<Self, BaseField, BitReversedOrder>,
+            &Col<Self, SecureField>,
+        )],
+    ) -> Vec<SecureField> {
+        if items.is_empty() {
+            return Vec::new();
+        }
+        crate::columns::bindings::ensure_mem_pool_init();
+        // 4 words per qm31 slot.
+        let slots = crate::columns::BaseFieldVec::new_uninitialized(4 * items.len());
+        for (i, (evals, weights)) in items.iter().enumerate() {
+            assert_eq!(evals.len(), weights.len());
+            unsafe {
+                stwo_backend_cuda_kernels::raw::barycentric_eval_base_field_into(
+                    evals.values.device_ptr,
+                    weights.device_ptr,
+                    evals.len() as u32,
+                    slots.device_ptr.add(4 * i).cast_mut(),
+                );
+            }
+        }
+        // One synchronous readback for the whole batch (the fence).
+        let words = slots.to_vec();
+        words
+            .chunks_exact(4)
+            .map(|c| SecureField::from_u32_unchecked(c[0].0, c[1].0, c[2].0, c[3].0))
+            .collect()
+    }
+
     fn eval_at_point_by_folding(
         evals: &CircleEvaluation<Self, BaseField, BitReversedOrder>,
         point: CirclePoint<SecureField>,
