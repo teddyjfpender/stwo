@@ -129,4 +129,27 @@ extern "C" uint32_t* cuda_mem_pool_allocate_uint32(size_t count);
 extern "C" uint32_t* cuda_mem_pool_allocate_zeroes_uint32(size_t count);
 extern "C" void cuda_mem_pool_free_uint32(uint32_t* ptr);
 
+// ---------------------------------------------------------------------------
+// Upload lane (async H2D; the M1 follow-up — H2D was 47% of GPU-op time).
+//
+// A dedicated copy stream so pinned-staging uploads overlap whatever compute is
+// already enqueued on the legacy stream. CONTRACT:
+//   - Destination buffers MUST come from `stwo_upload_alloc_uint32`
+//     (stream-ordered on the upload stream), so the copy needs no opening
+//     bridge and never trails pending legacy compute.
+//   - `stwo_upload_h2d_async` enqueues the copy; the PINNED source slice must
+//     stay untouched until its staging half is fenced.
+//   - `stwo_upload_record_half(h)` / `stwo_upload_half_sync(h)` fence staging
+//     half reuse (ping-pong packing).
+//   - `stwo_legacy_wait_uploads()` MUST run before any legacy-stream consumer
+//     of the uploaded buffers (callers do it once per batch set, at the end).
+// All record/wait pairs share the bridge mutex (atomic per pair).
+// ---------------------------------------------------------------------------
+extern "C" uint32_t* stwo_upload_alloc_uint32(size_t count);
+extern "C" void stwo_upload_h2d_async(const uint32_t* pinned_src, uint32_t* device_dst,
+                                      uint64_t n_words);
+extern "C" void stwo_upload_record_half(int half);
+extern "C" void stwo_upload_half_sync(int half);
+extern "C" void stwo_legacy_wait_uploads();
+
 #endif // CUDA_MEM_POOL_H

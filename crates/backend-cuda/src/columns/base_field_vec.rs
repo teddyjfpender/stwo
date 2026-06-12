@@ -53,6 +53,16 @@ impl BaseFieldVec {
         Self::new(device_ptr, size)
     }
 
+    /// Uninitialized buffer allocated STREAM-ORDERED ON THE UPLOAD STREAM — the
+    /// destination for `stwo_upload_h2d_async` copies (see the upload-lane
+    /// contract in `cuda_mem_pool.cuh`). Legacy-stream consumers are only
+    /// correct after `stwo_legacy_wait_uploads()`.
+    pub fn new_uninitialized_on_upload(size: usize) -> Self {
+        crate::columns::bindings::ensure_mem_pool_init();
+        let device_ptr = unsafe { stwo_backend_cuda_kernels::raw::stwo_upload_alloc_uint32(size) };
+        Self::new(device_ptr, size)
+    }
+
     pub fn new_zeroes(size: usize) -> Self {
         crate::columns::bindings::ensure_mem_pool_init();
         let device_ptr = unsafe { bindings::cuda_alloc_zeroes_uint32_t(size as u32) };

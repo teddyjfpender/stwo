@@ -1027,3 +1027,36 @@ pub unsafe extern "C" fn gen_bitwise_xor_columns_on_gpu(
 ) {
     no_cuda_symbol("gen_bitwise_xor_columns_on_gpu")
 }
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_upload_alloc_uint32(count: usize) -> *mut u32 {
+    let _ = count;
+    no_cuda_symbol("stwo_upload_alloc_uint32")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_upload_h2d_async(
+    pinned_src: *const u32,
+    device_dst: *mut u32,
+    n_words: u64,
+) {
+    let _ = (pinned_src, device_dst, n_words);
+    no_cuda_symbol("stwo_upload_h2d_async")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_upload_record_half(half: i32) {
+    let _ = half;
+    no_cuda_symbol("stwo_upload_record_half")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_upload_half_sync(half: i32) {
+    let _ = half;
+    no_cuda_symbol("stwo_upload_half_sync")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_legacy_wait_uploads() {
+    no_cuda_symbol("stwo_legacy_wait_uploads")
+}

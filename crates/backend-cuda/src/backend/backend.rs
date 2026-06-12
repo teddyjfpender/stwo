@@ -89,6 +89,96 @@ unsafe impl Send for PinnedStaging {}
 /// 256 Mi u32 words = 1 GiB of page-locked staging at most.
 const PINNED_STAGING_CAP_WORDS: usize = 1 << 28;
 
+/// Uploads arbitrary word slices through the pinned ping-pong staging onto the
+/// dedicated upload stream (async; the host never blocks on PCIe). Returns one
+/// upload-stream-allocated [`crate::columns::BaseFieldVec`] per slice, in order.
+///
+/// CONTRACT: the caller MUST call `stwo_backend_cuda_kernels::raw::
+/// stwo_legacy_wait_uploads()` before any legacy-stream consumer of the returned
+/// buffers. Falls back to synchronous pageable copies when pinned allocation is
+/// unavailable or `STWO_CUDA_SYNC_UPLOADS=1`.
+pub(crate) fn upload_slices_async(slices: &[&[u32]]) -> Vec<crate::columns::BaseFieldVec> {
+    crate::columns::bindings::ensure_mem_pool_init();
+    let sync_uploads = std::env::var("STWO_CUDA_SYNC_UPLOADS").as_deref() == Ok("1");
+    let total: usize = slices.iter().map(|s| s.len()).sum();
+    let largest: usize = slices.iter().map(|s| s.len()).max().unwrap_or(0);
+
+    let sync_fallback = |slices: &[&[u32]]| -> Vec<crate::columns::BaseFieldVec> {
+        slices
+            .iter()
+            .map(|words| {
+                let device_ptr = unsafe {
+                    crate::columns::bindings::copy_uint32_t_vec_from_host_to_device(
+                        words.as_ptr(),
+                        words.len() as u32,
+                    )
+                };
+                crate::columns::BaseFieldVec::new(device_ptr, words.len())
+            })
+            .collect()
+    };
+    if sync_uploads || largest == 0 {
+        return sync_fallback(slices);
+    }
+
+    let mut staging = pinned_staging().lock().unwrap();
+    let needed = (2 * largest)
+        .max(total.min(PINNED_STAGING_CAP_WORDS))
+        .max(2 * largest);
+    if staging.capacity_words < needed {
+        unsafe {
+            crate::columns::bindings::cuda_free_pinned_host_u32(staging.ptr);
+            staging.ptr = crate::columns::bindings::cuda_alloc_pinned_host_u32(needed as u64);
+        }
+        staging.capacity_words = if staging.ptr.is_null() { 0 } else { needed };
+    }
+    if staging.ptr.is_null() {
+        return sync_fallback(slices);
+    }
+
+    let half_words = staging.capacity_words / 2;
+    let mut results = Vec::with_capacity(slices.len());
+    let mut half: i32 = 0;
+    let mut batch_start = 0;
+    while batch_start < slices.len() {
+        unsafe { stwo_backend_cuda_kernels::raw::stwo_upload_half_sync(half) };
+        let mut batch_end = batch_start;
+        let mut words = 0usize;
+        let mut offsets = Vec::new();
+        while batch_end < slices.len()
+            && (batch_end == batch_start || words + slices[batch_end].len() <= half_words)
+        {
+            offsets.push(words);
+            words += slices[batch_end].len();
+            batch_end += 1;
+        }
+        let half_base = unsafe { staging.ptr.add(half as usize * half_words) };
+        for (i, words_slice) in slices[batch_start..batch_end].iter().enumerate() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    words_slice.as_ptr(),
+                    half_base.add(offsets[i]),
+                    words_slice.len(),
+                );
+            }
+            let column =
+                crate::columns::BaseFieldVec::new_uninitialized_on_upload(words_slice.len());
+            unsafe {
+                stwo_backend_cuda_kernels::raw::stwo_upload_h2d_async(
+                    half_base.add(offsets[i]),
+                    column.device_ptr.cast_mut(),
+                    words_slice.len() as u64,
+                );
+            }
+            results.push(column);
+        }
+        unsafe { stwo_backend_cuda_kernels::raw::stwo_upload_record_half(half) };
+        half ^= 1;
+        batch_start = batch_end;
+    }
+    results
+}
+
 fn pinned_staging() -> &'static std::sync::Mutex<PinnedStaging> {
     static STAGING: std::sync::OnceLock<std::sync::Mutex<PinnedStaging>> =
         std::sync::OnceLock::new();
@@ -148,7 +238,15 @@ impl stwo::prover::backend::FromSimdColumns for CudaBackend {
         // at least the largest single column (so every batch below is non-empty).
         let total: usize = evals.iter().map(|eval| eval.values.len()).sum();
         let largest: usize = evals.iter().map(|eval| eval.values.len()).max().unwrap();
-        let needed = largest.max(total.min(PINNED_STAGING_CAP_WORDS));
+        let sync_uploads = std::env::var("STWO_CUDA_SYNC_UPLOADS").as_deref() == Ok("1");
+        // Ping-pong packing needs two halves that each hold the largest column.
+        let needed = if sync_uploads {
+            largest.max(total.min(PINNED_STAGING_CAP_WORDS))
+        } else {
+            (2 * largest)
+                .max(total.min(PINNED_STAGING_CAP_WORDS))
+                .max(2 * largest)
+        };
         if staging.capacity_words < needed {
             unsafe {
                 crate::columns::bindings::cuda_free_pinned_host_u32(staging.ptr);
@@ -171,16 +269,32 @@ impl stwo::prover::backend::FromSimdColumns for CudaBackend {
         }
 
         let mut results = Vec::with_capacity(evals.len());
+        // Async upload lane (default): columns pack into alternating staging
+        // halves and upload with cudaMemcpyAsync on the dedicated copy stream —
+        // the host never blocks on PCIe, uploads overlap already-enqueued legacy
+        // compute, and each half is fenced before repacking. Destinations are
+        // allocated stream-ordered on the upload stream; one closing bridge
+        // orders every later legacy consumer. STWO_CUDA_SYNC_UPLOADS=1 restores
+        // the previous synchronous path (kill switch).
+        let half_words = if sync_uploads {
+            staging.capacity_words
+        } else {
+            staging.capacity_words / 2
+        };
+        let mut half: i32 = 0;
         let mut batch_start = 0;
         while batch_start < evals.len() {
-            // Greedily take columns while they fit the staging buffer (always at
-            // least one: capacity covers the largest single column).
+            if !sync_uploads {
+                // Wait until this half's previous uploads (any thread) drained.
+                unsafe { stwo_backend_cuda_kernels::raw::stwo_upload_half_sync(half) };
+            }
+            // Greedily take columns while they fit the active staging region
+            // (always at least one: capacity covers the largest single column).
             let mut batch_end = batch_start;
             let mut words = 0usize;
             let mut offsets = Vec::new();
             while batch_end < evals.len()
-                && (batch_end == batch_start
-                    || words + evals[batch_end].values.len() <= staging.capacity_words)
+                && (batch_end == batch_start || words + evals[batch_end].values.len() <= half_words)
             {
                 offsets.push(words);
                 words += evals[batch_end].values.len();
@@ -188,10 +302,9 @@ impl stwo::prover::backend::FromSimdColumns for CudaBackend {
             }
             let batch = &evals[batch_start..batch_end];
 
-            // Parallel pack: each column unpacks its SIMD lanes straight into its
-            // disjoint staging slice (BaseField is a transparent u32 wrapper).
-            let staging_slice =
-                unsafe { std::slice::from_raw_parts_mut(staging.ptr, staging.capacity_words) };
+            // Parallel pack into this half's disjoint slices.
+            let half_base = unsafe { staging.ptr.add(half as usize * half_words) };
+            let staging_slice = unsafe { std::slice::from_raw_parts_mut(half_base, half_words) };
             let mut chunks: Vec<&mut [u32]> = Vec::with_capacity(batch.len());
             let mut rest = staging_slice;
             for eval in batch.iter() {
@@ -203,10 +316,6 @@ impl stwo::prover::backend::FromSimdColumns for CudaBackend {
                 .par_iter()
                 .zip(chunks.par_iter_mut())
                 .for_each(|(eval, chunk)| {
-                    // `as_slice` is a zero-copy view over the SIMD column's packed
-                    // lanes (PackedM31 is a transparent [u32; 16]), truncated to the
-                    // logical length — one copy straight into pinned staging, no
-                    // intermediate Vec per column.
                     let host = eval.values.as_slice();
                     // BaseField is repr(transparent) over u32.
                     let words: &[u32] =
@@ -214,23 +323,44 @@ impl stwo::prover::backend::FromSimdColumns for CudaBackend {
                     chunk.copy_from_slice(words);
                 });
 
-            // Upload each column from its pinned staging offset into its own buffer.
+            // Upload each column from its staging offset into its own buffer.
             for (i, eval) in batch.iter().enumerate() {
                 let len = eval.values.len();
-                let column = crate::columns::BaseFieldVec::new_uninitialized(len);
-                unsafe {
-                    crate::columns::bindings::copy_uint32_t_vec_from_host_to_device_into(
-                        staging.ptr.add(offsets[i]),
-                        column.device_ptr,
-                        len as u64,
-                    );
-                }
+                let column = if sync_uploads {
+                    let column = crate::columns::BaseFieldVec::new_uninitialized(len);
+                    unsafe {
+                        crate::columns::bindings::copy_uint32_t_vec_from_host_to_device_into(
+                            half_base.add(offsets[i]),
+                            column.device_ptr,
+                            len as u64,
+                        );
+                    }
+                    column
+                } else {
+                    let column = crate::columns::BaseFieldVec::new_uninitialized_on_upload(len);
+                    unsafe {
+                        stwo_backend_cuda_kernels::raw::stwo_upload_h2d_async(
+                            half_base.add(offsets[i]),
+                            column.device_ptr.cast_mut(),
+                            len as u64,
+                        );
+                    }
+                    column
+                };
                 results.push(stwo::prover::poly::circle::CircleEvaluation::new(
                     eval.domain,
                     column,
                 ));
             }
+            if !sync_uploads {
+                unsafe { stwo_backend_cuda_kernels::raw::stwo_upload_record_half(half) };
+                half ^= 1;
+            }
             batch_start = batch_end;
+        }
+        if !sync_uploads {
+            // Order every later legacy-stream consumer after the in-flight copies.
+            unsafe { stwo_backend_cuda_kernels::raw::stwo_legacy_wait_uploads() };
         }
         results
     }

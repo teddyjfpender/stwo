@@ -22,7 +22,6 @@
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::poly::circle::CanonicCoset;
-use stwo::prover::backend::Column;
 use stwo::prover::poly::circle::CircleEvaluation;
 use stwo::prover::poly::BitReversedOrder;
 use stwo_constraint_framework::{LogupFinalizeBackend, RawLogupTrace};
@@ -45,35 +44,39 @@ pub fn finalize_raw_logup(
     let domain = CanonicCoset::new(log_size).circle_domain();
     crate::columns::bindings::ensure_mem_pool_init();
 
-    // Chain the columns: value_k = num_k * inv(den_k) + value_{k-1}, computed in
-    // place over the uploaded numerator coordinate columns.
-    let mut finalized: Vec<[BaseFieldVec; 4]> = Vec::with_capacity(raw.columns.len());
-    for raw_col in raw.columns {
-        // Numerator coordinates are contiguous m31 columns in the SIMD layout —
-        // upload as-is. The denominators are packed-lane and de-interleave on device.
-        let coords: [BaseFieldVec; 4] = std::array::from_fn(|i| {
-            let column = &raw_col.numerator.columns[i];
-            let words: &[u32] =
-                unsafe { std::slice::from_raw_parts(column.data.as_ptr().cast(), column.len()) };
-            let device_ptr = unsafe {
-                bindings::copy_uint32_t_vec_from_host_to_device(words.as_ptr(), size as u32)
+    // Pass 1 — stage every column's raw pairs through the pinned ping-pong lane
+    // and enqueue async uploads on the dedicated copy stream (the host never
+    // blocks on PCIe; uploads overlap already-enqueued legacy compute). Slice
+    // order per column: the 4 numerator coordinate columns, then the packed-lane
+    // denominators (which de-interleave on device).
+    let slices: Vec<&[u32]> = raw
+        .columns
+        .iter()
+        .flat_map(|raw_col| {
+            let coords = raw_col.numerator.columns.iter().map(|column| -> &[u32] {
+                unsafe { std::slice::from_raw_parts(column.data.as_ptr().cast(), size) }
+            });
+            let denoms: &[u32] = unsafe {
+                std::slice::from_raw_parts(
+                    raw_col.denominator.data.as_ptr().cast(),
+                    // PackedSecureField = 4 coords x 16 lanes = 64 u32 words/packed elem.
+                    raw_col.denominator.data.len() * 64,
+                )
             };
-            BaseFieldVec::new(device_ptr, size)
-        });
-        let denom_words: &[u32] = unsafe {
-            std::slice::from_raw_parts(
-                raw_col.denominator.data.as_ptr().cast(),
-                // PackedSecureField = 4 coords x 16 lanes = 64 u32 words per packed element.
-                raw_col.denominator.data.len() * 64,
-            )
-        };
-        let denom_dev = unsafe {
-            bindings::copy_uint32_t_vec_from_host_to_device(
-                denom_words.as_ptr(),
-                denom_words.len() as u32,
-            )
-        };
-        let denom = BaseFieldVec::new(denom_dev, denom_words.len());
+            coords.chain([denoms]).collect::<Vec<_>>()
+        })
+        .collect();
+    let mut uploaded = super::backend::upload_slices_async(&slices).into_iter();
+    // Order the legacy-stream chain kernels after the in-flight copies.
+    unsafe { stwo_backend_cuda_kernels::raw::stwo_legacy_wait_uploads() };
+
+    // Pass 2 — chain the columns: value_k = num_k * inv(den_k) + value_{k-1},
+    // computed in place over the uploaded numerator coordinate columns.
+    let mut finalized: Vec<[BaseFieldVec; 4]> = Vec::with_capacity(raw.columns.len());
+    for _ in &raw.columns {
+        let coords: [BaseFieldVec; 4] =
+            std::array::from_fn(|_| uploaded.next().expect("upload count"));
+        let denom = uploaded.next().expect("upload count");
 
         let prev = finalized.last();
         unsafe {

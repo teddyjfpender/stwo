@@ -1,6 +1,7 @@
 #include "cuda_mem_pool.cuh"
 #include <cuda_runtime.h>
 #include <cstdint>
+#include <cstdlib>
 #include <mutex>
 
 namespace {
@@ -101,4 +102,74 @@ extern "C" uint32_t* cuda_mem_pool_allocate_zeroes_uint32(size_t count) {
 
 extern "C" void cuda_mem_pool_free_uint32(uint32_t* ptr) {
     cuda_mem_pool_free(ptr);
+}
+
+// ---------------------------------------------------------------------------
+// Upload lane (see header contract).
+// ---------------------------------------------------------------------------
+namespace {
+struct UploadLane {
+    cudaStream_t stream;
+    cudaEvent_t bridge;
+    cudaEvent_t half_fence[2];
+};
+UploadLane &upload_lane() {
+    static UploadLane lane = [] {
+        UploadLane l{};
+        cudaStreamCreateWithFlags(&l.stream, cudaStreamNonBlocking);
+        cudaEventCreateWithFlags(&l.bridge, cudaEventDisableTiming);
+        cudaEventCreateWithFlags(&l.half_fence[0], cudaEventDisableTiming);
+        cudaEventCreateWithFlags(&l.half_fence[1], cudaEventDisableTiming);
+        return l;
+    }();
+    return lane;
+}
+}  // namespace
+
+extern "C" uint32_t* stwo_upload_alloc_uint32(size_t count) {
+    cudaMemPool_t pool = stwo_default_mem_pool();
+    uint32_t *ptr = nullptr;
+    if (pool != nullptr) {
+        cudaError_t err = cudaMallocFromPoolAsync((void**)&ptr, count * sizeof(uint32_t), pool,
+                                                  upload_lane().stream);
+        if (err == cudaSuccess) {
+            return ptr;
+        }
+        printf("upload-lane pool alloc of %zu words failed: %s\n", count,
+               cudaGetErrorString(err));
+    }
+    // Fallback: plain device alloc (synchronizing, but correct on every path).
+    if (cudaMalloc((void**)&ptr, count * sizeof(uint32_t)) != cudaSuccess) {
+        return nullptr;
+    }
+    return ptr;
+}
+
+extern "C" void stwo_upload_h2d_async(const uint32_t* pinned_src, uint32_t* device_dst,
+                                      uint64_t n_words) {
+    cudaError_t err = cudaMemcpyAsync(device_dst, pinned_src, n_words * sizeof(uint32_t),
+                                      cudaMemcpyHostToDevice, upload_lane().stream);
+    if (err != cudaSuccess) {
+        printf("stwo_upload_h2d_async(%llu words) failed: %s\n",
+               (unsigned long long)n_words, cudaGetErrorString(err));
+        std::abort();
+    }
+}
+
+extern "C" void stwo_upload_record_half(int half) {
+    UploadLane &l = upload_lane();
+    std::lock_guard<std::mutex> lock(bridge_mutex());
+    cudaEventRecord(l.half_fence[half & 1], l.stream);
+}
+
+extern "C" void stwo_upload_half_sync(int half) {
+    // Synchronizing an unrecorded (fresh) event returns immediately.
+    cudaEventSynchronize(upload_lane().half_fence[half & 1]);
+}
+
+extern "C" void stwo_legacy_wait_uploads() {
+    UploadLane &l = upload_lane();
+    std::lock_guard<std::mutex> lock(bridge_mutex());
+    cudaEventRecord(l.bridge, l.stream);
+    cudaStreamWaitEvent((cudaStream_t)0, l.bridge, 0);
 }

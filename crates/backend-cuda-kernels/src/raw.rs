@@ -52,6 +52,12 @@ extern "C" {
     /// Returns a CUDA error code (0 = success). Sets the default mem pool's release
     /// threshold to never-release so warm proves reuse allocations.
     pub fn cuda_mem_pool_init() -> i32;
+    // Upload lane (async H2D on a dedicated copy stream; see cuda_mem_pool.cuh).
+    pub fn stwo_upload_alloc_uint32(count: usize) -> *mut u32;
+    pub fn stwo_upload_h2d_async(pinned_src: *const u32, device_dst: *mut u32, n_words: u64);
+    pub fn stwo_upload_record_half(half: i32);
+    pub fn stwo_upload_half_sync(half: i32);
+    pub fn stwo_legacy_wait_uploads();
     /// Chunked atomicMin nonce search; returns the LOWEST valid nonce, matching the
     /// SIMD grind's search order byte-exactly (non-M31 Blake2s channel only).
     pub fn grind_blake2s(host_prefixed_digest: *const u32, pow_bits: u32) -> u64;
