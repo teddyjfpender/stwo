@@ -1088,11 +1088,13 @@ pub unsafe extern "C" fn barycentric_eval_base_field_into(
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn tuple_pair_logup(
-    rel_id0: u32,
+    base0: CudaSecureField,
     cols0: *const *const u32,
+    alphas0: *const u32,
     n0: u32,
-    rel_id1: u32,
+    base1: CudaSecureField,
     cols1: *const *const u32,
+    alphas1: *const u32,
     n1: u32,
     mult0_col: *const u32,
     enabler0: u32,
@@ -1100,15 +1102,13 @@ pub unsafe extern "C" fn tuple_pair_logup(
     enabler1: u32,
     negate: u32,
     column_length: u32,
-    alphas: *const u32,
-    z: CudaSecureField,
     denoms: *const u32,
     num0: *const u32,
     num1: *const u32,
     num2: *const u32,
     num3: *const u32,
 ) {
-    let _ = (rel_id0, cols0, n0, rel_id1, cols1, n1);
+    let _ = (base0, cols0, alphas0, n0, base1, cols1, alphas1, n1);
     let _ = (
         mult0_col,
         enabler0,
@@ -1117,31 +1117,52 @@ pub unsafe extern "C" fn tuple_pair_logup(
         negate,
         column_length,
     );
-    let _ = (alphas, z, denoms, num0, num1, num2, num3);
+    let _ = (denoms, num0, num1, num2, num3);
     no_cuda_symbol("tuple_pair_logup")
 }
 
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn tuple_single_logup(
-    rel_id: u32,
+    base: CudaSecureField,
     cols: *const *const u32,
+    alphas: *const u32,
     n: u32,
     mult_col: *const u32,
     enabler: u32,
     negate: u32,
     column_length: u32,
-    alphas: *const u32,
-    z: CudaSecureField,
     denoms: *const u32,
     num0: *const u32,
     num1: *const u32,
     num2: *const u32,
     num3: *const u32,
 ) {
-    let _ = (rel_id, cols, n, mult_col, enabler, negate, column_length);
-    let _ = (alphas, z, denoms, num0, num1, num2, num3);
+    let _ = (base, cols, alphas, n, mult_col, enabler, negate, column_length);
+    let _ = (denoms, num0, num1, num2, num3);
     no_cuda_symbol("tuple_single_logup")
+}
+
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn ret_opcode_trace(
+    pc: *const u32,
+    ap: *const u32,
+    fp: *const u32,
+    addr_table: *const u32,
+    big_words: *const u32,
+    small_words: *const u32,
+    n_rows: u32,
+    column_length: u32,
+    trace: *const *const u32,
+    addr0: *const u32,
+    addr1: *const u32,
+    next_pc: *const u32,
+    next_fp: *const u32,
+) {
+    let _ = (pc, ap, fp, addr_table, big_words, small_words);
+    let _ = (n_rows, column_length, trace, addr0, addr1, next_pc, next_fp);
+    no_cuda_symbol("ret_opcode_trace")
 }
 
 #[unsafe(no_mangle)]

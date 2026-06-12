@@ -2,11 +2,14 @@
 //
 // Every generated interaction writer in stwo-cairo follows one of two shapes,
 // per packed row:
-//   pair:   d_i = combine([REL_ID_i const, staged tuple columns_i...]),
+//   pair:   d_i = base_i + sum_k alphas_i[k] * cols_i[k][row],
 //           numerator = sign * (d0*m1 + d1*m0), denominator = d0*d1
-//   single: d = combine([REL_ID const, staged tuple columns...]),
+//   single: d = base + sum_k alphas[k] * cols[k][row],
 //           numerator = (sign * m, 0, 0, 0), denominator = d
-// with combine(v) = sum_k alphas[k]*v_k - z and multiplicity m one of:
+// The host wrapper folds every row-invariant tuple slot into `base` =
+// alpha^0 * REL_ID + sum_{const slots j} alpha^(1+j) * c_j - z, and repacks
+// `alphas` to hold only the live columns' alpha powers (opcode tuples are
+// constant-heavy, so constants cost nothing on device). Multiplicity m is:
 //   - the constant 1                        (mult_col == nullptr, enabler == ~0)
 //   - a trace/staged column                 (mult_col != nullptr)
 //   - the Enabler pattern: 1 iff row < off  (mult_col == nullptr, enabler == off)
@@ -28,18 +31,17 @@ DEVICE_FORCEINLINE qm31 wl_mul_m31(qm31 x, m31 s) {
 }
 
 DEVICE_FORCEINLINE qm31 wl_combine(
-    uint32_t rel_id,
+    qm31 base,
     const uint32_t *const *cols,
-    uint32_t n_cols,
-    uint32_t row,
     const qm31 *alphas,
-    qm31 z
+    uint32_t n_cols,
+    uint32_t row
 ) {
-    qm31 acc = wl_mul_m31(alphas[0], rel_id);
+    qm31 acc = base;
     for (uint32_t k = 0; k < n_cols; ++k) {
-        acc = add(acc, wl_mul_m31(alphas[1 + k], cols[k][row]));
+        acc = add(acc, wl_mul_m31(alphas[k], cols[k][row]));
     }
-    return sub(acc, z);
+    return acc;
 }
 
 DEVICE_FORCEINLINE m31 wl_mult(
@@ -57,21 +59,19 @@ DEVICE_FORCEINLINE m31 wl_mult(
 }
 
 __global__ void tuple_pair_logup_kernel(
-    uint32_t rel_id0, const uint32_t *const *cols0, uint32_t n0,
-    uint32_t rel_id1, const uint32_t *const *cols1, uint32_t n1,
+    qm31 base0, const uint32_t *const *cols0, const qm31 *alphas0, uint32_t n0,
+    qm31 base1, const uint32_t *const *cols1, const qm31 *alphas1, uint32_t n1,
     const uint32_t *mult0_col, uint32_t enabler0,
     const uint32_t *mult1_col, uint32_t enabler1,
     uint32_t negate,
     uint32_t column_length,
-    const qm31 *alphas,
-    qm31 z,
     qm31 *denoms,
     uint32_t *num0, uint32_t *num1, uint32_t *num2, uint32_t *num3
 ) {
     uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= column_length) return;
-    qm31 d0 = wl_combine(rel_id0, cols0, n0, row, alphas, z);
-    qm31 d1 = wl_combine(rel_id1, cols1, n1, row, alphas, z);
+    qm31 d0 = wl_combine(base0, cols0, alphas0, n0, row);
+    qm31 d1 = wl_combine(base1, cols1, alphas1, n1, row);
     m31 m0 = wl_mult(mult0_col, enabler0, row);
     m31 m1 = wl_mult(mult1_col, enabler1, row);
     qm31 numerator = add(wl_mul_m31(d0, m1), wl_mul_m31(d1, m0));
@@ -86,17 +86,15 @@ __global__ void tuple_pair_logup_kernel(
 }
 
 __global__ void tuple_single_logup_kernel(
-    uint32_t rel_id, const uint32_t *const *cols, uint32_t n,
+    qm31 base, const uint32_t *const *cols, const qm31 *alphas, uint32_t n,
     const uint32_t *mult_col, uint32_t enabler, uint32_t negate,
     uint32_t column_length,
-    const qm31 *alphas,
-    qm31 z,
     qm31 *denoms,
     uint32_t *num0, uint32_t *num1, uint32_t *num2, uint32_t *num3
 ) {
     uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= column_length) return;
-    denoms[row] = wl_combine(rel_id, cols, n, row, alphas, z);
+    denoms[row] = wl_combine(base, cols, alphas, n, row);
     m31 m = wl_mult(mult_col, enabler, row);
     num0[row] = negate ? neg(m) : m;
     num1[row] = 0;
@@ -135,39 +133,37 @@ __global__ void tuple_count_kernel(
 }  // namespace
 
 extern "C" void tuple_pair_logup(
-    uint32_t rel_id0, const uint32_t *const *cols0, uint32_t n0,
-    uint32_t rel_id1, const uint32_t *const *cols1, uint32_t n1,
+    qm31 base0, const uint32_t *const *cols0, const uint32_t *alphas0, uint32_t n0,
+    qm31 base1, const uint32_t *const *cols1, const uint32_t *alphas1, uint32_t n1,
     const uint32_t *mult0_col, uint32_t enabler0,
     const uint32_t *mult1_col, uint32_t enabler1,
     uint32_t negate,
     uint32_t column_length,
-    const uint32_t *alphas,
-    qm31 z,
     uint32_t *denoms,
     uint32_t *num0, uint32_t *num1, uint32_t *num2, uint32_t *num3
 ) {
     uint32_t blocks = (column_length + WL_BLOCK - 1) / WL_BLOCK;
     tuple_pair_logup_kernel<<<blocks, WL_BLOCK>>>(
-        rel_id0, cols0, n0, rel_id1, cols1, n1, mult0_col, enabler0, mult1_col, enabler1,
-        negate, column_length, reinterpret_cast<const qm31 *>(alphas), z,
+        base0, cols0, reinterpret_cast<const qm31 *>(alphas0), n0,
+        base1, cols1, reinterpret_cast<const qm31 *>(alphas1), n1,
+        mult0_col, enabler0, mult1_col, enabler1,
+        negate, column_length,
         reinterpret_cast<qm31 *>(denoms), num0, num1, num2, num3);
     stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 }
 
 extern "C" void tuple_single_logup(
-    uint32_t rel_id, const uint32_t *const *cols, uint32_t n,
+    qm31 base, const uint32_t *const *cols, const uint32_t *alphas, uint32_t n,
     const uint32_t *mult_col, uint32_t enabler, uint32_t negate,
     uint32_t column_length,
-    const uint32_t *alphas,
-    qm31 z,
     uint32_t *denoms,
     uint32_t *num0, uint32_t *num1, uint32_t *num2, uint32_t *num3
 ) {
     uint32_t blocks = (column_length + WL_BLOCK - 1) / WL_BLOCK;
     tuple_single_logup_kernel<<<blocks, WL_BLOCK>>>(
-        rel_id, cols, n, mult_col, enabler, negate, column_length,
-        reinterpret_cast<const qm31 *>(alphas), z,
+        base, cols, reinterpret_cast<const qm31 *>(alphas), n,
+        mult_col, enabler, negate, column_length,
         reinterpret_cast<qm31 *>(denoms), num0, num1, num2, num3);
     stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());

@@ -60,11 +60,13 @@ extern "C" {
     pub fn stwo_legacy_wait_uploads();
     // Generic witness logup-input kernels (witness_logup.cu).
     pub fn tuple_pair_logup(
-        rel_id0: u32,
+        base0: CudaSecureField,
         cols0: *const *const u32,
+        alphas0: *const u32,
         n0: u32,
-        rel_id1: u32,
+        base1: CudaSecureField,
         cols1: *const *const u32,
+        alphas1: *const u32,
         n1: u32,
         mult0_col: *const u32,
         enabler0: u32,
@@ -72,8 +74,6 @@ extern "C" {
         enabler1: u32,
         negate: u32,
         column_length: u32,
-        alphas: *const u32,
-        z: CudaSecureField,
         denoms: *const u32,
         num0: *const u32,
         num1: *const u32,
@@ -81,20 +81,35 @@ extern "C" {
         num3: *const u32,
     );
     pub fn tuple_single_logup(
-        rel_id: u32,
+        base: CudaSecureField,
         cols: *const *const u32,
+        alphas: *const u32,
         n: u32,
         mult_col: *const u32,
         enabler: u32,
         negate: u32,
         column_length: u32,
-        alphas: *const u32,
-        z: CudaSecureField,
         denoms: *const u32,
         num0: *const u32,
         num1: *const u32,
         num2: *const u32,
         num3: *const u32,
+    );
+
+    pub fn ret_opcode_trace(
+        pc: *const u32,
+        ap: *const u32,
+        fp: *const u32,
+        addr_table: *const u32,
+        big_words: *const u32,
+        small_words: *const u32,
+        n_rows: u32,
+        column_length: u32,
+        trace: *const *const u32,
+        addr0: *const u32,
+        addr1: *const u32,
+        next_pc: *const u32,
+        next_fp: *const u32,
     );
     pub fn tuple_count(
         cols: *const *const u32,

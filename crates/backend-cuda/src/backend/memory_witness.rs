@@ -17,7 +17,7 @@ use stwo::prover::poly::circle::CircleEvaluation;
 use stwo::prover::poly::BitReversedOrder;
 
 use crate::backend::{CudaBackend, UploadedDevicePointerVec};
-use crate::columns::base_field_vec::BaseFieldVec;
+use crate::columns::base_field_vec::{BaseFieldVec, Uint32Vec};
 use crate::columns::bindings::{self, CudaSecureField};
 
 /// A logup column whose raw inputs already live on the device: numerator
@@ -342,13 +342,97 @@ impl Mult<'_> {
     }
 }
 
-fn upload_alphas(alpha_powers: &[SecureField], needed: usize) -> crate::columns::SecureFieldVec {
-    assert!(alpha_powers.len() >= needed);
-    crate::columns::SecureFieldVec::from_vec(alpha_powers[..needed].to_vec())
+/// One slot of a lookup tuple (after the leading relation id): either a staged
+/// device column or a row-invariant constant. Constants cost nothing on
+/// device: the wrapper folds them (with the relation id and `-z`) into the
+/// tuple's `base` and repacks the alpha powers to only the live columns.
+pub enum TupleSlot<'a> {
+    Col(&'a BaseFieldVec),
+    Const(u32),
 }
 
-/// Pair-of-tuples logup column: `d_i = combine([rel_id_i, cols_i...])`,
+/// Folds a tuple's row-invariant parts: returns the combined
+/// `base = alpha^0 * rel_id + sum_(const slots j) alpha^(1+j) * c_j - z`
+/// and the (column pointer, alpha power) lists of the live slots.
+fn fold_tuple_slots(
+    rel_id: u32,
+    slots: &[TupleSlot<'_>],
+    alpha_powers: &[SecureField],
+    z: SecureField,
+) -> (SecureField, Vec<*const u32>, Vec<SecureField>) {
+    assert!(alpha_powers.len() > slots.len());
+    let mut base = alpha_powers[0] * SecureField::from(BaseField::from(rel_id)) - z;
+    let mut ptrs = Vec::with_capacity(slots.len());
+    let mut alphas = Vec::with_capacity(slots.len());
+    for (j, slot) in slots.iter().enumerate() {
+        match slot {
+            TupleSlot::Col(col) => {
+                ptrs.push(col.device_ptr);
+                alphas.push(alpha_powers[1 + j]);
+            }
+            TupleSlot::Const(c) => {
+                base += alpha_powers[1 + j] * SecureField::from(BaseField::from(*c));
+            }
+        }
+    }
+    (base, ptrs, alphas)
+}
+
+fn slots_of_cols<'a>(cols: &[&'a BaseFieldVec]) -> Vec<TupleSlot<'a>> {
+    cols.iter().map(|c| TupleSlot::Col(c)).collect()
+}
+
+/// Pair-of-tuples logup column: `d_i = combine([rel_id_i, slots_i...])`,
 /// numerator `sign * (d0*m1 + d1*m0)`, denominator `d0*d1`.
+#[allow(clippy::too_many_arguments)]
+pub fn tuple_pair_logup_slots(
+    rel_id0: u32,
+    slots0: &[TupleSlot<'_>],
+    rel_id1: u32,
+    slots1: &[TupleSlot<'_>],
+    mult0: Mult<'_>,
+    mult1: Mult<'_>,
+    negate: bool,
+    column_length: usize,
+    alpha_powers: &[SecureField],
+    z: SecureField,
+) -> DeviceRawLogupColumn {
+    let (base0, ptrs0, alphas0) = fold_tuple_slots(rel_id0, slots0, alpha_powers, z);
+    let (base1, ptrs1, alphas1) = fold_tuple_slots(rel_id1, slots1, alpha_powers, z);
+    let table0 = UploadedDevicePointerVec::upload(&ptrs0);
+    let table1 = UploadedDevicePointerVec::upload(&ptrs1);
+    let alphas0_dev = crate::columns::SecureFieldVec::from_vec(alphas0);
+    let alphas1_dev = crate::columns::SecureFieldVec::from_vec(alphas1);
+    let (m0_ptr, e0) = mult0.encode();
+    let (m1_ptr, e1) = mult1.encode();
+    let out = new_device_raw_column(column_length);
+    unsafe {
+        stwo_backend_cuda_kernels::raw::tuple_pair_logup(
+            CudaSecureField::from(base0).into_raw(),
+            table0.as_ptr(),
+            alphas0_dev.device_ptr,
+            ptrs0.len() as u32,
+            CudaSecureField::from(base1).into_raw(),
+            table1.as_ptr(),
+            alphas1_dev.device_ptr,
+            ptrs1.len() as u32,
+            m0_ptr,
+            e0,
+            m1_ptr,
+            e1,
+            negate as u32,
+            column_length as u32,
+            out.denominator.device_ptr,
+            out.numerator[0].device_ptr,
+            out.numerator[1].device_ptr,
+            out.numerator[2].device_ptr,
+            out.numerator[3].device_ptr,
+        );
+    }
+    out
+}
+
+/// Column-only convenience over [`tuple_pair_logup_slots`].
 #[allow(clippy::too_many_arguments)]
 pub fn tuple_pair_logup(
     rel_id0: u32,
@@ -362,30 +446,47 @@ pub fn tuple_pair_logup(
     alpha_powers: &[SecureField],
     z: SecureField,
 ) -> DeviceRawLogupColumn {
-    let alphas = upload_alphas(alpha_powers, 1 + cols0.len().max(cols1.len()));
-    let ptrs0: Vec<*const u32> = cols0.iter().map(|c| c.device_ptr).collect();
-    let ptrs1: Vec<*const u32> = cols1.iter().map(|c| c.device_ptr).collect();
-    let table0 = UploadedDevicePointerVec::upload(&ptrs0);
-    let table1 = UploadedDevicePointerVec::upload(&ptrs1);
-    let (m0_ptr, e0) = mult0.encode();
-    let (m1_ptr, e1) = mult1.encode();
+    tuple_pair_logup_slots(
+        rel_id0,
+        &slots_of_cols(cols0),
+        rel_id1,
+        &slots_of_cols(cols1),
+        mult0,
+        mult1,
+        negate,
+        column_length,
+        alpha_powers,
+        z,
+    )
+}
+
+/// Single-tuple logup column: numerator `(sign * m, 0, 0, 0)`, denominator
+/// `combine([rel_id, slots...])`.
+#[allow(clippy::too_many_arguments)]
+pub fn tuple_single_logup_slots(
+    rel_id: u32,
+    slots: &[TupleSlot<'_>],
+    mult: Mult<'_>,
+    negate: bool,
+    column_length: usize,
+    alpha_powers: &[SecureField],
+    z: SecureField,
+) -> DeviceRawLogupColumn {
+    let (base, ptrs, alphas) = fold_tuple_slots(rel_id, slots, alpha_powers, z);
+    let table = UploadedDevicePointerVec::upload(&ptrs);
+    let alphas_dev = crate::columns::SecureFieldVec::from_vec(alphas);
+    let (m_ptr, e) = mult.encode();
     let out = new_device_raw_column(column_length);
     unsafe {
-        stwo_backend_cuda_kernels::raw::tuple_pair_logup(
-            rel_id0,
-            table0.as_ptr(),
-            cols0.len() as u32,
-            rel_id1,
-            table1.as_ptr(),
-            cols1.len() as u32,
-            m0_ptr,
-            e0,
-            m1_ptr,
-            e1,
+        stwo_backend_cuda_kernels::raw::tuple_single_logup(
+            CudaSecureField::from(base).into_raw(),
+            table.as_ptr(),
+            alphas_dev.device_ptr,
+            ptrs.len() as u32,
+            m_ptr,
+            e,
             negate as u32,
             column_length as u32,
-            alphas.device_ptr,
-            CudaSecureField::from(z).into_raw(),
             out.denominator.device_ptr,
             out.numerator[0].device_ptr,
             out.numerator[1].device_ptr,
@@ -396,8 +497,7 @@ pub fn tuple_pair_logup(
     out
 }
 
-/// Single-tuple logup column: numerator `(sign * m, 0, 0, 0)`, denominator
-/// `combine([rel_id, cols...])`.
+/// Column-only convenience over [`tuple_single_logup_slots`].
 #[allow(clippy::too_many_arguments)]
 pub fn tuple_single_logup(
     rel_id: u32,
@@ -408,30 +508,15 @@ pub fn tuple_single_logup(
     alpha_powers: &[SecureField],
     z: SecureField,
 ) -> DeviceRawLogupColumn {
-    let alphas = upload_alphas(alpha_powers, 1 + cols.len());
-    let ptrs: Vec<*const u32> = cols.iter().map(|c| c.device_ptr).collect();
-    let table = UploadedDevicePointerVec::upload(&ptrs);
-    let (m_ptr, e) = mult.encode();
-    let out = new_device_raw_column(column_length);
-    unsafe {
-        stwo_backend_cuda_kernels::raw::tuple_single_logup(
-            rel_id,
-            table.as_ptr(),
-            cols.len() as u32,
-            m_ptr,
-            e,
-            negate as u32,
-            column_length as u32,
-            alphas.device_ptr,
-            CudaSecureField::from(z).into_raw(),
-            out.denominator.device_ptr,
-            out.numerator[0].device_ptr,
-            out.numerator[1].device_ptr,
-            out.numerator[2].device_ptr,
-            out.numerator[3].device_ptr,
-        );
-    }
-    out
+    tuple_single_logup_slots(
+        rel_id,
+        &slots_of_cols(cols),
+        mult,
+        negate,
+        column_length,
+        alpha_powers,
+        z,
+    )
 }
 
 /// Counts width-W column tuples into relation-indexed count tables through a
@@ -515,6 +600,68 @@ pub fn verify_instruction_trace(
             staged[0].device_ptr.cast_mut(),
             staged[1].device_ptr.cast_mut(),
             staged[2].device_ptr.cast_mut(),
+        );
+    }
+    (trace, staged)
+}
+
+// ---------------------------------------------------------------------------
+// Opcode cohort (opcodes.cu): per-opcode base-trace kernels with the memory
+// deduce lookups fused as gathers against prove-wide device tables.
+// ---------------------------------------------------------------------------
+
+/// The memory tables every opcode base kernel gathers from, uploaded once per
+/// prove (raw words, not field elements): the address-ordered raw id table,
+/// the big-value words (8 per value) and the small-value words (4 per value,
+/// u128 LE).
+pub struct DeviceMemTables {
+    pub addr_to_id: Uint32Vec,
+    pub big_words: Uint32Vec,
+    pub small_words: Uint32Vec,
+}
+
+impl DeviceMemTables {
+    pub fn upload(addr_to_id: Vec<u32>, big_words: Vec<u32>, small_words: Vec<u32>) -> Self {
+        bindings::ensure_mem_pool_init();
+        Self {
+            addr_to_id: Uint32Vec::from_vec(addr_to_id),
+            big_words: Uint32Vec::from_vec(big_words),
+            small_words: Uint32Vec::from_vec(small_words),
+        }
+    }
+}
+
+/// ret_opcode base trace: 16 trace columns plus 4 staged columns
+/// (read addresses fp-1 / fp-2, and the next_pc / next_fp recombinations).
+pub fn ret_opcode_trace(
+    inputs: [&BaseFieldVec; 3], // pc, ap, fp (padded to column_length)
+    tables: &DeviceMemTables,
+    n_rows: usize,
+    column_length: usize,
+) -> (Vec<BaseFieldVec>, [BaseFieldVec; 4]) {
+    bindings::ensure_mem_pool_init();
+    let trace: Vec<BaseFieldVec> = (0..16)
+        .map(|_| BaseFieldVec::new_uninitialized(column_length))
+        .collect();
+    let staged: [BaseFieldVec; 4] =
+        std::array::from_fn(|_| BaseFieldVec::new_uninitialized(column_length));
+    let trace_ptrs: Vec<*const u32> = trace.iter().map(|c| c.device_ptr).collect();
+    let table = UploadedDevicePointerVec::upload(&trace_ptrs);
+    unsafe {
+        stwo_backend_cuda_kernels::raw::ret_opcode_trace(
+            inputs[0].device_ptr,
+            inputs[1].device_ptr,
+            inputs[2].device_ptr,
+            tables.addr_to_id.device_ptr,
+            tables.big_words.device_ptr,
+            tables.small_words.device_ptr,
+            n_rows as u32,
+            column_length as u32,
+            table.as_ptr(),
+            staged[0].device_ptr,
+            staged[1].device_ptr,
+            staged[2].device_ptr,
+            staged[3].device_ptr,
         );
     }
     (trace, staged)
