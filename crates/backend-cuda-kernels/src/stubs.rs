@@ -1138,7 +1138,16 @@ pub unsafe extern "C" fn tuple_single_logup(
     num2: *const u32,
     num3: *const u32,
 ) {
-    let _ = (base, cols, alphas, n, mult_col, enabler, negate, column_length);
+    let _ = (
+        base,
+        cols,
+        alphas,
+        n,
+        mult_col,
+        enabler,
+        negate,
+        column_length,
+    );
     let _ = (denoms, num0, num1, num2, num3);
     no_cuda_symbol("tuple_single_logup")
 }
@@ -1163,6 +1172,34 @@ pub unsafe extern "C" fn ret_opcode_trace(
     let _ = (pc, ap, fp, addr_table, big_words, small_words);
     let _ = (n_rows, column_length, trace, addr0, addr1, next_pc, next_fp);
     no_cuda_symbol("ret_opcode_trace")
+}
+
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn call_opcode_rel_imm_trace(
+    pc: *const u32,
+    ap: *const u32,
+    fp: *const u32,
+    addr_table: *const u32,
+    big_words: *const u32,
+    small_words: *const u32,
+    n_rows: u32,
+    column_length: u32,
+    trace: *const *const u32,
+    ret_pc_addr: *const u32,
+    next_pc_addr: *const u32,
+    m6_s5: *const u32,
+    m6_s6: *const u32,
+    m6_s22: *const u32,
+    m6_s28: *const u32,
+    next_pc_out: *const u32,
+    next_ap_out: *const u32,
+) {
+    let _ = (pc, ap, fp, addr_table, big_words, small_words);
+    let _ = (n_rows, column_length, trace);
+    let _ = (ret_pc_addr, next_pc_addr, m6_s5, m6_s6);
+    let _ = (m6_s22, m6_s28, next_pc_out, next_ap_out);
+    no_cuda_symbol("call_opcode_rel_imm_trace")
 }
 
 #[unsafe(no_mangle)]

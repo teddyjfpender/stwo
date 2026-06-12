@@ -413,6 +413,115 @@ __global__ void add_opcode_small_trace_kernel(
     staged[3][row] = add(v_ap, ap_update_add_1);
 }
 
+// call_opcode_rel_imm (24 trace columns): a `call rel imm` instruction. The
+// fixed instruction shape means the verify_instruction tuple is all constants
+// except pc (no instruction-felt decode of offsets/flags is needed). Reads two
+// 29-bit felts (stored_fp at ap, stored_ret_pc at ap+1) and one small-signed
+// felt (the relative immediate distance_to_next_pc at pc+1). Staged columns are
+// the lookup-tuple slots that are not plain trace columns:
+//   [0] ret_pc_addr   = ap + 1   (memory_address_to_id_3 read addr)
+//   [1] next_pc_addr  = pc + 1   (memory_address_to_id_5 read addr)
+//   [2] m6_s5  = remainder_bits + mid_limbs_set*508   (memory_id_to_big_6)
+//   [3] m6_s6  = mid_limbs_set*511
+//   [4] m6_s22 = msb*136 - mid_limbs_set
+//   [5] m6_s28 = msb*256
+//   [6] next_pc_out = pc + read_small   (opcodes-out yield)
+//   [7] next_ap_out = ap + 2            (opcodes-out yield)
+__global__ void call_opcode_rel_imm_trace_kernel(
+    const uint32_t *pc, const uint32_t *ap, const uint32_t *fp,
+    const uint32_t *addr_table,
+    const uint32_t *big_words, const uint32_t *small_words,
+    uint32_t n_rows,
+    uint32_t column_length,
+    uint32_t *const *trace,                       // 24 trace columns
+    uint32_t *ret_pc_addr, uint32_t *next_pc_addr, // staged read addrs (ap+1, pc+1)
+    uint32_t *m6_s5, uint32_t *m6_s6,             // staged: memory_id_to_big_6 slots
+    uint32_t *m6_s22, uint32_t *m6_s28,           // staged: memory_id_to_big_6 slots
+    uint32_t *next_pc_out, uint32_t *next_ap_out  // staged: opcodes-out yield exprs
+) {
+    uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= column_length) return;
+    uint32_t v_pc = pc[row], v_ap = ap[row], v_fp = fp[row];
+    trace[0][row] = v_pc;
+    trace[1][row] = v_ap;
+    trace[2][row] = v_fp;
+
+    // Decode Instruction at pc: the verify_instruction tuple is all constants
+    // for this opcode, so the instruction felt is not split into trace columns.
+
+    // Read Positive Num Bits 29: stored_fp at ap.
+    uint32_t stored_fp_id = mem_addr_to_id(addr_table, v_ap);
+    trace[3][row] = stored_fp_id;
+    uint32_t fl[4];
+    mem_id_to_limbs<4>(stored_fp_id, big_words, small_words, fl);
+    trace[4][row] = fl[0];
+    trace[5][row] = fl[1];
+    trace[6][row] = fl[2];
+    trace[7][row] = fl[3];
+    trace[8][row] = (fl[3] & 2u) >> 1;  // partial_limb_msb (u16 bit math)
+
+    // Read Positive Num Bits 29: stored_ret_pc at ap + 1.
+    uint32_t ret_addr = add(v_ap, 1u);
+    ret_pc_addr[row] = ret_addr;
+    uint32_t stored_ret_pc_id = mem_addr_to_id(addr_table, ret_addr);
+    trace[9][row] = stored_ret_pc_id;
+    uint32_t rl[4];
+    mem_id_to_limbs<4>(stored_ret_pc_id, big_words, small_words, rl);
+    trace[10][row] = rl[0];
+    trace[11][row] = rl[1];
+    trace[12][row] = rl[2];
+    trace[13][row] = rl[3];
+    trace[14][row] = (rl[3] & 2u) >> 1;  // partial_limb_msb
+
+    // Read Small: distance_to_next_pc (the relative immediate) at pc + 1.
+    uint32_t npc_addr = add(v_pc, 1u);
+    next_pc_addr[row] = npc_addr;
+    uint32_t dist_id = mem_addr_to_id(addr_table, npc_addr);
+    trace[15][row] = dist_id;
+    uint32_t dl[28];
+    mem_id_to_limbs<28>(dist_id, big_words, small_words, dl);
+
+    // Decode Small Sign.
+    uint32_t msb = (dl[27] == 256u) ? 1u : 0u;
+    trace[16][row] = msb;
+    uint32_t mid_limbs_set = ((dl[20] == 511u) && (msb != 0u)) ? 1u : 0u;
+    trace[17][row] = mid_limbs_set;
+    // decode_small_sign outputs (M31 ops).
+    uint32_t dss2 = mul(mid_limbs_set, 508u);
+    uint32_t dss3 = mul(mid_limbs_set, 511u);
+    uint32_t dss4 = sub(mul(msb, 136u), mid_limbs_set);
+    uint32_t dss5 = mul(msb, 256u);
+
+    uint32_t d0 = dl[0];
+    trace[18][row] = d0;
+    uint32_t d1 = dl[1];
+    trace[19][row] = d1;
+    uint32_t d2 = dl[2];
+    trace[20][row] = d2;
+    uint32_t remainder_bits = dl[3] & 3u;  // PackedUInt16
+    trace[21][row] = remainder_bits;
+    trace[22][row] = (remainder_bits & 2u) >> 1;  // partial_limb_msb
+
+    // memory_id_to_big_6 staged slots.
+    m6_s5[row] = add(remainder_bits, dss2);
+    m6_s6[row] = dss3;
+    m6_s22[row] = dss4;
+    m6_s28[row] = dss5;
+
+    trace[23][row] = row < n_rows ? 1u : 0u;  // enabler
+
+    // read_small_output.0 = ((((d0 + d1*512) + d2*262144)
+    //   + remainder_bits*134217728) - msb) - 536870912*mid_limbs_set  (M31).
+    uint32_t read_small =
+        sub(sub(add(add(add(d0, mul(d1, 512u)), mul(d2, 262144u)),
+                    mul(remainder_bits, 134217728u)),
+                msb),
+            mul(536870912u, mid_limbs_set));
+    // opcodes-out yield staged exprs: next_pc = pc + read_small, next_ap = ap + 2.
+    next_pc_out[row] = add(v_pc, read_small);
+    next_ap_out[row] = add(v_ap, 2u);
+}
+
 // add_opcode (103 trace columns): decodes the instruction at pc, then three
 // FULL "Read Positive Num Bits 252" memory reads (dst/op0/op1) each producing
 // an id trace column and a 28-limb f252 decode (all limbs are trace columns,
@@ -532,6 +641,28 @@ __global__ void add_opcode_trace_kernel(
 }
 
 }  // namespace
+
+extern "C" void call_opcode_rel_imm_trace(
+    const uint32_t *pc, const uint32_t *ap, const uint32_t *fp,
+    const uint32_t *addr_table,
+    const uint32_t *big_words, const uint32_t *small_words,
+    uint32_t n_rows,
+    uint32_t column_length,
+    const uint32_t *const *trace,
+    uint32_t *ret_pc_addr, uint32_t *next_pc_addr,
+    uint32_t *m6_s5, uint32_t *m6_s6,
+    uint32_t *m6_s22, uint32_t *m6_s28,
+    uint32_t *next_pc_out, uint32_t *next_ap_out
+) {
+    uint32_t blocks = (column_length + OP_BLOCK - 1) / OP_BLOCK;
+    call_opcode_rel_imm_trace_kernel<<<blocks, OP_BLOCK>>>(
+        pc, ap, fp, addr_table, big_words, small_words, n_rows, column_length,
+        const_cast<uint32_t *const *>(trace),
+        ret_pc_addr, next_pc_addr, m6_s5, m6_s6, m6_s22, m6_s28,
+        next_pc_out, next_ap_out);
+    stwo_maybe_debug_sync();
+    ASSERT_CUDA_SUCCESS(cudaGetLastError());
+}
 
 extern "C" void add_opcode_trace(
     const uint32_t *pc, const uint32_t *ap, const uint32_t *fp,

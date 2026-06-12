@@ -112,6 +112,26 @@ extern "C" {
         next_fp: *const u32,
     );
     #[allow(clippy::too_many_arguments)]
+    pub fn call_opcode_rel_imm_trace(
+        pc: *const u32,
+        ap: *const u32,
+        fp: *const u32,
+        addr_table: *const u32,
+        big_words: *const u32,
+        small_words: *const u32,
+        n_rows: u32,
+        column_length: u32,
+        trace: *const *const u32,
+        ret_pc_addr: *const u32,
+        next_pc_addr: *const u32,
+        m6_s5: *const u32,
+        m6_s6: *const u32,
+        m6_s22: *const u32,
+        m6_s28: *const u32,
+        next_pc_out: *const u32,
+        next_ap_out: *const u32,
+    );
+    #[allow(clippy::too_many_arguments)]
     pub fn jnz_opcode_taken_trace(
         pc: *const u32,
         ap: *const u32,
