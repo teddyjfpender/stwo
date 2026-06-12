@@ -271,6 +271,38 @@ pub unsafe extern "C" fn memory_rc_pair_logup(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn addr_to_id_pair_logup(
+    id0: *const u32,
+    mult0: *const u32,
+    id1: *const u32,
+    mult1: *const u32,
+    rel_id: u32,
+    addr0_base: u32,
+    addr1_base: u32,
+    column_length: u32,
+    alpha_powers: *const u32,
+    z: CudaSecureField,
+    denoms: *const u32,
+    num0: *const u32,
+    num1: *const u32,
+    num2: *const u32,
+    num3: *const u32,
+) {
+    let _ = (id0, mult0, id1, mult1, rel_id, addr0_base, addr1_base);
+    let _ = (
+        column_length,
+        alpha_powers,
+        z,
+        denoms,
+        num0,
+        num1,
+        num2,
+        num3,
+    );
+    no_cuda_symbol("addr_to_id_pair_logup")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn logup_shift_secure_coords(
     c0: *const u32,
     c1: *const u32,

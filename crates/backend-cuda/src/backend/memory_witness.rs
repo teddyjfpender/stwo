@@ -194,6 +194,46 @@ pub fn memory_rc_pair_logup(
     out
 }
 
+/// One pair-batched `memory_address_to_id` logup column: split chunks `(2i, 2i+1)`
+/// of the id table share a column with sequential addresses
+/// `addr_k = addr_base_k + row`, numerator `d0·(-mult1) + d1·(-mult0)`,
+/// denominator `d0·d1`.
+#[allow(clippy::too_many_arguments)]
+pub fn addr_to_id_pair_logup(
+    ids: [&BaseFieldVec; 2],
+    mults: [&BaseFieldVec; 2],
+    rel_id: u32,
+    addr0_base: u32,
+    addr1_base: u32,
+    column_length: usize,
+    alpha_powers: &[SecureField],
+    z: SecureField,
+) -> DeviceRawLogupColumn {
+    assert!(alpha_powers.len() >= 3);
+    let alphas = crate::columns::SecureFieldVec::from_vec(alpha_powers[..3].to_vec());
+    let out = new_device_raw_column(column_length);
+    unsafe {
+        stwo_backend_cuda_kernels::raw::addr_to_id_pair_logup(
+            ids[0].device_ptr,
+            mults[0].device_ptr,
+            ids[1].device_ptr,
+            mults[1].device_ptr,
+            rel_id,
+            addr0_base,
+            addr1_base,
+            column_length as u32,
+            alphas.device_ptr,
+            CudaSecureField::from(z).into_raw(),
+            out.denominator.device_ptr,
+            out.numerator[0].device_ptr,
+            out.numerator[1].device_ptr,
+            out.numerator[2].device_ptr,
+            out.numerator[3].device_ptr,
+        );
+    }
+    out
+}
+
 fn new_device_raw_column(column_length: usize) -> DeviceRawLogupColumn {
     bindings::ensure_mem_pool_init();
     DeviceRawLogupColumn {

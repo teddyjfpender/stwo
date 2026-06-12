@@ -180,7 +180,67 @@ __global__ void memory_rc_pair_logup_kernel(
     num3[row] = numerator.b.b;
 }
 
+// One pair-batched memory_address_to_id logup column (the host writes SPLIT/2
+// of these): split chunks (2i, 2i+1) of the id table share a column.
+//   addr_k    = addr_base_k + row          (addr_base_k = 1 + chunk_k * n_rows)
+//   d_k       = alpha[0]*rel_id + alpha[1]*addr_k + alpha[2]*id_k[row] - z
+//   numerator = d0 * (-mult1[row]) + d1 * (-mult0[row])
+//   denominator = d0 * d1
+__global__ void addr_to_id_pair_logup_kernel(
+    const uint32_t *id0, const uint32_t *mult0,
+    const uint32_t *id1, const uint32_t *mult1,
+    uint32_t rel_id,
+    uint32_t addr0_base,
+    uint32_t addr1_base,
+    uint32_t column_length,
+    const qm31 *alpha_powers,  // 3 entries
+    qm31 z,
+    qm31 *denoms,
+    uint32_t *num0, uint32_t *num1, uint32_t *num2, uint32_t *num3
+) {
+    uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= column_length) {
+        return;
+    }
+    qm31 d0 = qm31_mul_m31(alpha_powers[0], rel_id);
+    d0 = add(d0, qm31_mul_m31(alpha_powers[1], addr0_base + row));
+    d0 = add(d0, qm31_mul_m31(alpha_powers[2], id0[row]));
+    d0 = sub(d0, z);
+    qm31 d1 = qm31_mul_m31(alpha_powers[0], rel_id);
+    d1 = add(d1, qm31_mul_m31(alpha_powers[1], addr1_base + row));
+    d1 = add(d1, qm31_mul_m31(alpha_powers[2], id1[row]));
+    d1 = sub(d1, z);
+    qm31 numerator =
+        add(qm31_mul_m31(d0, neg(mult1[row])), qm31_mul_m31(d1, neg(mult0[row])));
+    denoms[row] = mul(d0, d1);
+    num0[row] = numerator.a.a;
+    num1[row] = numerator.a.b;
+    num2[row] = numerator.b.a;
+    num3[row] = numerator.b.b;
+}
+
 }  // namespace
+
+extern "C" void addr_to_id_pair_logup(
+    const uint32_t *id0, const uint32_t *mult0,
+    const uint32_t *id1, const uint32_t *mult1,
+    uint32_t rel_id,
+    uint32_t addr0_base,
+    uint32_t addr1_base,
+    uint32_t column_length,
+    const uint32_t *alpha_powers,  // 3 qm31s, element-major
+    qm31 z,
+    uint32_t *denoms,
+    uint32_t *num0, uint32_t *num1, uint32_t *num2, uint32_t *num3
+) {
+    uint32_t blocks = (column_length + MW_BLOCK - 1) / MW_BLOCK;
+    addr_to_id_pair_logup_kernel<<<blocks, MW_BLOCK>>>(
+        id0, mult0, id1, mult1, rel_id, addr0_base, addr1_base, column_length,
+        reinterpret_cast<const qm31 *>(alpha_powers), z,
+        reinterpret_cast<qm31 *>(denoms), num0, num1, num2, num3);
+    stwo_maybe_debug_sync();
+    ASSERT_CUDA_SUCCESS(cudaGetLastError());
+}
 
 extern "C" void memory_limb_split_big(
     const uint32_t *values,
