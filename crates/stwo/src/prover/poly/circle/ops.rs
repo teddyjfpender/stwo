@@ -14,6 +14,13 @@ use crate::prover::poly::twiddles::{TwiddleBuffer, TwiddleTree};
 use crate::prover::poly::BitReversedOrder;
 
 /// Operations on BaseField polynomials.
+/// One batched out-of-domain evaluation job: a column's evaluations and the
+/// precomputed barycentric weights for the (folded) sample point.
+pub type BarycentricJob<'a, B> = (
+    &'a CircleEvaluation<B, BaseField, BitReversedOrder>,
+    &'a Col<B, SecureField>,
+);
+
 pub trait PolyOps: ColumnOps<BaseField> + ColumnOps<SecureField> + Sized {
     // TODO(alont): Use a column instead of this type.
     /// The type for precomputed twiddles.
@@ -69,12 +76,7 @@ pub trait PolyOps: ColumnOps<BaseField> + ColumnOps<SecureField> + Sized {
     /// intermediate synchronization and read all results back in ONE transfer
     /// (the per-item path costs a full stream drain per column). The values are
     /// identical by construction — each item's evaluation is independent.
-    fn barycentric_eval_many(
-        items: &[(
-            &CircleEvaluation<Self, BaseField, BitReversedOrder>,
-            &Col<Self, SecureField>,
-        )],
-    ) -> Vec<SecureField> {
+    fn barycentric_eval_many(items: &[BarycentricJob<'_, Self>]) -> Vec<SecureField> {
         #[cfg(feature = "parallel")]
         {
             use rayon::prelude::*;

@@ -431,10 +431,7 @@ impl PolyOps for CudaBackend {
     /// 16-byte fenced readbacks per prove). Values are identical: the kernels
     /// are the same; only the synchronization points moved.
     fn barycentric_eval_many(
-        items: &[(
-            &CircleEvaluation<Self, BaseField, BitReversedOrder>,
-            &Col<Self, SecureField>,
-        )],
+        items: &[stwo::prover::poly::circle::BarycentricJob<'_, Self>],
     ) -> Vec<SecureField> {
         if items.is_empty() {
             return Vec::new();
