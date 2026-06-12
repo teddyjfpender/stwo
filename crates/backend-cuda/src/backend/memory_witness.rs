@@ -667,6 +667,52 @@ pub fn ret_opcode_trace(
     (trace, staged)
 }
 
+/// jnz_opcode_taken base trace: 47 trace columns plus 10 staged columns
+/// (the lookup tuple slots that are not plain trace columns):
+/// `vi_off1`/`vi_off2` (verify_instruction off1/off2 exprs), `addr_dst`
+/// (mem_address_to_id_1 read addr), `next_pc_addr` (pc+1), the four
+/// memory_id_to_big_4 slots `m4_s4`/`m4_s5`/`m4_s22`/`m4_s28`, and the
+/// opcodes-out yield `next_pc_out`/`next_ap_out`.
+pub fn jnz_opcode_taken_trace(
+    inputs: [&BaseFieldVec; 3], // pc, ap, fp (padded to column_length)
+    tables: &DeviceMemTables,
+    n_rows: usize,
+    column_length: usize,
+) -> (Vec<BaseFieldVec>, [BaseFieldVec; 10]) {
+    bindings::ensure_mem_pool_init();
+    let trace: Vec<BaseFieldVec> = (0..47)
+        .map(|_| BaseFieldVec::new_uninitialized(column_length))
+        .collect();
+    let staged: [BaseFieldVec; 10] =
+        std::array::from_fn(|_| BaseFieldVec::new_uninitialized(column_length));
+    let trace_ptrs: Vec<*const u32> = trace.iter().map(|c| c.device_ptr).collect();
+    let table = UploadedDevicePointerVec::upload(&trace_ptrs);
+    unsafe {
+        stwo_backend_cuda_kernels::raw::jnz_opcode_taken_trace(
+            inputs[0].device_ptr,
+            inputs[1].device_ptr,
+            inputs[2].device_ptr,
+            tables.addr_to_id.device_ptr,
+            tables.big_words.device_ptr,
+            tables.small_words.device_ptr,
+            n_rows as u32,
+            column_length as u32,
+            table.as_ptr(),
+            staged[0].device_ptr,
+            staged[1].device_ptr,
+            staged[2].device_ptr,
+            staged[3].device_ptr,
+            staged[4].device_ptr,
+            staged[5].device_ptr,
+            staged[6].device_ptr,
+            staged[7].device_ptr,
+            staged[8].device_ptr,
+            staged[9].device_ptr,
+        );
+    }
+    (trace, staged)
+}
+
 /// add_opcode_small base trace: 39 trace columns plus 19 staged columns
 /// (the lookup-tuple expressions that are not plain trace columns — the two
 /// verify_instruction felts, the opcodes-out next_pc / next_ap, and per memory

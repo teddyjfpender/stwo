@@ -1167,6 +1167,36 @@ pub unsafe extern "C" fn ret_opcode_trace(
 
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn jnz_opcode_taken_trace(
+    pc: *const u32,
+    ap: *const u32,
+    fp: *const u32,
+    addr_table: *const u32,
+    big_words: *const u32,
+    small_words: *const u32,
+    n_rows: u32,
+    column_length: u32,
+    trace: *const *const u32,
+    vi_off1: *const u32,
+    vi_off2: *const u32,
+    addr_dst: *const u32,
+    next_pc_addr: *const u32,
+    m4_s4: *const u32,
+    m4_s5: *const u32,
+    m4_s22: *const u32,
+    m4_s28: *const u32,
+    next_pc_out: *const u32,
+    next_ap_out: *const u32,
+) {
+    let _ = (pc, ap, fp, addr_table, big_words, small_words);
+    let _ = (n_rows, column_length, trace);
+    let _ = (vi_off1, vi_off2, addr_dst, next_pc_addr);
+    let _ = (m4_s4, m4_s5, m4_s22, m4_s28, next_pc_out, next_ap_out);
+    no_cuda_symbol("jnz_opcode_taken_trace")
+}
+
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn add_opcode_small_trace(
     pc: *const u32,
     ap: *const u32,
