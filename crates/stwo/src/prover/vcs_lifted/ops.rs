@@ -17,6 +17,21 @@ pub trait MerkleOpsLifted<H: MerkleHasherLifted>:
     /// Given a layer of hashes as input, computes a new layer by hashing pairs
     /// of adjacent elements of the input, as in a standard Merkle tree.
     fn build_next_layer(prev_layer: &Col<Self, H::Hash>) -> Col<Self, H::Hash>;
+
+    /// Computes the leaf hashes at the given leaf `indices` straight from the committed
+    /// columns: the same byte stream as [`Self::build_leaves`] (columns in ascending-size
+    /// order, raw stored representations), restricted to `indices`. Used by the pruned-tree
+    /// decommit to recompute the unretained leaf hashes in one batch instead of per element.
+    ///
+    /// Returns `None` when the backend has no batched path; the caller falls back to the
+    /// per-element host recompute. The default is `None`, so backends only opt in.
+    fn leaf_hashes_at(
+        _columns: &[&Col<Self, BaseField>],
+        _lifting_log_size: u32,
+        _indices: &[usize],
+    ) -> Option<Vec<H::Hash>> {
+        None
+    }
 }
 
 pub trait PackLeavesOps: ColumnOps<BaseField> {

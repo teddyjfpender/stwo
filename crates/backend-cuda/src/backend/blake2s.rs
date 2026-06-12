@@ -1,3 +1,4 @@
+use itertools::Itertools;
 use stwo::core::vcs::blake2_hash::Blake2sHash;
 use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleHasherGeneric;
 use stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
@@ -68,6 +69,65 @@ impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M3
             );
         }
         result
+    }
+
+    /// Batched leaf-hash recompute for the pruned-tree decommit: one indexed kernel
+    /// launch + one D2H of `indices.len()` hashes, replacing the per-(column, leaf)
+    /// synchronous `raw_value` readbacks of the host path. Same byte stream as
+    /// [`Self::build_leaves`] => byte-identical hashes (proof byte-equality gated).
+    /// Kill switch: `STWO_CUDA_LEAF_HASHES=0` falls back to the host recompute.
+    fn leaf_hashes_at(
+        columns: &[&BaseFieldVec],
+        lifting_log_size: u32,
+        indices: &[usize],
+    ) -> Option<Vec<Blake2sHash>> {
+        if IS_M31_OUTPUT
+            || columns.is_empty()
+            || std::env::var("STWO_CUDA_LEAF_HASHES").as_deref() == Ok("0")
+        {
+            return None;
+        }
+        assert!(lifting_log_size < u32::BITS);
+        let column_log_sizes = columns
+            .iter()
+            .map(|column| {
+                let len = column.len();
+                assert!(len.is_power_of_two() && len >= 2);
+                len.ilog2()
+            })
+            .collect_vec();
+        assert!(
+            column_log_sizes.windows(2).all(|w| w[0] <= w[1]),
+            "columns must be sorted increasingly by length"
+        );
+        assert!(*column_log_sizes.last().unwrap() <= lifting_log_size);
+
+        let indices_u32 = indices
+            .iter()
+            .map(|&idx| {
+                assert!(idx < 1usize << lifting_log_size);
+                idx as u32
+            })
+            .collect_vec();
+        let result = Blake2sHashVec::new_uninitialized(indices.len());
+        unsafe {
+            let device_column_pointers_vector: Vec<*const u32> =
+                columns.iter().map(|column| column.device_ptr).collect();
+            let device_column_pointers =
+                UploadedDevicePointerVec::upload(&device_column_pointers_vector);
+            let uploaded_column_log_sizes = UploadedUint32Vec::upload(&column_log_sizes);
+            let uploaded_indices = UploadedUint32Vec::upload(&indices_u32);
+            bindings::commit_on_first_layer_lifted_indexed(
+                indices.len(),
+                uploaded_indices.as_ptr(),
+                columns.len(),
+                device_column_pointers.as_ptr(),
+                uploaded_column_log_sizes.as_ptr(),
+                lifting_log_size,
+                result.device_ptr as *mut Blake2sHash,
+            );
+        }
+        Some(result.to_vec())
     }
 
     fn build_next_layer(prev_layer: &Blake2sHashVec) -> Blake2sHashVec {
@@ -396,6 +456,36 @@ mod lifted_tests {
             );
 
         assert_eq!(result.to_cpu(), expected);
+    }
+
+    #[test]
+    fn test_leaf_hashes_at_matches_cpu_build_leaves() {
+        // Mixed sizes + extra lifting, scattered indices: the indexed kernel must
+        // reproduce the exact leaves the full commit kernel (and the CPU reference)
+        // produces at those positions.
+        let cpu_columns = vec![
+            base_field_column(8, 23),
+            base_field_column(16, 29),
+            base_field_column(16, 31),
+            base_field_column(32, 37),
+            base_field_column(64, 41),
+        ];
+        let gpu_columns = gpu_columns_from(&cpu_columns);
+        let lifting_log_size = 7u32;
+        let expected = <CpuBackend as MerkleOpsLifted<Blake2sMerkleHasher>>::build_leaves(
+            &cpu_columns.iter().collect::<Vec<_>>(),
+            lifting_log_size,
+        );
+        let indices = vec![0usize, 1, 5, 30, 31, 64, 99, 127];
+        let result = <CudaBackend as MerkleOpsLifted<Blake2sMerkleHasher>>::leaf_hashes_at(
+            &gpu_columns.iter().collect::<Vec<_>>(),
+            lifting_log_size,
+            &indices,
+        )
+        .expect("CUDA backend must provide the batched leaf-hash path");
+        for (&idx, hash) in indices.iter().zip(&result) {
+            assert_eq!(*hash, expected[idx], "leaf {idx}");
+        }
     }
 
     fn gpu_columns_from(columns: &[Vec<BaseField>]) -> Vec<BaseFieldVec> {

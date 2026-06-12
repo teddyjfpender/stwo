@@ -264,6 +264,55 @@ __global__ void commit_on_first_layer_lifted_in_gpu(
     #pragma unroll
     for (int i = 0; i < 8; i++) result[index].s[i] = h[i];
 }
+// Indexed variant of commit_on_first_layer_lifted_in_gpu: thread i hashes the
+// leaf at indices[i] instead of leaf i. Used by the pruned-tree decommit to
+// recompute exactly the unretained leaf hashes it needs in one launch (the
+// per-element host path reads every (column, leaf) value through a sync D2H).
+// Same byte stream as the full commit kernel => byte-identical hashes.
+__global__ void commit_on_first_layer_lifted_indexed_in_gpu(
+    uint32_t n_indices,
+    const uint32_t *indices,
+    uint32_t number_of_columns,
+    uint32_t **data,
+    const uint32_t *column_log_sizes,
+    uint32_t lifting_log_size,
+    Blake2sHash *result
+) {
+    uint32_t thread = blockIdx.x * blockDim.x + threadIdx.x;
+    if (thread >= n_indices) return;
+    uint32_t index = indices[thread];
+
+    uint32_t h[8];
+    blake2s_word_init(h);
+    uint32_t t = 0;
+    uint32_t m[16];
+    uint32_t col = 0;
+    while (number_of_columns - col > 16) {
+        #pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            uint32_t column_log_size = column_log_sizes[col + j];
+            uint32_t source_index =
+                lifted_column_index(index, lifting_log_size - column_log_size);
+            m[j] = data[col + j][source_index];
+        }
+        t += 64;
+        blake2s_compress_words(h, m, t, 0);
+        col += 16;
+    }
+    uint32_t rem = number_of_columns - col;
+    #pragma unroll
+    for (int j = 0; j < 16; ++j) m[j] = 0;
+    for (uint32_t j = 0; j < rem; ++j) {
+        uint32_t column_log_size = column_log_sizes[col + j];
+        uint32_t source_index = lifted_column_index(index, lifting_log_size - column_log_size);
+        m[j] = data[col + j][source_index];
+    }
+    t += 4 * rem;
+    blake2s_compress_words(h, m, t, 0xFFFFFFFF);
+    #pragma unroll
+    for (int i = 0; i < 8; i++) result[thread].s[i] = h[i];
+}
+
 __global__ void commit_on_layer_using_previous_in_gpu(
     uint32_t size,
     uint32_t number_of_columns,
@@ -338,6 +387,23 @@ void commit_on_first_layer_lifted(
 ) {
     commit_on_first_layer_lifted_in_gpu<<<number_of_blocks_for(size), BLOCK_SIZE>>>(
         size, number_of_columns, device_columns, column_log_sizes, lifting_log_size, result);
+    ASSERT_CUDA_SUCCESS(cudaGetLastError());
+    stwo_maybe_debug_sync();
+    ASSERT_CUDA_SUCCESS(cudaGetLastError());
+}
+
+void commit_on_first_layer_lifted_indexed(
+    uint32_t n_indices,
+    const uint32_t *indices,
+    uint32_t number_of_columns,
+    uint32_t **device_columns,
+    const uint32_t *column_log_sizes,
+    uint32_t lifting_log_size,
+    Blake2sHash* result
+) {
+    commit_on_first_layer_lifted_indexed_in_gpu<<<number_of_blocks_for(n_indices), BLOCK_SIZE>>>(
+        n_indices, indices, number_of_columns, device_columns, column_log_sizes,
+        lifting_log_size, result);
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
     stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());

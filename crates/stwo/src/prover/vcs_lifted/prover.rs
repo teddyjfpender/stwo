@@ -155,7 +155,35 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
         ColumnVec<Vec<BaseField>>,
         ExtendedMerkleDecommitmentLifted<H>,
     ) {
-        self.decommit_inner(query_positions, &DenseColumns::<B>(&columns))
+        // For pruned trees, recompute the needed (unretained) leaf hashes in one batch on
+        // backends that support it, seeding the node memo the decommit walk reads from.
+        // The hashes are identical to the per-element `leaf_hash` recompute, so the
+        // decommitment is byte-identical either way.
+        let mut node_memo = HashMap::<(usize, usize), H::Hash>::new();
+        let is_pruned = self.layers.len() <= self.leaf_log_size as usize;
+        if is_pruned {
+            let needed = self.unretained_leaf_indices(query_positions);
+            if !needed.is_empty() {
+                // The exact column order `build_leaves` committed (stable ascending-size
+                // sort, like `commit_inner` and `leaf_hash`).
+                let sorted = columns
+                    .iter()
+                    .copied()
+                    .sorted_by_key(|c| c.len())
+                    .collect_vec();
+                if let Some(hashes) = B::leaf_hashes_at(&sorted, self.leaf_log_size, &needed) {
+                    assert_eq!(hashes.len(), needed.len());
+                    let leaf_level = self.leaf_log_size as usize;
+                    node_memo.extend(
+                        needed
+                            .into_iter()
+                            .zip(hashes)
+                            .map(|(idx, hash)| ((leaf_level, idx), hash)),
+                    );
+                }
+            }
+        }
+        self.decommit_inner(query_positions, &DenseColumns::<B>(&columns), node_memo)
     }
 
     /// Same as [`Self::decommit`], but reads column values from a sparse, row-gathered view
@@ -170,13 +198,16 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
         ColumnVec<Vec<BaseField>>,
         ExtendedMerkleDecommitmentLifted<H>,
     ) {
-        self.decommit_inner(query_positions, gathered)
+        self.decommit_inner(query_positions, gathered, HashMap::new())
     }
 
     fn decommit_inner(
         &self,
         query_positions: &[usize],
         columns: &impl ColumnAccess,
+        // Recomputed-node memo, optionally pre-seeded with batched leaf hashes (see
+        // [`Self::decommit`]); `node_hash` falls back to the host recompute on misses.
+        mut node_memo: HashMap<(usize, usize), H::Hash>,
     ) -> (
         ColumnVec<Vec<BaseField>>,
         ExtendedMerkleDecommitmentLifted<H>,
@@ -210,7 +241,6 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
         } else {
             vec![]
         };
-        let mut node_memo = HashMap::<(usize, usize), H::Hash>::new();
 
         let mut prev_layer_queries = query_positions.to_vec();
         prev_layer_queries.dedup();

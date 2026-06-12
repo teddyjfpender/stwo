@@ -333,6 +333,26 @@ pub unsafe fn commit_on_first_layer_lifted(
     );
 }
 
+pub unsafe fn commit_on_first_layer_lifted_indexed(
+    n_indices: usize,
+    indices: *const u32,
+    amount_of_columns: usize,
+    columns: *const *const u32,
+    column_log_sizes: *const u32,
+    lifting_log_size: u32,
+    result: *mut Blake2sHash,
+) {
+    sys_raw::commit_on_first_layer_lifted_indexed(
+        n_indices as u32,
+        indices,
+        amount_of_columns as u32,
+        columns,
+        column_log_sizes,
+        lifting_log_size,
+        raw_blake2s_mut_ptr(result),
+    );
+}
+
 pub unsafe fn commit_on_layer_with_previous(
     size: usize,
     amount_of_columns: usize,
