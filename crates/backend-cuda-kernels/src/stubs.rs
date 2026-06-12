@@ -1216,6 +1216,25 @@ pub unsafe extern "C" fn add_opcode_small_trace(
 
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn add_opcode_trace(
+    pc: *const u32,
+    ap: *const u32,
+    fp: *const u32,
+    addr_table: *const u32,
+    big_words: *const u32,
+    small_words: *const u32,
+    n_rows: u32,
+    column_length: u32,
+    trace: *const *const u32,
+    staged: *const *const u32,
+) {
+    let _ = (pc, ap, fp, addr_table, big_words, small_words);
+    let _ = (n_rows, column_length, trace, staged);
+    no_cuda_symbol("add_opcode_trace")
+}
+
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn tuple_count(
     cols: *const *const u32,
     n_tuples: u32,

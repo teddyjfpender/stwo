@@ -413,7 +413,142 @@ __global__ void add_opcode_small_trace_kernel(
     staged[3][row] = add(v_ap, ap_update_add_1);
 }
 
+// add_opcode (103 trace columns): decodes the instruction at pc, then three
+// FULL "Read Positive Num Bits 252" memory reads (dst/op0/op1) each producing
+// an id trace column and a 28-limb f252 decode (all limbs are trace columns,
+// no small-sign decode), then a carry-chain add check producing sub_p_bit.
+// Staged columns (lookup-tuple expressions that are not plain trace columns):
+//   [0] vi_felt5 = dst_base_fp*8 + op0_base_fp*16 + op1_imm*32
+//                   + op1_base_fp*64 + op1_base_ap*128 + 256
+//   [1] vi_felt6 = ap_update_add_1*32 + 256
+//   [2] dst_addr = mem_dst_base + (offset0 - 32768)
+//   [3] op0_addr = mem0_base + (offset1 - 32768)
+//   [4] op1_addr = mem1_base + (offset2 - 32768)
+//   [5] next_pc  = pc + 1 + op1_imm      (opcodes-out yield)
+//   [6] next_ap  = ap + ap_update_add_1  (opcodes-out yield)
+// All PackedM31 expressions use the modular fields.cuh ops; the instruction
+// bit-extractions are PackedUInt16 (plain u32).
+__global__ void add_opcode_trace_kernel(
+    const uint32_t *pc, const uint32_t *ap, const uint32_t *fp,
+    const uint32_t *addr_table,
+    const uint32_t *big_words, const uint32_t *small_words,
+    uint32_t n_rows,
+    uint32_t column_length,
+    uint32_t *const *trace,    // 103 trace columns
+    uint32_t *const *staged    // 7 staged columns
+) {
+    uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= column_length) return;
+    uint32_t v_pc = pc[row], v_ap = ap[row], v_fp = fp[row];
+    trace[0][row] = v_pc;
+    trace[1][row] = v_ap;
+    trace[2][row] = v_fp;
+
+    // Decode Instruction: pc -> id -> first 7 limbs (u16 bit-extraction math).
+    uint32_t instr_id = mem_addr_to_id(addr_table, v_pc);
+    uint32_t il[7];
+    mem_id_to_limbs<7>(instr_id, big_words, small_words, il);
+    uint32_t offset0 = il[0] + ((il[1] & 127u) << 9);
+    uint32_t offset1 = (il[1] >> 7) + (il[2] << 2) + ((il[3] & 31u) << 11);
+    uint32_t offset2 = (il[3] >> 5) + (il[4] << 4) + ((il[5] & 7u) << 13);
+    uint32_t flags = (il[5] >> 3) + (il[6] << 6);
+    uint32_t dst_base_fp = (flags >> 0) & 1u;
+    uint32_t op0_base_fp = (flags >> 1) & 1u;
+    uint32_t op1_imm = (flags >> 2) & 1u;
+    uint32_t op1_base_fp = (flags >> 3) & 1u;
+    uint32_t ap_update_add_1 = (flags >> 11) & 1u;
+    trace[3][row] = offset0;
+    trace[4][row] = offset1;
+    trace[5][row] = offset2;
+    trace[6][row] = dst_base_fp;
+    trace[7][row] = op0_base_fp;
+    trace[8][row] = op1_imm;
+    trace[9][row] = op1_base_fp;
+    trace[10][row] = ap_update_add_1;
+    // op1_base_ap = 1 - op1_imm - op1_base_fp (modular M31).
+    uint32_t op1_base_ap = sub(sub(1u, op1_imm), op1_base_fp);
+
+    // Memory bases (modular M31).
+    uint32_t mem_dst_base = add(mul(dst_base_fp, v_fp), mul(sub(1u, dst_base_fp), v_ap));
+    uint32_t mem0_base = add(mul(op0_base_fp, v_fp), mul(sub(1u, op0_base_fp), v_ap));
+    uint32_t mem1_base = add(add(mul(op1_imm, v_pc), mul(op1_base_fp, v_fp)),
+                             mul(op1_base_ap, v_ap));
+    trace[11][row] = mem_dst_base;
+    trace[12][row] = mem0_base;
+    trace[13][row] = mem1_base;
+
+    // Signed offsets: offset - 32768 (modular M31).
+    uint32_t off0_signed = sub(offset0, 32768u);
+    uint32_t off1_signed = sub(offset1, 32768u);
+    uint32_t off2_signed = sub(offset2, 32768u);
+
+    // dst read (full 252) at mem_dst_base + off0_signed.
+    uint32_t dst_addr = add(mem_dst_base, off0_signed);
+    uint32_t dst_id = mem_addr_to_id(addr_table, dst_addr);
+    trace[14][row] = dst_id;
+    uint32_t dstl[28];
+    mem_id_to_limbs<28>(dst_id, big_words, small_words, dstl);
+    #pragma unroll
+    for (int i = 0; i < 28; ++i) trace[15 + i][row] = dstl[i];
+
+    // op0 read (full 252) at mem0_base + off1_signed.
+    uint32_t op0_addr = add(mem0_base, off1_signed);
+    uint32_t op0_id = mem_addr_to_id(addr_table, op0_addr);
+    trace[43][row] = op0_id;
+    uint32_t op0l[28];
+    mem_id_to_limbs<28>(op0_id, big_words, small_words, op0l);
+    #pragma unroll
+    for (int i = 0; i < 28; ++i) trace[44 + i][row] = op0l[i];
+
+    // op1 read (full 252) at mem1_base + off2_signed.
+    uint32_t op1_addr = add(mem1_base, off2_signed);
+    uint32_t op1_id = mem_addr_to_id(addr_table, op1_addr);
+    trace[72][row] = op1_id;
+    uint32_t op1l[28];
+    mem_id_to_limbs<28>(op1_id, big_words, small_words, op1l);
+    #pragma unroll
+    for (int i = 0; i < 28; ++i) trace[73 + i][row] = op1l[i];
+
+    // Verify Add 252: sub_p_bit = 1 & (op0_limb0 ^ op1_limb0 ^ dst_limb0)
+    // (PackedUInt16 bit math, plain u32).
+    uint32_t sub_p_bit = 1u & ((op0l[0] ^ op1l[0]) ^ dstl[0]);
+    trace[101][row] = sub_p_bit;
+
+    trace[102][row] = row < n_rows ? 1u : 0u;  // enabler
+
+    // verify_instruction staged felts (modular M31).
+    staged[0][row] = add(
+        add(add(mul(dst_base_fp, 8u), mul(op0_base_fp, 16u)),
+            add(mul(op1_imm, 32u), mul(op1_base_fp, 64u))),
+        add(mul(op1_base_ap, 128u), 256u));
+    staged[1][row] = add(mul(ap_update_add_1, 32u), 256u);
+    // memory_address_to_id read addresses (staged tuple slots).
+    staged[2][row] = dst_addr;
+    staged[3][row] = op0_addr;
+    staged[4][row] = op1_addr;
+    // opcodes-out yield staged: next_pc = pc + 1 + op1_imm, next_ap = ap + ap_update_add_1.
+    staged[5][row] = add(add(v_pc, 1u), op1_imm);
+    staged[6][row] = add(v_ap, ap_update_add_1);
+}
+
 }  // namespace
+
+extern "C" void add_opcode_trace(
+    const uint32_t *pc, const uint32_t *ap, const uint32_t *fp,
+    const uint32_t *addr_table,
+    const uint32_t *big_words, const uint32_t *small_words,
+    uint32_t n_rows,
+    uint32_t column_length,
+    const uint32_t *const *trace,
+    const uint32_t *const *staged
+) {
+    uint32_t blocks = (column_length + OP_BLOCK - 1) / OP_BLOCK;
+    add_opcode_trace_kernel<<<blocks, OP_BLOCK>>>(
+        pc, ap, fp, addr_table, big_words, small_words, n_rows, column_length,
+        const_cast<uint32_t *const *>(trace), const_cast<uint32_t *const *>(staged));
+    stwo_maybe_debug_sync();
+    ASSERT_CUDA_SUCCESS(cudaGetLastError());
+}
 
 extern "C" void jnz_opcode_taken_trace(
     const uint32_t *pc, const uint32_t *ap, const uint32_t *fp,

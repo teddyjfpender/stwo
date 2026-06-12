@@ -749,3 +749,41 @@ pub fn add_opcode_small_trace(
     }
     (trace, staged)
 }
+
+/// add_opcode base trace: 103 trace columns plus 7 staged columns (the
+/// lookup-tuple expressions that are not plain trace columns): the two
+/// verify_instruction felts, the three memory_address_to_id read addresses
+/// (dst/op0/op1), and the opcodes-out next_pc / next_ap. The three memory
+/// reads are FULL 252-bit reads (28 trace limbs each, no small-sign decode).
+pub fn add_opcode_trace(
+    inputs: [&BaseFieldVec; 3], // pc, ap, fp (padded to column_length)
+    tables: &DeviceMemTables,
+    n_rows: usize,
+    column_length: usize,
+) -> (Vec<BaseFieldVec>, [BaseFieldVec; 7]) {
+    bindings::ensure_mem_pool_init();
+    let trace: Vec<BaseFieldVec> = (0..103)
+        .map(|_| BaseFieldVec::new_uninitialized(column_length))
+        .collect();
+    let staged: [BaseFieldVec; 7] =
+        std::array::from_fn(|_| BaseFieldVec::new_uninitialized(column_length));
+    let trace_ptrs: Vec<*const u32> = trace.iter().map(|c| c.device_ptr).collect();
+    let trace_table = UploadedDevicePointerVec::upload(&trace_ptrs);
+    let staged_ptrs: Vec<*const u32> = staged.iter().map(|c| c.device_ptr).collect();
+    let staged_table = UploadedDevicePointerVec::upload(&staged_ptrs);
+    unsafe {
+        stwo_backend_cuda_kernels::raw::add_opcode_trace(
+            inputs[0].device_ptr,
+            inputs[1].device_ptr,
+            inputs[2].device_ptr,
+            tables.addr_to_id.device_ptr,
+            tables.big_words.device_ptr,
+            tables.small_words.device_ptr,
+            n_rows as u32,
+            column_length as u32,
+            trace_table.as_ptr(),
+            staged_table.as_ptr(),
+        );
+    }
+    (trace, staged)
+}
