@@ -191,11 +191,11 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
         for col in 0..columns.n_columns() {
             let log_size = columns.column_log_size(col) as usize;
             let shift = max_log_size - log_size;
-            let res: Vec<_> = query_positions
+            let rows: Vec<usize> = query_positions
                 .iter()
-                .map(|pos| columns.value(col, (pos >> (shift + 1) << 1) + (pos & 1)))
+                .map(|pos| (pos >> (shift + 1) << 1) + (pos & 1))
                 .collect();
-            queried_values.push(res);
+            queried_values.push(columns.values_at(col, &rows));
         }
 
         // Used to recompute nodes of unretained bottom layers (trees committed with
@@ -358,6 +358,11 @@ trait ColumnAccess {
     /// recomputing leaf hashes, which must reproduce the exact bytes that
     /// [`MerkleOpsLifted::build_leaves`] committed.
     fn raw_value(&self, col: usize, row: usize) -> BaseField;
+    /// Batched [`Self::value`] over many rows (one device gather + one readback
+    /// on GPU backends; the per-element path is a synchronous transfer each).
+    fn values_at(&self, col: usize, rows: &[usize]) -> Vec<BaseField> {
+        rows.iter().map(|&row| self.value(col, row)).collect()
+    }
 }
 
 /// Dense access: the full committed columns.
@@ -375,6 +380,9 @@ impl<B: ColumnOps<BaseField>> ColumnAccess for DenseColumns<'_, B> {
     }
     fn raw_value(&self, col: usize, row: usize) -> BaseField {
         self.0[col].at_unreduced(row)
+    }
+    fn values_at(&self, col: usize, rows: &[usize]) -> Vec<BaseField> {
+        self.0[col].at_many(rows)
     }
 }
 

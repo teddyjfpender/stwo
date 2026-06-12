@@ -71,6 +71,13 @@ impl Column<BaseField> for interface::base_field_vec::BaseFieldVec {
         Self::get_data(self, index)
     }
 
+    /// Batched `at`: identical to [`Self::gather_unreduced`] here — device storage
+    /// is raw u32 words and `at` performs no canonicalization either, so the
+    /// gathered words match the per-element path exactly.
+    fn at_many(&self, indices: &[usize]) -> Vec<BaseField> {
+        self.gather_unreduced(indices)
+    }
+
     /// Batched gather: one kernel + one D2H copy for all indices. The default
     /// (per-element `at`) is one 4-byte PCIe roundtrip per index — the decommit phase
     /// issues ~queries x columns of those, which measured as the dominant warm-prove

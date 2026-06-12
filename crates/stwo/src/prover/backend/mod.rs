@@ -136,6 +136,13 @@ pub trait Column<T>: Clone + Debug + FromIterator<T> + Send + Sync {
     }
     /// Retrieves the element at the given index.
     fn at(&self, index: usize) -> T;
+    /// Retrieves many elements by index, in order. The default loops over
+    /// [`Self::at`]; GPU backends override it with one device gather + one
+    /// readback (the per-element path costs a synchronous transfer each — the
+    /// decommit hot loop reads queries x columns elements).
+    fn at_many(&self, indices: &[usize]) -> Vec<T> {
+        indices.iter().map(|&index| self.at(index)).collect()
+    }
     /// Retrieves the element at the given index without canonicalizing its representation.
     ///
     /// Backends whose stored representation may be unreduced (e.g. SIMD columns holding
