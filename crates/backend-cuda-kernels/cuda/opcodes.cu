@@ -413,6 +413,97 @@ __global__ void add_opcode_small_trace_kernel(
     staged[3][row] = add(v_ap, ap_update_add_1);
 }
 
+// assert_eq_opcode (12 trace columns, the smallest opcode): decodes the
+// instruction at pc, computes the two memory bases (dst / op1), and performs
+// the "Mem Verify Equal" read of dst at mem_dst_base + (offset0 - 32768). The
+// op1 read (memory_address_to_id_2) shares the same id (dst_id) but a different
+// address (mem1_base + (offset2 - 32768)) — that's the equality being asserted.
+// Staged columns (lookup tuple slots that are not plain trace columns):
+//   [0] vi_felt5  = ((dst_base_fp*8 + 16) + op1_base_fp*64) + (1-op1_base_fp)*128
+//   [1] vi_felt6  = ap_update_add_1*32 + 256
+//   [2] dst_addr  = mem_dst_base + (offset0 - 32768)   (mem_address_to_id_1 addr)
+//   [3] op1_addr  = mem1_base    + (offset2 - 32768)   (mem_address_to_id_2 addr)
+//   [4] next_pc   = pc + 1                              (opcodes-out yield)
+//   [5] next_ap   = ap + ap_update_add_1               (opcodes-out yield)
+// PackedM31 expressions use the modular fields.cuh ops; the instruction
+// bit-extractions are PackedUInt16 (plain u32).
+__global__ void assert_eq_opcode_trace_kernel(
+    const uint32_t *pc, const uint32_t *ap, const uint32_t *fp,
+    const uint32_t *addr_table,
+    const uint32_t *big_words, const uint32_t *small_words,
+    uint32_t n_rows,
+    uint32_t column_length,
+    uint32_t *const *trace,                 // 12 trace columns
+    uint32_t *vi_felt5, uint32_t *vi_felt6, // staged: verify_instruction exprs
+    uint32_t *dst_addr_out,                 // staged: mem_address_to_id_1 read addr
+    uint32_t *op1_addr_out,                 // staged: mem_address_to_id_2 read addr
+    uint32_t *next_pc_out, uint32_t *next_ap_out // staged: opcodes-out yield exprs
+) {
+    uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= column_length) return;
+    uint32_t v_pc = pc[row], v_ap = ap[row], v_fp = fp[row];
+    trace[0][row] = v_pc;
+    trace[1][row] = v_ap;
+    trace[2][row] = v_fp;
+
+    // Decode Instruction: read the instruction felt at pc and split limbs.
+    uint32_t instr_id = mem_addr_to_id(addr_table, v_pc);
+    uint32_t il[7];
+    mem_id_to_limbs<7>(instr_id, big_words, small_words, il);
+
+    // offset0 = il[0] + ((il[1] & 127) << 9)  (PackedUInt16, plain u32 ops).
+    uint32_t offset0 = il[0] + (((il[1] & 127u) << 9));
+    trace[3][row] = offset0;
+    // offset2 = (il[3] >> 5) + (il[4] << 4) + ((il[5] & 7) << 13).
+    uint32_t offset2 = (il[3] >> 5) + (il[4] << 4) + ((il[5] & 7u) << 13);
+    trace[4][row] = offset2;
+    // flags from limb 5 >> 3 + limb 6 << 6.
+    uint32_t flags = (il[5] >> 3) + (il[6] << 6);
+    uint32_t dst_base_fp = (flags >> 0) & 1u;
+    trace[5][row] = dst_base_fp;
+    uint32_t op1_base_fp = (flags >> 3) & 1u;
+    trace[6][row] = op1_base_fp;
+    uint32_t ap_update_add_1 = (flags >> 11) & 1u;
+    trace[7][row] = ap_update_add_1;
+
+    // verify_instruction tuple staged exprs (M31 modular ops).
+    // vi_felt5 = (((dst_base_fp*8) + 16) + op1_base_fp*64) + (1-op1_base_fp)*128.
+    vi_felt5[row] = add(
+        add(add(mul(dst_base_fp, 8u), 16u), mul(op1_base_fp, 64u)),
+        mul(sub(1u, op1_base_fp), 128u));
+    // vi_felt6 = ap_update_add_1*32 + 256.
+    vi_felt6[row] = add(mul(ap_update_add_1, 32u), 256u);
+
+    // Signed offsets: offset - 32768 (modular M31).
+    uint32_t off0_signed = sub(offset0, 32768u);
+    uint32_t off2_signed = sub(offset2, 32768u);
+
+    // mem_dst_base = dst_base_fp*fp + (1 - dst_base_fp)*ap.
+    uint32_t mem_dst_base = add(mul(dst_base_fp, v_fp),
+                               mul(sub(1u, dst_base_fp), v_ap));
+    trace[8][row] = mem_dst_base;
+    // mem1_base = op1_base_fp*fp + (1 - op1_base_fp)*ap.
+    uint32_t mem1_base = add(mul(op1_base_fp, v_fp),
+                            mul(sub(1u, op1_base_fp), v_ap));
+    trace[9][row] = mem1_base;
+
+    // Mem Verify Equal — Read Id at mem_dst_base + off0_signed.
+    uint32_t dst_addr = add(mem_dst_base, off0_signed);
+    dst_addr_out[row] = dst_addr;
+    uint32_t dst_id = mem_addr_to_id(addr_table, dst_addr);
+    trace[10][row] = dst_id;
+
+    // memory_address_to_id_2 reads the same id (dst_id) at op1_addr.
+    uint32_t op1_addr = add(mem1_base, off2_signed);
+    op1_addr_out[row] = op1_addr;
+
+    trace[11][row] = row < n_rows ? 1u : 0u;  // enabler
+
+    // opcodes-out yield staged: next_pc = pc + 1, next_ap = ap + ap_update_add_1.
+    next_pc_out[row] = add(v_pc, 1u);
+    next_ap_out[row] = add(v_ap, ap_update_add_1);
+}
+
 // call_opcode_rel_imm (24 trace columns): a `call rel imm` instruction. The
 // fixed instruction shape means the verify_instruction tuple is all constants
 // except pc (no instruction-felt decode of offsets/flags is needed). Reads two
@@ -641,6 +732,26 @@ __global__ void add_opcode_trace_kernel(
 }
 
 }  // namespace
+
+extern "C" void assert_eq_opcode_trace(
+    const uint32_t *pc, const uint32_t *ap, const uint32_t *fp,
+    const uint32_t *addr_table,
+    const uint32_t *big_words, const uint32_t *small_words,
+    uint32_t n_rows,
+    uint32_t column_length,
+    const uint32_t *const *trace,
+    uint32_t *vi_felt5, uint32_t *vi_felt6,
+    uint32_t *dst_addr_out, uint32_t *op1_addr_out,
+    uint32_t *next_pc_out, uint32_t *next_ap_out
+) {
+    uint32_t blocks = (column_length + OP_BLOCK - 1) / OP_BLOCK;
+    assert_eq_opcode_trace_kernel<<<blocks, OP_BLOCK>>>(
+        pc, ap, fp, addr_table, big_words, small_words, n_rows, column_length,
+        const_cast<uint32_t *const *>(trace),
+        vi_felt5, vi_felt6, dst_addr_out, op1_addr_out, next_pc_out, next_ap_out);
+    stwo_maybe_debug_sync();
+    ASSERT_CUDA_SUCCESS(cudaGetLastError());
+}
 
 extern "C" void call_opcode_rel_imm_trace(
     const uint32_t *pc, const uint32_t *ap, const uint32_t *fp,
