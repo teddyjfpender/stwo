@@ -58,6 +58,71 @@ extern "C" {
     pub fn stwo_upload_record_half(half: i32);
     pub fn stwo_upload_half_sync(half: i32);
     pub fn stwo_legacy_wait_uploads();
+    // Generic witness logup-input kernels (witness_logup.cu).
+    pub fn tuple_pair_logup(
+        rel_id0: u32,
+        cols0: *const *const u32,
+        n0: u32,
+        rel_id1: u32,
+        cols1: *const *const u32,
+        n1: u32,
+        mult0_col: *const u32,
+        enabler0: u32,
+        mult1_col: *const u32,
+        enabler1: u32,
+        negate: u32,
+        column_length: u32,
+        alphas: *const u32,
+        z: CudaSecureField,
+        denoms: *const u32,
+        num0: *const u32,
+        num1: *const u32,
+        num2: *const u32,
+        num3: *const u32,
+    );
+    pub fn tuple_single_logup(
+        rel_id: u32,
+        cols: *const *const u32,
+        n: u32,
+        mult_col: *const u32,
+        enabler: u32,
+        negate: u32,
+        column_length: u32,
+        alphas: *const u32,
+        z: CudaSecureField,
+        denoms: *const u32,
+        num0: *const u32,
+        num1: *const u32,
+        num2: *const u32,
+        num3: *const u32,
+    );
+    pub fn tuple_count(
+        cols: *const *const u32,
+        n_tuples: u32,
+        width: u32,
+        slot_bits: *const u32,
+        n_relations: u32,
+        column_length: u32,
+        input_to_row_lut: *const u32,
+        table_size: u32,
+        counts: *mut u32,
+    );
+    pub fn verify_instruction_trace(
+        pc: *const u32,
+        off0: *const u32,
+        off1: *const u32,
+        off2: *const u32,
+        felt5_high: *const u32,
+        felt6: *const u32,
+        opcode_ext: *const u32,
+        instruction_id: *const u32,
+        mult: *const u32,
+        column_length: u32,
+        trace: *const *const u32,
+        enc1: *const u32,
+        enc3: *const u32,
+        enc5b: *const u32,
+    );
     /// Batched-OODS barycentric eval: result lands in a device slot (no D2H).
     pub fn barycentric_eval_base_field_into(
         eval_values: *const u32,

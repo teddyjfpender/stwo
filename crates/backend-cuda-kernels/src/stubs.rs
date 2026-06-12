@@ -1071,3 +1071,111 @@ pub unsafe extern "C" fn barycentric_eval_base_field_into(
     let _ = (eval_values, weights, size, out_slot);
     no_cuda_symbol("barycentric_eval_base_field_into")
 }
+
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn tuple_pair_logup(
+    rel_id0: u32,
+    cols0: *const *const u32,
+    n0: u32,
+    rel_id1: u32,
+    cols1: *const *const u32,
+    n1: u32,
+    mult0_col: *const u32,
+    enabler0: u32,
+    mult1_col: *const u32,
+    enabler1: u32,
+    negate: u32,
+    column_length: u32,
+    alphas: *const u32,
+    z: CudaSecureField,
+    denoms: *const u32,
+    num0: *const u32,
+    num1: *const u32,
+    num2: *const u32,
+    num3: *const u32,
+) {
+    let _ = (rel_id0, cols0, n0, rel_id1, cols1, n1);
+    let _ = (
+        mult0_col,
+        enabler0,
+        mult1_col,
+        enabler1,
+        negate,
+        column_length,
+    );
+    let _ = (alphas, z, denoms, num0, num1, num2, num3);
+    no_cuda_symbol("tuple_pair_logup")
+}
+
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn tuple_single_logup(
+    rel_id: u32,
+    cols: *const *const u32,
+    n: u32,
+    mult_col: *const u32,
+    enabler: u32,
+    negate: u32,
+    column_length: u32,
+    alphas: *const u32,
+    z: CudaSecureField,
+    denoms: *const u32,
+    num0: *const u32,
+    num1: *const u32,
+    num2: *const u32,
+    num3: *const u32,
+) {
+    let _ = (rel_id, cols, n, mult_col, enabler, negate, column_length);
+    let _ = (alphas, z, denoms, num0, num1, num2, num3);
+    no_cuda_symbol("tuple_single_logup")
+}
+
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn tuple_count(
+    cols: *const *const u32,
+    n_tuples: u32,
+    width: u32,
+    slot_bits: *const u32,
+    n_relations: u32,
+    column_length: u32,
+    input_to_row_lut: *const u32,
+    table_size: u32,
+    counts: *mut u32,
+) {
+    let _ = (cols, n_tuples, width, slot_bits, n_relations);
+    let _ = (column_length, input_to_row_lut, table_size, counts);
+    no_cuda_symbol("tuple_count")
+}
+
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn verify_instruction_trace(
+    pc: *const u32,
+    off0: *const u32,
+    off1: *const u32,
+    off2: *const u32,
+    felt5_high: *const u32,
+    felt6: *const u32,
+    opcode_ext: *const u32,
+    instruction_id: *const u32,
+    mult: *const u32,
+    column_length: u32,
+    trace: *const *const u32,
+    enc1: *const u32,
+    enc3: *const u32,
+    enc5b: *const u32,
+) {
+    let _ = (pc, off0, off1, off2, felt5_high, felt6, opcode_ext);
+    let _ = (
+        instruction_id,
+        mult,
+        column_length,
+        trace,
+        enc1,
+        enc3,
+        enc5b,
+    );
+    no_cuda_symbol("verify_instruction_trace")
+}

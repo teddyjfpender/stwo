@@ -313,3 +313,209 @@ pub fn finalize_device_raw_logup(
         .collect();
     (trace, claimed_sum)
 }
+
+// ---------------------------------------------------------------------------
+// Generic witness logup lane (witness_logup.cu): every generated interaction
+// writer reduces to pair-of-tuples / single-tuple columns over staged device
+// columns, so component ports only supply a base-trace kernel.
+// ---------------------------------------------------------------------------
+
+/// A logup multiplicity operand.
+pub enum Mult<'a> {
+    /// The constant 1 (most "use" tuples).
+    One,
+    /// A device column (mult columns, enabler-like data columns).
+    Column(&'a BaseFieldVec),
+    /// The Enabler pattern: 1 iff `row < offset` (opcode padding).
+    Enabler(u32),
+}
+
+const NO_ENABLER: u32 = u32::MAX;
+
+impl Mult<'_> {
+    fn encode(&self) -> (*const u32, u32) {
+        match self {
+            Mult::One => (std::ptr::null(), NO_ENABLER),
+            Mult::Column(col) => (col.device_ptr, NO_ENABLER),
+            Mult::Enabler(offset) => (std::ptr::null(), *offset),
+        }
+    }
+}
+
+fn upload_alphas(alpha_powers: &[SecureField], needed: usize) -> crate::columns::SecureFieldVec {
+    assert!(alpha_powers.len() >= needed);
+    crate::columns::SecureFieldVec::from_vec(alpha_powers[..needed].to_vec())
+}
+
+/// Pair-of-tuples logup column: `d_i = combine([rel_id_i, cols_i...])`,
+/// numerator `sign * (d0*m1 + d1*m0)`, denominator `d0*d1`.
+#[allow(clippy::too_many_arguments)]
+pub fn tuple_pair_logup(
+    rel_id0: u32,
+    cols0: &[&BaseFieldVec],
+    rel_id1: u32,
+    cols1: &[&BaseFieldVec],
+    mult0: Mult<'_>,
+    mult1: Mult<'_>,
+    negate: bool,
+    column_length: usize,
+    alpha_powers: &[SecureField],
+    z: SecureField,
+) -> DeviceRawLogupColumn {
+    let alphas = upload_alphas(alpha_powers, 1 + cols0.len().max(cols1.len()));
+    let ptrs0: Vec<*const u32> = cols0.iter().map(|c| c.device_ptr).collect();
+    let ptrs1: Vec<*const u32> = cols1.iter().map(|c| c.device_ptr).collect();
+    let table0 = UploadedDevicePointerVec::upload(&ptrs0);
+    let table1 = UploadedDevicePointerVec::upload(&ptrs1);
+    let (m0_ptr, e0) = mult0.encode();
+    let (m1_ptr, e1) = mult1.encode();
+    let out = new_device_raw_column(column_length);
+    unsafe {
+        stwo_backend_cuda_kernels::raw::tuple_pair_logup(
+            rel_id0,
+            table0.as_ptr(),
+            cols0.len() as u32,
+            rel_id1,
+            table1.as_ptr(),
+            cols1.len() as u32,
+            m0_ptr,
+            e0,
+            m1_ptr,
+            e1,
+            negate as u32,
+            column_length as u32,
+            alphas.device_ptr,
+            CudaSecureField::from(z).into_raw(),
+            out.denominator.device_ptr,
+            out.numerator[0].device_ptr,
+            out.numerator[1].device_ptr,
+            out.numerator[2].device_ptr,
+            out.numerator[3].device_ptr,
+        );
+    }
+    out
+}
+
+/// Single-tuple logup column: numerator `(sign * m, 0, 0, 0)`, denominator
+/// `combine([rel_id, cols...])`.
+#[allow(clippy::too_many_arguments)]
+pub fn tuple_single_logup(
+    rel_id: u32,
+    cols: &[&BaseFieldVec],
+    mult: Mult<'_>,
+    negate: bool,
+    column_length: usize,
+    alpha_powers: &[SecureField],
+    z: SecureField,
+) -> DeviceRawLogupColumn {
+    let alphas = upload_alphas(alpha_powers, 1 + cols.len());
+    let ptrs: Vec<*const u32> = cols.iter().map(|c| c.device_ptr).collect();
+    let table = UploadedDevicePointerVec::upload(&ptrs);
+    let (m_ptr, e) = mult.encode();
+    let out = new_device_raw_column(column_length);
+    unsafe {
+        stwo_backend_cuda_kernels::raw::tuple_single_logup(
+            rel_id,
+            table.as_ptr(),
+            cols.len() as u32,
+            m_ptr,
+            e,
+            negate as u32,
+            column_length as u32,
+            alphas.device_ptr,
+            CudaSecureField::from(z).into_raw(),
+            out.denominator.device_ptr,
+            out.numerator[0].device_ptr,
+            out.numerator[1].device_ptr,
+            out.numerator[2].device_ptr,
+            out.numerator[3].device_ptr,
+        );
+    }
+    out
+}
+
+/// Counts width-W column tuples into relation-indexed count tables through a
+/// dense input->row LUT (per-slot bit packing; rc_9_9 = [9,9], rc_7_2_5 =
+/// [7,2,5], rc_4_3 = [4,3]). Padding rows included, like every host feed.
+#[allow(clippy::too_many_arguments)]
+pub fn tuple_count(
+    tuple_cols: &[&BaseFieldVec],
+    width: usize,
+    slot_bits: &[u32],
+    n_relations: usize,
+    column_length: usize,
+    input_to_row_lut: &[u32],
+    table_size: usize,
+) -> Vec<u32> {
+    assert_eq!(slot_bits.len(), width);
+    assert!(tuple_cols.len().is_multiple_of(width));
+    assert_eq!(
+        input_to_row_lut.len(),
+        1usize << slot_bits.iter().sum::<u32>()
+    );
+    bindings::ensure_mem_pool_init();
+    let ptrs: Vec<*const u32> = tuple_cols.iter().map(|c| c.device_ptr).collect();
+    let table = UploadedDevicePointerVec::upload(&ptrs);
+    let bits_dev = unsafe {
+        bindings::copy_uint32_t_vec_from_host_to_device(slot_bits.as_ptr(), slot_bits.len() as u32)
+    };
+    let bits = BaseFieldVec::new(bits_dev, slot_bits.len());
+    let lut_dev = unsafe {
+        bindings::copy_uint32_t_vec_from_host_to_device(
+            input_to_row_lut.as_ptr(),
+            input_to_row_lut.len() as u32,
+        )
+    };
+    let lut = BaseFieldVec::new(lut_dev, input_to_row_lut.len());
+    let counts = BaseFieldVec::new_zeroes(n_relations * table_size);
+    unsafe {
+        stwo_backend_cuda_kernels::raw::tuple_count(
+            table.as_ptr(),
+            (tuple_cols.len() / width) as u32,
+            width as u32,
+            bits.device_ptr,
+            n_relations as u32,
+            column_length as u32,
+            lut.device_ptr,
+            table_size as u32,
+            counts.device_ptr.cast_mut(),
+        );
+    }
+    counts.to_vec().into_iter().map(|f| f.0).collect()
+}
+
+/// The verify_instruction base trace: 17 trace columns + the 3 staged
+/// combination columns its interaction tuples reference.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_instruction_trace(
+    inputs: [&BaseFieldVec; 9],
+    column_length: usize,
+) -> (Vec<BaseFieldVec>, [BaseFieldVec; 3]) {
+    bindings::ensure_mem_pool_init();
+    let trace: Vec<BaseFieldVec> = (0..17)
+        .map(|_| BaseFieldVec::new_uninitialized(column_length))
+        .collect();
+    let staged: [BaseFieldVec; 3] =
+        std::array::from_fn(|_| BaseFieldVec::new_uninitialized(column_length));
+    let trace_ptrs: Vec<*const u32> = trace.iter().map(|c| c.device_ptr).collect();
+    let table = UploadedDevicePointerVec::upload(&trace_ptrs);
+    unsafe {
+        stwo_backend_cuda_kernels::raw::verify_instruction_trace(
+            inputs[0].device_ptr,
+            inputs[1].device_ptr,
+            inputs[2].device_ptr,
+            inputs[3].device_ptr,
+            inputs[4].device_ptr,
+            inputs[5].device_ptr,
+            inputs[6].device_ptr,
+            inputs[7].device_ptr,
+            inputs[8].device_ptr,
+            column_length as u32,
+            table.as_ptr(),
+            staged[0].device_ptr.cast_mut(),
+            staged[1].device_ptr.cast_mut(),
+            staged[2].device_ptr.cast_mut(),
+        );
+    }
+    (trace, staged)
+}
