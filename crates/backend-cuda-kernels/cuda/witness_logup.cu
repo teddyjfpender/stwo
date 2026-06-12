@@ -76,7 +76,7 @@ __global__ void tuple_pair_logup_kernel(
     m31 m1 = wl_mult(mult1_col, enabler1, row);
     qm31 numerator = add(wl_mul_m31(d0, m1), wl_mul_m31(d1, m0));
     if (negate) {
-        numerator = neg(numerator);
+        numerator = qm31{neg(numerator.a), neg(numerator.b)};
     }
     denoms[row] = mul(d0, d1);
     num0[row] = numerator.a.a;
