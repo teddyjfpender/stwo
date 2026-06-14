@@ -426,6 +426,18 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
             }
         }
 
+        // Low-memory spill point: the compacted columns and their transient
+        // regeneration buffers (returned to the pool during compaction and
+        // decommit above) have served their last consumer. Drop them and trim the
+        // backend allocator so the spilled memory is actually released — this is
+        // what makes low-memory mode lower *reserved* VRAM, not just live memory
+        // (the CUDA mem pool never releases on its own). Gated on `low_memory`, so
+        // the default path keeps the buffers pooled for reuse and is byte- and
+        // throughput-identical.
+        if self.low_memory {
+            self.base_column_pool.clear();
+        }
+
         ExtendedCommitmentSchemeProof {
             proof: CommitmentSchemeProof {
                 commitments,

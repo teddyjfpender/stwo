@@ -67,8 +67,16 @@ Notes: CUDA is 2.0–2.3× the 224-vCPU SIMD run at these sizes. The VRAM saving
 modest on this 16-column AIR (quotient/FRI working set dominates); the mode targets
 many-tree, many-column workloads (Cairo's preprocessed + base + interaction trees)
 where committed-LDE retention is the dominant term — the deck's 51 GB interaction
-trace is the motivating case. The probe reports the end-of-run pool footprint, not
-the true in-flight peak; a high-water-mark probe is future work.
+trace is the motivating case.
+
+The figures above predate two memory-plumbing fixes: (1) the never-release mem pool
+now exposes an explicit trim (`release_mem_pool` → `cudaMemPoolTrimTo(pool, 0)`),
+invoked at the low-memory spill point (`CommitmentSchemeProver::prove_values` drops
+the pooled buffers and trims when `low_memory` is set), so the mode now actually
+returns reserved VRAM to the OS instead of leaving it pooled forever; and (2)
+`gpu_peak_vram_bytes` reports a true high-water mark (`cudaMemPoolAttrReservedMemHigh`)
+rather than the end-of-run footprint. Re-measure low-memory ON vs OFF `peak_vram_gb`
+to confirm the drop.
 
 ## stwo-cairo GPU witness pieces
 

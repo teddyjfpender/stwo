@@ -35,6 +35,19 @@ extern "C" cudaError_t cuda_mem_pool_init();
 // Destroy the CUDA memory pool
 extern "C" cudaError_t cuda_mem_pool_destroy();
 
+// Explicitly release pooled-but-unused device memory back to the OS
+// (cudaMemPoolTrimTo(pool, 0)). The never-release threshold is unchanged; this
+// is an opt-in trim for spill points (the low-memory path) and must run AFTER
+// the freed buffers' stream-ordered cudaFreeAsync have completed.
+extern "C" void stwo_cuda_mem_pool_trim();
+
+// Instantaneous device footprint (total - free) of this process, in bytes.
+extern "C" uint64_t stwo_cuda_vram_used_bytes();
+
+// True high-water mark of device memory reserved by the allocator over the
+// process lifetime, in bytes (cudaMemPoolAttrReservedMemHigh).
+extern "C" uint64_t stwo_cuda_vram_peak_bytes();
+
 // Cached default-mem-pool handle for the current device. Resolved once per
 // process (the backend is single-device); nullptr when stream-ordered allocation
 // is unavailable, in which case callers fall back to plain cudaMalloc/cudaFree.

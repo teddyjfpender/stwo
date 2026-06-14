@@ -52,6 +52,16 @@ extern "C" {
     /// Returns a CUDA error code (0 = success). Sets the default mem pool's release
     /// threshold to never-release so warm proves reuse allocations.
     pub fn cuda_mem_pool_init() -> i32;
+    /// Releases pooled-but-unused device memory back to the OS
+    /// (`cudaMemPoolTrimTo(pool, 0)`). Opt-in trim for spill points; the
+    /// never-release threshold is unchanged. Must run after the freed buffers'
+    /// stream-ordered frees have completed.
+    pub fn stwo_cuda_mem_pool_trim();
+    /// Instantaneous device footprint (total - free) of this process, in bytes.
+    pub fn stwo_cuda_vram_used_bytes() -> u64;
+    /// True high-water mark of device memory reserved by the allocator over the
+    /// process lifetime, in bytes (`cudaMemPoolAttrReservedMemHigh`).
+    pub fn stwo_cuda_vram_peak_bytes() -> u64;
     // Upload lane (async H2D on a dedicated copy stream; see cuda_mem_pool.cuh).
     pub fn stwo_upload_alloc_uint32(count: usize) -> *mut u32;
     pub fn stwo_upload_h2d_async(pinned_src: *const u32, device_dst: *mut u32, n_words: u64);

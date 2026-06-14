@@ -22,6 +22,23 @@ pub fn ensure_mem_pool_init() {
     });
 }
 
+/// Releases pooled-but-unused device memory back to the OS (`cudaMemPoolTrimTo`).
+/// Opt-in; only the low-memory spill point calls it (see [`crate::release_mem_pool`]).
+pub fn trim_mem_pool() {
+    if !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
+        return;
+    }
+    unsafe { sys_raw::stwo_cuda_mem_pool_trim() };
+}
+
+/// True peak reserved VRAM (high-water mark) of this process, in bytes.
+pub fn vram_peak_bytes() -> u64 {
+    if !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
+        return 0;
+    }
+    unsafe { sys_raw::stwo_cuda_vram_peak_bytes() }
+}
+
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct CudaSecureField {

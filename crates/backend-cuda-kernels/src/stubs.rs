@@ -965,6 +965,21 @@ pub unsafe extern "C" fn cuda_mem_pool_init() -> i32 {
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_cuda_mem_pool_trim() {
+    no_cuda_symbol("stwo_cuda_mem_pool_trim")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_cuda_vram_used_bytes() -> u64 {
+    no_cuda_symbol("stwo_cuda_vram_used_bytes")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_cuda_vram_peak_bytes() -> u64 {
+    no_cuda_symbol("stwo_cuda_vram_peak_bytes")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn grind_blake2s(_host_prefixed_digest: *const u32, _pow_bits: u32) -> u64 {
     no_cuda_symbol("grind_blake2s")
 }

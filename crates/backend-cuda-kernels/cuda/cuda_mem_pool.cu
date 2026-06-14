@@ -41,6 +41,55 @@ extern "C" cudaError_t cuda_mem_pool_destroy() {
     return cudaSuccess;
 }
 
+// Release pooled-but-unused device memory back to the OS. The pool's release
+// threshold stays UINT64_MAX (warm proves keep reusing allocations), so the pool
+// otherwise never shrinks: this is an EXPLICIT, opt-in trim called at a spill
+// point (the low-memory eval-compaction path) AFTER the freed buffers' deferred
+// cudaFreeAsync have made them unused. cudaMemPoolTrimTo(pool, 0) keeps zero
+// bytes reserved beyond what is still in use. No-op (returns success) when
+// stream-ordered allocation is unavailable.
+extern "C" void stwo_cuda_mem_pool_trim() {
+    cudaMemPool_t pool = stwo_default_mem_pool();
+    if (pool != nullptr) {
+        // The just-dropped buffers were freed with stream-ordered cudaFreeAsync on
+        // the legacy stream; cudaMemPoolTrimTo only reclaims blocks that are
+        // already free, so drain the stream first to make the release
+        // deterministic. This runs once at the spill point, never in a hot loop.
+        cudaStreamSynchronize((cudaStream_t)0);
+        cudaMemPoolTrimTo(pool, 0);
+    }
+}
+
+// Instantaneous device footprint of THIS process: total - free from
+// cudaMemGetInfo. End-of-run footprint only (not a peak); see
+// stwo_cuda_vram_peak_bytes for the high-water mark.
+extern "C" uint64_t stwo_cuda_vram_used_bytes() {
+    size_t free_mem = 0;
+    size_t total_mem = 0;
+    if (cudaMemGetInfo(&free_mem, &total_mem) != cudaSuccess) {
+        return 0;
+    }
+    return (uint64_t)(total_mem - free_mem);
+}
+
+// True high-water mark of device memory RESERVED by the allocator over the
+// process lifetime, in bytes. With the never-release pool this equals peak
+// reserved VRAM: cudaMemPoolAttrReservedMemHigh is a running max the pool
+// maintains at every allocation, so it captures the peak even when polled at the
+// end of a run (after a trim has already shrunk the live footprint). Returns 0
+// when stream-ordered allocation is unavailable.
+extern "C" uint64_t stwo_cuda_vram_peak_bytes() {
+    cudaMemPool_t pool = stwo_default_mem_pool();
+    if (pool == nullptr) {
+        return 0;
+    }
+    uint64_t high = 0;
+    if (cudaMemPoolGetAttribute(pool, cudaMemPoolAttrReservedMemHigh, &high) != cudaSuccess) {
+        return 0;
+    }
+    return high;
+}
+
 namespace {
 struct StreamPool {
     cudaStream_t streams[STWO_N_POOL_STREAMS];

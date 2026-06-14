@@ -114,6 +114,18 @@ impl FromSimdColumns for CpuBackend {
 pub trait ColumnOps<T> {
     type Column: Column<T>;
     fn bit_reverse_column(column: &mut Self::Column);
+
+    /// Releases backend-pooled-but-unused buffers back to the OS, after their
+    /// owning columns have already been dropped.
+    ///
+    /// The default is a no-op: CPU/SIMD columns are plain host allocations the
+    /// global allocator already reclaims on drop. Device backends that pool
+    /// allocations with a never-release threshold (the CUDA backend) override
+    /// this to trim the pool, so a caller that has just dropped a batch of
+    /// columns can actually return that VRAM. Called only from the low-memory
+    /// spill point (see [`crate::prover::mempool::BaseColumnPool::clear`]); the
+    /// default proving path never invokes it.
+    fn release_pooled_memory() {}
 }
 
 pub type Col<B, T> = <B as ColumnOps<T>>::Column;

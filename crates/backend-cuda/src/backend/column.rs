@@ -40,6 +40,13 @@ impl ColumnOps<BaseField> for CudaBackend {
             interface::bindings::bit_reverse_base_field(column.device_ptr, size);
         }
     }
+
+    /// Trims the never-release CUDA mem pool so buffers freed via dropped columns
+    /// are actually returned to the OS. Only the low-memory spill point calls
+    /// this (after dropping the pooled columns); steady-state pooling is unchanged.
+    fn release_pooled_memory() {
+        crate::release_mem_pool();
+    }
 }
 
 impl ColumnOps<SecureField> for CudaBackend {

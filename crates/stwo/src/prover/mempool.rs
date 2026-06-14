@@ -60,6 +60,22 @@ impl<B: ColumnOps<BaseField>> BaseColumnPool<B> {
         debug_assert_eq!(buf.len(), 1 << log_size);
         self.pools.entry(log_size).or_default().push(buf);
     }
+
+    /// Drops every buffer the pool is holding, then asks the backend to release any
+    /// pooled-but-unused device memory back to the OS.
+    ///
+    /// On host backends (CPU/SIMD) the dropped buffers are reclaimed by the global
+    /// allocator and [`ColumnOps::release_pooled_memory`] is a no-op. On the CUDA
+    /// backend, dropping the buffers enqueues their stream-ordered frees and the
+    /// release hook trims the never-release mem pool, so the freed VRAM is actually
+    /// returned — this is what lets low-memory mode lower reserved VRAM.
+    ///
+    /// Only the low-memory spill path calls this; the default proving path keeps
+    /// the buffers pooled for reuse (no drop, no trim).
+    pub fn clear(&self) {
+        self.pools.clear();
+        B::release_pooled_memory();
+    }
 }
 
 impl<B: ColumnOps<BaseField>> Default for BaseColumnPool<B> {
