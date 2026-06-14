@@ -1239,6 +1239,32 @@ pub unsafe extern "C" fn assert_eq_opcode_trace(
 
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn assert_eq_opcode_imm_trace(
+    pc: *const u32,
+    ap: *const u32,
+    fp: *const u32,
+    addr_table: *const u32,
+    big_words: *const u32,
+    small_words: *const u32,
+    n_rows: u32,
+    column_length: u32,
+    trace: *const *const u32,
+    vi_felt5: *const u32,
+    vi_felt6: *const u32,
+    dst_addr_out: *const u32,
+    imm_addr_out: *const u32,
+    next_pc_out: *const u32,
+    next_ap_out: *const u32,
+) {
+    let _ = (pc, ap, fp, addr_table, big_words, small_words);
+    let _ = (n_rows, column_length, trace);
+    let _ = (vi_felt5, vi_felt6, dst_addr_out, imm_addr_out);
+    let _ = (next_pc_out, next_ap_out);
+    no_cuda_symbol("assert_eq_opcode_imm_trace")
+}
+
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn jnz_opcode_taken_trace(
     pc: *const u32,
     ap: *const u32,
