@@ -12,12 +12,66 @@ mod cuda_codegen;
 mod program;
 mod recording;
 
+use std::collections::HashMap;
 use std::ffi::CString;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use program::lower_framework_eval_to_v1_with_logup;
 use stwo_constraint_framework::{FrameworkComponent, FrameworkEval};
 
 use crate::columns::{BaseFieldVec, SecureFieldVec};
+
+/// The structural codegen output for one component kernel: the CUDA source and
+/// kernel name (as ready-to-pass `CString`s) plus the PTX-cache key. These depend
+/// ONLY on the AIR structure (component type + log size + n_interactions), never on
+/// the statement, so they are computed once and reused across every prove.
+struct CachedCodegen {
+    source_c: CString,
+    name_c: CString,
+    cache_key: u64,
+}
+
+/// Process-global codegen cache, keyed by (component type name, log size).
+/// `lower_framework_eval_to_v1_with_logup` (symbolic recording) and
+/// `compile_v1_to_cuda_source` (CUDA string emission) are single-threaded and, for
+/// constraint-heavy components, expensive; caching their structural result here
+/// makes the prelude skip them entirely on a hit and the eval lane skip the source
+/// emission (it must still lower to obtain the per-prove ext params).
+fn codegen_cache() -> &'static Mutex<HashMap<(&'static str, u32), Arc<CachedCodegen>>> {
+    static CACHE: OnceLock<Mutex<HashMap<(&'static str, u32), Arc<CachedCodegen>>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Cache lookup by structural key (no lowering).
+fn cached_codegen(eval_name: &'static str, log_size: u32) -> Option<Arc<CachedCodegen>> {
+    codegen_cache()
+        .lock()
+        .unwrap()
+        .get(&(eval_name, log_size))
+        .cloned()
+}
+
+/// Emit the CUDA source for an already-lowered program, build the `CString`s + cache
+/// key, and store them in the codegen cache. Returns `None` if source emission fails.
+fn build_and_cache_codegen(
+    eval_name: &'static str,
+    log_size: u32,
+    program: &program::OwnedMetalEvaluationProgramV1,
+) -> Option<Arc<CachedCodegen>> {
+    let source = cuda_codegen::compile_v1_to_cuda_source(program)?;
+    let kernel_name = cuda_codegen::fused_kernel_name(program.header().semantic_hash);
+    let cached = Arc::new(CachedCodegen {
+        source_c: CString::new(source).ok()?,
+        name_c: CString::new(kernel_name).ok()?,
+        cache_key: cuda_codegen::jit_cache_key(program.header().semantic_hash),
+    });
+    codegen_cache()
+        .lock()
+        .unwrap()
+        .insert((eval_name, log_size), cached.clone());
+    Some(cached)
+}
 
 /// Inputs prepared by the shared constraint-eval driver (single accumulator claim).
 pub(crate) struct JitInputs<'a> {
@@ -80,41 +134,45 @@ pub(crate) fn precompile_prepare<E: FrameworkEval>(
     if std::env::var_os("STWO_CUDA_DISABLE_JIT").is_some() {
         return None;
     }
+    let eval_name = super::constraint_eval::derived_eval_name::<E>();
     if let Ok(skip) = std::env::var("STWO_CUDA_JIT_SKIP") {
-        let name = super::constraint_eval::derived_eval_name::<E>();
-        if skip.split(',').any(|s| s.trim() == name) {
+        if skip.split(',').any(|s| s.trim() == eval_name) {
             return None;
         }
     }
-    // Lower + codegen NOW, on the caller's thread (the component holds `!Sync`
-    // state). n_interactions = 3 matches the eval path's `inputs.trace_ptrs.len()`
-    // (the (0..3) preprocessed/base/interaction trees in constraint_eval.rs), so
-    // the program's semantic hash — and thus the cache key — is identical to what
-    // the lazy lane computes; the warmed kernel is reused there.
-    let (program, _ext_param_values) = lower_framework_eval_to_v1_with_logup(
-        component.evaluator(),
-        3,
-        0,
-        0,
-        component.claimed_sum(),
-        component.evaluator().log_size(),
-    )
-    .ok()?;
-    let source = cuda_codegen::compile_v1_to_cuda_source(&program)?;
-    let kernel_name = cuda_codegen::fused_kernel_name(program.header().semantic_hash);
-    let cache_key = cuda_codegen::jit_cache_key(program.header().semantic_hash);
-    // The compile closure captures only owned/`Send` data (source + name strings,
-    // cache key), so it runs safely on a parallel worker thread.
+    let log_size = component.evaluator().log_size();
+    // Codegen-once: a hit means another component instance (or a prior prove) already
+    // lowered + emitted this kernel's source. The prelude only needs to COMPILE, so on
+    // a hit we skip lowering and codegen entirely — the expensive single-threaded step
+    // the always-on prelude used to double. n_interactions = 3 matches the eval path's
+    // `inputs.trace_ptrs.len()` (the (0..3) preprocessed/base/interaction trees), so the
+    // semantic hash — and thus the PTX cache key — is identical to what the lazy lane
+    // computes; the warmed kernel is reused there.
+    let cached = match cached_codegen(eval_name, log_size) {
+        Some(cached) => cached,
+        None => {
+            let (program, _ext_param_values) = lower_framework_eval_to_v1_with_logup(
+                component.evaluator(),
+                3,
+                0,
+                0,
+                component.claimed_sum(),
+                log_size,
+            )
+            .ok()?;
+            build_and_cache_codegen(eval_name, log_size, &program)?
+        }
+    };
+    // The compile closure captures only the `Arc<CachedCodegen>` (CStrings + key are
+    // `Send + Sync`), so it runs safely on a parallel worker thread.
     Some(Box::new(move || {
-        if let (Ok(source_c), Ok(name_c)) = (CString::new(source), CString::new(kernel_name)) {
-            crate::columns::bindings::ensure_mem_pool_init();
-            unsafe {
-                stwo_backend_cuda_kernels::raw::stwo_cuda_jit_compile(
-                    source_c.as_ptr(),
-                    name_c.as_ptr(),
-                    cache_key,
-                );
-            }
+        crate::columns::bindings::ensure_mem_pool_init();
+        unsafe {
+            stwo_backend_cuda_kernels::raw::stwo_cuda_jit_compile(
+                cached.source_c.as_ptr(),
+                cached.name_c.as_ptr(),
+                cached.cache_key,
+            );
         }
     }))
 }
@@ -123,21 +181,50 @@ fn try_jit_constraint_quotients_inner<E: FrameworkEval>(
     component: &FrameworkComponent<E>,
     inputs: &JitInputs<'_>,
 ) -> Option<()> {
+    let jit_log = std::env::var_os("STWO_JIT_LOG").is_some();
+    let eval_name = super::constraint_eval::derived_eval_name::<E>();
+    let log_size = component.evaluator().log_size();
+
     // Lowering hoists every ext constant (lookup elements, cumsum shift) into
     // `ext_param_values`, so `program` — and its semantic hash — depends only on the
     // AIR structure. The hash therefore stays stable across statements and the
-    // compiled kernel is reused from the in-memory or on-disk PTX cache.
+    // compiled kernel is reused from the in-memory or on-disk PTX cache. The ext
+    // constants are channel-drawn (per-prove) and const-folded during recording, so
+    // we MUST re-lower every prove to recover `ext_param_values` — but the heavy
+    // CUDA source emission below depends only on structure and is cached.
+    let lower_t = std::time::Instant::now();
     let (program, ext_param_values) = lower_framework_eval_to_v1_with_logup(
         component.evaluator(),
         inputs.trace_ptrs.len() as u32,
         0,
         0,
         component.claimed_sum(),
-        component.evaluator().log_size(),
+        log_size,
     )
     .ok()?;
-    let source = cuda_codegen::compile_v1_to_cuda_source(&program)?;
-    let kernel_name = cuda_codegen::fused_kernel_name(program.header().semantic_hash);
+    let lower_ms = lower_t.elapsed().as_millis();
+
+    // Codegen-once: reuse the cached CUDA source/name/key on a hit, skipping the
+    // O(program-size) `compile_v1_to_cuda_source` string emission. The reuse is
+    // guarded by the freshly-lowered program's semantic hash: we only adopt a cached
+    // entry whose `cache_key` matches this prove's program, so a `(eval_name,
+    // log_size)` key collision can never feed a mismatched kernel to the dispatch
+    // (the semantic hash, not the name, is the source of truth). The FFI below always
+    // receives `cached.cache_key`, which equals this program's real key in both arms.
+    let real_key = cuda_codegen::jit_cache_key(program.header().semantic_hash);
+    let gen_t = std::time::Instant::now();
+    let (cached, source_hit) = match cached_codegen(eval_name, log_size) {
+        Some(cached) if cached.cache_key == real_key => (cached, true),
+        _ => (build_and_cache_codegen(eval_name, log_size, &program)?, false),
+    };
+    let gen_ms = gen_t.elapsed().as_millis();
+    if jit_log {
+        eprintln!(
+            "[stwo-jit] {eval_name} log_size={log_size} lower={lower_ms}ms \
+             source_gen={gen_ms}ms ({})",
+            if source_hit { "cache-hit" } else { "emitted" },
+        );
+    }
 
     let n_rows = inputs.n_rows;
     // Pointer-table trace ABI: the kernel indexes trace_cols[global_column][row], so
@@ -162,8 +249,6 @@ fn try_jit_constraint_quotients_inner<E: FrameworkEval>(
             .collect(),
     );
 
-    let source_c = CString::new(source).ok()?;
-    let name_c = CString::new(kernel_name).ok()?;
     let empty = BaseFieldVec::new_zeroes(1);
     // Ext params = every constant the lowering hoisted out of the bytecode (lookup
     // elements, cumsum shift, structural constants), uploaded in slot order. A
@@ -179,9 +264,9 @@ fn try_jit_constraint_quotients_inner<E: FrameworkEval>(
     // columns and no separate accumulate dispatch (see cuda_codegen's fused store).
     let ok = unsafe {
         stwo_backend_cuda_kernels::raw::stwo_cuda_jit_eval_fused(
-            source_c.as_ptr(),
-            name_c.as_ptr(),
-            cuda_codegen::jit_cache_key(program.header().semantic_hash),
+            cached.source_c.as_ptr(),
+            cached.name_c.as_ptr(),
+            cached.cache_key,
             trace_table.as_ptr().cast(),
             offsets_dev.device_ptr,
             empty.device_ptr,

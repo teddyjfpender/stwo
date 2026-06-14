@@ -725,6 +725,14 @@ pub fn lower_framework_eval_to_v1_with_logup<F: FrameworkEval>(
 {
     validate_eval_program_abi_layout_v1()?;
 
+    // Per-phase timing for the warm-prove hotspot analysis (STWO_JIT_LOG=1): the
+    // symbolic `eval.evaluate` recording vs. the register compaction below. This is
+    // the lowering work that — unlike CUDA source emission — must run every prove
+    // (it produces the per-prove `ext_param_values`), so its split decides whether a
+    // deeper recorder refactor is needed beyond the codegen cache.
+    let jit_log = std::env::var_os("STWO_JIT_LOG").is_some();
+    let record_t = std::time::Instant::now();
+
     let mut recorder = RecordingEvaluator::new();
     // Set the correct logup parameters. The default from
     // LogupAtRow::dummy() uses interaction=100 and cumsum_shift=1, but
@@ -737,6 +745,7 @@ pub fn lower_framework_eval_to_v1_with_logup<F: FrameworkEval>(
     );
     let recorder = eval.evaluate(recorder);
     let mut state = recorder.finish();
+    let record_ms = record_t.elapsed().as_millis();
 
     // Statement-independence: channel-drawn lookup elements, the logup cumsum shift
     // (claimed_sum / 2^log_size), and record-time const folds of either all land in
@@ -772,7 +781,17 @@ pub fn lower_framework_eval_to_v1_with_logup<F: FrameworkEval>(
 
     // Compact registers (linear-scan reuse) so big components don't spill: the
     // recorder's monotonic SSA allocation can produce hundreds of live slots.
+    let compact_t = std::time::Instant::now();
     state.compact_registers();
+    let compact_ms = compact_t.elapsed().as_millis();
+    if jit_log {
+        eprintln!(
+            "[stwo-jit] lower phases: record={record_ms}ms compact={compact_ms}ms \
+             base_insts={} ext_insts={}",
+            state.base_insts.len(),
+            state.ext_insts.len(),
+        );
+    }
 
     // Sanity check: every ext instruction's registers must be valid.
     let max_er = state.max_ext_regs();
