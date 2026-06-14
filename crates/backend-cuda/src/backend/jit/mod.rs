@@ -67,6 +67,16 @@ pub(crate) fn try_jit_constraint_quotients<E: FrameworkEval>(
 pub(crate) fn precompile_prepare<E: FrameworkEval>(
     component: &FrameworkComponent<E>,
 ) -> Option<Box<dyn FnOnce() + Send>> {
+    // Opt-in (default OFF). The prelude parallelizes the NVRTC *compile*, but the
+    // per-component lowering/codegen it must run first is itself single-threaded
+    // and, for constraint-heavy components (partial_ec_mul / pedersen / poseidon),
+    // expensive — and the lazy eval lane re-does that codegen, so an always-on
+    // prelude DOUBLES codegen on the warm path. Until the lowered program is cached
+    // (the real fix), keep this opt-in so the default path is unregressed; the
+    // pre-baked PTX seed is the cold-start mitigation meanwhile.
+    if std::env::var_os("STWO_CUDA_PARALLEL_JIT_WARMUP").is_none() {
+        return None;
+    }
     if std::env::var_os("STWO_CUDA_DISABLE_JIT").is_some() {
         return None;
     }
