@@ -98,17 +98,29 @@ bool compile_kernel(const char *source, const char *kernel_name, uint64_t semant
     }
 
     if (image.empty()) {
+        // The monster constraint kernels (EC double-and-add ladder, hash rounds: huge
+        // inlined straight-line programs) blow up superlinearly in ptxas at the default
+        // -O3 — partial_ec_mul measured >24 min (effectively unbounded), and even the
+        // disk-PTX builtins took 30-164s in pure cuModuleLoadDataEx (= ptxas). They run
+        // over tiny domains (581-200k instances) where SASS quality barely affects
+        // runtime, so we drop them to ptxas -O1 (stage 2). The big opcode kernels
+        // (runtime-bound over 2^20-2^24 rows) keep high opt. Heuristic: source size ~
+        // instruction count. (NVRTC's frontend opt is left at default — its cost is
+        // bounded; the unbounded blowup is the ptxas backend, controlled below.)
+        size_t src_len = strlen(source);
+        const size_t HUGE_SOURCE_BYTES = 150000; // ~2.5k instructions; catches the EC/hash family
+        int opt_level = (src_len > HUGE_SOURCE_BYTES) ? 1 : 3;
+
+        // Stage 1: source -> PTX via NVRTC (virtual arch compute_XX). NVRTC emits PTX;
+        // we deliberately do NOT let it run ptxas here (the superlinear backend step),
+        // deferring SASS assembly to the cuLink stage below where we control opt.
         nvrtcProgram program;
         if (nvrtcCreateProgram(&program, source, "stwo_jit.cu", 0, nullptr, nullptr) !=
             NVRTC_SUCCESS) {
             return false;
         }
-        // Real arch (sm_XX), not virtual (compute_XX): NVRTC then compiles all the
-        // way through ptxas to SASS, and nvrtcGetCUBIN returns the final cubin. (A
-        // virtual arch only yields PTX, which would defer ptxas to load time — the
-        // very cost this caches away.)
         char arch_flag[64];
-        snprintf(arch_flag, sizeof(arch_flag), "--gpu-architecture=sm_%d%d",
+        snprintf(arch_flag, sizeof(arch_flag), "--gpu-architecture=compute_%d%d",
                  props.major, props.minor);
         const char *options[] = {arch_flag, "--std=c++14"};
         nvrtcResult compile_result = nvrtcCompileProgram(program, 2, options);
@@ -121,19 +133,50 @@ bool compile_kernel(const char *source, const char *kernel_name, uint64_t semant
             nvrtcDestroyProgram(&program);
             return false;
         }
-        size_t cubin_size = 0;
-        if (nvrtcGetCUBINSize(program, &cubin_size) != NVRTC_SUCCESS || cubin_size == 0) {
-            fprintf(stderr, "stwo JIT: nvrtcGetCUBINSize failed\n");
-            nvrtcDestroyProgram(&program);
-            return false;
-        }
-        image.resize(cubin_size);
-        if (nvrtcGetCUBIN(program, image.data()) != NVRTC_SUCCESS) {
-            fprintf(stderr, "stwo JIT: nvrtcGetCUBIN failed\n");
-            nvrtcDestroyProgram(&program);
-            return false;
-        }
+        size_t ptx_size = 0;
+        nvrtcGetPTXSize(program, &ptx_size);
+        std::vector<char> ptx(ptx_size);
+        nvrtcGetPTX(program, ptx.data());
         nvrtcDestroyProgram(&program);
+
+        // Stage 2: PTX -> cubin (SASS) via the driver linker at the same controlled
+        // ptxas optimization level. The result is cached as cubin so this (one-time,
+        // now-fast) ptxas never reruns on load — cuModuleLoadDataEx on a cubin is a
+        // direct SASS load, no JIT.
+        cudaFree(0); // ensure the primary context is current for the driver linker
+        // One option: the ptxas optimization level. Target arch defaults to the current
+        // context's device (the GPU we are running on) — exactly the arch we want, and
+        // it avoids depending on the CU_TARGET_COMPUTE_* enum value.
+        CUjit_option jit_opts[1];
+        void *jit_vals[1];
+        jit_opts[0] = CU_JIT_OPTIMIZATION_LEVEL;
+        jit_vals[0] = (void *)(uintptr_t)opt_level;
+        CUlinkState link_state;
+        if (cuLinkCreate(1, jit_opts, jit_vals, &link_state) != CUDA_SUCCESS) {
+            fprintf(stderr, "stwo JIT: cuLinkCreate failed\n");
+            return false;
+        }
+        if (cuLinkAddData(link_state, CU_JIT_INPUT_PTX, ptx.data(), ptx.size(),
+                          "stwo_jit.ptx", 0, nullptr, nullptr) != CUDA_SUCCESS) {
+            fprintf(stderr, "stwo JIT: cuLinkAddData failed\n");
+            cuLinkDestroy(link_state);
+            return false;
+        }
+        void *cubin_ptr = nullptr;
+        size_t cubin_bytes = 0;
+        if (cuLinkComplete(link_state, &cubin_ptr, &cubin_bytes) != CUDA_SUCCESS ||
+            cubin_bytes == 0) {
+            fprintf(stderr, "stwo JIT: cuLinkComplete failed\n");
+            cuLinkDestroy(link_state);
+            return false;
+        }
+        // cuLinkComplete's buffer is owned by the link state; copy before destroying.
+        image.assign((const char *)cubin_ptr, (const char *)cubin_ptr + cubin_bytes);
+        cuLinkDestroy(link_state);
+        if (jit_log_enabled()) {
+            fprintf(stderr, "stwo JIT: %s compiled src=%zuB ptxas-O%d -> cubin=%zuB\n",
+                    kernel_name, src_len, opt_level, cubin_bytes);
+        }
 
         if (!cache_file.empty()) {
             // mkdir -p the cache dir (two levels at most), best-effort.
