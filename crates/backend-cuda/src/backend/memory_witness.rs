@@ -750,6 +750,51 @@ pub fn assert_eq_opcode_imm_trace(
     (trace, staged)
 }
 
+/// assert_eq_opcode_double_deref base trace (the double-dereference sibling of
+/// assert_eq_opcode): 19 trace columns plus 7 staged columns (the lookup tuple
+/// slots that are not plain trace columns): the two verify_instruction felts
+/// `vi_felt5`/`vi_felt6`, the three read addresses `mem1_base_addr`
+/// (mem_address_to_id_1 = mem0_base + (offset1-32768), the pointer read),
+/// `dst_addr` (mem_address_to_id_3 = mem_dst_base + (offset0-32768)) and
+/// `ddref_addr` (mem_address_to_id_4 = ptr + (offset2-32768), the second deref),
+/// and the opcodes-out yield `next_pc` (pc+1) / `next_ap` (ap+ap_update).
+pub fn assert_eq_opcode_double_deref_trace(
+    inputs: [&BaseFieldVec; 3], // pc, ap, fp (padded to column_length)
+    tables: &DeviceMemTables,
+    n_rows: usize,
+    column_length: usize,
+) -> (Vec<BaseFieldVec>, [BaseFieldVec; 7]) {
+    bindings::ensure_mem_pool_init();
+    let trace: Vec<BaseFieldVec> = (0..19)
+        .map(|_| BaseFieldVec::new_uninitialized(column_length))
+        .collect();
+    let staged: [BaseFieldVec; 7] =
+        std::array::from_fn(|_| BaseFieldVec::new_uninitialized(column_length));
+    let trace_ptrs: Vec<*const u32> = trace.iter().map(|c| c.device_ptr).collect();
+    let table = UploadedDevicePointerVec::upload(&trace_ptrs);
+    unsafe {
+        stwo_backend_cuda_kernels::raw::assert_eq_opcode_double_deref_trace(
+            inputs[0].device_ptr,
+            inputs[1].device_ptr,
+            inputs[2].device_ptr,
+            tables.addr_to_id.device_ptr,
+            tables.big_words.device_ptr,
+            tables.small_words.device_ptr,
+            n_rows as u32,
+            column_length as u32,
+            table.as_ptr(),
+            staged[0].device_ptr,
+            staged[1].device_ptr,
+            staged[2].device_ptr,
+            staged[3].device_ptr,
+            staged[4].device_ptr,
+            staged[5].device_ptr,
+            staged[6].device_ptr,
+        );
+    }
+    (trace, staged)
+}
+
 /// call_opcode_rel_imm base trace: 24 trace columns plus 8 staged columns
 /// (the lookup tuple slots that are not plain trace columns): the two read
 /// addresses `ret_pc_addr` (ap+1) and `next_pc_addr` (pc+1), the four

@@ -148,6 +148,25 @@ extern "C" {
         next_ap_out: *const u32,
     );
     #[allow(clippy::too_many_arguments)]
+    pub fn assert_eq_opcode_double_deref_trace(
+        pc: *const u32,
+        ap: *const u32,
+        fp: *const u32,
+        addr_table: *const u32,
+        big_words: *const u32,
+        small_words: *const u32,
+        n_rows: u32,
+        column_length: u32,
+        trace: *const *const u32,
+        vi_felt5: *const u32,
+        vi_felt6: *const u32,
+        mem1_base_addr_out: *const u32,
+        dst_addr_out: *const u32,
+        ddref_addr_out: *const u32,
+        next_pc_out: *const u32,
+        next_ap_out: *const u32,
+    );
+    #[allow(clippy::too_many_arguments)]
     pub fn call_opcode_rel_imm_trace(
         pc: *const u32,
         ap: *const u32,
