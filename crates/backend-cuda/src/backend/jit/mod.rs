@@ -42,6 +42,17 @@ pub(crate) fn try_jit_constraint_quotients<E: FrameworkEval>(
     if std::env::var_os("STWO_CUDA_DISABLE_JIT").is_some() {
         return false;
     }
+    // Per-component opt-out: comma-separated component names routed to the CPU
+    // constraint lane instead of JIT. Skips the few pathologically-large kernels
+    // (e.g. partial_ec_mul_generic, whose EC-ladder constraint program takes NVRTC
+    // many minutes to compile) when their instance count is tiny enough that CPU
+    // eval is cheap — avoids the one-time compile on a cold PTX cache.
+    if let Ok(skip) = std::env::var("STWO_CUDA_JIT_SKIP") {
+        let name = super::constraint_eval::derived_eval_name::<E>();
+        if skip.split(',').any(|s| s.trim() == name) {
+            return false;
+        }
+    }
     try_jit_constraint_quotients_inner(component, inputs).is_some()
 }
 

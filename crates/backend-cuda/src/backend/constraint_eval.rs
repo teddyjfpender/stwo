@@ -42,7 +42,7 @@ fn fnv1a_eval_id(name: &str) -> u32 {
 /// name (e.g. `cairo_air::components::add_opcode::Eval` -> `add_opcode`), matching the
 /// names stwo-cairo components carry in the NitrooZK dispatch table. Components whose
 /// derived name has no kernel simply fall back to the CPU lane.
-fn derived_eval_name<E>() -> &'static str {
+pub(crate) fn derived_eval_name<E>() -> &'static str {
     let full = core::any::type_name::<E>();
     let full = full.split('<').next().unwrap_or(full);
     let mut segments = full.rsplit("::");
