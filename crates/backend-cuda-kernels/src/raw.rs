@@ -218,6 +218,27 @@ extern "C" {
         next_pc_out: *const u32,
         next_ap_out: *const u32,
     );
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_ap_opcode_trace(
+        pc: *const u32,
+        ap: *const u32,
+        fp: *const u32,
+        addr_table: *const u32,
+        big_words: *const u32,
+        small_words: *const u32,
+        n_rows: u32,
+        column_length: u32,
+        trace: *const *const u32,
+        vi_felt: *const u32,
+        op1_addr_out: *const u32,
+        m_s5: *const u32,
+        m_s6: *const u32,
+        m_s22: *const u32,
+        m_s28: *const u32,
+        rc18_val: *const u32,
+        next_pc_out: *const u32,
+        next_ap_out: *const u32,
+    );
     pub fn add_opcode_small_trace(
         pc: *const u32,
         ap: *const u32,

@@ -272,6 +272,137 @@ __global__ void jnz_opcode_taken_trace_kernel(
     next_ap_out[row] = add(v_ap, ap_update_add_1);
 }
 
+// add_ap_opcode (17 trace columns): decodes the add_ap instruction at pc, reads
+// the small-signed operand (op1, which may be the immediate at pc, or an
+// fp/ap-based cell), forms next_ap = ap + read_small, and range-checks next_ap
+// (RangeCheck29 = bottom 11 bits via range_check_11 + the remaining high bits
+// scaled by 2^20 via range_check_18). Staged columns are every lookup tuple
+// slot that is not a plain trace column (mirroring the host writer's LookupData
+// arrays element-for-element):
+//   [0] vi_felt   = (24 + op1_imm*32) + op1_base_fp*64 + op1_base_ap*128
+//                                                   (verify_instruction slot)
+//   [1] op1_addr  = mem1_base + (offset2 - 32768)   (mem_address_to_id_1 addr)
+//   [2] m_s5      = remainder_bits + mid_limbs_set*508  (memory_id_to_big_2)
+//   [3] m_s6      = mid_limbs_set*511
+//   [4] m_s22     = msb*136 - mid_limbs_set
+//   [5] m_s28     = msb*256
+//   [6] rc18_val  = (next_ap - rc29_bot11bits) * 1048576  (range_check_18 slot)
+//   [7] next_pc   = pc + (1 + op1_imm)              (opcodes-out yield)
+//   [8] next_ap   = ap + read_small                 (opcodes-out yield)
+// All PackedM31 expressions use the modular fields.cuh ops; the instruction
+// bit-extractions, the limb (op_split_le_9bit) values, remainder_bits,
+// partial_limb_msb and the range_check_29 bottom-11-bit split are PackedUInt16 /
+// PackedUInt32 (plain u32). range_check_11's lookup value is the trace column
+// rc29_bot11bits itself (col 15), so it is not staged.
+__global__ void add_ap_opcode_trace_kernel(
+    const uint32_t *pc, const uint32_t *ap, const uint32_t *fp,
+    const uint32_t *addr_table,
+    const uint32_t *big_words, const uint32_t *small_words,
+    uint32_t n_rows,
+    uint32_t column_length,
+    uint32_t *const *trace,                 // 17 trace columns
+    uint32_t *vi_felt,                      // staged: verify_instruction tuple expr
+    uint32_t *op1_addr_out,                 // staged: mem_address_to_id_1 read addr
+    uint32_t *m_s5, uint32_t *m_s6,         // staged: memory_id_to_big_2 slots
+    uint32_t *m_s22, uint32_t *m_s28,       // staged: memory_id_to_big_2 slots
+    uint32_t *rc18_val,                     // staged: range_check_18 tuple value
+    uint32_t *next_pc_out, uint32_t *next_ap_out // staged: opcodes-out yield exprs
+) {
+    uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= column_length) return;
+    uint32_t v_pc = pc[row], v_ap = ap[row], v_fp = fp[row];
+    trace[0][row] = v_pc;
+    trace[1][row] = v_ap;
+    trace[2][row] = v_fp;
+
+    // Decode Instruction: read the instruction felt at pc and split limbs.
+    uint32_t instr_id = mem_addr_to_id(addr_table, v_pc);
+    uint32_t il[7];
+    mem_id_to_limbs<7>(instr_id, big_words, small_words, il);
+
+    // offset2 = (il[3] >> 5) + (il[4] << 4) + ((il[5] & 7) << 13)  (PackedUInt16).
+    uint32_t offset2 = (il[3] >> 5) + (il[4] << 4) + ((il[5] & 7u) << 13);
+    trace[3][row] = offset2;
+    // flags from limb 5 >> 3 + limb 6 << 6.
+    uint32_t flags = (il[5] >> 3) + (il[6] << 6);
+    uint32_t op1_imm = (flags >> 2) & 1u;
+    trace[4][row] = op1_imm;
+    uint32_t op1_base_fp = (flags >> 3) & 1u;
+    trace[5][row] = op1_base_fp;
+    // op1_base_ap = (1 - op1_imm) - op1_base_fp  (M31).
+    uint32_t op1_base_ap = sub(sub(1u, op1_imm), op1_base_fp);
+
+    // verify_instruction tuple staged expr (M31 modular ops):
+    // ((24 + op1_imm*32) + op1_base_fp*64) + op1_base_ap*128.
+    vi_felt[row] = add(add(add(24u, mul(op1_imm, 32u)), mul(op1_base_fp, 64u)),
+                       mul(op1_base_ap, 128u));
+
+    // mem1_base = op1_imm*pc + op1_base_fp*fp + op1_base_ap*ap  (M31).
+    uint32_t mem1_base = add(add(mul(op1_imm, v_pc), mul(op1_base_fp, v_fp)),
+                             mul(op1_base_ap, v_ap));
+    trace[6][row] = mem1_base;
+
+    // Read Small: Read Id at mem1_base + (offset2 - 32768).
+    uint32_t op1_addr = add(mem1_base, sub(offset2, 32768u));
+    op1_addr_out[row] = op1_addr;
+    uint32_t op1_id = mem_addr_to_id(addr_table, op1_addr);
+    trace[7][row] = op1_id;
+    uint32_t ol[28];
+    mem_id_to_limbs<28>(op1_id, big_words, small_words, ol);
+
+    // Decode Small Sign.
+    uint32_t msb = (ol[27] == 256u) ? 1u : 0u;
+    trace[8][row] = msb;
+    uint32_t mid_limbs_set = ((ol[20] == 511u) && (msb != 0u)) ? 1u : 0u;
+    trace[9][row] = mid_limbs_set;
+    // decode_small_sign outputs (M31 ops).
+    uint32_t dss2 = mul(mid_limbs_set, 508u);
+    uint32_t dss3 = mul(mid_limbs_set, 511u);
+    uint32_t dss4 = sub(mul(msb, 136u), mid_limbs_set);
+    uint32_t dss5 = mul(msb, 256u);
+
+    uint32_t op1_limb_0 = ol[0];
+    trace[10][row] = op1_limb_0;
+    uint32_t op1_limb_1 = ol[1];
+    trace[11][row] = op1_limb_1;
+    uint32_t op1_limb_2 = ol[2];
+    trace[12][row] = op1_limb_2;
+    uint32_t remainder_bits = ol[3] & 3u;  // PackedUInt16
+    trace[13][row] = remainder_bits;
+    uint32_t partial_limb_msb = (remainder_bits & 2u) >> 1;  // PackedUInt16
+    trace[14][row] = partial_limb_msb;
+
+    // memory_id_to_big_2 staged sign slots.
+    m_s5[row] = add(remainder_bits, dss2);
+    m_s6[row] = dss3;
+    m_s22[row] = dss4;
+    m_s28[row] = dss5;
+
+    // read_small_output.0 = ((((op1_limb_0 + op1_limb_1*512) + op1_limb_2*262144)
+    //   + remainder_bits*134217728) - msb) - 536870912*mid_limbs_set  (M31).
+    uint32_t read_small =
+        sub(sub(add(add(add(op1_limb_0, mul(op1_limb_1, 512u)),
+                        mul(op1_limb_2, 262144u)),
+                    mul(remainder_bits, 134217728u)),
+                msb),
+            mul(536870912u, mid_limbs_set));
+
+    // next_ap = ap + read_small  (M31).
+    uint32_t next_ap = add(v_ap, read_small);
+
+    // Range Check 29: bottom 11 bits of next_ap (PackedUInt32, plain u32 mask).
+    uint32_t rc29_bot11bits = next_ap & 2047u;
+    trace[15][row] = rc29_bot11bits;
+    // range_check_18 tuple value = (next_ap - rc29_bot11bits) * 1048576  (M31).
+    rc18_val[row] = mul(sub(next_ap, rc29_bot11bits), 1048576u);
+
+    trace[16][row] = row < n_rows ? 1u : 0u;  // enabler
+
+    // opcodes-out yield staged exprs (M31).
+    next_pc_out[row] = add(v_pc, add(1u, op1_imm));
+    next_ap_out[row] = next_ap;
+}
+
 // add_opcode_small (39 trace columns): decodes the instruction at pc (a fused
 // pc->id->limbs gather, limbs NOT staged — only the derived offsets/flags are
 // trace columns), then three "Read Small" memory reads (dst/op0/op1) each
@@ -1051,6 +1182,30 @@ extern "C" void jnz_opcode_taken_trace(
         const_cast<uint32_t *const *>(trace),
         vi_off1, vi_off2, addr_dst, next_pc_addr,
         m4_s4, m4_s5, m4_s22, m4_s28, next_pc_out, next_ap_out);
+    stwo_maybe_debug_sync();
+    ASSERT_CUDA_SUCCESS(cudaGetLastError());
+}
+
+extern "C" void add_ap_opcode_trace(
+    const uint32_t *pc, const uint32_t *ap, const uint32_t *fp,
+    const uint32_t *addr_table,
+    const uint32_t *big_words, const uint32_t *small_words,
+    uint32_t n_rows,
+    uint32_t column_length,
+    const uint32_t *const *trace,
+    uint32_t *vi_felt,
+    uint32_t *op1_addr_out,
+    uint32_t *m_s5, uint32_t *m_s6,
+    uint32_t *m_s22, uint32_t *m_s28,
+    uint32_t *rc18_val,
+    uint32_t *next_pc_out, uint32_t *next_ap_out
+) {
+    uint32_t blocks = (column_length + OP_BLOCK - 1) / OP_BLOCK;
+    add_ap_opcode_trace_kernel<<<blocks, OP_BLOCK>>>(
+        pc, ap, fp, addr_table, big_words, small_words, n_rows, column_length,
+        const_cast<uint32_t *const *>(trace),
+        vi_felt, op1_addr_out, m_s5, m_s6, m_s22, m_s28, rc18_val,
+        next_pc_out, next_ap_out);
     stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 }

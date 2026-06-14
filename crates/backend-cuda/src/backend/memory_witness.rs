@@ -884,6 +884,53 @@ pub fn jnz_opcode_taken_trace(
     (trace, staged)
 }
 
+/// add_ap_opcode base trace: 17 trace columns plus 9 staged columns (the lookup
+/// tuple slots that are not plain trace columns): the verify_instruction expr
+/// `vi_felt`, the read address `op1_addr` (mem_address_to_id_1), the four
+/// memory_id_to_big_2 small-sign slots `m_s5`/`m_s6`/`m_s22`/`m_s28`, the
+/// range_check_18 tuple value `rc18_val` (= (next_ap - rc29_bot11bits)*2^20),
+/// and the opcodes-out yield `next_pc_out` (pc+1+op1_imm) / `next_ap_out`
+/// (ap+read_small). range_check_11's lookup value is the trace column
+/// rc29_bot11bits (col 15), so it is not staged.
+pub fn add_ap_opcode_trace(
+    inputs: [&BaseFieldVec; 3], // pc, ap, fp (padded to column_length)
+    tables: &DeviceMemTables,
+    n_rows: usize,
+    column_length: usize,
+) -> (Vec<BaseFieldVec>, [BaseFieldVec; 9]) {
+    bindings::ensure_mem_pool_init();
+    let trace: Vec<BaseFieldVec> = (0..17)
+        .map(|_| BaseFieldVec::new_uninitialized(column_length))
+        .collect();
+    let staged: [BaseFieldVec; 9] =
+        std::array::from_fn(|_| BaseFieldVec::new_uninitialized(column_length));
+    let trace_ptrs: Vec<*const u32> = trace.iter().map(|c| c.device_ptr).collect();
+    let table = UploadedDevicePointerVec::upload(&trace_ptrs);
+    unsafe {
+        stwo_backend_cuda_kernels::raw::add_ap_opcode_trace(
+            inputs[0].device_ptr,
+            inputs[1].device_ptr,
+            inputs[2].device_ptr,
+            tables.addr_to_id.device_ptr,
+            tables.big_words.device_ptr,
+            tables.small_words.device_ptr,
+            n_rows as u32,
+            column_length as u32,
+            table.as_ptr(),
+            staged[0].device_ptr,
+            staged[1].device_ptr,
+            staged[2].device_ptr,
+            staged[3].device_ptr,
+            staged[4].device_ptr,
+            staged[5].device_ptr,
+            staged[6].device_ptr,
+            staged[7].device_ptr,
+            staged[8].device_ptr,
+        );
+    }
+    (trace, staged)
+}
+
 /// add_opcode_small base trace: 39 trace columns plus 19 staged columns
 /// (the lookup-tuple expressions that are not plain trace columns — the two
 /// verify_instruction felts, the opcodes-out next_pc / next_ap, and per memory
