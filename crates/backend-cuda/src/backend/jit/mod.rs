@@ -56,6 +56,59 @@ pub(crate) fn try_jit_constraint_quotients<E: FrameworkEval>(
     try_jit_constraint_quotients_inner(component, inputs).is_some()
 }
 
+/// Compile (and disk/in-memory cache) this component's fused constraint kernel
+/// WITHOUT evaluating — no trace, no launch. Called by the parallel pre-compile
+/// pass to warm the cache before the sequential composition loop, so the per-row
+/// cold-start NVRTC cost (minutes for the EC/Pedersen/Poseidon monster kernels)
+/// is paid once, concurrently across components, instead of serially on the
+/// critical path. Safe and idempotent: same content hash as the lazy eval path
+/// (so it is a cache hit there), best-effort (failures just leave the lazy path
+/// to compile), honors STWO_CUDA_DISABLE_JIT and STWO_CUDA_JIT_SKIP.
+pub(crate) fn precompile_prepare<E: FrameworkEval>(
+    component: &FrameworkComponent<E>,
+) -> Option<Box<dyn FnOnce() + Send>> {
+    if std::env::var_os("STWO_CUDA_DISABLE_JIT").is_some() {
+        return None;
+    }
+    if let Ok(skip) = std::env::var("STWO_CUDA_JIT_SKIP") {
+        let name = super::constraint_eval::derived_eval_name::<E>();
+        if skip.split(',').any(|s| s.trim() == name) {
+            return None;
+        }
+    }
+    // Lower + codegen NOW, on the caller's thread (the component holds `!Sync`
+    // state). n_interactions = 3 matches the eval path's `inputs.trace_ptrs.len()`
+    // (the (0..3) preprocessed/base/interaction trees in constraint_eval.rs), so
+    // the program's semantic hash — and thus the cache key — is identical to what
+    // the lazy lane computes; the warmed kernel is reused there.
+    let (program, _ext_param_values) = lower_framework_eval_to_v1_with_logup(
+        component.evaluator(),
+        3,
+        0,
+        0,
+        component.claimed_sum(),
+        component.evaluator().log_size(),
+    )
+    .ok()?;
+    let source = cuda_codegen::compile_v1_to_cuda_source(&program)?;
+    let kernel_name = cuda_codegen::fused_kernel_name(program.header().semantic_hash);
+    let cache_key = cuda_codegen::jit_cache_key(program.header().semantic_hash);
+    // The compile closure captures only owned/`Send` data (source + name strings,
+    // cache key), so it runs safely on a parallel worker thread.
+    Some(Box::new(move || {
+        if let (Ok(source_c), Ok(name_c)) = (CString::new(source), CString::new(kernel_name)) {
+            crate::columns::bindings::ensure_mem_pool_init();
+            unsafe {
+                stwo_backend_cuda_kernels::raw::stwo_cuda_jit_compile(
+                    source_c.as_ptr(),
+                    name_c.as_ptr(),
+                    cache_key,
+                );
+            }
+        }
+    }))
+}
+
 fn try_jit_constraint_quotients_inner<E: FrameworkEval>(
     component: &FrameworkComponent<E>,
     inputs: &JitInputs<'_>,

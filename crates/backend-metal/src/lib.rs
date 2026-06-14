@@ -15,5 +15,15 @@
 mod backend;
 mod columns;
 
-pub use backend::MetalBackend;
+pub use backend::{
+    add_opcode_small_logup_inputs, add_opcode_small_logup_inputs_from_cols,
+    assert_eq_opcode_logup_inputs, assert_eq_opcode_logup_inputs_from_cols,
+    finalize_device_raw_logup, finalize_raw_logup, memory_addr_to_id_logup_inputs,
+    memory_logup_inputs, memory_rc_pair_logup, ret_opcode_logup_inputs, MetalBackend,
+    MetalRawLogupColumn,
+};
 pub use columns::{BaseFieldVec, Blake2sHashVec, SecureFieldVec};
+
+pub mod metal {
+    pub use stwo_backend_metal_sys::metal::U32Buffer;
+}

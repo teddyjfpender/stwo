@@ -40,7 +40,8 @@ fn build_leaves_native_fast(
     if columns.is_empty() || lifting_log_size < 4 || columns.len() <= 16 {
         return None;
     }
-    let column_buffers: Vec<&U32Buffer> = columns.iter().map(|column| &column.buffer).collect();
+    let column_buffers: Vec<&U32Buffer> =
+        columns.iter().map(|column| column.gpu_buffer()).collect();
     let column_log_sizes: Vec<u32> = columns.iter().map(|c| c.len().ilog2()).collect();
     let packed_hashes = U32Buffer::blake2s_build_leaves_lifted_fast(
         &column_buffers,
@@ -59,7 +60,10 @@ fn build_leaves_native_wide(
         return None;
     }
 
-    let column_buffers = columns.iter().map(|column| &column.buffer).collect_vec();
+    let column_buffers = columns
+        .iter()
+        .map(|column| column.gpu_buffer())
+        .collect_vec();
     let column_log_sizes = columns
         .iter()
         .map(|column| column.len().ilog2())
@@ -101,7 +105,7 @@ fn build_leaves_native_standard_packed(
         column_offsets.push(offset.try_into().ok()?);
         column_log_sizes.push(column.len().ilog2());
         flat_columns
-            .copy_range_from(&column.buffer, 0, column.len(), offset)
+            .copy_range_from(column.gpu_buffer(), 0, column.len(), offset)
             .ok()?;
         offset += column.len();
     }
@@ -124,7 +128,8 @@ fn build_leaves_native_fast_packed(
     if columns.is_empty() || lifting_log_size < 4 || columns.len() <= 16 {
         return None;
     }
-    let column_buffers: Vec<&U32Buffer> = columns.iter().map(|column| &column.buffer).collect();
+    let column_buffers: Vec<&U32Buffer> =
+        columns.iter().map(|column| column.gpu_buffer()).collect();
     let column_log_sizes: Vec<u32> = columns.iter().map(|c| c.len().ilog2()).collect();
     U32Buffer::blake2s_build_leaves_lifted_fast(
         &column_buffers,
@@ -142,7 +147,10 @@ fn build_leaves_native_wide_packed(
         return None;
     }
 
-    let column_buffers = columns.iter().map(|column| &column.buffer).collect_vec();
+    let column_buffers = columns
+        .iter()
+        .map(|column| column.gpu_buffer())
+        .collect_vec();
     let column_log_sizes = columns
         .iter()
         .map(|column| column.len().ilog2())
@@ -164,7 +172,8 @@ fn build_merkle_tree_fused(
     if columns.is_empty() || lifting_log_size < 4 || columns.len() <= 16 {
         return None;
     }
-    let column_buffers: Vec<&U32Buffer> = columns.iter().map(|column| &column.buffer).collect();
+    let column_buffers: Vec<&U32Buffer> =
+        columns.iter().map(|column| column.gpu_buffer()).collect();
     let column_log_sizes: Vec<u32> = columns.iter().map(|c| c.len().ilog2()).collect();
     let packed_layers = U32Buffer::blake2s_build_merkle_tree_fast(
         &column_buffers,
@@ -201,6 +210,52 @@ fn build_merkle_layers_native_standard(
         .collect::<Vec<_>>();
     layers.reverse();
     Some(layers)
+}
+
+fn leaf_hashes_at_batched<const IS_M31_OUTPUT: bool>(
+    columns: &[&MetalBaseFieldVec],
+    lifting_log_size: u32,
+    indices: &[usize],
+) -> Vec<<Blake2sMerkleHasherGeneric<IS_M31_OUTPUT> as MerkleHasherLifted>::Hash> {
+    let mut hashers = vec![Blake2sMerkleHasherGeneric::<IS_M31_OUTPUT>::default(); indices.len()];
+    if columns.is_empty() {
+        return hashers
+            .into_iter()
+            .map(|hasher| hasher.finalize())
+            .collect();
+    }
+
+    for (log_size, group) in columns
+        .iter()
+        .group_by(|column| column.len().ilog2())
+        .into_iter()
+    {
+        let log_ratio = lifting_log_size - log_size;
+        let rows = indices
+            .iter()
+            .map(|idx| (idx >> (log_ratio + 1) << 1) + (idx & 1))
+            .collect_vec();
+        let gathered_columns = group
+            .map(|column| column.batch_get(&rows))
+            .collect::<Vec<_>>();
+
+        for chunk_columns in gathered_columns.chunks(HOST_BLAKE2S_LEAF_CHUNK_COLUMNS) {
+            for (row, hasher) in hashers.iter_mut().enumerate() {
+                let mut chunk_bytes = [0u8; HOST_BLAKE2S_LEAF_CHUNK_COLUMNS * 4];
+                let mut used = 0usize;
+                for column in chunk_columns {
+                    chunk_bytes[used..used + 4].copy_from_slice(&column[row].0.to_le_bytes());
+                    used += 4;
+                }
+                hasher.update(&chunk_bytes[..used]);
+            }
+        }
+    }
+
+    hashers
+        .into_iter()
+        .map(|hasher| hasher.finalize())
+        .collect()
 }
 
 impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M31_OUTPUT>>
@@ -346,6 +401,18 @@ impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M3
             );
         }
         next
+    }
+
+    fn leaf_hashes_at(
+        columns: &[&MetalBaseFieldVec],
+        lifting_log_size: u32,
+        indices: &[usize],
+    ) -> Option<Vec<<Blake2sMerkleHasherGeneric<IS_M31_OUTPUT> as MerkleHasherLifted>::Hash>> {
+        Some(leaf_hashes_at_batched::<IS_M31_OUTPUT>(
+            columns,
+            lifting_log_size,
+            indices,
+        ))
     }
 }
 

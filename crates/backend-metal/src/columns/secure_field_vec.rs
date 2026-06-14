@@ -76,10 +76,10 @@ impl SecureFieldVec {
     pub fn from_base_coords(columns: [&BaseFieldVec; 4]) -> Self {
         let size = columns[0].len();
         let buffer = U32Buffer::pack_secure_column_coords([
-            &columns[0].buffer,
-            &columns[1].buffer,
-            &columns[2].buffer,
-            &columns[3].buffer,
+            columns[0].gpu_buffer(),
+            columns[1].gpu_buffer(),
+            columns[2].gpu_buffer(),
+            columns[3].gpu_buffer(),
         ])
         .expect("Metal secure-field packing should succeed");
         Self {
@@ -287,12 +287,17 @@ impl SecureFieldVec {
         let [src_0, src_1, src_2, src_3] = src_columns;
         let [dst_0, dst_1, dst_2, dst_3] = dst_columns;
         U32Buffer::fri_fold_circle_into_line_accumulate_from_coords_u32x4(
-            [&src_0.buffer, &src_1.buffer, &src_2.buffer, &src_3.buffer],
             [
-                &mut dst_0.buffer,
-                &mut dst_1.buffer,
-                &mut dst_2.buffer,
-                &mut dst_3.buffer,
+                src_0.gpu_buffer(),
+                src_1.gpu_buffer(),
+                src_2.gpu_buffer(),
+                src_3.gpu_buffer(),
+            ],
+            [
+                dst_0.gpu_buffer_mut(),
+                dst_1.gpu_buffer_mut(),
+                dst_2.gpu_buffer_mut(),
+                dst_3.gpu_buffer_mut(),
             ],
             inverse_y_factors,
             alpha_limbs,
@@ -310,7 +315,12 @@ impl SecureFieldVec {
         let [src_0, src_1, src_2, src_3] = src_columns;
         let [dst_0, dst_1, dst_2, dst_3] =
             U32Buffer::fri_fold_circle_into_line_first_layer_from_coords_u32x4(
-                [&src_0.buffer, &src_1.buffer, &src_2.buffer, &src_3.buffer],
+                [
+                    src_0.gpu_buffer(),
+                    src_1.gpu_buffer(),
+                    src_2.gpu_buffer(),
+                    src_3.gpu_buffer(),
+                ],
                 inverse_y_factors,
                 alpha_limbs,
             )
@@ -366,7 +376,12 @@ impl SecureFieldVec {
         let alpha_limbs = alpha.to_m31_array().map(|limb| limb.0);
         let [src_0, src_1, src_2, src_3] = src_columns;
         let [dst_0, dst_1, dst_2, dst_3] = U32Buffer::fri_fold_line_step_from_coords_u32x4(
-            [&src_0.buffer, &src_1.buffer, &src_2.buffer, &src_3.buffer],
+            [
+                src_0.gpu_buffer(),
+                src_1.gpu_buffer(),
+                src_2.gpu_buffer(),
+                src_3.gpu_buffer(),
+            ],
             inverse_x_factors,
             alpha_limbs,
         )
@@ -392,7 +407,12 @@ impl SecureFieldVec {
         let [src_0, src_1, src_2, src_3] = src_columns;
         let ([dst_0, dst_1, dst_2, dst_3], handle) =
             U32Buffer::fri_fold_line_step_from_coords_u32x4_async(
-                [&src_0.buffer, &src_1.buffer, &src_2.buffer, &src_3.buffer],
+                [
+                    src_0.gpu_buffer(),
+                    src_1.gpu_buffer(),
+                    src_2.gpu_buffer(),
+                    src_3.gpu_buffer(),
+                ],
                 inverse_x_factors,
                 alpha_limbs,
             )

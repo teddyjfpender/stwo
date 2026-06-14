@@ -177,7 +177,7 @@ impl QuotientOps for MetalBackend {
         // row_count) bytes of CPU-side memmove that dominated large groups.
         let column_bufs: Vec<&U32Buffer> = global_col_indices
             .iter()
-            .map(|&orig_idx| &columns[orig_idx].values.buffer)
+            .map(|&orig_idx| columns[orig_idx].values.gpu_buffer())
             .collect();
         let per_batch_coords =
             U32Buffer::accumulate_and_unpack_partial_numerators_indirect_batched(

@@ -29,7 +29,7 @@
 
 static id<MTLFunction> stwo_metal_find_function(StwoMetalRuntimeBox *runtime, NSString *name) {
     if (runtime.library != nil) {
-        id<MTLFunction> function = stwo_metal_find_function(runtime, name);
+        id<MTLFunction> function = [runtime.library newFunctionWithName:name];
         if (function != nil) {
             return function;
         }
@@ -3354,9 +3354,380 @@ bool stwo_metal_inclusive_prefix_sum_bit_rev_circle_domain_u32(
     }
 }
 
+bool stwo_metal_inclusive_prefix_sum_bit_rev_circle_domain_4col_u32(
+    void *runtime_ptr,
+    void *col0_ptr, void *col1_ptr, void *col2_ptr, void *col3_ptr,
+    uint32_t log_len,
+    char *error_message,
+    size_t error_message_len
+) {
+    @autoreleasepool {
+        StwoMetalRuntimeBox *runtime = stwo_metal_runtime_box(runtime_ptr);
+        StwoMetalBufferBox *cols[4] = {
+            stwo_metal_buffer_box(col0_ptr),
+            stwo_metal_buffer_box(col1_ptr),
+            stwo_metal_buffer_box(col2_ptr),
+            stwo_metal_buffer_box(col3_ptr),
+        };
+        uint32_t len = ((uint32_t)1) << log_len;
+        for (int i = 0; i < 4; i++) {
+            if (cols[i].len != (NSUInteger)len) {
+                stwo_metal_write_error(error_message, error_message_len, @"4-column prefix sum expects power-of-two base-field buffers matching log_len.");
+                return false;
+            }
+        }
+
+        id<MTLComputePipelineState> bit_reverse =
+            stwo_metal_pipeline(runtime, @"bit_reverse_u32", error_message, error_message_len);
+        if (bit_reverse == nil) return false;
+        id<MTLComputePipelineState> circle_to_coset =
+            stwo_metal_pipeline(runtime, @"prefix_sum_circle_domain_order_to_coset_order_u32", error_message, error_message_len);
+        if (circle_to_coset == nil) return false;
+        id<MTLComputePipelineState> coset_to_circle =
+            stwo_metal_pipeline(runtime, @"prefix_sum_coset_order_to_circle_domain_order_u32", error_message, error_message_len);
+        if (coset_to_circle == nil) return false;
+        id<MTLComputePipelineState> inclusive_step =
+            stwo_metal_pipeline(runtime, @"prefix_sum_inclusive_step_u32", error_message, error_message_len);
+        if (inclusive_step == nil) return false;
+
+        StwoMetalBufferPool *pool = [StwoMetalBufferPool sharedPoolForDevice:runtime.device];
+        NSUInteger bytes = (NSUInteger)len * sizeof(uint32_t);
+        id<MTLBuffer> coset_buffers[4];
+        id<MTLBuffer> scan_buffers[4];
+        for (int i = 0; i < 4; i++) {
+            coset_buffers[i] = [pool acquireWithByteSize:bytes];
+            scan_buffers[i] = [pool acquireWithByteSize:bytes];
+            if (coset_buffers[i] == nil || scan_buffers[i] == nil) {
+                stwo_metal_write_error(error_message, error_message_len, @"Failed to allocate Metal 4-column prefix-sum scratch buffers.");
+                for (int j = 0; j <= i; j++) {
+                    if (coset_buffers[j]) [pool returnBuffer:coset_buffers[j]];
+                    if (scan_buffers[j]) [pool returnBuffer:scan_buffers[j]];
+                }
+                return false;
+            }
+        }
+
+        id<MTLCommandBuffer> command_buffer = [runtime.queue commandBuffer];
+        if (command_buffer == nil) {
+            stwo_metal_write_error(error_message, error_message_len, @"Failed to create Metal command buffer.");
+            for (int i = 0; i < 4; i++) {
+                [pool returnBuffer:coset_buffers[i]];
+                [pool returnBuffer:scan_buffers[i]];
+            }
+            return false;
+        }
+
+        MTLSize bit_reverse_grid = MTLSizeMake(len, 1, 1);
+        MTLSize bit_reverse_threads = MTLSizeMake(stwo_metal_threads_per_group(bit_reverse), 1, 1);
+        for (int i = 0; i < 4; i++) {
+            id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+            if (encoder == nil) {
+                stwo_metal_write_error(error_message, error_message_len, @"Failed to create Metal bit-reverse encoder.");
+                return false;
+            }
+            [encoder setComputePipelineState:bit_reverse];
+            [encoder setBuffer:cols[i].buffer offset:0 atIndex:0];
+            [encoder setBytes:&log_len length:sizeof(log_len) atIndex:1];
+            [encoder dispatchThreads:bit_reverse_grid threadsPerThreadgroup:bit_reverse_threads];
+            [encoder endEncoding];
+        }
+
+        uint32_t half_len = len >> 1u;
+        MTLSize reorder_grid = MTLSizeMake(MAX((uint32_t)1u, half_len), 1, 1);
+        MTLSize reorder_threads = MTLSizeMake(stwo_metal_threads_per_group(circle_to_coset), 1, 1);
+        for (int i = 0; i < 4; i++) {
+            id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+            if (encoder == nil) {
+                stwo_metal_write_error(error_message, error_message_len, @"Failed to create Metal reorder encoder.");
+                return false;
+            }
+            [encoder setComputePipelineState:circle_to_coset];
+            [encoder setBuffer:cols[i].buffer offset:0 atIndex:0];
+            [encoder setBuffer:coset_buffers[i] offset:0 atIndex:1];
+            [encoder setBytes:&len length:sizeof(len) atIndex:2];
+            [encoder dispatchThreads:reorder_grid threadsPerThreadgroup:reorder_threads];
+            [encoder endEncoding];
+        }
+
+        id<MTLBuffer> current[4];
+        id<MTLBuffer> temp[4];
+        for (int i = 0; i < 4; i++) {
+            current[i] = coset_buffers[i];
+            temp[i] = scan_buffers[i];
+        }
+        MTLSize scan_grid = MTLSizeMake(len, 1, 1);
+        MTLSize scan_threads = MTLSizeMake(stwo_metal_threads_per_group(inclusive_step), 1, 1);
+        for (uint32_t stride = 1u; stride < len; stride <<= 1u) {
+            for (int i = 0; i < 4; i++) {
+                id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+                if (encoder == nil) {
+                    stwo_metal_write_error(error_message, error_message_len, @"Failed to create Metal scan encoder.");
+                    return false;
+                }
+                [encoder setComputePipelineState:inclusive_step];
+                [encoder setBuffer:current[i] offset:0 atIndex:0];
+                [encoder setBuffer:temp[i] offset:0 atIndex:1];
+                [encoder setBytes:&len length:sizeof(len) atIndex:2];
+                [encoder setBytes:&stride length:sizeof(stride) atIndex:3];
+                [encoder dispatchThreads:scan_grid threadsPerThreadgroup:scan_threads];
+                [encoder endEncoding];
+
+                id<MTLBuffer> swap = current[i];
+                current[i] = temp[i];
+                temp[i] = swap;
+            }
+        }
+
+        MTLSize restore_grid = MTLSizeMake(len, 1, 1);
+        MTLSize restore_threads = MTLSizeMake(stwo_metal_threads_per_group(coset_to_circle), 1, 1);
+        for (int i = 0; i < 4; i++) {
+            id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+            if (encoder == nil) {
+                stwo_metal_write_error(error_message, error_message_len, @"Failed to create Metal restore encoder.");
+                return false;
+            }
+            [encoder setComputePipelineState:coset_to_circle];
+            [encoder setBuffer:current[i] offset:0 atIndex:0];
+            [encoder setBuffer:cols[i].buffer offset:0 atIndex:1];
+            [encoder setBytes:&len length:sizeof(len) atIndex:2];
+            [encoder dispatchThreads:restore_grid threadsPerThreadgroup:restore_threads];
+            [encoder endEncoding];
+        }
+
+        for (int i = 0; i < 4; i++) {
+            id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+            if (encoder == nil) {
+                stwo_metal_write_error(error_message, error_message_len, @"Failed to create Metal final bit-reverse encoder.");
+                return false;
+            }
+            [encoder setComputePipelineState:bit_reverse];
+            [encoder setBuffer:cols[i].buffer offset:0 atIndex:0];
+            [encoder setBytes:&log_len length:sizeof(log_len) atIndex:1];
+            [encoder dispatchThreads:bit_reverse_grid threadsPerThreadgroup:bit_reverse_threads];
+            [encoder endEncoding];
+        }
+
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+        for (int i = 0; i < 4; i++) {
+            [pool returnBuffer:coset_buffers[i]];
+            [pool returnBuffer:scan_buffers[i]];
+        }
+
+        if (command_buffer.status == MTLCommandBufferStatusError) {
+            stwo_metal_write_error(error_message, error_message_len, command_buffer.error.localizedDescription ?: @"Metal 4-column prefix sum failed.");
+            return false;
+        }
+        return true;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Interaction trace prefix sum: reduce + subtract + sequential scan
 // ---------------------------------------------------------------------------
+
+typedef struct {
+    void *nums[4];
+    void *denom_packed;
+    void *prev[4];
+} StwoMetalLogupFractionChainDescriptor;
+
+/// One raw logup column's chain step.
+///
+/// Denominators arrive in the SIMD PackedSecureField lane layout:
+/// [16 a-limbs][16 b-limbs][16 c-limbs][16 d-limbs] per packed row.
+/// The kernel de-interleaves, inverts, multiplies numerator * denom^{-1}, and
+/// optionally accumulates the previous finalized logup column, writing back into
+/// the numerator coordinate columns in place.
+bool stwo_metal_logup_fraction_chain_u32x4(
+    void *runtime_ptr,
+    void *num0_ptr, void *num1_ptr, void *num2_ptr, void *num3_ptr,
+    void *denom_packed_ptr,
+    void *prev0_ptr, void *prev1_ptr, void *prev2_ptr, void *prev3_ptr,
+    uint32_t n_elements,
+    bool wait_until_completed,
+    char *error_message,
+    size_t error_message_len
+) {
+    @autoreleasepool {
+        StwoMetalRuntimeBox *runtime = stwo_metal_runtime_box(runtime_ptr);
+        StwoMetalBufferBox *num0 = stwo_metal_buffer_box(num0_ptr);
+        StwoMetalBufferBox *num1 = stwo_metal_buffer_box(num1_ptr);
+        StwoMetalBufferBox *num2 = stwo_metal_buffer_box(num2_ptr);
+        StwoMetalBufferBox *num3 = stwo_metal_buffer_box(num3_ptr);
+        StwoMetalBufferBox *denom_packed = stwo_metal_buffer_box(denom_packed_ptr);
+
+        NSUInteger expected_len = (NSUInteger)n_elements;
+        NSUInteger expected_denom_len = expected_len * 4u;
+        if (num0.len != expected_len || num1.len != expected_len ||
+            num2.len != expected_len || num3.len != expected_len ||
+            denom_packed.len != expected_denom_len) {
+            stwo_metal_write_error(error_message, error_message_len, @"Logup fraction-chain expects four n-element numerator coordinate buffers and one 4n-element packed-denominator buffer.");
+            return false;
+        }
+
+        BOOL has_prev =
+            prev0_ptr != NULL || prev1_ptr != NULL || prev2_ptr != NULL || prev3_ptr != NULL;
+        if (has_prev &&
+            (prev0_ptr == NULL || prev1_ptr == NULL || prev2_ptr == NULL || prev3_ptr == NULL)) {
+            stwo_metal_write_error(error_message, error_message_len, @"Logup fraction-chain previous-column buffers must be all-present or all-null.");
+            return false;
+        }
+
+        StwoMetalBufferBox *prev0 = has_prev ? stwo_metal_buffer_box(prev0_ptr) : nil;
+        StwoMetalBufferBox *prev1 = has_prev ? stwo_metal_buffer_box(prev1_ptr) : nil;
+        StwoMetalBufferBox *prev2 = has_prev ? stwo_metal_buffer_box(prev2_ptr) : nil;
+        StwoMetalBufferBox *prev3 = has_prev ? stwo_metal_buffer_box(prev3_ptr) : nil;
+        if (has_prev &&
+            (prev0.len != expected_len || prev1.len != expected_len ||
+             prev2.len != expected_len || prev3.len != expected_len)) {
+            stwo_metal_write_error(error_message, error_message_len, @"Logup fraction-chain previous-column buffers must have n elements.");
+            return false;
+        }
+
+        id<MTLComputePipelineState> pipeline =
+            stwo_metal_pipeline(runtime, @"logup_fraction_chain_u32x4", error_message, error_message_len);
+        if (pipeline == nil) return false;
+
+        id<MTLCommandBuffer> command_buffer = [runtime.queue commandBuffer];
+        if (command_buffer == nil) {
+            stwo_metal_write_error(error_message, error_message_len, @"Failed to create Metal command buffer.");
+            return false;
+        }
+
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:num0.buffer offset:0 atIndex:0];
+        [encoder setBuffer:num1.buffer offset:0 atIndex:1];
+        [encoder setBuffer:num2.buffer offset:0 atIndex:2];
+        [encoder setBuffer:num3.buffer offset:0 atIndex:3];
+        [encoder setBuffer:denom_packed.buffer offset:0 atIndex:4];
+        [encoder setBuffer:(has_prev ? prev0.buffer : nil) offset:0 atIndex:5];
+        [encoder setBuffer:(has_prev ? prev1.buffer : nil) offset:0 atIndex:6];
+        [encoder setBuffer:(has_prev ? prev2.buffer : nil) offset:0 atIndex:7];
+        [encoder setBuffer:(has_prev ? prev3.buffer : nil) offset:0 atIndex:8];
+        [encoder setBytes:&n_elements length:sizeof(n_elements) atIndex:9];
+        bool has_prev_bool = has_prev;
+        [encoder setBytes:&has_prev_bool length:sizeof(has_prev_bool) atIndex:10];
+
+        NSUInteger tg_size = MIN((NSUInteger)256, pipeline.maxTotalThreadsPerThreadgroup);
+        MTLSize grid = MTLSizeMake(expected_len, 1, 1);
+        MTLSize threads = MTLSizeMake(tg_size, 1, 1);
+        [encoder dispatchThreads:grid threadsPerThreadgroup:threads];
+        [encoder endEncoding];
+
+        [command_buffer commit];
+        if (!wait_until_completed) {
+            return true;
+        }
+        [command_buffer waitUntilCompleted];
+
+        if (command_buffer.status == MTLCommandBufferStatusError) {
+            stwo_metal_write_error(error_message, error_message_len, command_buffer.error.localizedDescription ?: @"Metal logup fraction-chain failed.");
+            return false;
+        }
+        return true;
+    }
+}
+
+bool stwo_metal_logup_fraction_chain_batch_u32x4(
+    void *runtime_ptr,
+    const StwoMetalLogupFractionChainDescriptor *descriptors,
+    uint32_t n_columns,
+    uint32_t n_elements,
+    char *error_message,
+    size_t error_message_len
+) {
+    @autoreleasepool {
+        if (descriptors == NULL || n_columns == 0) {
+            stwo_metal_write_error(error_message, error_message_len, @"Logup fraction-chain batch requires at least one descriptor.");
+            return false;
+        }
+
+        StwoMetalRuntimeBox *runtime = stwo_metal_runtime_box(runtime_ptr);
+        id<MTLComputePipelineState> pipeline =
+            stwo_metal_pipeline(runtime, @"logup_fraction_chain_u32x4", error_message, error_message_len);
+        if (pipeline == nil) return false;
+
+        id<MTLCommandBuffer> command_buffer = [runtime.queue commandBuffer];
+        if (command_buffer == nil) {
+            stwo_metal_write_error(error_message, error_message_len, @"Failed to create Metal command buffer.");
+            return false;
+        }
+
+        NSUInteger expected_len = (NSUInteger)n_elements;
+        NSUInteger expected_denom_len = expected_len * 4u;
+        NSUInteger tg_size = MIN((NSUInteger)256, pipeline.maxTotalThreadsPerThreadgroup);
+        MTLSize grid = MTLSizeMake(expected_len, 1, 1);
+        MTLSize threads = MTLSizeMake(tg_size, 1, 1);
+
+        for (uint32_t column = 0; column < n_columns; ++column) {
+            const StwoMetalLogupFractionChainDescriptor desc = descriptors[column];
+            StwoMetalBufferBox *nums[4] = {
+                stwo_metal_buffer_box(desc.nums[0]),
+                stwo_metal_buffer_box(desc.nums[1]),
+                stwo_metal_buffer_box(desc.nums[2]),
+                stwo_metal_buffer_box(desc.nums[3]),
+            };
+            StwoMetalBufferBox *denom_packed = stwo_metal_buffer_box(desc.denom_packed);
+            if (nums[0].len != expected_len || nums[1].len != expected_len ||
+                nums[2].len != expected_len || nums[3].len != expected_len ||
+                denom_packed.len != expected_denom_len) {
+                stwo_metal_write_error(error_message, error_message_len, @"Logup fraction-chain batch descriptor has invalid numerator or denominator length.");
+                return false;
+            }
+
+            BOOL has_prev =
+                desc.prev[0] != NULL || desc.prev[1] != NULL ||
+                desc.prev[2] != NULL || desc.prev[3] != NULL;
+            if (has_prev &&
+                (desc.prev[0] == NULL || desc.prev[1] == NULL ||
+                 desc.prev[2] == NULL || desc.prev[3] == NULL)) {
+                stwo_metal_write_error(error_message, error_message_len, @"Logup fraction-chain batch previous-column buffers must be all-present or all-null.");
+                return false;
+            }
+
+            StwoMetalBufferBox *prev[4] = { nil, nil, nil, nil };
+            if (has_prev) {
+                for (int i = 0; i < 4; ++i) {
+                    prev[i] = stwo_metal_buffer_box(desc.prev[i]);
+                    if (prev[i].len != expected_len) {
+                        stwo_metal_write_error(error_message, error_message_len, @"Logup fraction-chain batch previous-column buffers must have n elements.");
+                        return false;
+                    }
+                }
+            }
+
+            id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+            if (encoder == nil) {
+                stwo_metal_write_error(error_message, error_message_len, @"Failed to create Metal compute encoder.");
+                return false;
+            }
+            [encoder setComputePipelineState:pipeline];
+            for (int i = 0; i < 4; ++i) {
+                [encoder setBuffer:nums[i].buffer offset:0 atIndex:i];
+            }
+            [encoder setBuffer:denom_packed.buffer offset:0 atIndex:4];
+            for (int i = 0; i < 4; ++i) {
+                [encoder setBuffer:(has_prev ? prev[i].buffer : nil) offset:0 atIndex:5 + i];
+            }
+            [encoder setBytes:&n_elements length:sizeof(n_elements) atIndex:9];
+            bool has_prev_bool = has_prev;
+            [encoder setBytes:&has_prev_bool length:sizeof(has_prev_bool) atIndex:10];
+            [encoder dispatchThreads:grid threadsPerThreadgroup:threads];
+            [encoder endEncoding];
+        }
+
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+
+        if (command_buffer.status == MTLCommandBufferStatusError) {
+            stwo_metal_write_error(error_message, error_message_len, command_buffer.error.localizedDescription ?: @"Metal logup fraction-chain batch failed.");
+            return false;
+        }
+        return true;
+    }
+}
 
 /// Batched reduce + prefix-sum for 4 QM31 coordinate columns.
 /// Phase 1: parallel reduction of each coordinate (4 threadgroups in 1 CB).
@@ -3460,6 +3831,63 @@ bool stwo_metal_prefix_sum_subtract_m31_4col(
 
         if (command_buffer.status == MTLCommandBufferStatusError) {
             stwo_metal_write_error(error_message, error_message_len, command_buffer.error.localizedDescription ?: @"Metal prefix_sum_subtract_m31_4col failed.");
+            return false;
+        }
+        return true;
+    }
+}
+
+bool stwo_metal_subtract_m31_4col(
+    void *runtime_ptr,
+    void *col0_ptr, void *col1_ptr, void *col2_ptr, void *col3_ptr,
+    const uint32_t *shifts,
+    uint32_t n_elements,
+    char *error_message,
+    size_t error_message_len
+) {
+    @autoreleasepool {
+        StwoMetalRuntimeBox *runtime = stwo_metal_runtime_box(runtime_ptr);
+        StwoMetalBufferBox *cols[4] = {
+            stwo_metal_buffer_box(col0_ptr),
+            stwo_metal_buffer_box(col1_ptr),
+            stwo_metal_buffer_box(col2_ptr),
+            stwo_metal_buffer_box(col3_ptr),
+        };
+
+        for (int i = 0; i < 4; i++) {
+            if (cols[i].len != (NSUInteger)n_elements) {
+                stwo_metal_write_error(error_message, error_message_len, @"Metal subtract_m31_4col expects all columns to have n elements.");
+                return false;
+            }
+        }
+
+        id<MTLComputePipelineState> pipeline =
+            stwo_metal_pipeline(runtime, @"subtract_m31", error_message, error_message_len);
+        if (pipeline == nil) return false;
+
+        id<MTLCommandBuffer> command_buffer = [runtime.queue commandBuffer];
+        if (command_buffer == nil) {
+            stwo_metal_write_error(error_message, error_message_len, @"Failed to create Metal command buffer.");
+            return false;
+        }
+
+        for (int i = 0; i < 4; i++) {
+            id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBuffer:cols[i].buffer offset:0 atIndex:0];
+            [encoder setBytes:&shifts[i] length:sizeof(uint32_t) atIndex:1];
+            [encoder setBytes:&n_elements length:sizeof(n_elements) atIndex:2];
+            MTLSize grid = MTLSizeMake((NSUInteger)n_elements, 1, 1);
+            MTLSize threads = MTLSizeMake(stwo_metal_threads_per_group(pipeline), 1, 1);
+            [encoder dispatchThreads:grid threadsPerThreadgroup:threads];
+            [encoder endEncoding];
+        }
+
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+
+        if (command_buffer.status == MTLCommandBufferStatusError) {
+            stwo_metal_write_error(error_message, error_message_len, command_buffer.error.localizedDescription ?: @"Metal subtract_m31_4col failed.");
             return false;
         }
         return true;
@@ -7339,6 +7767,132 @@ bool stwo_metal_eval_compiled_program_v1_u32x4_tg(
     }
 }
 
+bool stwo_metal_eval_compiled_fused_composition_blit_v1(
+    void *runtime_ptr,
+    const char *shader_source,
+    size_t shader_source_len,
+    const char *kernel_name,
+    size_t kernel_name_len,
+    void **column_buffer_ptrs,
+    size_t n_columns,
+    void *interaction_offsets_ptr,
+    void *preprocessed_values_ptr,
+    void *base_params_ptr,
+    void *ext_params_ptr,
+    void *random_coeff_powers_ptr,
+    void *denom_inv_ptr,
+    void *coord_0_ptr,
+    void *coord_1_ptr,
+    void *coord_2_ptr,
+    void *coord_3_ptr,
+    uint32_t row_count,
+    uint32_t log_n_rows,
+    char *error_message,
+    size_t error_message_len
+) {
+    @autoreleasepool {
+        StwoMetalRuntimeBox *runtime = stwo_metal_runtime_box(runtime_ptr);
+        StwoMetalBufferBox *interaction_offsets = stwo_metal_buffer_box(interaction_offsets_ptr);
+        StwoMetalBufferBox *preprocessed_values = stwo_metal_buffer_box(preprocessed_values_ptr);
+        StwoMetalBufferBox *base_params = stwo_metal_buffer_box(base_params_ptr);
+        StwoMetalBufferBox *ext_params = stwo_metal_buffer_box(ext_params_ptr);
+        StwoMetalBufferBox *random_coeff_powers = stwo_metal_buffer_box(random_coeff_powers_ptr);
+        StwoMetalBufferBox *denom_inv = stwo_metal_buffer_box(denom_inv_ptr);
+        StwoMetalBufferBox *coord_0 = stwo_metal_buffer_box(coord_0_ptr);
+        StwoMetalBufferBox *coord_1 = stwo_metal_buffer_box(coord_1_ptr);
+        StwoMetalBufferBox *coord_2 = stwo_metal_buffer_box(coord_2_ptr);
+        StwoMetalBufferBox *coord_3 = stwo_metal_buffer_box(coord_3_ptr);
+
+        NSString *nameStr = [[NSString alloc] initWithBytes:kernel_name
+                                                     length:kernel_name_len
+                                                   encoding:NSUTF8StringEncoding];
+        NSString *sourceStr = [[NSString alloc] initWithBytes:shader_source
+                                                       length:shader_source_len
+                                                     encoding:NSUTF8StringEncoding];
+
+        id<MTLComputePipelineState> pipeline = stwo_metal_jit_pipeline_cached(
+            runtime, sourceStr, nameStr, 0, error_message, error_message_len);
+        if (pipeline == nil) return false;
+
+        size_t row_bytes = (size_t)row_count * sizeof(uint32_t);
+        size_t total_elements = (size_t)n_columns * (size_t)row_count;
+        id<MTLBuffer> trace_buffer = [runtime.device newBufferWithLength:total_elements * sizeof(uint32_t)
+                                                                  options:MTLResourceStorageModePrivate];
+        if (trace_buffer == nil) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"Failed to allocate flat trace buffer for fused composition blit.");
+            return false;
+        }
+
+        id<MTLCommandBuffer> command_buffer = [runtime.queue commandBuffer];
+        if (command_buffer == nil) {
+            stwo_metal_write_error(error_message, error_message_len, @"Failed to create Metal command buffer.");
+            return false;
+        }
+
+        id<MTLBlitCommandEncoder> blit = [command_buffer blitCommandEncoder];
+        if (blit == nil) {
+            stwo_metal_write_error(error_message, error_message_len, @"Failed to create Metal blit encoder.");
+            return false;
+        }
+
+        size_t dst_byte_offset = 0;
+        for (size_t i = 0; i < n_columns; ++i) {
+            StwoMetalBufferBox *col = stwo_metal_buffer_box(column_buffer_ptrs[i]);
+            if (col.len < (NSUInteger)row_count) {
+                [blit endEncoding];
+                stwo_metal_write_error(error_message, error_message_len,
+                    @"Fused composition blit column shorter than row_count.");
+                return false;
+            }
+            [blit copyFromBuffer:col.buffer
+                    sourceOffset:0
+                        toBuffer:trace_buffer
+               destinationOffset:dst_byte_offset
+                            size:row_bytes];
+            dst_byte_offset += row_bytes;
+        }
+        [blit endEncoding];
+
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        if (encoder == nil) {
+            stwo_metal_write_error(error_message, error_message_len, @"Failed to create Metal compute encoder.");
+            return false;
+        }
+
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:trace_buffer offset:0 atIndex:0];
+        [encoder setBuffer:interaction_offsets.buffer offset:0 atIndex:1];
+        [encoder setBuffer:preprocessed_values.buffer offset:0 atIndex:2];
+        [encoder setBuffer:base_params.buffer offset:0 atIndex:3];
+        [encoder setBuffer:ext_params.buffer offset:0 atIndex:4];
+        [encoder setBuffer:random_coeff_powers.buffer offset:0 atIndex:5];
+        [encoder setBuffer:denom_inv.buffer offset:0 atIndex:6];
+        [encoder setBuffer:coord_0.buffer offset:0 atIndex:7];
+        [encoder setBuffer:coord_1.buffer offset:0 atIndex:8];
+        [encoder setBytes:&row_count length:sizeof(row_count) atIndex:10];
+        [encoder setBuffer:coord_2.buffer offset:0 atIndex:11];
+        [encoder setBuffer:coord_3.buffer offset:0 atIndex:12];
+        [encoder setBytes:&log_n_rows length:sizeof(log_n_rows) atIndex:13];
+
+        MTLSize grid_size = MTLSizeMake(row_count, 1, 1);
+        MTLSize threadgroup_size = MTLSizeMake(stwo_metal_threads_per_group(pipeline), 1, 1);
+        [encoder dispatchThreads:grid_size threadsPerThreadgroup:threadgroup_size];
+        [encoder endEncoding];
+
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+
+        if (command_buffer.status == MTLCommandBufferStatusError) {
+            stwo_metal_write_error(error_message, error_message_len,
+                command_buffer.error.localizedDescription ?: @"Fused composition blit kernel execution failed.");
+            return false;
+        }
+
+        return true;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // JIT-compiled V1 evaluation kernel dispatch — async (non-blocking) variant
 // ---------------------------------------------------------------------------
@@ -7931,6 +8485,155 @@ bool stwo_metal_witness_memory_id_to_big_trace(
     }
 }
 
+static bool stwo_metal_witness_memory_id_trace_columns_common(
+    StwoMetalRuntimeBox *runtime,
+    StwoMetalBufferBox *values,
+    StwoMetalBufferBox *mults,
+    void **trace_col_ptrs,
+    uint32_t n_values,
+    uint32_t column_length,
+    uint32_t n_words,
+    uint32_t n_trace_columns,
+    NSString *kernel_name,
+    NSString *error_label,
+    bool wait_until_completed,
+    char *error_message,
+    size_t error_message_len
+) {
+    if (values.len != (NSUInteger)n_values * (NSUInteger)n_words) {
+        stwo_metal_write_error(error_message, error_message_len,
+            [error_label stringByAppendingString:@": values buffer length mismatch."]);
+        return false;
+    }
+    if (mults.len != (NSUInteger)n_values) {
+        stwo_metal_write_error(error_message, error_message_len,
+            [error_label stringByAppendingString:@": mults buffer length mismatch."]);
+        return false;
+    }
+    if (trace_col_ptrs == NULL) {
+        stwo_metal_write_error(error_message, error_message_len,
+            [error_label stringByAppendingString:@": missing output column buffers."]);
+        return false;
+    }
+
+    NSUInteger column_len = (NSUInteger)column_length;
+    for (NSUInteger i = 0; i < (NSUInteger)n_trace_columns; ++i) {
+        if (trace_col_ptrs[i] == NULL) {
+            stwo_metal_write_error(error_message, error_message_len,
+                [error_label stringByAppendingString:@": null output column buffer."]);
+            return false;
+        }
+        StwoMetalBufferBox *col = stwo_metal_buffer_box(trace_col_ptrs[i]);
+        if (col.len != column_len) {
+            stwo_metal_write_error(error_message, error_message_len,
+                [error_label stringByAppendingString:@": output column length mismatch."]);
+            return false;
+        }
+    }
+
+    id<MTLComputePipelineState> pipeline = stwo_metal_pipeline(
+        runtime,
+        kernel_name,
+        error_message,
+        error_message_len
+    );
+    if (pipeline == nil) {
+        return false;
+    }
+
+    NSUInteger addr_buf_len = (NSUInteger)n_trace_columns * sizeof(uint64_t);
+    id<MTLBuffer> addr_buffer = [runtime.device
+        newBufferWithLength:addr_buf_len
+        options:MTLResourceStorageModeShared];
+    if (addr_buffer == nil) {
+        stwo_metal_write_error(error_message, error_message_len,
+            [error_label stringByAppendingString:@": failed to allocate address buffer."]);
+        return false;
+    }
+    uint64_t *addrs = (uint64_t *)addr_buffer.contents;
+    for (NSUInteger i = 0; i < (NSUInteger)n_trace_columns; ++i) {
+        StwoMetalBufferBox *col = stwo_metal_buffer_box(trace_col_ptrs[i]);
+        addrs[i] = col.buffer.gpuAddress;
+    }
+
+    id<MTLCommandBuffer> command_buffer = [runtime.queue commandBuffer];
+    if (command_buffer == nil) {
+        stwo_metal_write_error(error_message, error_message_len,
+            @"Failed to create Metal command buffer.");
+        return false;
+    }
+
+    id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+    if (encoder == nil) {
+        stwo_metal_write_error(error_message, error_message_len,
+            @"Failed to create Metal compute encoder.");
+        return false;
+    }
+
+    [encoder setComputePipelineState:pipeline];
+    [encoder setBuffer:values.buffer offset:0 atIndex:0];
+    [encoder setBuffer:mults.buffer offset:0 atIndex:1];
+    [encoder setBuffer:addr_buffer offset:0 atIndex:2];
+    [encoder setBytes:&n_values length:sizeof(n_values) atIndex:3];
+    [encoder setBytes:&column_length length:sizeof(column_length) atIndex:4];
+    for (NSUInteger i = 0; i < (NSUInteger)n_trace_columns; ++i) {
+        StwoMetalBufferBox *col = stwo_metal_buffer_box(trace_col_ptrs[i]);
+        [encoder useResource:col.buffer usage:MTLResourceUsageWrite];
+    }
+
+    MTLSize grid_size = MTLSizeMake((NSUInteger)column_length, 1, 1);
+    MTLSize threadgroup_size = MTLSizeMake(
+        stwo_metal_threads_per_group(pipeline), 1, 1);
+    [encoder dispatchThreads:grid_size threadsPerThreadgroup:threadgroup_size];
+    [encoder endEncoding];
+
+    [command_buffer commit];
+    if (!wait_until_completed) {
+        return true;
+    }
+
+    [command_buffer waitUntilCompleted];
+
+    if (command_buffer.status == MTLCommandBufferStatusError) {
+        stwo_metal_write_error(error_message, error_message_len,
+            command_buffer.error.localizedDescription
+                ?: [error_label stringByAppendingString:@": kernel failed."]);
+        return false;
+    }
+
+    return true;
+}
+
+bool stwo_metal_witness_memory_id_to_big_trace_columns(
+    void *runtime_ptr,
+    void *big_values_ptr,
+    void *mults_ptr,
+    void **trace_col_ptrs,
+    uint32_t n_values,
+    uint32_t column_length,
+    bool wait_until_completed,
+    char *error_message,
+    size_t error_message_len
+) {
+    @autoreleasepool {
+        return stwo_metal_witness_memory_id_trace_columns_common(
+            stwo_metal_runtime_box(runtime_ptr),
+            stwo_metal_buffer_box(big_values_ptr),
+            stwo_metal_buffer_box(mults_ptr),
+            trace_col_ptrs,
+            n_values,
+            column_length,
+            8u,
+            29u,
+            @"witness_memory_id_to_big_trace_columns",
+            @"witness_memory_id_to_big_columns",
+            wait_until_completed,
+            error_message,
+            error_message_len
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Witness generation: memory_id_to_big trace (small values)
 // ---------------------------------------------------------------------------
@@ -8014,6 +8717,438 @@ bool stwo_metal_witness_memory_id_to_big_small_trace(
             stwo_metal_write_error(error_message, error_message_len,
                 command_buffer.error.localizedDescription
                     ?: @"witness_memory_id_to_big_small_trace kernel failed.");
+            return false;
+        }
+
+        return true;
+    }
+}
+
+bool stwo_metal_witness_memory_id_to_big_small_trace_columns(
+    void *runtime_ptr,
+    void *small_values_ptr,
+    void *mults_ptr,
+    void **trace_col_ptrs,
+    uint32_t n_values,
+    uint32_t column_length,
+    bool wait_until_completed,
+    char *error_message,
+    size_t error_message_len
+) {
+    @autoreleasepool {
+        return stwo_metal_witness_memory_id_trace_columns_common(
+            stwo_metal_runtime_box(runtime_ptr),
+            stwo_metal_buffer_box(small_values_ptr),
+            stwo_metal_buffer_box(mults_ptr),
+            trace_col_ptrs,
+            n_values,
+            column_length,
+            4u,
+            9u,
+            @"witness_memory_id_to_big_small_trace_columns",
+            @"witness_memory_id_to_big_small_columns",
+            wait_until_completed,
+            error_message,
+            error_message_len
+        );
+    }
+}
+
+bool stwo_metal_witness_memory_rc99_count(
+    void *runtime_ptr,
+    void **limb_col_ptrs,
+    void *input_to_row_lut_ptr,
+    void *counts_ptr,
+    uint32_t n_pairs,
+    uint32_t column_length,
+    uint32_t rc_table_size,
+    char *error_message,
+    size_t error_message_len
+) {
+    @autoreleasepool {
+        StwoMetalRuntimeBox *runtime = stwo_metal_runtime_box(runtime_ptr);
+        StwoMetalBufferBox *input_to_row_lut = stwo_metal_buffer_box(input_to_row_lut_ptr);
+        StwoMetalBufferBox *counts = stwo_metal_buffer_box(counts_ptr);
+
+        if (n_pairs == 0) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"witness_memory_rc99_count: n_pairs must be non-zero.");
+            return false;
+        }
+        if (limb_col_ptrs == NULL) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"witness_memory_rc99_count: missing limb column buffers.");
+            return false;
+        }
+        if (input_to_row_lut.len != (NSUInteger)1u << 18u) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"witness_memory_rc99_count: input_to_row_lut must have 2^18 entries.");
+            return false;
+        }
+        if (counts.len != (NSUInteger)8u * (NSUInteger)rc_table_size) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"witness_memory_rc99_count: counts buffer length mismatch.");
+            return false;
+        }
+
+        NSUInteger n_limb_cols = (NSUInteger)n_pairs * 2u;
+        for (NSUInteger i = 0; i < n_limb_cols; ++i) {
+            if (limb_col_ptrs[i] == NULL) {
+                stwo_metal_write_error(error_message, error_message_len,
+                    @"witness_memory_rc99_count: null limb column buffer.");
+                return false;
+            }
+            StwoMetalBufferBox *col = stwo_metal_buffer_box(limb_col_ptrs[i]);
+            if (col.len != (NSUInteger)column_length) {
+                stwo_metal_write_error(error_message, error_message_len,
+                    @"witness_memory_rc99_count: limb column length mismatch.");
+                return false;
+            }
+        }
+
+        id<MTLComputePipelineState> pipeline = stwo_metal_pipeline(
+            runtime,
+            @"witness_memory_rc99_count",
+            error_message,
+            error_message_len
+        );
+        if (pipeline == nil) {
+            return false;
+        }
+
+        NSUInteger addr_buf_len = n_limb_cols * sizeof(uint64_t);
+        id<MTLBuffer> addr_buffer = [runtime.device
+            newBufferWithLength:addr_buf_len
+            options:MTLResourceStorageModeShared];
+        if (addr_buffer == nil) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"witness_memory_rc99_count: failed to allocate address buffer.");
+            return false;
+        }
+        uint64_t *addrs = (uint64_t *)addr_buffer.contents;
+        for (NSUInteger i = 0; i < n_limb_cols; ++i) {
+            StwoMetalBufferBox *col = stwo_metal_buffer_box(limb_col_ptrs[i]);
+            addrs[i] = col.buffer.gpuAddress;
+        }
+
+        id<MTLCommandBuffer> command_buffer = [runtime.queue commandBuffer];
+        if (command_buffer == nil) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"Failed to create Metal command buffer.");
+            return false;
+        }
+
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        if (encoder == nil) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"Failed to create Metal compute encoder.");
+            return false;
+        }
+
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:addr_buffer offset:0 atIndex:0];
+        [encoder setBuffer:input_to_row_lut.buffer offset:0 atIndex:1];
+        [encoder setBuffer:counts.buffer offset:0 atIndex:2];
+        [encoder setBytes:&n_pairs length:sizeof(n_pairs) atIndex:3];
+        [encoder setBytes:&column_length length:sizeof(column_length) atIndex:4];
+        [encoder setBytes:&rc_table_size length:sizeof(rc_table_size) atIndex:5];
+        for (NSUInteger i = 0; i < n_limb_cols; ++i) {
+            StwoMetalBufferBox *col = stwo_metal_buffer_box(limb_col_ptrs[i]);
+            [encoder useResource:col.buffer usage:MTLResourceUsageRead];
+        }
+
+        MTLSize grid_size = MTLSizeMake((NSUInteger)column_length, 1, 1);
+        MTLSize threadgroup_size = MTLSizeMake(
+            stwo_metal_threads_per_group(pipeline), 1, 1);
+        [encoder dispatchThreads:grid_size threadsPerThreadgroup:threadgroup_size];
+        [encoder endEncoding];
+
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+
+        if (command_buffer.status == MTLCommandBufferStatusError) {
+            stwo_metal_write_error(error_message, error_message_len,
+                command_buffer.error.localizedDescription
+                    ?: @"witness_memory_rc99_count kernel failed.");
+            return false;
+        }
+
+        return true;
+    }
+}
+
+bool stwo_metal_witness_memory_rc_pair_logup(
+    void *runtime_ptr,
+    void *limb_a_ptr,
+    void *limb_b_ptr,
+    void *limb_c_ptr,
+    void *limb_d_ptr,
+    void *denom_packed_ptr,
+    void *num0_ptr,
+    void *num1_ptr,
+    void *num2_ptr,
+    void *num3_ptr,
+    void *alpha_powers_ptr,
+    const uint32_t *z_limbs,
+    uint32_t rel_id0,
+    uint32_t rel_id1,
+    uint32_t column_length,
+    bool wait_until_completed,
+    char *error_message,
+    size_t error_message_len
+) {
+    @autoreleasepool {
+        StwoMetalRuntimeBox *runtime = stwo_metal_runtime_box(runtime_ptr);
+        StwoMetalBufferBox *limbs[4] = {
+            stwo_metal_buffer_box(limb_a_ptr),
+            stwo_metal_buffer_box(limb_b_ptr),
+            stwo_metal_buffer_box(limb_c_ptr),
+            stwo_metal_buffer_box(limb_d_ptr),
+        };
+        StwoMetalBufferBox *denom_packed = stwo_metal_buffer_box(denom_packed_ptr);
+        StwoMetalBufferBox *nums[4] = {
+            stwo_metal_buffer_box(num0_ptr),
+            stwo_metal_buffer_box(num1_ptr),
+            stwo_metal_buffer_box(num2_ptr),
+            stwo_metal_buffer_box(num3_ptr),
+        };
+        StwoMetalBufferBox *alpha_powers = stwo_metal_buffer_box(alpha_powers_ptr);
+
+        for (NSUInteger i = 0; i < 4; ++i) {
+            if (limbs[i].len != (NSUInteger)column_length ||
+                nums[i].len != (NSUInteger)column_length) {
+                stwo_metal_write_error(error_message, error_message_len,
+                    @"witness_memory_rc_pair_logup: limb and numerator columns must match column_length.");
+                return false;
+            }
+        }
+        if (denom_packed.len != (NSUInteger)column_length * 4u) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"witness_memory_rc_pair_logup: denominator buffer length mismatch.");
+            return false;
+        }
+        if (alpha_powers.len != 12u) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"witness_memory_rc_pair_logup: alpha_powers must contain 3 QM31 values.");
+            return false;
+        }
+        if (z_limbs == NULL) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"witness_memory_rc_pair_logup: missing z limbs.");
+            return false;
+        }
+
+        id<MTLComputePipelineState> pipeline = stwo_metal_pipeline(
+            runtime,
+            @"witness_memory_rc_pair_logup",
+            error_message,
+            error_message_len
+        );
+        if (pipeline == nil) {
+            return false;
+        }
+
+        id<MTLCommandBuffer> command_buffer = [runtime.queue commandBuffer];
+        if (command_buffer == nil) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"Failed to create Metal command buffer.");
+            return false;
+        }
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        if (encoder == nil) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"Failed to create Metal compute encoder.");
+            return false;
+        }
+
+        [encoder setComputePipelineState:pipeline];
+        for (NSUInteger i = 0; i < 4; ++i) {
+            [encoder setBuffer:limbs[i].buffer offset:0 atIndex:i];
+        }
+        [encoder setBuffer:denom_packed.buffer offset:0 atIndex:4];
+        for (NSUInteger i = 0; i < 4; ++i) {
+            [encoder setBuffer:nums[i].buffer offset:0 atIndex:5 + i];
+        }
+        [encoder setBuffer:alpha_powers.buffer offset:0 atIndex:9];
+        [encoder setBytes:z_limbs length:4u * sizeof(uint32_t) atIndex:10];
+        [encoder setBytes:&rel_id0 length:sizeof(rel_id0) atIndex:11];
+        [encoder setBytes:&rel_id1 length:sizeof(rel_id1) atIndex:12];
+        [encoder setBytes:&column_length length:sizeof(column_length) atIndex:13];
+
+        MTLSize grid_size = MTLSizeMake((NSUInteger)column_length, 1, 1);
+        MTLSize threadgroup_size = MTLSizeMake(
+            stwo_metal_threads_per_group(pipeline), 1, 1);
+        [encoder dispatchThreads:grid_size threadsPerThreadgroup:threadgroup_size];
+        [encoder endEncoding];
+
+        [command_buffer commit];
+        if (!wait_until_completed) {
+            return true;
+        }
+        [command_buffer waitUntilCompleted];
+
+        if (command_buffer.status == MTLCommandBufferStatusError) {
+            stwo_metal_write_error(error_message, error_message_len,
+                command_buffer.error.localizedDescription
+                    ?: @"witness_memory_rc_pair_logup kernel failed.");
+            return false;
+        }
+
+        return true;
+    }
+}
+
+bool stwo_metal_witness_memory_logup_inputs(
+    void *runtime_ptr,
+    void **limb_col_ptrs,
+    void *mults_ptr,
+    void *denom_packed_ptr,
+    void *num0_ptr,
+    void *num1_ptr,
+    void *num2_ptr,
+    void *num3_ptr,
+    void *alpha_powers_ptr,
+    const uint32_t *z_limbs,
+    uint32_t relation_id,
+    uint32_t id_offset,
+    uint32_t id_tag,
+    uint32_t n_limbs,
+    uint32_t column_length,
+    bool wait_until_completed,
+    char *error_message,
+    size_t error_message_len
+) {
+    @autoreleasepool {
+        StwoMetalRuntimeBox *runtime = stwo_metal_runtime_box(runtime_ptr);
+        StwoMetalBufferBox *mults = stwo_metal_buffer_box(mults_ptr);
+        StwoMetalBufferBox *denom_packed = stwo_metal_buffer_box(denom_packed_ptr);
+        StwoMetalBufferBox *nums[4] = {
+            stwo_metal_buffer_box(num0_ptr),
+            stwo_metal_buffer_box(num1_ptr),
+            stwo_metal_buffer_box(num2_ptr),
+            stwo_metal_buffer_box(num3_ptr),
+        };
+        StwoMetalBufferBox *alpha_powers = stwo_metal_buffer_box(alpha_powers_ptr);
+
+        if (n_limbs == 0 || limb_col_ptrs == NULL) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"witness_memory_logup_inputs: missing limb columns.");
+            return false;
+        }
+        for (NSUInteger i = 0; i < (NSUInteger)n_limbs; ++i) {
+            if (limb_col_ptrs[i] == NULL) {
+                stwo_metal_write_error(error_message, error_message_len,
+                    @"witness_memory_logup_inputs: null limb column buffer.");
+                return false;
+            }
+            StwoMetalBufferBox *col = stwo_metal_buffer_box(limb_col_ptrs[i]);
+            if (col.len != (NSUInteger)column_length) {
+                stwo_metal_write_error(error_message, error_message_len,
+                    @"witness_memory_logup_inputs: limb column length mismatch.");
+                return false;
+            }
+        }
+        if (mults.len != (NSUInteger)column_length) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"witness_memory_logup_inputs: multiplicity column length mismatch.");
+            return false;
+        }
+        for (NSUInteger i = 0; i < 4; ++i) {
+            if (nums[i].len != (NSUInteger)column_length) {
+                stwo_metal_write_error(error_message, error_message_len,
+                    @"witness_memory_logup_inputs: numerator column length mismatch.");
+                return false;
+            }
+        }
+        if (denom_packed.len != (NSUInteger)column_length * 4u) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"witness_memory_logup_inputs: denominator buffer length mismatch.");
+            return false;
+        }
+        if (alpha_powers.len != ((NSUInteger)n_limbs + 2u) * 4u) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"witness_memory_logup_inputs: alpha_powers length mismatch.");
+            return false;
+        }
+        if (z_limbs == NULL) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"witness_memory_logup_inputs: missing z limbs.");
+            return false;
+        }
+
+        id<MTLComputePipelineState> pipeline = stwo_metal_pipeline(
+            runtime,
+            @"witness_memory_logup_inputs",
+            error_message,
+            error_message_len
+        );
+        if (pipeline == nil) {
+            return false;
+        }
+
+        NSUInteger addr_buf_len = (NSUInteger)n_limbs * sizeof(uint64_t);
+        id<MTLBuffer> addr_buffer = [runtime.device
+            newBufferWithLength:addr_buf_len
+            options:MTLResourceStorageModeShared];
+        if (addr_buffer == nil) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"witness_memory_logup_inputs: failed to allocate address buffer.");
+            return false;
+        }
+        uint64_t *addrs = (uint64_t *)addr_buffer.contents;
+        for (NSUInteger i = 0; i < (NSUInteger)n_limbs; ++i) {
+            StwoMetalBufferBox *col = stwo_metal_buffer_box(limb_col_ptrs[i]);
+            addrs[i] = col.buffer.gpuAddress;
+        }
+
+        id<MTLCommandBuffer> command_buffer = [runtime.queue commandBuffer];
+        if (command_buffer == nil) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"Failed to create Metal command buffer.");
+            return false;
+        }
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        if (encoder == nil) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"Failed to create Metal compute encoder.");
+            return false;
+        }
+
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:addr_buffer offset:0 atIndex:0];
+        [encoder setBuffer:mults.buffer offset:0 atIndex:1];
+        [encoder setBuffer:denom_packed.buffer offset:0 atIndex:2];
+        for (NSUInteger i = 0; i < 4; ++i) {
+            [encoder setBuffer:nums[i].buffer offset:0 atIndex:3 + i];
+        }
+        [encoder setBuffer:alpha_powers.buffer offset:0 atIndex:7];
+        [encoder setBytes:z_limbs length:4u * sizeof(uint32_t) atIndex:8];
+        [encoder setBytes:&relation_id length:sizeof(relation_id) atIndex:9];
+        [encoder setBytes:&id_offset length:sizeof(id_offset) atIndex:10];
+        [encoder setBytes:&id_tag length:sizeof(id_tag) atIndex:11];
+        [encoder setBytes:&n_limbs length:sizeof(n_limbs) atIndex:12];
+        [encoder setBytes:&column_length length:sizeof(column_length) atIndex:13];
+        for (NSUInteger i = 0; i < (NSUInteger)n_limbs; ++i) {
+            StwoMetalBufferBox *col = stwo_metal_buffer_box(limb_col_ptrs[i]);
+            [encoder useResource:col.buffer usage:MTLResourceUsageRead];
+        }
+
+        MTLSize grid_size = MTLSizeMake((NSUInteger)column_length, 1, 1);
+        MTLSize threadgroup_size = MTLSizeMake(
+            stwo_metal_threads_per_group(pipeline), 1, 1);
+        [encoder dispatchThreads:grid_size threadsPerThreadgroup:threadgroup_size];
+        [encoder endEncoding];
+
+        [command_buffer commit];
+        if (!wait_until_completed) {
+            return true;
+        }
+        [command_buffer waitUntilCompleted];
+
+        if (command_buffer.status == MTLCommandBufferStatusError) {
+            stwo_metal_write_error(error_message, error_message_len,
+                command_buffer.error.localizedDescription
+                    ?: @"witness_memory_logup_inputs kernel failed.");
             return false;
         }
 
@@ -8113,6 +9248,310 @@ bool stwo_metal_witness_memory_addr_to_id_trace(
     }
 }
 
+bool stwo_metal_witness_memory_addr_to_id_trace_columns(
+    void *runtime_ptr,
+    void *ids_ptr,
+    void *mults_ptr,
+    void **trace_col_ptrs,
+    uint32_t n_ids,
+    uint32_t column_length,
+    uint32_t split,
+    bool wait_until_completed,
+    char *error_message,
+    size_t error_message_len
+) {
+    @autoreleasepool {
+        StwoMetalRuntimeBox *runtime = stwo_metal_runtime_box(runtime_ptr);
+        StwoMetalBufferBox *ids = stwo_metal_buffer_box(ids_ptr);
+        StwoMetalBufferBox *mults = stwo_metal_buffer_box(mults_ptr);
+
+        if (ids.len != (NSUInteger)n_ids) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"witness_memory_addr_to_id_columns: ids buffer length mismatch.");
+            return false;
+        }
+        if (mults.len != (NSUInteger)n_ids) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"witness_memory_addr_to_id_columns: mults buffer length mismatch.");
+            return false;
+        }
+        if (trace_col_ptrs == NULL) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"witness_memory_addr_to_id_columns: missing output column buffers.");
+            return false;
+        }
+
+        NSUInteger n_trace_columns = (NSUInteger)split * 2u;
+        NSUInteger column_len = (NSUInteger)column_length;
+        for (NSUInteger i = 0; i < n_trace_columns; ++i) {
+            if (trace_col_ptrs[i] == NULL) {
+                stwo_metal_write_error(error_message, error_message_len,
+                    @"witness_memory_addr_to_id_columns: null output column buffer.");
+                return false;
+            }
+            StwoMetalBufferBox *col = stwo_metal_buffer_box(trace_col_ptrs[i]);
+            if (col.len != column_len) {
+                stwo_metal_write_error(error_message, error_message_len,
+                    @"witness_memory_addr_to_id_columns: output column length mismatch.");
+                return false;
+            }
+        }
+
+        id<MTLComputePipelineState> pipeline = stwo_metal_pipeline(
+            runtime,
+            @"witness_memory_addr_to_id_trace_columns",
+            error_message,
+            error_message_len
+        );
+        if (pipeline == nil) {
+            return false;
+        }
+
+        NSUInteger addr_buf_len = n_trace_columns * sizeof(uint64_t);
+        id<MTLBuffer> addr_buffer = [runtime.device
+            newBufferWithLength:addr_buf_len
+            options:MTLResourceStorageModeShared];
+        if (addr_buffer == nil) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"Failed to allocate address buffer for memory_addr_to_id columns.");
+            return false;
+        }
+        uint64_t *addrs = (uint64_t *)addr_buffer.contents;
+        for (NSUInteger i = 0; i < n_trace_columns; ++i) {
+            StwoMetalBufferBox *col = stwo_metal_buffer_box(trace_col_ptrs[i]);
+            addrs[i] = col.buffer.gpuAddress;
+        }
+
+        id<MTLCommandBuffer> command_buffer = [runtime.queue commandBuffer];
+        if (command_buffer == nil) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"Failed to create Metal command buffer.");
+            return false;
+        }
+
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        if (encoder == nil) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"Failed to create Metal compute encoder.");
+            return false;
+        }
+
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:ids.buffer offset:0 atIndex:0];
+        [encoder setBuffer:mults.buffer offset:0 atIndex:1];
+        [encoder setBuffer:addr_buffer offset:0 atIndex:2];
+        [encoder setBytes:&n_ids length:sizeof(n_ids) atIndex:3];
+        [encoder setBytes:&column_length length:sizeof(column_length) atIndex:4];
+        [encoder setBytes:&split length:sizeof(split) atIndex:5];
+        for (NSUInteger i = 0; i < n_trace_columns; ++i) {
+            StwoMetalBufferBox *col = stwo_metal_buffer_box(trace_col_ptrs[i]);
+            [encoder useResource:col.buffer usage:MTLResourceUsageWrite];
+        }
+
+        NSUInteger total_threads = (NSUInteger)split * (NSUInteger)column_length;
+        MTLSize grid_size = MTLSizeMake(total_threads, 1, 1);
+        MTLSize threadgroup_size = MTLSizeMake(
+            stwo_metal_threads_per_group(pipeline), 1, 1);
+        [encoder dispatchThreads:grid_size threadsPerThreadgroup:threadgroup_size];
+        [encoder endEncoding];
+
+        [command_buffer commit];
+        if (!wait_until_completed) {
+            return true;
+        }
+
+        [command_buffer waitUntilCompleted];
+
+        if (command_buffer.status == MTLCommandBufferStatusError) {
+            stwo_metal_write_error(error_message, error_message_len,
+                command_buffer.error.localizedDescription
+                    ?: @"witness_memory_addr_to_id_trace_columns kernel failed.");
+            return false;
+        }
+
+        return true;
+    }
+}
+
+bool stwo_metal_witness_memory_addr_to_id_interaction_raw(
+    void *runtime_ptr,
+    void **trace_col_ptrs,
+    void **num_col_ptrs,
+    void **denom_col_ptrs,
+    void *alpha_powers_ptr,
+    const uint32_t *z_limbs,
+    uint32_t relation_id,
+    uint32_t column_length,
+    uint32_t split,
+    bool wait_until_completed,
+    char *error_message,
+    size_t error_message_len
+) {
+    @autoreleasepool {
+        StwoMetalRuntimeBox *runtime = stwo_metal_runtime_box(runtime_ptr);
+        StwoMetalBufferBox *alpha_powers = stwo_metal_buffer_box(alpha_powers_ptr);
+
+        if (split == 0u || (split & 1u) != 0u) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"witness_memory_addr_to_id_interaction_raw: split must be positive and even.");
+            return false;
+        }
+        if (trace_col_ptrs == NULL || num_col_ptrs == NULL || denom_col_ptrs == NULL) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"witness_memory_addr_to_id_interaction_raw: missing column buffers.");
+            return false;
+        }
+        if (z_limbs == NULL) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"witness_memory_addr_to_id_interaction_raw: missing z limbs.");
+            return false;
+        }
+        if (alpha_powers.len < 12u) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"witness_memory_addr_to_id_interaction_raw: alpha_powers must contain at least 3 QM31 values.");
+            return false;
+        }
+
+        NSUInteger column_len = (NSUInteger)column_length;
+        NSUInteger n_trace_columns = (NSUInteger)split * 2u;
+        NSUInteger n_logup_cols = (NSUInteger)split / 2u;
+        NSUInteger n_num_columns = n_logup_cols * 4u;
+
+        for (NSUInteger i = 0; i < n_trace_columns; ++i) {
+            if (trace_col_ptrs[i] == NULL) {
+                stwo_metal_write_error(error_message, error_message_len,
+                    @"witness_memory_addr_to_id_interaction_raw: null trace column.");
+                return false;
+            }
+            StwoMetalBufferBox *trace_col = stwo_metal_buffer_box(trace_col_ptrs[i]);
+            if (trace_col.len != column_len) {
+                stwo_metal_write_error(error_message, error_message_len,
+                    @"witness_memory_addr_to_id_interaction_raw: trace columns must match column_length.");
+                return false;
+            }
+        }
+        for (NSUInteger i = 0; i < n_num_columns; ++i) {
+            if (num_col_ptrs[i] == NULL) {
+                stwo_metal_write_error(error_message, error_message_len,
+                    @"witness_memory_addr_to_id_interaction_raw: null numerator column.");
+                return false;
+            }
+            StwoMetalBufferBox *num_col = stwo_metal_buffer_box(num_col_ptrs[i]);
+            if (num_col.len != column_len) {
+                stwo_metal_write_error(error_message, error_message_len,
+                    @"witness_memory_addr_to_id_interaction_raw: numerator columns must match column_length.");
+                return false;
+            }
+        }
+        for (NSUInteger i = 0; i < n_logup_cols; ++i) {
+            if (denom_col_ptrs[i] == NULL) {
+                stwo_metal_write_error(error_message, error_message_len,
+                    @"witness_memory_addr_to_id_interaction_raw: null denominator column.");
+                return false;
+            }
+            StwoMetalBufferBox *denom_col = stwo_metal_buffer_box(denom_col_ptrs[i]);
+            if (denom_col.len != column_len * 4u) {
+                stwo_metal_write_error(error_message, error_message_len,
+                    @"witness_memory_addr_to_id_interaction_raw: denominator columns must have 4 * column_length entries.");
+                return false;
+            }
+        }
+
+        id<MTLComputePipelineState> pipeline = stwo_metal_pipeline(
+            runtime,
+            @"witness_memory_addr_to_id_interaction_raw",
+            error_message,
+            error_message_len
+        );
+        if (pipeline == nil) {
+            return false;
+        }
+
+        id<MTLBuffer> trace_addr_buffer = [runtime.device
+            newBufferWithLength:n_trace_columns * sizeof(uint64_t)
+            options:MTLResourceStorageModeShared];
+        id<MTLBuffer> num_addr_buffer = [runtime.device
+            newBufferWithLength:n_num_columns * sizeof(uint64_t)
+            options:MTLResourceStorageModeShared];
+        id<MTLBuffer> denom_addr_buffer = [runtime.device
+            newBufferWithLength:n_logup_cols * sizeof(uint64_t)
+            options:MTLResourceStorageModeShared];
+        if (trace_addr_buffer == nil || num_addr_buffer == nil || denom_addr_buffer == nil) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"Failed to allocate address buffers for memory_address_to_id interaction.");
+            return false;
+        }
+
+        uint64_t *trace_addrs = (uint64_t *)trace_addr_buffer.contents;
+        uint64_t *num_addrs = (uint64_t *)num_addr_buffer.contents;
+        uint64_t *denom_addrs = (uint64_t *)denom_addr_buffer.contents;
+        for (NSUInteger i = 0; i < n_trace_columns; ++i) {
+            trace_addrs[i] = stwo_metal_buffer_box(trace_col_ptrs[i]).buffer.gpuAddress;
+        }
+        for (NSUInteger i = 0; i < n_num_columns; ++i) {
+            num_addrs[i] = stwo_metal_buffer_box(num_col_ptrs[i]).buffer.gpuAddress;
+        }
+        for (NSUInteger i = 0; i < n_logup_cols; ++i) {
+            denom_addrs[i] = stwo_metal_buffer_box(denom_col_ptrs[i]).buffer.gpuAddress;
+        }
+
+        id<MTLCommandBuffer> command_buffer = [runtime.queue commandBuffer];
+        if (command_buffer == nil) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"Failed to create Metal command buffer.");
+            return false;
+        }
+
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        if (encoder == nil) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"Failed to create Metal compute encoder.");
+            return false;
+        }
+
+        uint32_t n_logup_cols_u32 = (uint32_t)n_logup_cols;
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:trace_addr_buffer offset:0 atIndex:0];
+        [encoder setBuffer:num_addr_buffer offset:0 atIndex:1];
+        [encoder setBuffer:denom_addr_buffer offset:0 atIndex:2];
+        [encoder setBuffer:alpha_powers.buffer offset:0 atIndex:3];
+        [encoder setBytes:z_limbs length:4u * sizeof(uint32_t) atIndex:4];
+        [encoder setBytes:&relation_id length:sizeof(relation_id) atIndex:5];
+        [encoder setBytes:&column_length length:sizeof(column_length) atIndex:6];
+        [encoder setBytes:&n_logup_cols_u32 length:sizeof(n_logup_cols_u32) atIndex:7];
+        for (NSUInteger i = 0; i < n_trace_columns; ++i) {
+            [encoder useResource:stwo_metal_buffer_box(trace_col_ptrs[i]).buffer usage:MTLResourceUsageRead];
+        }
+        for (NSUInteger i = 0; i < n_num_columns; ++i) {
+            [encoder useResource:stwo_metal_buffer_box(num_col_ptrs[i]).buffer usage:MTLResourceUsageWrite];
+        }
+        for (NSUInteger i = 0; i < n_logup_cols; ++i) {
+            [encoder useResource:stwo_metal_buffer_box(denom_col_ptrs[i]).buffer usage:MTLResourceUsageWrite];
+        }
+
+        MTLSize grid_size = MTLSizeMake(column_len * n_logup_cols, 1, 1);
+        MTLSize threadgroup_size = MTLSizeMake(
+            stwo_metal_threads_per_group(pipeline), 1, 1);
+        [encoder dispatchThreads:grid_size threadsPerThreadgroup:threadgroup_size];
+        [encoder endEncoding];
+
+        [command_buffer commit];
+        if (!wait_until_completed) {
+            return true;
+        }
+        [command_buffer waitUntilCompleted];
+
+        if (command_buffer.status == MTLCommandBufferStatusError) {
+            stwo_metal_write_error(error_message, error_message_len,
+                command_buffer.error.localizedDescription
+                    ?: @"witness_memory_addr_to_id_interaction_raw kernel failed.");
+            return false;
+        }
+
+        return true;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Witness generation: add_opcode_small trace
 // ---------------------------------------------------------------------------
@@ -8197,6 +9636,959 @@ bool stwo_metal_witness_add_opcode_small_trace(
             stwo_metal_write_error(error_message, error_message_len,
                 command_buffer.error.localizedDescription
                     ?: @"witness_add_opcode_small_trace kernel failed.");
+            return false;
+        }
+
+        return true;
+    }
+}
+
+bool stwo_metal_witness_add_opcode_small_trace_columns(
+    void *runtime_ptr,
+    void *inputs_ptr,
+    void *address_to_id_ptr,
+    void *big_values_ptr,
+    void *small_values_ptr,
+    void **trace_col_ptrs,
+    uint32_t n_rows,
+    uint32_t column_length,
+    bool wait_until_completed,
+    char *error_message,
+    size_t error_message_len
+) {
+    @autoreleasepool {
+        StwoMetalRuntimeBox *runtime = stwo_metal_runtime_box(runtime_ptr);
+        StwoMetalBufferBox *inputs = stwo_metal_buffer_box(inputs_ptr);
+        StwoMetalBufferBox *address_to_id = stwo_metal_buffer_box(address_to_id_ptr);
+        StwoMetalBufferBox *big_values = stwo_metal_buffer_box(big_values_ptr);
+        StwoMetalBufferBox *small_values = stwo_metal_buffer_box(small_values_ptr);
+
+        if (inputs.len < (NSUInteger)n_rows * 3u) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"witness_add_opcode_small_trace_columns: inputs buffer length mismatch.");
+            return false;
+        }
+        if (trace_col_ptrs == NULL) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"witness_add_opcode_small_trace_columns: missing output column buffers.");
+            return false;
+        }
+
+        NSUInteger column_len = (NSUInteger)column_length;
+        for (NSUInteger i = 0; i < 39u; ++i) {
+            if (trace_col_ptrs[i] == NULL) {
+                stwo_metal_write_error(error_message, error_message_len,
+                    @"witness_add_opcode_small_trace_columns: null output column buffer.");
+                return false;
+            }
+            StwoMetalBufferBox *col = stwo_metal_buffer_box(trace_col_ptrs[i]);
+            if (col.len != column_len) {
+                stwo_metal_write_error(error_message, error_message_len,
+                    @"witness_add_opcode_small_trace_columns: output column length mismatch.");
+                return false;
+            }
+        }
+
+        id<MTLComputePipelineState> pipeline = stwo_metal_pipeline(
+            runtime,
+            @"witness_add_opcode_small_trace_columns",
+            error_message,
+            error_message_len
+        );
+        if (pipeline == nil) {
+            return false;
+        }
+
+        id<MTLBuffer> addr_buffer = [runtime.device
+            newBufferWithLength:39u * sizeof(uint64_t)
+            options:MTLResourceStorageModeShared];
+        if (addr_buffer == nil) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"witness_add_opcode_small_trace_columns: failed to allocate address buffer.");
+            return false;
+        }
+        uint64_t *addrs = (uint64_t *)addr_buffer.contents;
+        for (NSUInteger i = 0; i < 39u; ++i) {
+            addrs[i] = stwo_metal_buffer_box(trace_col_ptrs[i]).buffer.gpuAddress;
+        }
+
+        id<MTLCommandBuffer> command_buffer = [runtime.queue commandBuffer];
+        if (command_buffer == nil) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"Failed to create Metal command buffer.");
+            return false;
+        }
+
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        if (encoder == nil) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"Failed to create Metal compute encoder.");
+            return false;
+        }
+
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:inputs.buffer offset:0 atIndex:0];
+        [encoder setBuffer:address_to_id.buffer offset:0 atIndex:1];
+        [encoder setBuffer:big_values.buffer offset:0 atIndex:2];
+        [encoder setBuffer:small_values.buffer offset:0 atIndex:3];
+        [encoder setBuffer:addr_buffer offset:0 atIndex:4];
+        [encoder setBytes:&n_rows length:sizeof(n_rows) atIndex:5];
+        [encoder setBytes:&column_length length:sizeof(column_length) atIndex:6];
+        for (NSUInteger i = 0; i < 39u; ++i) {
+            [encoder useResource:stwo_metal_buffer_box(trace_col_ptrs[i]).buffer usage:MTLResourceUsageWrite];
+        }
+
+        MTLSize grid_size = MTLSizeMake(column_len, 1, 1);
+        MTLSize threadgroup_size = MTLSizeMake(
+            stwo_metal_threads_per_group(pipeline), 1, 1);
+        [encoder dispatchThreads:grid_size threadsPerThreadgroup:threadgroup_size];
+        [encoder endEncoding];
+
+        [command_buffer commit];
+        if (!wait_until_completed) {
+            return true;
+        }
+        [command_buffer waitUntilCompleted];
+
+        if (command_buffer.status == MTLCommandBufferStatusError) {
+            stwo_metal_write_error(error_message, error_message_len,
+                command_buffer.error.localizedDescription
+                    ?: @"witness_add_opcode_small_trace_columns kernel failed.");
+            return false;
+        }
+
+        return true;
+    }
+}
+
+bool stwo_metal_witness_assert_eq_opcode_trace(
+    void *runtime_ptr,
+    void *inputs_ptr,
+    void *address_to_id_ptr,
+    void *big_values_ptr,
+    void *small_values_ptr,
+    void *trace_ptr,
+    uint32_t n_rows,
+    uint32_t column_length,
+    char *error_message,
+    size_t error_message_len
+) {
+    @autoreleasepool {
+        StwoMetalRuntimeBox *runtime = stwo_metal_runtime_box(runtime_ptr);
+        StwoMetalBufferBox *inputs = stwo_metal_buffer_box(inputs_ptr);
+        StwoMetalBufferBox *address_to_id = stwo_metal_buffer_box(address_to_id_ptr);
+        StwoMetalBufferBox *big_values = stwo_metal_buffer_box(big_values_ptr);
+        StwoMetalBufferBox *small_values = stwo_metal_buffer_box(small_values_ptr);
+        StwoMetalBufferBox *trace = stwo_metal_buffer_box(trace_ptr);
+
+        if (inputs.len < (NSUInteger)n_rows * 3u) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"witness_assert_eq_opcode: inputs buffer length mismatch.");
+            return false;
+        }
+        NSUInteger expected_trace_len = (NSUInteger)12u * (NSUInteger)column_length;
+        if (trace.len != expected_trace_len) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"witness_assert_eq_opcode: trace output buffer length mismatch.");
+            return false;
+        }
+
+        id<MTLComputePipelineState> pipeline = stwo_metal_pipeline(
+            runtime,
+            @"witness_assert_eq_opcode_trace",
+            error_message,
+            error_message_len
+        );
+        if (pipeline == nil) {
+            return false;
+        }
+
+        id<MTLCommandBuffer> command_buffer = [runtime.queue commandBuffer];
+        if (command_buffer == nil) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"Failed to create Metal command buffer.");
+            return false;
+        }
+
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        if (encoder == nil) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"Failed to create Metal compute encoder.");
+            return false;
+        }
+
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:inputs.buffer offset:0 atIndex:0];
+        [encoder setBuffer:address_to_id.buffer offset:0 atIndex:1];
+        [encoder setBuffer:big_values.buffer offset:0 atIndex:2];
+        [encoder setBuffer:small_values.buffer offset:0 atIndex:3];
+        [encoder setBuffer:trace.buffer offset:0 atIndex:4];
+        [encoder setBytes:&n_rows length:sizeof(n_rows) atIndex:5];
+        [encoder setBytes:&column_length length:sizeof(column_length) atIndex:6];
+
+        MTLSize grid_size = MTLSizeMake((NSUInteger)column_length, 1, 1);
+        MTLSize threadgroup_size = MTLSizeMake(
+            stwo_metal_threads_per_group(pipeline), 1, 1);
+        [encoder dispatchThreads:grid_size threadsPerThreadgroup:threadgroup_size];
+        [encoder endEncoding];
+
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+
+        if (command_buffer.status == MTLCommandBufferStatusError) {
+            stwo_metal_write_error(error_message, error_message_len,
+                command_buffer.error.localizedDescription
+                    ?: @"witness_assert_eq_opcode_trace kernel failed.");
+            return false;
+        }
+
+        return true;
+    }
+}
+
+bool stwo_metal_witness_assert_eq_opcode_trace_columns(
+    void *runtime_ptr,
+    void *inputs_ptr,
+    void *address_to_id_ptr,
+    void *big_values_ptr,
+    void *small_values_ptr,
+    void **trace_col_ptrs,
+    uint32_t n_rows,
+    uint32_t column_length,
+    bool wait_until_completed,
+    char *error_message,
+    size_t error_message_len
+) {
+    @autoreleasepool {
+        StwoMetalRuntimeBox *runtime = stwo_metal_runtime_box(runtime_ptr);
+        StwoMetalBufferBox *inputs = stwo_metal_buffer_box(inputs_ptr);
+        StwoMetalBufferBox *address_to_id = stwo_metal_buffer_box(address_to_id_ptr);
+        StwoMetalBufferBox *big_values = stwo_metal_buffer_box(big_values_ptr);
+        StwoMetalBufferBox *small_values = stwo_metal_buffer_box(small_values_ptr);
+
+        if (inputs.len < (NSUInteger)n_rows * 3u) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"witness_assert_eq_opcode_trace_columns: inputs buffer length mismatch.");
+            return false;
+        }
+        if (trace_col_ptrs == NULL) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"witness_assert_eq_opcode_trace_columns: missing output column buffers.");
+            return false;
+        }
+
+        NSUInteger column_len = (NSUInteger)column_length;
+        for (NSUInteger i = 0; i < 12u; ++i) {
+            if (trace_col_ptrs[i] == NULL) {
+                stwo_metal_write_error(error_message, error_message_len,
+                    @"witness_assert_eq_opcode_trace_columns: null output column buffer.");
+                return false;
+            }
+            StwoMetalBufferBox *col = stwo_metal_buffer_box(trace_col_ptrs[i]);
+            if (col.len != column_len) {
+                stwo_metal_write_error(error_message, error_message_len,
+                    @"witness_assert_eq_opcode_trace_columns: output column length mismatch.");
+                return false;
+            }
+        }
+
+        id<MTLComputePipelineState> pipeline = stwo_metal_pipeline(
+            runtime,
+            @"witness_assert_eq_opcode_trace_columns",
+            error_message,
+            error_message_len
+        );
+        if (pipeline == nil) {
+            return false;
+        }
+
+        id<MTLBuffer> addr_buffer = [runtime.device
+            newBufferWithLength:12u * sizeof(uint64_t)
+            options:MTLResourceStorageModeShared];
+        if (addr_buffer == nil) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"witness_assert_eq_opcode_trace_columns: failed to allocate address buffer.");
+            return false;
+        }
+        uint64_t *addrs = (uint64_t *)addr_buffer.contents;
+        for (NSUInteger i = 0; i < 12u; ++i) {
+            addrs[i] = stwo_metal_buffer_box(trace_col_ptrs[i]).buffer.gpuAddress;
+        }
+
+        id<MTLCommandBuffer> command_buffer = [runtime.queue commandBuffer];
+        if (command_buffer == nil) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"Failed to create Metal command buffer.");
+            return false;
+        }
+
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        if (encoder == nil) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"Failed to create Metal compute encoder.");
+            return false;
+        }
+
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:inputs.buffer offset:0 atIndex:0];
+        [encoder setBuffer:address_to_id.buffer offset:0 atIndex:1];
+        [encoder setBuffer:big_values.buffer offset:0 atIndex:2];
+        [encoder setBuffer:small_values.buffer offset:0 atIndex:3];
+        [encoder setBuffer:addr_buffer offset:0 atIndex:4];
+        [encoder setBytes:&n_rows length:sizeof(n_rows) atIndex:5];
+        [encoder setBytes:&column_length length:sizeof(column_length) atIndex:6];
+        for (NSUInteger i = 0; i < 12u; ++i) {
+            [encoder useResource:stwo_metal_buffer_box(trace_col_ptrs[i]).buffer usage:MTLResourceUsageWrite];
+        }
+
+        MTLSize grid_size = MTLSizeMake(column_len, 1, 1);
+        MTLSize threadgroup_size = MTLSizeMake(
+            stwo_metal_threads_per_group(pipeline), 1, 1);
+        [encoder dispatchThreads:grid_size threadsPerThreadgroup:threadgroup_size];
+        [encoder endEncoding];
+
+        [command_buffer commit];
+        if (!wait_until_completed) {
+            return true;
+        }
+        [command_buffer waitUntilCompleted];
+
+        if (command_buffer.status == MTLCommandBufferStatusError) {
+            stwo_metal_write_error(error_message, error_message_len,
+                command_buffer.error.localizedDescription
+                    ?: @"witness_assert_eq_opcode_trace_columns kernel failed.");
+            return false;
+        }
+
+        return true;
+    }
+}
+
+bool stwo_metal_witness_add_opcode_small_interaction_raw(
+    void *runtime_ptr,
+    void *trace_ptr,
+    void **num_col_ptrs,
+    void **denom_col_ptrs,
+    void *alpha_powers_ptr,
+    const uint32_t *z_limbs,
+    uint32_t n_rows,
+    uint32_t column_length,
+    bool wait_until_completed,
+    char *error_message,
+    size_t error_message_len
+) {
+    @autoreleasepool {
+        StwoMetalRuntimeBox *runtime = stwo_metal_runtime_box(runtime_ptr);
+        StwoMetalBufferBox *trace = stwo_metal_buffer_box(trace_ptr);
+        StwoMetalBufferBox *alpha_powers = stwo_metal_buffer_box(alpha_powers_ptr);
+
+        if (num_col_ptrs == NULL || denom_col_ptrs == NULL) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"witness_add_opcode_small_interaction_raw: missing column buffers.");
+            return false;
+        }
+        if (z_limbs == NULL) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"witness_add_opcode_small_interaction_raw: missing z limbs.");
+            return false;
+        }
+        if (alpha_powers.len < 120u) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"witness_add_opcode_small_interaction_raw: alpha_powers must contain at least 30 QM31 values.");
+            return false;
+        }
+
+        NSUInteger column_len = (NSUInteger)column_length;
+        if (trace.len != 39u * column_len) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"witness_add_opcode_small_interaction_raw: trace length must be 39 * column_length.");
+            return false;
+        }
+        for (NSUInteger i = 0; i < 20u; ++i) {
+            if (num_col_ptrs[i] == NULL) {
+                stwo_metal_write_error(error_message, error_message_len,
+                    @"witness_add_opcode_small_interaction_raw: null numerator column.");
+                return false;
+            }
+            StwoMetalBufferBox *num_col = stwo_metal_buffer_box(num_col_ptrs[i]);
+            if (num_col.len != column_len) {
+                stwo_metal_write_error(error_message, error_message_len,
+                    @"witness_add_opcode_small_interaction_raw: numerator columns must match column_length.");
+                return false;
+            }
+        }
+        for (NSUInteger i = 0; i < 5u; ++i) {
+            if (denom_col_ptrs[i] == NULL) {
+                stwo_metal_write_error(error_message, error_message_len,
+                    @"witness_add_opcode_small_interaction_raw: null denominator column.");
+                return false;
+            }
+            StwoMetalBufferBox *denom_col = stwo_metal_buffer_box(denom_col_ptrs[i]);
+            if (denom_col.len != column_len * 4u) {
+                stwo_metal_write_error(error_message, error_message_len,
+                    @"witness_add_opcode_small_interaction_raw: denominator columns must have 4 * column_length entries.");
+                return false;
+            }
+        }
+
+        id<MTLComputePipelineState> pipeline = stwo_metal_pipeline(
+            runtime,
+            @"witness_add_opcode_small_interaction_raw",
+            error_message,
+            error_message_len
+        );
+        if (pipeline == nil) {
+            return false;
+        }
+
+        id<MTLBuffer> num_addr_buffer = [runtime.device
+            newBufferWithLength:20u * sizeof(uint64_t)
+            options:MTLResourceStorageModeShared];
+        id<MTLBuffer> denom_addr_buffer = [runtime.device
+            newBufferWithLength:5u * sizeof(uint64_t)
+            options:MTLResourceStorageModeShared];
+        if (num_addr_buffer == nil || denom_addr_buffer == nil) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"Failed to allocate address buffers for add_opcode_small interaction.");
+            return false;
+        }
+
+        uint64_t *num_addrs = (uint64_t *)num_addr_buffer.contents;
+        uint64_t *denom_addrs = (uint64_t *)denom_addr_buffer.contents;
+        for (NSUInteger i = 0; i < 20u; ++i) {
+            num_addrs[i] = stwo_metal_buffer_box(num_col_ptrs[i]).buffer.gpuAddress;
+        }
+        for (NSUInteger i = 0; i < 5u; ++i) {
+            denom_addrs[i] = stwo_metal_buffer_box(denom_col_ptrs[i]).buffer.gpuAddress;
+        }
+
+        id<MTLCommandBuffer> command_buffer = [runtime.queue commandBuffer];
+        if (command_buffer == nil) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"Failed to create Metal command buffer.");
+            return false;
+        }
+
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        if (encoder == nil) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"Failed to create Metal compute encoder.");
+            return false;
+        }
+
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:trace.buffer offset:0 atIndex:0];
+        [encoder setBuffer:num_addr_buffer offset:0 atIndex:1];
+        [encoder setBuffer:denom_addr_buffer offset:0 atIndex:2];
+        [encoder setBuffer:alpha_powers.buffer offset:0 atIndex:3];
+        [encoder setBytes:z_limbs length:4u * sizeof(uint32_t) atIndex:4];
+        [encoder setBytes:&n_rows length:sizeof(n_rows) atIndex:5];
+        [encoder setBytes:&column_length length:sizeof(column_length) atIndex:6];
+        [encoder useResource:trace.buffer usage:MTLResourceUsageRead];
+        for (NSUInteger i = 0; i < 20u; ++i) {
+            [encoder useResource:stwo_metal_buffer_box(num_col_ptrs[i]).buffer usage:MTLResourceUsageWrite];
+        }
+        for (NSUInteger i = 0; i < 5u; ++i) {
+            [encoder useResource:stwo_metal_buffer_box(denom_col_ptrs[i]).buffer usage:MTLResourceUsageWrite];
+        }
+
+        MTLSize grid_size = MTLSizeMake(column_len, 1, 1);
+        MTLSize threadgroup_size = MTLSizeMake(
+            stwo_metal_threads_per_group(pipeline), 1, 1);
+        [encoder dispatchThreads:grid_size threadsPerThreadgroup:threadgroup_size];
+        [encoder endEncoding];
+
+        [command_buffer commit];
+        if (!wait_until_completed) {
+            return true;
+        }
+        [command_buffer waitUntilCompleted];
+
+        if (command_buffer.status == MTLCommandBufferStatusError) {
+            stwo_metal_write_error(error_message, error_message_len,
+                command_buffer.error.localizedDescription
+                    ?: @"witness_add_opcode_small_interaction_raw kernel failed.");
+            return false;
+        }
+
+        return true;
+    }
+}
+
+bool stwo_metal_witness_add_opcode_small_interaction_raw_columns(
+    void *runtime_ptr,
+    void **trace_col_ptrs,
+    void **num_col_ptrs,
+    void **denom_col_ptrs,
+    void *alpha_powers_ptr,
+    const uint32_t *z_limbs,
+    uint32_t n_rows,
+    uint32_t column_length,
+    bool wait_until_completed,
+    char *error_message,
+    size_t error_message_len
+) {
+    @autoreleasepool {
+        StwoMetalRuntimeBox *runtime = stwo_metal_runtime_box(runtime_ptr);
+        StwoMetalBufferBox *alpha_powers = stwo_metal_buffer_box(alpha_powers_ptr);
+
+        if (trace_col_ptrs == NULL || num_col_ptrs == NULL || denom_col_ptrs == NULL) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"witness_add_opcode_small_interaction_raw_columns: missing column buffers.");
+            return false;
+        }
+        if (z_limbs == NULL) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"witness_add_opcode_small_interaction_raw_columns: missing z limbs.");
+            return false;
+        }
+        if (alpha_powers.len < 120u) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"witness_add_opcode_small_interaction_raw_columns: alpha_powers must contain at least 30 QM31 values.");
+            return false;
+        }
+
+        NSUInteger column_len = (NSUInteger)column_length;
+        for (NSUInteger i = 0; i < 39u; ++i) {
+            if (trace_col_ptrs[i] == NULL) {
+                stwo_metal_write_error(error_message, error_message_len,
+                    @"witness_add_opcode_small_interaction_raw_columns: null trace column.");
+                return false;
+            }
+            StwoMetalBufferBox *trace_col = stwo_metal_buffer_box(trace_col_ptrs[i]);
+            if (trace_col.len != column_len) {
+                stwo_metal_write_error(error_message, error_message_len,
+                    @"witness_add_opcode_small_interaction_raw_columns: trace columns must match column_length.");
+                return false;
+            }
+        }
+        for (NSUInteger i = 0; i < 20u; ++i) {
+            if (num_col_ptrs[i] == NULL) {
+                stwo_metal_write_error(error_message, error_message_len,
+                    @"witness_add_opcode_small_interaction_raw_columns: null numerator column.");
+                return false;
+            }
+            StwoMetalBufferBox *num_col = stwo_metal_buffer_box(num_col_ptrs[i]);
+            if (num_col.len != column_len) {
+                stwo_metal_write_error(error_message, error_message_len,
+                    @"witness_add_opcode_small_interaction_raw_columns: numerator columns must match column_length.");
+                return false;
+            }
+        }
+        for (NSUInteger i = 0; i < 5u; ++i) {
+            if (denom_col_ptrs[i] == NULL) {
+                stwo_metal_write_error(error_message, error_message_len,
+                    @"witness_add_opcode_small_interaction_raw_columns: null denominator column.");
+                return false;
+            }
+            StwoMetalBufferBox *denom_col = stwo_metal_buffer_box(denom_col_ptrs[i]);
+            if (denom_col.len != column_len * 4u) {
+                stwo_metal_write_error(error_message, error_message_len,
+                    @"witness_add_opcode_small_interaction_raw_columns: denominator columns must have 4 * column_length entries.");
+                return false;
+            }
+        }
+
+        id<MTLComputePipelineState> pipeline = stwo_metal_pipeline(
+            runtime,
+            @"witness_add_opcode_small_interaction_raw_columns",
+            error_message,
+            error_message_len
+        );
+        if (pipeline == nil) {
+            return false;
+        }
+
+        id<MTLBuffer> trace_addr_buffer = [runtime.device
+            newBufferWithLength:39u * sizeof(uint64_t)
+            options:MTLResourceStorageModeShared];
+        id<MTLBuffer> num_addr_buffer = [runtime.device
+            newBufferWithLength:20u * sizeof(uint64_t)
+            options:MTLResourceStorageModeShared];
+        id<MTLBuffer> denom_addr_buffer = [runtime.device
+            newBufferWithLength:5u * sizeof(uint64_t)
+            options:MTLResourceStorageModeShared];
+        if (trace_addr_buffer == nil || num_addr_buffer == nil || denom_addr_buffer == nil) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"Failed to allocate address buffers for add_opcode_small column interaction.");
+            return false;
+        }
+
+        uint64_t *trace_addrs = (uint64_t *)trace_addr_buffer.contents;
+        uint64_t *num_addrs = (uint64_t *)num_addr_buffer.contents;
+        uint64_t *denom_addrs = (uint64_t *)denom_addr_buffer.contents;
+        for (NSUInteger i = 0; i < 39u; ++i) {
+            trace_addrs[i] = stwo_metal_buffer_box(trace_col_ptrs[i]).buffer.gpuAddress;
+        }
+        for (NSUInteger i = 0; i < 20u; ++i) {
+            num_addrs[i] = stwo_metal_buffer_box(num_col_ptrs[i]).buffer.gpuAddress;
+        }
+        for (NSUInteger i = 0; i < 5u; ++i) {
+            denom_addrs[i] = stwo_metal_buffer_box(denom_col_ptrs[i]).buffer.gpuAddress;
+        }
+
+        id<MTLCommandBuffer> command_buffer = [runtime.queue commandBuffer];
+        if (command_buffer == nil) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"Failed to create Metal command buffer.");
+            return false;
+        }
+
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        if (encoder == nil) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"Failed to create Metal compute encoder.");
+            return false;
+        }
+
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:trace_addr_buffer offset:0 atIndex:0];
+        [encoder setBuffer:num_addr_buffer offset:0 atIndex:1];
+        [encoder setBuffer:denom_addr_buffer offset:0 atIndex:2];
+        [encoder setBuffer:alpha_powers.buffer offset:0 atIndex:3];
+        [encoder setBytes:z_limbs length:4u * sizeof(uint32_t) atIndex:4];
+        [encoder setBytes:&n_rows length:sizeof(n_rows) atIndex:5];
+        [encoder setBytes:&column_length length:sizeof(column_length) atIndex:6];
+        for (NSUInteger i = 0; i < 39u; ++i) {
+            [encoder useResource:stwo_metal_buffer_box(trace_col_ptrs[i]).buffer usage:MTLResourceUsageRead];
+        }
+        for (NSUInteger i = 0; i < 20u; ++i) {
+            [encoder useResource:stwo_metal_buffer_box(num_col_ptrs[i]).buffer usage:MTLResourceUsageWrite];
+        }
+        for (NSUInteger i = 0; i < 5u; ++i) {
+            [encoder useResource:stwo_metal_buffer_box(denom_col_ptrs[i]).buffer usage:MTLResourceUsageWrite];
+        }
+
+        MTLSize grid_size = MTLSizeMake(column_len, 1, 1);
+        MTLSize threadgroup_size = MTLSizeMake(
+            stwo_metal_threads_per_group(pipeline), 1, 1);
+        [encoder dispatchThreads:grid_size threadsPerThreadgroup:threadgroup_size];
+        [encoder endEncoding];
+
+        [command_buffer commit];
+        if (!wait_until_completed) {
+            return true;
+        }
+        [command_buffer waitUntilCompleted];
+
+        if (command_buffer.status == MTLCommandBufferStatusError) {
+            stwo_metal_write_error(error_message, error_message_len,
+                command_buffer.error.localizedDescription
+                    ?: @"witness_add_opcode_small_interaction_raw_columns kernel failed.");
+            return false;
+        }
+
+        return true;
+    }
+}
+
+bool stwo_metal_witness_assert_eq_opcode_interaction_raw(
+    void *runtime_ptr,
+    void *trace_ptr,
+    void **num_col_ptrs,
+    void **denom_col_ptrs,
+    void *alpha_powers_ptr,
+    const uint32_t *z_limbs,
+    uint32_t n_rows,
+    uint32_t column_length,
+    bool wait_until_completed,
+    char *error_message,
+    size_t error_message_len
+) {
+    @autoreleasepool {
+        StwoMetalRuntimeBox *runtime = stwo_metal_runtime_box(runtime_ptr);
+        StwoMetalBufferBox *trace = stwo_metal_buffer_box(trace_ptr);
+        StwoMetalBufferBox *alpha_powers = stwo_metal_buffer_box(alpha_powers_ptr);
+
+        if (num_col_ptrs == NULL || denom_col_ptrs == NULL) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"witness_assert_eq_opcode_interaction_raw: missing column buffers.");
+            return false;
+        }
+        if (z_limbs == NULL) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"witness_assert_eq_opcode_interaction_raw: missing z limbs.");
+            return false;
+        }
+        if (alpha_powers.len < 32u) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"witness_assert_eq_opcode_interaction_raw: alpha_powers must contain at least 8 QM31 values.");
+            return false;
+        }
+
+        NSUInteger column_len = (NSUInteger)column_length;
+        if (trace.len != 12u * column_len) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"witness_assert_eq_opcode_interaction_raw: trace length must be 12 * column_length.");
+            return false;
+        }
+        for (NSUInteger i = 0; i < 12u; ++i) {
+            if (num_col_ptrs[i] == NULL) {
+                stwo_metal_write_error(error_message, error_message_len,
+                    @"witness_assert_eq_opcode_interaction_raw: null numerator column.");
+                return false;
+            }
+            StwoMetalBufferBox *num_col = stwo_metal_buffer_box(num_col_ptrs[i]);
+            if (num_col.len != column_len) {
+                stwo_metal_write_error(error_message, error_message_len,
+                    @"witness_assert_eq_opcode_interaction_raw: numerator columns must match column_length.");
+                return false;
+            }
+        }
+        for (NSUInteger i = 0; i < 3u; ++i) {
+            if (denom_col_ptrs[i] == NULL) {
+                stwo_metal_write_error(error_message, error_message_len,
+                    @"witness_assert_eq_opcode_interaction_raw: null denominator column.");
+                return false;
+            }
+            StwoMetalBufferBox *denom_col = stwo_metal_buffer_box(denom_col_ptrs[i]);
+            if (denom_col.len != column_len * 4u) {
+                stwo_metal_write_error(error_message, error_message_len,
+                    @"witness_assert_eq_opcode_interaction_raw: denominator columns must have 4 * column_length entries.");
+                return false;
+            }
+        }
+
+        id<MTLComputePipelineState> pipeline = stwo_metal_pipeline(
+            runtime,
+            @"witness_assert_eq_opcode_interaction_raw",
+            error_message,
+            error_message_len
+        );
+        if (pipeline == nil) {
+            return false;
+        }
+
+        id<MTLBuffer> num_addr_buffer = [runtime.device
+            newBufferWithLength:12u * sizeof(uint64_t)
+            options:MTLResourceStorageModeShared];
+        id<MTLBuffer> denom_addr_buffer = [runtime.device
+            newBufferWithLength:3u * sizeof(uint64_t)
+            options:MTLResourceStorageModeShared];
+        if (num_addr_buffer == nil || denom_addr_buffer == nil) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"Failed to allocate address buffers for assert_eq_opcode interaction.");
+            return false;
+        }
+
+        uint64_t *num_addrs = (uint64_t *)num_addr_buffer.contents;
+        uint64_t *denom_addrs = (uint64_t *)denom_addr_buffer.contents;
+        for (NSUInteger i = 0; i < 12u; ++i) {
+            num_addrs[i] = stwo_metal_buffer_box(num_col_ptrs[i]).buffer.gpuAddress;
+        }
+        for (NSUInteger i = 0; i < 3u; ++i) {
+            denom_addrs[i] = stwo_metal_buffer_box(denom_col_ptrs[i]).buffer.gpuAddress;
+        }
+
+        id<MTLCommandBuffer> command_buffer = [runtime.queue commandBuffer];
+        if (command_buffer == nil) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"Failed to create Metal command buffer.");
+            return false;
+        }
+
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        if (encoder == nil) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"Failed to create Metal compute encoder.");
+            return false;
+        }
+
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:trace.buffer offset:0 atIndex:0];
+        [encoder setBuffer:num_addr_buffer offset:0 atIndex:1];
+        [encoder setBuffer:denom_addr_buffer offset:0 atIndex:2];
+        [encoder setBuffer:alpha_powers.buffer offset:0 atIndex:3];
+        [encoder setBytes:z_limbs length:4u * sizeof(uint32_t) atIndex:4];
+        [encoder setBytes:&n_rows length:sizeof(n_rows) atIndex:5];
+        [encoder setBytes:&column_length length:sizeof(column_length) atIndex:6];
+        [encoder useResource:trace.buffer usage:MTLResourceUsageRead];
+        for (NSUInteger i = 0; i < 12u; ++i) {
+            [encoder useResource:stwo_metal_buffer_box(num_col_ptrs[i]).buffer usage:MTLResourceUsageWrite];
+        }
+        for (NSUInteger i = 0; i < 3u; ++i) {
+            [encoder useResource:stwo_metal_buffer_box(denom_col_ptrs[i]).buffer usage:MTLResourceUsageWrite];
+        }
+
+        MTLSize grid_size = MTLSizeMake(column_len, 1, 1);
+        MTLSize threadgroup_size = MTLSizeMake(
+            stwo_metal_threads_per_group(pipeline), 1, 1);
+        [encoder dispatchThreads:grid_size threadsPerThreadgroup:threadgroup_size];
+        [encoder endEncoding];
+
+        [command_buffer commit];
+        if (!wait_until_completed) {
+            return true;
+        }
+        [command_buffer waitUntilCompleted];
+
+        if (command_buffer.status == MTLCommandBufferStatusError) {
+            stwo_metal_write_error(error_message, error_message_len,
+                command_buffer.error.localizedDescription
+                    ?: @"witness_assert_eq_opcode_interaction_raw kernel failed.");
+            return false;
+        }
+
+        return true;
+    }
+}
+
+bool stwo_metal_witness_assert_eq_opcode_interaction_raw_columns(
+    void *runtime_ptr,
+    void **trace_col_ptrs,
+    void **num_col_ptrs,
+    void **denom_col_ptrs,
+    void *alpha_powers_ptr,
+    const uint32_t *z_limbs,
+    uint32_t n_rows,
+    uint32_t column_length,
+    bool wait_until_completed,
+    char *error_message,
+    size_t error_message_len
+) {
+    @autoreleasepool {
+        StwoMetalRuntimeBox *runtime = stwo_metal_runtime_box(runtime_ptr);
+        StwoMetalBufferBox *alpha_powers = stwo_metal_buffer_box(alpha_powers_ptr);
+
+        if (trace_col_ptrs == NULL || num_col_ptrs == NULL || denom_col_ptrs == NULL) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"witness_assert_eq_opcode_interaction_raw_columns: missing column buffers.");
+            return false;
+        }
+        if (z_limbs == NULL) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"witness_assert_eq_opcode_interaction_raw_columns: missing z limbs.");
+            return false;
+        }
+        if (alpha_powers.len < 32u) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"witness_assert_eq_opcode_interaction_raw_columns: alpha_powers must contain at least 8 QM31 values.");
+            return false;
+        }
+
+        NSUInteger column_len = (NSUInteger)column_length;
+        for (NSUInteger i = 0; i < 12u; ++i) {
+            if (trace_col_ptrs[i] == NULL) {
+                stwo_metal_write_error(error_message, error_message_len,
+                    @"witness_assert_eq_opcode_interaction_raw_columns: null trace column.");
+                return false;
+            }
+            StwoMetalBufferBox *trace_col = stwo_metal_buffer_box(trace_col_ptrs[i]);
+            if (trace_col.len != column_len) {
+                stwo_metal_write_error(error_message, error_message_len,
+                    @"witness_assert_eq_opcode_interaction_raw_columns: trace columns must match column_length.");
+                return false;
+            }
+        }
+        for (NSUInteger i = 0; i < 12u; ++i) {
+            if (num_col_ptrs[i] == NULL) {
+                stwo_metal_write_error(error_message, error_message_len,
+                    @"witness_assert_eq_opcode_interaction_raw_columns: null numerator column.");
+                return false;
+            }
+            StwoMetalBufferBox *num_col = stwo_metal_buffer_box(num_col_ptrs[i]);
+            if (num_col.len != column_len) {
+                stwo_metal_write_error(error_message, error_message_len,
+                    @"witness_assert_eq_opcode_interaction_raw_columns: numerator columns must match column_length.");
+                return false;
+            }
+        }
+        for (NSUInteger i = 0; i < 3u; ++i) {
+            if (denom_col_ptrs[i] == NULL) {
+                stwo_metal_write_error(error_message, error_message_len,
+                    @"witness_assert_eq_opcode_interaction_raw_columns: null denominator column.");
+                return false;
+            }
+            StwoMetalBufferBox *denom_col = stwo_metal_buffer_box(denom_col_ptrs[i]);
+            if (denom_col.len != column_len * 4u) {
+                stwo_metal_write_error(error_message, error_message_len,
+                    @"witness_assert_eq_opcode_interaction_raw_columns: denominator columns must have 4 * column_length entries.");
+                return false;
+            }
+        }
+
+        id<MTLComputePipelineState> pipeline = stwo_metal_pipeline(
+            runtime,
+            @"witness_assert_eq_opcode_interaction_raw_columns",
+            error_message,
+            error_message_len
+        );
+        if (pipeline == nil) {
+            return false;
+        }
+
+        id<MTLBuffer> trace_addr_buffer = [runtime.device
+            newBufferWithLength:12u * sizeof(uint64_t)
+            options:MTLResourceStorageModeShared];
+        id<MTLBuffer> num_addr_buffer = [runtime.device
+            newBufferWithLength:12u * sizeof(uint64_t)
+            options:MTLResourceStorageModeShared];
+        id<MTLBuffer> denom_addr_buffer = [runtime.device
+            newBufferWithLength:3u * sizeof(uint64_t)
+            options:MTLResourceStorageModeShared];
+        if (trace_addr_buffer == nil || num_addr_buffer == nil || denom_addr_buffer == nil) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"Failed to allocate address buffers for assert_eq_opcode column interaction.");
+            return false;
+        }
+
+        uint64_t *trace_addrs = (uint64_t *)trace_addr_buffer.contents;
+        uint64_t *num_addrs = (uint64_t *)num_addr_buffer.contents;
+        uint64_t *denom_addrs = (uint64_t *)denom_addr_buffer.contents;
+        for (NSUInteger i = 0; i < 12u; ++i) {
+            trace_addrs[i] = stwo_metal_buffer_box(trace_col_ptrs[i]).buffer.gpuAddress;
+            num_addrs[i] = stwo_metal_buffer_box(num_col_ptrs[i]).buffer.gpuAddress;
+        }
+        for (NSUInteger i = 0; i < 3u; ++i) {
+            denom_addrs[i] = stwo_metal_buffer_box(denom_col_ptrs[i]).buffer.gpuAddress;
+        }
+
+        id<MTLCommandBuffer> command_buffer = [runtime.queue commandBuffer];
+        if (command_buffer == nil) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"Failed to create Metal command buffer.");
+            return false;
+        }
+
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        if (encoder == nil) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"Failed to create Metal compute encoder.");
+            return false;
+        }
+
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:trace_addr_buffer offset:0 atIndex:0];
+        [encoder setBuffer:num_addr_buffer offset:0 atIndex:1];
+        [encoder setBuffer:denom_addr_buffer offset:0 atIndex:2];
+        [encoder setBuffer:alpha_powers.buffer offset:0 atIndex:3];
+        [encoder setBytes:z_limbs length:4u * sizeof(uint32_t) atIndex:4];
+        [encoder setBytes:&n_rows length:sizeof(n_rows) atIndex:5];
+        [encoder setBytes:&column_length length:sizeof(column_length) atIndex:6];
+        for (NSUInteger i = 0; i < 12u; ++i) {
+            [encoder useResource:stwo_metal_buffer_box(trace_col_ptrs[i]).buffer usage:MTLResourceUsageRead];
+            [encoder useResource:stwo_metal_buffer_box(num_col_ptrs[i]).buffer usage:MTLResourceUsageWrite];
+        }
+        for (NSUInteger i = 0; i < 3u; ++i) {
+            [encoder useResource:stwo_metal_buffer_box(denom_col_ptrs[i]).buffer usage:MTLResourceUsageWrite];
+        }
+
+        MTLSize grid_size = MTLSizeMake(column_len, 1, 1);
+        MTLSize threadgroup_size = MTLSizeMake(
+            stwo_metal_threads_per_group(pipeline), 1, 1);
+        [encoder dispatchThreads:grid_size threadsPerThreadgroup:threadgroup_size];
+        [encoder endEncoding];
+
+        [command_buffer commit];
+        if (!wait_until_completed) {
+            return true;
+        }
+        [command_buffer waitUntilCompleted];
+
+        if (command_buffer.status == MTLCommandBufferStatusError) {
+            stwo_metal_write_error(error_message, error_message_len,
+                command_buffer.error.localizedDescription
+                    ?: @"witness_assert_eq_opcode_interaction_raw_columns kernel failed.");
             return false;
         }
 
@@ -8585,7 +10977,7 @@ bool stwo_metal_witness_ret_opcode_trace(
         StwoMetalBufferBox *small_values = stwo_metal_buffer_box(small_values_ptr);
         StwoMetalBufferBox *trace = stwo_metal_buffer_box(trace_ptr);
 
-        if (inputs.len < (NSUInteger)n_rows * 3u) {
+        if (inputs.len < (NSUInteger)column_length * 3u) {
             stwo_metal_write_error(error_message, error_message_len,
                 @"witness_ret_opcode: inputs buffer length mismatch.");
             return false;
@@ -8643,6 +11035,273 @@ bool stwo_metal_witness_ret_opcode_trace(
             stwo_metal_write_error(error_message, error_message_len,
                 command_buffer.error.localizedDescription
                     ?: @"witness_ret_opcode_trace kernel failed.");
+            return false;
+        }
+
+        return true;
+    }
+}
+
+bool stwo_metal_witness_ret_opcode_trace_columns(
+    void *runtime_ptr,
+    void *inputs_ptr,
+    void *address_to_id_ptr,
+    void *big_values_ptr,
+    void *small_values_ptr,
+    void **trace_col_ptrs,
+    uint32_t n_rows,
+    uint32_t column_length,
+    bool wait_until_completed,
+    char *error_message,
+    size_t error_message_len
+) {
+    @autoreleasepool {
+        StwoMetalRuntimeBox *runtime = stwo_metal_runtime_box(runtime_ptr);
+        StwoMetalBufferBox *inputs = stwo_metal_buffer_box(inputs_ptr);
+        StwoMetalBufferBox *address_to_id = stwo_metal_buffer_box(address_to_id_ptr);
+        StwoMetalBufferBox *big_values = stwo_metal_buffer_box(big_values_ptr);
+        StwoMetalBufferBox *small_values = stwo_metal_buffer_box(small_values_ptr);
+
+        if (inputs.len < (NSUInteger)column_length * 3u) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"witness_ret_opcode_trace_columns: inputs buffer length mismatch.");
+            return false;
+        }
+        if (trace_col_ptrs == NULL) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"witness_ret_opcode_trace_columns: missing output column buffers.");
+            return false;
+        }
+
+        NSUInteger column_len = (NSUInteger)column_length;
+        for (NSUInteger i = 0; i < 16u; ++i) {
+            if (trace_col_ptrs[i] == NULL) {
+                stwo_metal_write_error(error_message, error_message_len,
+                    @"witness_ret_opcode_trace_columns: null output column buffer.");
+                return false;
+            }
+            StwoMetalBufferBox *col = stwo_metal_buffer_box(trace_col_ptrs[i]);
+            if (col.len != column_len) {
+                stwo_metal_write_error(error_message, error_message_len,
+                    @"witness_ret_opcode_trace_columns: output column length mismatch.");
+                return false;
+            }
+        }
+
+        id<MTLComputePipelineState> pipeline = stwo_metal_pipeline(
+            runtime,
+            @"witness_ret_opcode_trace_columns",
+            error_message,
+            error_message_len
+        );
+        if (pipeline == nil) {
+            return false;
+        }
+
+        id<MTLBuffer> addr_buffer = [runtime.device
+            newBufferWithLength:16u * sizeof(uint64_t)
+            options:MTLResourceStorageModeShared];
+        if (addr_buffer == nil) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"witness_ret_opcode_trace_columns: failed to allocate address buffer.");
+            return false;
+        }
+        uint64_t *addrs = (uint64_t *)addr_buffer.contents;
+        for (NSUInteger i = 0; i < 16u; ++i) {
+            addrs[i] = stwo_metal_buffer_box(trace_col_ptrs[i]).buffer.gpuAddress;
+        }
+
+        id<MTLCommandBuffer> command_buffer = [runtime.queue commandBuffer];
+        if (command_buffer == nil) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"Failed to create Metal command buffer.");
+            return false;
+        }
+
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        if (encoder == nil) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"Failed to create Metal compute encoder.");
+            return false;
+        }
+
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:inputs.buffer offset:0 atIndex:0];
+        [encoder setBuffer:address_to_id.buffer offset:0 atIndex:1];
+        [encoder setBuffer:big_values.buffer offset:0 atIndex:2];
+        [encoder setBuffer:small_values.buffer offset:0 atIndex:3];
+        [encoder setBuffer:addr_buffer offset:0 atIndex:4];
+        [encoder setBytes:&n_rows length:sizeof(n_rows) atIndex:5];
+        [encoder setBytes:&column_length length:sizeof(column_length) atIndex:6];
+        for (NSUInteger i = 0; i < 16u; ++i) {
+            [encoder useResource:stwo_metal_buffer_box(trace_col_ptrs[i]).buffer usage:MTLResourceUsageWrite];
+        }
+
+        MTLSize grid_size = MTLSizeMake(column_len, 1, 1);
+        MTLSize threadgroup_size = MTLSizeMake(
+            stwo_metal_threads_per_group(pipeline), 1, 1);
+        [encoder dispatchThreads:grid_size threadsPerThreadgroup:threadgroup_size];
+        [encoder endEncoding];
+
+        [command_buffer commit];
+        if (!wait_until_completed) {
+            return true;
+        }
+        [command_buffer waitUntilCompleted];
+
+        if (command_buffer.status == MTLCommandBufferStatusError) {
+            stwo_metal_write_error(error_message, error_message_len,
+                command_buffer.error.localizedDescription
+                    ?: @"witness_ret_opcode_trace_columns kernel failed.");
+            return false;
+        }
+
+        return true;
+    }
+}
+
+bool stwo_metal_witness_ret_opcode_interaction_raw(
+    void *runtime_ptr,
+    void **trace_col_ptrs,
+    void **num_col_ptrs,
+    void **denom_col_ptrs,
+    void *alpha_powers_ptr,
+    const uint32_t *z_limbs,
+    uint32_t column_length,
+    bool wait_until_completed,
+    char *error_message,
+    size_t error_message_len
+) {
+    @autoreleasepool {
+        StwoMetalRuntimeBox *runtime = stwo_metal_runtime_box(runtime_ptr);
+        StwoMetalBufferBox *alpha_powers = stwo_metal_buffer_box(alpha_powers_ptr);
+
+        if (trace_col_ptrs == NULL || num_col_ptrs == NULL || denom_col_ptrs == NULL) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"witness_ret_opcode_interaction_raw: missing column buffers.");
+            return false;
+        }
+        if (z_limbs == NULL) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"witness_ret_opcode_interaction_raw: missing z limbs.");
+            return false;
+        }
+        if (alpha_powers.len < 120u) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"witness_ret_opcode_interaction_raw: alpha_powers must contain at least 30 QM31 values.");
+            return false;
+        }
+
+        NSUInteger column_len = (NSUInteger)column_length;
+        for (NSUInteger i = 0; i < 16u; ++i) {
+            if (trace_col_ptrs[i] == NULL || num_col_ptrs[i] == NULL) {
+                stwo_metal_write_error(error_message, error_message_len,
+                    @"witness_ret_opcode_interaction_raw: null trace or numerator column.");
+                return false;
+            }
+            StwoMetalBufferBox *trace_col = stwo_metal_buffer_box(trace_col_ptrs[i]);
+            StwoMetalBufferBox *num_col = stwo_metal_buffer_box(num_col_ptrs[i]);
+            if (trace_col.len != column_len || num_col.len != column_len) {
+                stwo_metal_write_error(error_message, error_message_len,
+                    @"witness_ret_opcode_interaction_raw: trace and numerator columns must match column_length.");
+                return false;
+            }
+        }
+        for (NSUInteger i = 0; i < 4u; ++i) {
+            if (denom_col_ptrs[i] == NULL) {
+                stwo_metal_write_error(error_message, error_message_len,
+                    @"witness_ret_opcode_interaction_raw: null denominator column.");
+                return false;
+            }
+            StwoMetalBufferBox *denom_col = stwo_metal_buffer_box(denom_col_ptrs[i]);
+            if (denom_col.len != column_len * 4u) {
+                stwo_metal_write_error(error_message, error_message_len,
+                    @"witness_ret_opcode_interaction_raw: denominator columns must have 4 * column_length entries.");
+                return false;
+            }
+        }
+
+        id<MTLComputePipelineState> pipeline = stwo_metal_pipeline(
+            runtime,
+            @"witness_ret_opcode_interaction_raw",
+            error_message,
+            error_message_len
+        );
+        if (pipeline == nil) {
+            return false;
+        }
+
+        id<MTLBuffer> trace_addr_buffer = [runtime.device
+            newBufferWithLength:16u * sizeof(uint64_t)
+            options:MTLResourceStorageModeShared];
+        id<MTLBuffer> num_addr_buffer = [runtime.device
+            newBufferWithLength:16u * sizeof(uint64_t)
+            options:MTLResourceStorageModeShared];
+        id<MTLBuffer> denom_addr_buffer = [runtime.device
+            newBufferWithLength:4u * sizeof(uint64_t)
+            options:MTLResourceStorageModeShared];
+        if (trace_addr_buffer == nil || num_addr_buffer == nil || denom_addr_buffer == nil) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"Failed to allocate address buffers for ret opcode interaction.");
+            return false;
+        }
+
+        uint64_t *trace_addrs = (uint64_t *)trace_addr_buffer.contents;
+        uint64_t *num_addrs = (uint64_t *)num_addr_buffer.contents;
+        uint64_t *denom_addrs = (uint64_t *)denom_addr_buffer.contents;
+        for (NSUInteger i = 0; i < 16u; ++i) {
+            trace_addrs[i] = stwo_metal_buffer_box(trace_col_ptrs[i]).buffer.gpuAddress;
+            num_addrs[i] = stwo_metal_buffer_box(num_col_ptrs[i]).buffer.gpuAddress;
+        }
+        for (NSUInteger i = 0; i < 4u; ++i) {
+            denom_addrs[i] = stwo_metal_buffer_box(denom_col_ptrs[i]).buffer.gpuAddress;
+        }
+
+        id<MTLCommandBuffer> command_buffer = [runtime.queue commandBuffer];
+        if (command_buffer == nil) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"Failed to create Metal command buffer.");
+            return false;
+        }
+
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        if (encoder == nil) {
+            stwo_metal_write_error(error_message, error_message_len,
+                @"Failed to create Metal compute encoder.");
+            return false;
+        }
+
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:trace_addr_buffer offset:0 atIndex:0];
+        [encoder setBuffer:num_addr_buffer offset:0 atIndex:1];
+        [encoder setBuffer:denom_addr_buffer offset:0 atIndex:2];
+        [encoder setBuffer:alpha_powers.buffer offset:0 atIndex:3];
+        [encoder setBytes:z_limbs length:4u * sizeof(uint32_t) atIndex:4];
+        [encoder setBytes:&column_length length:sizeof(column_length) atIndex:5];
+        for (NSUInteger i = 0; i < 16u; ++i) {
+            [encoder useResource:stwo_metal_buffer_box(trace_col_ptrs[i]).buffer usage:MTLResourceUsageRead];
+            [encoder useResource:stwo_metal_buffer_box(num_col_ptrs[i]).buffer usage:MTLResourceUsageWrite];
+        }
+        for (NSUInteger i = 0; i < 4u; ++i) {
+            [encoder useResource:stwo_metal_buffer_box(denom_col_ptrs[i]).buffer usage:MTLResourceUsageWrite];
+        }
+
+        MTLSize grid_size = MTLSizeMake((NSUInteger)column_length * 4u, 1, 1);
+        MTLSize threadgroup_size = MTLSizeMake(
+            stwo_metal_threads_per_group(pipeline), 1, 1);
+        [encoder dispatchThreads:grid_size threadsPerThreadgroup:threadgroup_size];
+        [encoder endEncoding];
+
+        [command_buffer commit];
+        if (!wait_until_completed) {
+            return true;
+        }
+        [command_buffer waitUntilCompleted];
+
+        if (command_buffer.status == MTLCommandBufferStatusError) {
+            stwo_metal_write_error(error_message, error_message_len,
+                command_buffer.error.localizedDescription
+                    ?: @"witness_ret_opcode_interaction_raw kernel failed.");
             return false;
         }
 

@@ -890,3 +890,67 @@ pub fn execute_fused_composition_v1(
     )
     .map_err(map_metal)
 }
+
+/// Execute the fused composition kernel after first flattening trace columns
+/// with a GPU blit encoder in the same Metal command buffer.
+pub fn execute_fused_composition_blit_v1(
+    program: &OwnedMetalEvaluationProgramV1,
+    gpu_trace_columns: &[&U32Buffer],
+    interaction_offsets_cpu: &[u32],
+    n_rows: usize,
+    random_coeff_powers_cpu: &[SecureField],
+    denominator_inverses_cpu: &[BaseField],
+    log_n_rows: u32,
+) -> Result<[U32Buffer; 4], MetalEvaluationProgramExecutionError> {
+    let map_metal = |e: MetalError| MetalEvaluationProgramExecutionError::MetalRuntime {
+        message: e.message().to_string(),
+    };
+
+    let hash = program.header().semantic_hash;
+    let cache = jit_fused_shader_cache();
+    let (source, name) = {
+        let mut guard = cache.lock().expect("JIT shader cache mutex poisoned");
+        guard
+            .entry(hash)
+            .or_insert_with(|| {
+                let source = super::shader::compile_v1_to_metal_source_with_fused(program);
+                let name = super::shader::compiled_fused_kernel_name(hash);
+                (source, name)
+            })
+            .clone()
+    };
+
+    let interaction_offsets = U32Buffer::from_slice(interaction_offsets_cpu).map_err(map_metal)?;
+    let preprocessed_values = U32Buffer::zeroed(1).map_err(map_metal)?;
+    let base_params = optional_u32_buffer(&[]).map_err(map_metal)?;
+    let ext_params = optional_u32_buffer(&[]).map_err(map_metal)?;
+    let random_coeff_powers = U32Buffer::from_slice(
+        &random_coeff_powers_cpu
+            .iter()
+            .flat_map(|v| v.to_m31_array().map(|l| l.0))
+            .collect::<Vec<_>>(),
+    )
+    .map_err(map_metal)?;
+    let denom_inv = U32Buffer::from_slice(
+        &denominator_inverses_cpu
+            .iter()
+            .map(|v| v.0)
+            .collect::<Vec<_>>(),
+    )
+    .map_err(map_metal)?;
+
+    U32Buffer::eval_compiled_fused_composition_blit_v1(
+        &source,
+        &name,
+        gpu_trace_columns,
+        &interaction_offsets,
+        &preprocessed_values,
+        &base_params,
+        &ext_params,
+        &random_coeff_powers,
+        &denom_inv,
+        n_rows,
+        log_n_rows,
+    )
+    .map_err(map_metal)
+}

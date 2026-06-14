@@ -67,6 +67,14 @@ impl Column<BaseField> for BaseFieldVec {
         self.get_data(index)
     }
 
+    fn at_many(&self, indices: &[usize]) -> Vec<BaseField> {
+        self.batch_get(indices)
+    }
+
+    fn gather_unreduced(&self, indices: &[usize]) -> Vec<BaseField> {
+        self.batch_get(indices)
+    }
+
     fn set(&mut self, index: usize, value: BaseField) {
         self.set_data(index, value);
     }
@@ -155,6 +163,14 @@ impl Column<Blake2sHash> for Blake2sHashVec {
 
     fn at(&self, index: usize) -> Blake2sHash {
         self.get_data(index)
+    }
+
+    fn at_many(&self, indices: &[usize]) -> Vec<Blake2sHash> {
+        self.batch_get(indices)
+    }
+
+    fn gather_unreduced(&self, indices: &[usize]) -> Vec<Blake2sHash> {
+        self.batch_get(indices)
     }
 
     fn set(&mut self, index: usize, value: Blake2sHash) {

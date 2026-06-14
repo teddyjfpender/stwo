@@ -1,5 +1,7 @@
 use dashmap::DashMap;
 use itertools::Itertools;
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 
 use crate::core::air::{Component, Components};
 use crate::core::fields::m31::BaseField;
@@ -25,6 +27,21 @@ pub trait ComponentProver<B: Backend>: Component {
         trace: &Trace<'_, B>,
         evaluation_accumulator: &mut DomainEvaluationAccumulator<B>,
     );
+
+    /// Optionally prepare a backend constraint-kernel compile for this component:
+    /// do the (cheap, main-thread) lowering/codegen now and return a `Send`
+    /// closure that performs the (expensive) compile when run. Returns `None`
+    /// when there is nothing to precompile (default, and for backends without a
+    /// JIT lane). The returned closures are run in parallel before the sequential
+    /// constraint-evaluation loop, so the one-time per-AIR kernel compile is paid
+    /// once and concurrently rather than serially on the critical path. The split
+    /// (lower here, compile in the closure) keeps `!Sync` component state on the
+    /// calling thread while only owned/`Send` data crosses to the worker threads.
+    /// Best-effort: must never affect correctness — the eval path compiles lazily
+    /// if this did nothing.
+    fn precompile_prepare(&self) -> Option<Box<dyn FnOnce() + Send>> {
+        None
+    }
 }
 
 /// The set of polynomials that make up the trace.
@@ -115,6 +132,20 @@ impl<B: Backend> ComponentProvers<'_, B> {
             total_constraints,
             evaluation_mode,
         );
+        // Parallel kernel warmup: backends with a JIT constraint lane compile each
+        // component's fused kernel once (per AIR + arch, disk-cached) — a cold
+        // compile is minutes per EC/hash component and was the dominant serial
+        // cold-start cost. Lower on this thread (component state is `!Sync`), then
+        // run the owned compile closures concurrently. No-op for non-JIT backends;
+        // the eval loop below is unchanged and remains the source of truth.
+        let precompile_jobs: Vec<Box<dyn FnOnce() + Send>> = self
+            .components
+            .iter()
+            .filter_map(|component| component.precompile_prepare())
+            .collect();
+        if !precompile_jobs.is_empty() {
+            crate::parallel_iter!(precompile_jobs).for_each(|job| job());
+        }
         for component in &self.components {
             component.evaluate_constraint_quotients_on_domain(trace, &mut accumulator)
         }

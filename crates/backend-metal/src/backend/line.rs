@@ -90,7 +90,7 @@ pub fn interpolate_line_polynomial(
     for coord in &mut coords {
         coord.bit_reverse();
         coord
-            .buffer
+            .gpu_buffer_mut()
             .ifft_line_interpolate_in_place(inverse_line_factors.as_ref(), scale_factor)
             .expect("Metal line IFFT interpolation should complete through the native lane");
     }

@@ -68,6 +68,15 @@ impl stwo_constraint_framework::FrameworkBackend for CudaBackend {
             evaluation_accumulator,
         );
     }
+
+    fn precompile_prepare<E: stwo_constraint_framework::FrameworkEval + Sync>(
+        component: &stwo_constraint_framework::FrameworkComponent<E>,
+    ) -> Option<Box<dyn FnOnce() + Send>> {
+        // Warm the JIT constraint kernel: lower/codegen now, return a Send closure
+        // that runs NVRTC. The composition prelude runs these in parallel so the
+        // one-time per-AIR compile is concurrent instead of serial.
+        super::jit::precompile_prepare(component)
+    }
 }
 
 /// Process-wide pinned (page-locked) staging buffer for witness upload.

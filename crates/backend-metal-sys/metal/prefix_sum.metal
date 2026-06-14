@@ -88,6 +88,17 @@ kernel void reduce_sum_m31(
     }
 }
 
+kernel void subtract_m31(
+    device uint *data [[buffer(0)]],
+    constant uint &shift [[buffer(1)]],
+    constant uint &n_elements [[buffer(2)]],
+    uint index [[thread_position_in_grid]]
+) {
+    if (index < n_elements) {
+        data[index] = stwo_metal_m31_sub(data[index], shift);
+    }
+}
+
 /// Sequential inclusive prefix sum with constant subtraction.
 ///
 /// Grid: 1D with exactly 1 thread.

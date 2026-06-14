@@ -146,6 +146,19 @@ pub trait FrameworkBackend: Backend {
         trace: &Trace<'_, Self>,
         evaluation_accumulator: &mut DomainEvaluationAccumulator<Self>,
     );
+
+    /// Optionally prepare a constraint-kernel compile for `component`: do the
+    /// (cheap, caller-thread) lowering/codegen now and return a `Send` closure
+    /// that performs the (expensive) compile when run. Default `None`. GPU
+    /// backends override this to JIT-compile the fused constraint kernel ahead of
+    /// the sequential composition loop, paying the one-time (per AIR + arch)
+    /// compile once and concurrently across components. Best-effort: must never
+    /// affect correctness — the eval path compiles lazily if this did nothing.
+    fn precompile_prepare<E: FrameworkEval + Sync>(
+        _component: &FrameworkComponent<E>,
+    ) -> Option<Box<dyn FnOnce() + Send>> {
+        None
+    }
 }
 
 impl<E: FrameworkEval + Sync, B: FrameworkBackend> ComponentProver<B> for FrameworkComponent<E> {
@@ -155,6 +168,10 @@ impl<E: FrameworkEval + Sync, B: FrameworkBackend> ComponentProver<B> for Framew
         evaluation_accumulator: &mut DomainEvaluationAccumulator<B>,
     ) {
         B::evaluate_constraint_quotients_on_domain(self, trace, evaluation_accumulator);
+    }
+
+    fn precompile_prepare(&self) -> Option<Box<dyn FnOnce() + Send>> {
+        B::precompile_prepare(self)
     }
 }
 

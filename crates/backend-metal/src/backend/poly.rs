@@ -119,7 +119,7 @@ fn coeff_buffer_key(poly: &CircleCoefficients<MetalBackend>) -> usize {
     // opaque identity (FFI pointer address) is a stable cache key for reusing
     // flattened staging across repeated point queries.  This works for both
     // shared and private buffers (host_ptr returns NULL for private).
-    poly.coeffs.buffer.identity()
+    poly.coeffs.gpu_buffer().identity()
 }
 
 fn cached_flat_coeffs_buffer(
@@ -143,7 +143,7 @@ fn cached_flat_coeffs_buffer(
 
     let mut flat_coeffs_buffer = U32Buffer::uninitialized_private(polys.len() * coeffs_len)?;
     for (index, poly) in polys.iter().enumerate() {
-        flat_coeffs_buffer.copy_from_offset(&poly.coeffs.buffer, index * coeffs_len)?;
+        flat_coeffs_buffer.copy_from_offset(poly.coeffs.gpu_buffer(), index * coeffs_len)?;
     }
     let flat_coeffs_buffer = Arc::new(flat_coeffs_buffer);
 
@@ -187,7 +187,7 @@ fn batch_eval_same_size_native(
     };
     let coeffs_buffer = flat_coeffs_buffer
         .as_deref()
-        .unwrap_or(&polys[0].coeffs.buffer);
+        .unwrap_or(polys[0].coeffs.gpu_buffer());
     let result_buffer = coeffs_buffer
         .batch_eval_at_point_base_field(&factors_buffer, coeffs_log_len, polys.len())
         .expect("Metal batched point evaluation should succeed");
@@ -307,7 +307,9 @@ fn evaluate_into_native(
     buffer.copy_from(&extended.coeffs);
 
     let twiddle_tail = tail_twiddle_buffer(buffer.len(), &twiddles.twiddles)?;
-    buffer.buffer.rfft_evaluate_in_place(&twiddle_tail)?;
+    buffer
+        .gpu_buffer_mut()
+        .rfft_evaluate_in_place(&twiddle_tail)?;
     Ok(CircleEvaluation::new(domain, buffer))
 }
 
@@ -326,7 +328,7 @@ fn interpolate_native(
         )));
     }
 
-    let mut values = eval.values.buffer.clone();
+    let mut values = eval.values.into_buffer();
     let inverse_twiddle_tail = tail_twiddle_buffer(values.len(), &twiddles.itwiddles)?;
     let scale_factor = BaseField::from_u32_unchecked(
         values
@@ -574,8 +576,8 @@ impl PolyOps for MetalBackend {
                     let coeff_size = poly_coeffs.coeffs.len();
                     let domain_size = domain.size();
                     buffer
-                        .buffer
-                        .copy_from_offset(&poly_coeffs.coeffs.buffer, 0)
+                        .gpu_buffer_mut()
+                        .copy_from_offset(poly_coeffs.coeffs.gpu_buffer(), 0)
                         .expect("Metal coefficient copy should succeed");
                     let padding = domain_size - coeff_size;
                     if padding > 0 {
@@ -583,7 +585,7 @@ impl PolyOps for MetalBackend {
                             .get(&log_eval_size)
                             .expect("zero pad cache should have entry for this domain size");
                         buffer
-                            .buffer
+                            .gpu_buffer_mut()
                             .copy_range_from(zero_pad, 0, padding, coeff_size)
                             .expect("Metal zero padding copy should succeed");
                     }
@@ -592,7 +594,7 @@ impl PolyOps for MetalBackend {
                         .expect("twiddle cache should have entry for this domain size");
                     // Submit RFFT without blocking — GPU work starts immediately.
                     let handle = buffer
-                        .buffer
+                        .gpu_buffer_mut()
                         .rfft_evaluate_in_place_async(twiddle_tail.as_ref())
                         .expect("Metal RFFT async submit should succeed");
                     (poly_coeffs, buffer, domain, Some(handle))
@@ -740,7 +742,7 @@ impl MetalBackend {
                 .map(|(i, (_, group))| {
                     let coeffs_ref = match &flat_coeffs_owned[i] {
                         Some(arc) => arc.as_ref(),
-                        None => &group[0].1.coeffs.buffer,
+                        None => group[0].1.coeffs.gpu_buffer(),
                     };
                     (coeffs_ref, &factors_owned[i], meta[i].0, meta[i].1)
                 })

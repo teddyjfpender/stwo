@@ -154,6 +154,38 @@ bool compile_kernel(const char *source, const char *kernel_name, uint64_t semant
 
 }  // namespace
 
+// Compile (if not cached) and cache the fused kernel WITHOUT launching it. Used by
+// the parallel pre-compile pass that warms the kernel cache before composition.
+// NVRTC compilation is thread-safe and the disk cache write is atomic, so callers
+// run this concurrently across components; the actual compile happens OUTSIDE the
+// cache mutex (only the map check and insert are locked), so concurrent calls for
+// DIFFERENT kernels parallelize. A rare double-compile of the SAME kernel is benign:
+// the PTX is identical, the disk write is temp+rename atomic, and the second insert
+// is a no-op (its module leaks, bounded by the kernel count — a one-time warmup cost).
+extern "C" bool stwo_cuda_jit_compile(
+    const char *source,
+    const char *kernel_name,
+    uint64_t cache_key
+) {
+    {
+        JitCache &cache = jit_cache();
+        std::lock_guard<std::mutex> guard(cache.mutex);
+        if (cache.functions.find(cache_key) != cache.functions.end()) {
+            return true;
+        }
+    }
+    CUfunction function = nullptr;
+    if (!compile_kernel(source, kernel_name, cache_key, &function)) {
+        return false;
+    }
+    {
+        JitCache &cache = jit_cache();
+        std::lock_guard<std::mutex> guard(cache.mutex);
+        cache.functions.emplace(cache_key, function);
+    }
+    return true;
+}
+
 // Compiles (cached by cache_key = semantic hash mixed with the Rust emitter's
 // CODEGEN_VERSION) and launches the fused constraint kernel. Returns true once the
 // kernel is enqueued on the legacy default stream; false means nothing was launched

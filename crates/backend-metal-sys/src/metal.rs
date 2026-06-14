@@ -30,6 +30,15 @@ pub struct BatchEvalGroupDescriptor {
     pub n_polys: u32,
 }
 
+/// FFI descriptor for one raw-logup fraction-chain column.
+/// Must match `StwoMetalLogupFractionChainDescriptor` in `runtime.m`.
+#[repr(C)]
+pub struct LogupFractionChainDescriptor {
+    pub nums: [*mut c_void; 4],
+    pub denom_packed: *mut c_void,
+    pub prev: [*mut c_void; 4],
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum MetalRuntimeSupport {
     Available,
@@ -1215,6 +1224,139 @@ impl U32Buffer {
         }
     }
 
+    pub fn inclusive_prefix_sum_bit_rev_circle_domain_4col(
+        cols: [&mut Self; 4],
+    ) -> Result<(), MetalError> {
+        let [col0, col1, col2, col3] = cols;
+        assert!(
+            col0.len.is_power_of_two(),
+            "4-column prefix sum requires power-of-two base-field buffers"
+        );
+        assert!(
+            [col1.len, col2.len, col3.len]
+                .into_iter()
+                .all(|len| len == col0.len),
+            "4-column prefix sum coordinate lengths must match"
+        );
+        let runtime = shared_runtime()?;
+        unsafe {
+            ffi::inclusive_prefix_sum_bit_rev_circle_domain_4col_u32(
+                runtime.raw.as_ptr(),
+                [
+                    col0.raw.as_ptr(),
+                    col1.raw.as_ptr(),
+                    col2.raw.as_ptr(),
+                    col3.raw.as_ptr(),
+                ],
+                col0.len.ilog2(),
+                error_buffer_mut_ptr,
+            )
+        }
+    }
+
+    /// One raw logup column's finalize-chain step.
+    ///
+    /// `denom_packed` uses the SIMD PackedSecureField lane layout: for every 16
+    /// rows, 16 a-limbs, then 16 b-limbs, then 16 c-limbs, then 16 d-limbs.
+    /// The numerator coordinate columns are updated in place to
+    /// `numerator / denominator + previous_column`.
+    fn logup_fraction_chain_packed_with_wait(
+        cols: [&mut Self; 4],
+        denom_packed: &Self,
+        prev: Option<[&Self; 4]>,
+        wait_until_completed: bool,
+    ) -> Result<(), MetalError> {
+        let n_elements = cols[0]
+            .len
+            .try_into()
+            .expect("logup fraction-chain element count should fit in u32");
+        assert!(
+            cols.iter().all(|col| col.len == cols[0].len),
+            "logup fraction-chain numerator coordinate lengths must match"
+        );
+        assert_eq!(
+            denom_packed.len,
+            cols[0].len * 4,
+            "logup fraction-chain packed denominator must have 4 u32 limbs per row"
+        );
+
+        let prev_ptrs = if let Some(prev) = prev {
+            assert!(
+                prev.iter().all(|col| col.len == cols[0].len),
+                "logup fraction-chain previous coordinate lengths must match"
+            );
+            [
+                prev[0].raw.as_ptr(),
+                prev[1].raw.as_ptr(),
+                prev[2].raw.as_ptr(),
+                prev[3].raw.as_ptr(),
+            ]
+        } else {
+            [std::ptr::null_mut(); 4]
+        };
+
+        let runtime = shared_runtime()?;
+        unsafe {
+            ffi::logup_fraction_chain_u32x4(
+                runtime.raw.as_ptr(),
+                [
+                    cols[0].raw.as_ptr(),
+                    cols[1].raw.as_ptr(),
+                    cols[2].raw.as_ptr(),
+                    cols[3].raw.as_ptr(),
+                ],
+                denom_packed.raw.as_ptr(),
+                prev_ptrs,
+                n_elements,
+                wait_until_completed,
+                error_buffer_mut_ptr,
+            )
+        }
+    }
+
+    pub fn logup_fraction_chain_packed(
+        cols: [&mut Self; 4],
+        denom_packed: &Self,
+        prev: Option<[&Self; 4]>,
+    ) -> Result<(), MetalError> {
+        Self::logup_fraction_chain_packed_with_wait(cols, denom_packed, prev, true)
+    }
+
+    pub fn logup_fraction_chain_packed_async(
+        cols: [&mut Self; 4],
+        denom_packed: &Self,
+        prev: Option<[&Self; 4]>,
+    ) -> Result<(), MetalError> {
+        Self::logup_fraction_chain_packed_with_wait(cols, denom_packed, prev, false)
+    }
+
+    /// Batched raw-logup fraction-chain steps in one command buffer.
+    ///
+    /// The descriptors must reference live `U32Buffer` objects. This method waits
+    /// for the batch command buffer to complete before returning.
+    pub unsafe fn logup_fraction_chain_packed_batch_raw(
+        descriptors: &[LogupFractionChainDescriptor],
+        n_elements: u32,
+    ) -> Result<(), MetalError> {
+        assert!(
+            !descriptors.is_empty(),
+            "logup fraction-chain batch needs at least one descriptor"
+        );
+        let runtime = shared_runtime()?;
+        unsafe {
+            ffi::logup_fraction_chain_batch_u32x4(
+                runtime.raw.as_ptr(),
+                descriptors.as_ptr(),
+                descriptors
+                    .len()
+                    .try_into()
+                    .expect("logup fraction-chain descriptor count should fit in u32"),
+                n_elements,
+                error_buffer_mut_ptr,
+            )
+        }
+    }
+
     /// Compute M31 sum of 4 coordinate columns via batched GPU parallel reduction.
     /// All 4 reductions in a single command buffer. Returns [sum0, sum1, sum2, sum3].
     pub fn reduce_sum_m31_4col(cols: [&Self; 4]) -> Result<[u32; 4], MetalError> {
@@ -1263,6 +1405,33 @@ impl U32Buffer {
                     cols[3].raw.as_ptr(),
                 ],
                 &cumsum_shifts,
+                n_elements,
+                error_buffer_mut_ptr,
+            )
+        }
+    }
+
+    /// Subtract a constant from each of four M31 coordinate columns in place.
+    pub fn subtract_m31_4col(cols: [&mut Self; 4], shifts: [u32; 4]) -> Result<(), MetalError> {
+        let n_elements: u32 = cols[0]
+            .len
+            .try_into()
+            .expect("subtract_m31_4col element count should fit in u32");
+        assert!(
+            cols.iter().all(|col| col.len == cols[0].len),
+            "subtract_m31_4col coordinate lengths must match"
+        );
+        let runtime = shared_runtime()?;
+        unsafe {
+            ffi::subtract_m31_4col(
+                runtime.raw.as_ptr(),
+                [
+                    cols[0].raw.as_ptr(),
+                    cols[1].raw.as_ptr(),
+                    cols[2].raw.as_ptr(),
+                    cols[3].raw.as_ptr(),
+                ],
+                &shifts,
                 n_elements,
                 error_buffer_mut_ptr,
             )
@@ -1782,6 +1951,84 @@ impl U32Buffer {
         Ok(dst)
     }
 
+    fn witness_memory_id_to_big_trace_columns_with_wait(
+        big_values: &Self,
+        mults: &Self,
+        n_values: u32,
+        column_length: u32,
+        wait_until_completed: bool,
+    ) -> Result<Vec<Self>, MetalError> {
+        assert!(
+            column_length.is_power_of_two(),
+            "column_length must be a power of two"
+        );
+        assert!(
+            n_values as usize <= column_length as usize,
+            "n_values must be <= column_length"
+        );
+        assert_eq!(
+            big_values.len,
+            n_values as usize * 8,
+            "big_values length must be n_values * 8"
+        );
+        assert_eq!(
+            mults.len, n_values as usize,
+            "mults length must be n_values"
+        );
+        let n_trace_columns: usize = 29;
+        let runtime = shared_runtime()?;
+        let output_buffers = (0..n_trace_columns)
+            .map(|_| Self::uninitialized_private(column_length as usize))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut output_ptrs = output_buffers
+            .iter()
+            .map(|buffer| buffer.raw.as_ptr())
+            .collect::<Vec<_>>();
+        unsafe {
+            ffi::witness_memory_id_to_big_trace_columns(
+                runtime.raw.as_ptr(),
+                big_values.raw.as_ptr(),
+                mults.raw.as_ptr(),
+                output_ptrs.as_mut_ptr(),
+                n_values,
+                column_length,
+                wait_until_completed,
+                error_buffer_mut_ptr,
+            )?;
+        }
+        Ok(output_buffers)
+    }
+
+    pub fn witness_memory_id_to_big_trace_columns(
+        big_values: &Self,
+        mults: &Self,
+        n_values: u32,
+        column_length: u32,
+    ) -> Result<Vec<Self>, MetalError> {
+        Self::witness_memory_id_to_big_trace_columns_with_wait(
+            big_values,
+            mults,
+            n_values,
+            column_length,
+            true,
+        )
+    }
+
+    pub fn witness_memory_id_to_big_trace_columns_async(
+        big_values: &Self,
+        mults: &Self,
+        n_values: u32,
+        column_length: u32,
+    ) -> Result<Vec<Self>, MetalError> {
+        Self::witness_memory_id_to_big_trace_columns_with_wait(
+            big_values,
+            mults,
+            n_values,
+            column_length,
+            false,
+        )
+    }
+
     /// Generate the "small" trace for the memory_id_to_big witness component.
     ///
     /// # Arguments
@@ -1837,6 +2084,332 @@ impl U32Buffer {
         Ok(dst)
     }
 
+    fn witness_memory_id_to_big_small_trace_columns_with_wait(
+        small_values: &Self,
+        mults: &Self,
+        n_values: u32,
+        column_length: u32,
+        wait_until_completed: bool,
+    ) -> Result<Vec<Self>, MetalError> {
+        assert!(
+            column_length.is_power_of_two(),
+            "column_length must be a power of two"
+        );
+        assert!(
+            n_values as usize <= column_length as usize,
+            "n_values must be <= column_length"
+        );
+        assert_eq!(
+            small_values.len,
+            n_values as usize * 4,
+            "small_values length must be n_values * 4"
+        );
+        assert_eq!(
+            mults.len, n_values as usize,
+            "mults length must be n_values"
+        );
+        let n_trace_columns: usize = 9;
+        let runtime = shared_runtime()?;
+        let output_buffers = (0..n_trace_columns)
+            .map(|_| Self::uninitialized_private(column_length as usize))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut output_ptrs = output_buffers
+            .iter()
+            .map(|buffer| buffer.raw.as_ptr())
+            .collect::<Vec<_>>();
+        unsafe {
+            ffi::witness_memory_id_to_big_small_trace_columns(
+                runtime.raw.as_ptr(),
+                small_values.raw.as_ptr(),
+                mults.raw.as_ptr(),
+                output_ptrs.as_mut_ptr(),
+                n_values,
+                column_length,
+                wait_until_completed,
+                error_buffer_mut_ptr,
+            )?;
+        }
+        Ok(output_buffers)
+    }
+
+    pub fn witness_memory_id_to_big_small_trace_columns(
+        small_values: &Self,
+        mults: &Self,
+        n_values: u32,
+        column_length: u32,
+    ) -> Result<Vec<Self>, MetalError> {
+        Self::witness_memory_id_to_big_small_trace_columns_with_wait(
+            small_values,
+            mults,
+            n_values,
+            column_length,
+            true,
+        )
+    }
+
+    pub fn witness_memory_id_to_big_small_trace_columns_async(
+        small_values: &Self,
+        mults: &Self,
+        n_values: u32,
+        column_length: u32,
+    ) -> Result<Vec<Self>, MetalError> {
+        Self::witness_memory_id_to_big_small_trace_columns_with_wait(
+            small_values,
+            mults,
+            n_values,
+            column_length,
+            false,
+        )
+    }
+
+    pub fn witness_memory_rc99_count(
+        limb_cols: &[&Self],
+        input_to_row_lut: &Self,
+        column_length: u32,
+        n_pairs: u32,
+        rc_table_size: u32,
+    ) -> Result<Self, MetalError> {
+        assert!(n_pairs > 0, "n_pairs must be non-zero");
+        assert!(
+            limb_cols.len() >= n_pairs as usize * 2,
+            "limb_cols must contain two columns per pair"
+        );
+        assert_eq!(
+            input_to_row_lut.len,
+            1 << 18,
+            "input_to_row_lut must have 2^18 entries"
+        );
+        assert!(rc_table_size > 0, "rc_table_size must be non-zero");
+        for col in limb_cols.iter().take(n_pairs as usize * 2) {
+            assert_eq!(
+                col.len, column_length as usize,
+                "all limb columns must have column_length entries"
+            );
+        }
+        let output_len = 8usize
+            .checked_mul(rc_table_size as usize)
+            .expect("rc99 count table output length should fit in usize");
+        let runtime = shared_runtime()?;
+        let counts = Self::zeroed(output_len)?;
+        let mut limb_ptrs = limb_cols
+            .iter()
+            .take(n_pairs as usize * 2)
+            .map(|buffer| buffer.raw.as_ptr())
+            .collect::<Vec<_>>();
+        unsafe {
+            ffi::witness_memory_rc99_count(
+                runtime.raw.as_ptr(),
+                limb_ptrs.as_mut_ptr(),
+                input_to_row_lut.raw.as_ptr(),
+                counts.raw.as_ptr(),
+                n_pairs,
+                column_length,
+                rc_table_size,
+                error_buffer_mut_ptr,
+            )?;
+        }
+        Ok(counts)
+    }
+
+    fn witness_memory_rc_pair_logup_with_wait(
+        limbs: [&Self; 4],
+        rel_id0: u32,
+        rel_id1: u32,
+        alpha_powers: &Self,
+        z_limbs: [u32; 4],
+        wait_until_completed: bool,
+    ) -> Result<([Self; 4], Self), MetalError> {
+        let column_length = limbs[0].len;
+        assert!(
+            limbs.iter().all(|col| col.len == column_length),
+            "rc pair logup limb columns must have equal length"
+        );
+        assert_eq!(
+            alpha_powers.len, 12,
+            "rc pair logup expects exactly 3 QM31 alpha powers"
+        );
+        let runtime = shared_runtime()?;
+        let nums = [
+            Self::uninitialized_private(column_length)?,
+            Self::uninitialized_private(column_length)?,
+            Self::uninitialized_private(column_length)?,
+            Self::uninitialized_private(column_length)?,
+        ];
+        let denom_packed = Self::uninitialized_private(column_length * 4)?;
+        unsafe {
+            ffi::witness_memory_rc_pair_logup(
+                runtime.raw.as_ptr(),
+                limbs[0].raw.as_ptr(),
+                limbs[1].raw.as_ptr(),
+                limbs[2].raw.as_ptr(),
+                limbs[3].raw.as_ptr(),
+                denom_packed.raw.as_ptr(),
+                nums[0].raw.as_ptr(),
+                nums[1].raw.as_ptr(),
+                nums[2].raw.as_ptr(),
+                nums[3].raw.as_ptr(),
+                alpha_powers.raw.as_ptr(),
+                z_limbs.as_ptr(),
+                rel_id0,
+                rel_id1,
+                column_length
+                    .try_into()
+                    .expect("rc pair logup column length should fit in u32"),
+                wait_until_completed,
+                error_buffer_mut_ptr,
+            )?;
+        }
+        Ok((nums, denom_packed))
+    }
+
+    pub fn witness_memory_rc_pair_logup(
+        limbs: [&Self; 4],
+        rel_id0: u32,
+        rel_id1: u32,
+        alpha_powers: &Self,
+        z_limbs: [u32; 4],
+    ) -> Result<([Self; 4], Self), MetalError> {
+        Self::witness_memory_rc_pair_logup_with_wait(
+            limbs,
+            rel_id0,
+            rel_id1,
+            alpha_powers,
+            z_limbs,
+            true,
+        )
+    }
+
+    pub fn witness_memory_rc_pair_logup_async(
+        limbs: [&Self; 4],
+        rel_id0: u32,
+        rel_id1: u32,
+        alpha_powers: &Self,
+        z_limbs: [u32; 4],
+    ) -> Result<([Self; 4], Self), MetalError> {
+        Self::witness_memory_rc_pair_logup_with_wait(
+            limbs,
+            rel_id0,
+            rel_id1,
+            alpha_powers,
+            z_limbs,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn witness_memory_logup_inputs_with_wait(
+        limb_cols: &[&Self],
+        mults: &Self,
+        relation_id: u32,
+        id_offset: u32,
+        id_tag: u32,
+        alpha_powers: &Self,
+        z_limbs: [u32; 4],
+        wait_until_completed: bool,
+    ) -> Result<([Self; 4], Self), MetalError> {
+        assert!(
+            !limb_cols.is_empty(),
+            "memory logup needs at least one limb column"
+        );
+        let column_length = limb_cols[0].len;
+        assert!(
+            limb_cols.iter().all(|col| col.len == column_length),
+            "memory logup limb columns must have equal length"
+        );
+        assert_eq!(
+            mults.len, column_length,
+            "memory logup multiplicities must have column_length entries"
+        );
+        assert_eq!(
+            alpha_powers.len,
+            (limb_cols.len() + 2) * 4,
+            "memory logup alpha powers length mismatch"
+        );
+        let runtime = shared_runtime()?;
+        let nums = [
+            Self::uninitialized_private(column_length)?,
+            Self::uninitialized_private(column_length)?,
+            Self::uninitialized_private(column_length)?,
+            Self::uninitialized_private(column_length)?,
+        ];
+        let denom_packed = Self::uninitialized_private(column_length * 4)?;
+        let mut limb_ptrs = limb_cols
+            .iter()
+            .map(|buffer| buffer.raw.as_ptr())
+            .collect::<Vec<_>>();
+        unsafe {
+            ffi::witness_memory_logup_inputs(
+                runtime.raw.as_ptr(),
+                limb_ptrs.as_mut_ptr(),
+                mults.raw.as_ptr(),
+                denom_packed.raw.as_ptr(),
+                nums[0].raw.as_ptr(),
+                nums[1].raw.as_ptr(),
+                nums[2].raw.as_ptr(),
+                nums[3].raw.as_ptr(),
+                alpha_powers.raw.as_ptr(),
+                z_limbs.as_ptr(),
+                relation_id,
+                id_offset,
+                id_tag,
+                limb_cols
+                    .len()
+                    .try_into()
+                    .expect("memory logup limb count should fit in u32"),
+                column_length
+                    .try_into()
+                    .expect("memory logup column length should fit in u32"),
+                wait_until_completed,
+                error_buffer_mut_ptr,
+            )?;
+        }
+        Ok((nums, denom_packed))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn witness_memory_logup_inputs(
+        limb_cols: &[&Self],
+        mults: &Self,
+        relation_id: u32,
+        id_offset: u32,
+        id_tag: u32,
+        alpha_powers: &Self,
+        z_limbs: [u32; 4],
+    ) -> Result<([Self; 4], Self), MetalError> {
+        Self::witness_memory_logup_inputs_with_wait(
+            limb_cols,
+            mults,
+            relation_id,
+            id_offset,
+            id_tag,
+            alpha_powers,
+            z_limbs,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn witness_memory_logup_inputs_async(
+        limb_cols: &[&Self],
+        mults: &Self,
+        relation_id: u32,
+        id_offset: u32,
+        id_tag: u32,
+        alpha_powers: &Self,
+        z_limbs: [u32; 4],
+    ) -> Result<([Self; 4], Self), MetalError> {
+        Self::witness_memory_logup_inputs_with_wait(
+            limb_cols,
+            mults,
+            relation_id,
+            id_offset,
+            id_tag,
+            alpha_powers,
+            z_limbs,
+            false,
+        )
+    }
+
     pub fn witness_memory_addr_to_id_trace(
         ids: &Self,
         mults: &Self,
@@ -1867,6 +2440,201 @@ impl U32Buffer {
             )?;
         }
         Ok(dst)
+    }
+
+    fn witness_memory_addr_to_id_trace_columns_with_wait(
+        ids: &Self,
+        mults: &Self,
+        n_ids: u32,
+        column_length: u32,
+        split: u32,
+        wait_until_completed: bool,
+    ) -> Result<Vec<Self>, MetalError> {
+        assert!(
+            column_length.is_power_of_two(),
+            "column_length must be a power of two"
+        );
+        assert_eq!(ids.len, n_ids as usize, "ids length must be n_ids");
+        assert_eq!(mults.len, n_ids as usize, "mults length must be n_ids");
+        let n_trace_columns = split as usize * 2;
+        let runtime = shared_runtime()?;
+        let output_buffers = (0..n_trace_columns)
+            .map(|_| Self::uninitialized_private(column_length as usize))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut output_ptrs = output_buffers
+            .iter()
+            .map(|buffer| buffer.raw.as_ptr())
+            .collect::<Vec<_>>();
+        unsafe {
+            ffi::witness_memory_addr_to_id_trace_columns(
+                runtime.raw.as_ptr(),
+                ids.raw.as_ptr(),
+                mults.raw.as_ptr(),
+                output_ptrs.as_mut_ptr(),
+                n_ids,
+                column_length,
+                split,
+                wait_until_completed,
+                error_buffer_mut_ptr,
+            )?;
+        }
+        Ok(output_buffers)
+    }
+
+    pub fn witness_memory_addr_to_id_trace_columns(
+        ids: &Self,
+        mults: &Self,
+        n_ids: u32,
+        column_length: u32,
+        split: u32,
+    ) -> Result<Vec<Self>, MetalError> {
+        Self::witness_memory_addr_to_id_trace_columns_with_wait(
+            ids,
+            mults,
+            n_ids,
+            column_length,
+            split,
+            true,
+        )
+    }
+
+    pub fn witness_memory_addr_to_id_trace_columns_async(
+        ids: &Self,
+        mults: &Self,
+        n_ids: u32,
+        column_length: u32,
+        split: u32,
+    ) -> Result<Vec<Self>, MetalError> {
+        Self::witness_memory_addr_to_id_trace_columns_with_wait(
+            ids,
+            mults,
+            n_ids,
+            column_length,
+            split,
+            false,
+        )
+    }
+
+    fn witness_memory_addr_to_id_interaction_raw_with_wait(
+        trace_cols: &[&Self],
+        relation_id: u32,
+        alpha_powers: &Self,
+        z_limbs: [u32; 4],
+        split: u32,
+        wait_until_completed: bool,
+    ) -> Result<Vec<([Self; 4], Self)>, MetalError> {
+        assert!(
+            split > 0 && split % 2 == 0,
+            "memory_address_to_id split must be positive and even"
+        );
+        assert!(
+            trace_cols.len() >= 2 * split as usize,
+            "memory_address_to_id interaction needs 2 * split trace columns"
+        );
+        let column_length = trace_cols[0].len;
+        assert!(
+            column_length.is_power_of_two(),
+            "column_length must be a power of two"
+        );
+        assert!(
+            trace_cols
+                .iter()
+                .take(2 * split as usize)
+                .all(|col| col.len == column_length),
+            "memory_address_to_id trace columns must have equal length"
+        );
+        assert!(
+            alpha_powers.len >= 3 * 4,
+            "memory_address_to_id interaction expects at least 3 QM31 alpha powers"
+        );
+
+        let n_logup_cols = split as usize / 2;
+        let runtime = shared_runtime()?;
+        let num_buffers = (0..4 * n_logup_cols)
+            .map(|_| Self::uninitialized_private(column_length))
+            .collect::<Result<Vec<_>, _>>()?;
+        let denom_buffers = (0..n_logup_cols)
+            .map(|_| Self::uninitialized_private(column_length * 4))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut trace_ptrs = trace_cols
+            .iter()
+            .take(2 * split as usize)
+            .map(|buffer| buffer.raw.as_ptr())
+            .collect::<Vec<_>>();
+        let mut num_ptrs = num_buffers
+            .iter()
+            .map(|buffer| buffer.raw.as_ptr())
+            .collect::<Vec<_>>();
+        let mut denom_ptrs = denom_buffers
+            .iter()
+            .map(|buffer| buffer.raw.as_ptr())
+            .collect::<Vec<_>>();
+        unsafe {
+            ffi::witness_memory_addr_to_id_interaction_raw(
+                runtime.raw.as_ptr(),
+                trace_ptrs.as_mut_ptr(),
+                num_ptrs.as_mut_ptr(),
+                denom_ptrs.as_mut_ptr(),
+                alpha_powers.raw.as_ptr(),
+                z_limbs.as_ptr(),
+                relation_id,
+                column_length
+                    .try_into()
+                    .expect("memory_address_to_id interaction column length should fit in u32"),
+                split,
+                wait_until_completed,
+                error_buffer_mut_ptr,
+            )?;
+        }
+
+        let mut nums = num_buffers.into_iter();
+        let mut denoms = denom_buffers.into_iter();
+        Ok((0..n_logup_cols)
+            .map(|_| {
+                let numerator = std::array::from_fn(|_| {
+                    nums.next()
+                        .expect("memory_address_to_id interaction numerator buffer count")
+                });
+                let denominator = denoms
+                    .next()
+                    .expect("memory_address_to_id interaction denominator buffer count");
+                (numerator, denominator)
+            })
+            .collect())
+    }
+
+    pub fn witness_memory_addr_to_id_interaction_raw(
+        trace_cols: &[&Self],
+        relation_id: u32,
+        alpha_powers: &Self,
+        z_limbs: [u32; 4],
+        split: u32,
+    ) -> Result<Vec<([Self; 4], Self)>, MetalError> {
+        Self::witness_memory_addr_to_id_interaction_raw_with_wait(
+            trace_cols,
+            relation_id,
+            alpha_powers,
+            z_limbs,
+            split,
+            true,
+        )
+    }
+
+    pub fn witness_memory_addr_to_id_interaction_raw_async(
+        trace_cols: &[&Self],
+        relation_id: u32,
+        alpha_powers: &Self,
+        z_limbs: [u32; 4],
+        split: u32,
+    ) -> Result<Vec<([Self; 4], Self)>, MetalError> {
+        Self::witness_memory_addr_to_id_interaction_raw_with_wait(
+            trace_cols,
+            relation_id,
+            alpha_powers,
+            z_limbs,
+            split,
+            false,
+        )
     }
 
     /// Generate the trace for the add_opcode_small witness component on GPU.
@@ -1921,6 +2689,667 @@ impl U32Buffer {
             )?;
         }
         Ok(dst)
+    }
+
+    fn witness_add_opcode_small_trace_columns_with_wait(
+        inputs: &Self,
+        address_to_id: &Self,
+        big_values: &Self,
+        small_values: &Self,
+        n_rows: u32,
+        column_length: u32,
+        wait_until_completed: bool,
+    ) -> Result<Vec<Self>, MetalError> {
+        assert!(
+            column_length.is_power_of_two(),
+            "column_length must be a power of two"
+        );
+        assert!(
+            n_rows as usize <= column_length as usize,
+            "n_rows must be <= column_length"
+        );
+        assert!(
+            inputs.len >= n_rows as usize * 3,
+            "inputs length must be >= n_rows * 3"
+        );
+        let n_trace_columns: usize = 39;
+        let runtime = shared_runtime()?;
+        let output_buffers = (0..n_trace_columns)
+            .map(|_| Self::uninitialized_private(column_length as usize))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut output_ptrs = output_buffers
+            .iter()
+            .map(|buffer| buffer.raw.as_ptr())
+            .collect::<Vec<_>>();
+        unsafe {
+            ffi::witness_add_opcode_small_trace_columns(
+                runtime.raw.as_ptr(),
+                inputs.raw.as_ptr(),
+                address_to_id.raw.as_ptr(),
+                big_values.raw.as_ptr(),
+                small_values.raw.as_ptr(),
+                output_ptrs.as_mut_ptr(),
+                n_rows,
+                column_length,
+                wait_until_completed,
+                error_buffer_mut_ptr,
+            )?;
+        }
+        Ok(output_buffers)
+    }
+
+    pub fn witness_add_opcode_small_trace_columns(
+        inputs: &Self,
+        address_to_id: &Self,
+        big_values: &Self,
+        small_values: &Self,
+        n_rows: u32,
+        column_length: u32,
+    ) -> Result<Vec<Self>, MetalError> {
+        Self::witness_add_opcode_small_trace_columns_with_wait(
+            inputs,
+            address_to_id,
+            big_values,
+            small_values,
+            n_rows,
+            column_length,
+            true,
+        )
+    }
+
+    pub fn witness_add_opcode_small_trace_columns_async(
+        inputs: &Self,
+        address_to_id: &Self,
+        big_values: &Self,
+        small_values: &Self,
+        n_rows: u32,
+        column_length: u32,
+    ) -> Result<Vec<Self>, MetalError> {
+        Self::witness_add_opcode_small_trace_columns_with_wait(
+            inputs,
+            address_to_id,
+            big_values,
+            small_values,
+            n_rows,
+            column_length,
+            false,
+        )
+    }
+
+    fn witness_add_opcode_small_interaction_raw_with_wait(
+        trace: &Self,
+        alpha_powers: &Self,
+        z_limbs: [u32; 4],
+        n_rows: u32,
+        column_length: u32,
+        wait_until_completed: bool,
+    ) -> Result<Vec<([Self; 4], Self)>, MetalError> {
+        assert!(
+            column_length.is_power_of_two(),
+            "column_length must be a power of two"
+        );
+        assert!(
+            n_rows as usize <= column_length as usize,
+            "n_rows must be <= column_length"
+        );
+        assert_eq!(
+            trace.len,
+            39 * column_length as usize,
+            "add_opcode_small trace length must be 39 * column_length"
+        );
+        assert!(
+            alpha_powers.len >= 30 * 4,
+            "add_opcode_small interaction expects at least 30 QM31 alpha powers"
+        );
+
+        let runtime = shared_runtime()?;
+        let num_buffers = (0..20)
+            .map(|_| Self::uninitialized_private(column_length as usize))
+            .collect::<Result<Vec<_>, _>>()?;
+        let denom_buffers = (0..5)
+            .map(|_| Self::uninitialized_private(column_length as usize * 4))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut num_ptrs = num_buffers
+            .iter()
+            .map(|buffer| buffer.raw.as_ptr())
+            .collect::<Vec<_>>();
+        let mut denom_ptrs = denom_buffers
+            .iter()
+            .map(|buffer| buffer.raw.as_ptr())
+            .collect::<Vec<_>>();
+        unsafe {
+            ffi::witness_add_opcode_small_interaction_raw(
+                runtime.raw.as_ptr(),
+                trace.raw.as_ptr(),
+                num_ptrs.as_mut_ptr(),
+                denom_ptrs.as_mut_ptr(),
+                alpha_powers.raw.as_ptr(),
+                z_limbs.as_ptr(),
+                n_rows,
+                column_length,
+                wait_until_completed,
+                error_buffer_mut_ptr,
+            )?;
+        }
+
+        let mut nums = num_buffers.into_iter();
+        let mut denoms = denom_buffers.into_iter();
+        Ok((0..5)
+            .map(|_| {
+                let numerator = std::array::from_fn(|_| {
+                    nums.next()
+                        .expect("add_opcode_small interaction numerator buffer count")
+                });
+                let denominator = denoms
+                    .next()
+                    .expect("add_opcode_small interaction denominator buffer count");
+                (numerator, denominator)
+            })
+            .collect())
+    }
+
+    pub fn witness_add_opcode_small_interaction_raw(
+        trace: &Self,
+        alpha_powers: &Self,
+        z_limbs: [u32; 4],
+        n_rows: u32,
+        column_length: u32,
+    ) -> Result<Vec<([Self; 4], Self)>, MetalError> {
+        Self::witness_add_opcode_small_interaction_raw_with_wait(
+            trace,
+            alpha_powers,
+            z_limbs,
+            n_rows,
+            column_length,
+            true,
+        )
+    }
+
+    pub fn witness_add_opcode_small_interaction_raw_async(
+        trace: &Self,
+        alpha_powers: &Self,
+        z_limbs: [u32; 4],
+        n_rows: u32,
+        column_length: u32,
+    ) -> Result<Vec<([Self; 4], Self)>, MetalError> {
+        Self::witness_add_opcode_small_interaction_raw_with_wait(
+            trace,
+            alpha_powers,
+            z_limbs,
+            n_rows,
+            column_length,
+            false,
+        )
+    }
+
+    fn witness_add_opcode_small_interaction_raw_columns_with_wait(
+        trace_cols: &[&Self],
+        alpha_powers: &Self,
+        z_limbs: [u32; 4],
+        n_rows: u32,
+        column_length: u32,
+        wait_until_completed: bool,
+    ) -> Result<Vec<([Self; 4], Self)>, MetalError> {
+        assert!(
+            column_length.is_power_of_two(),
+            "column_length must be a power of two"
+        );
+        assert!(
+            n_rows as usize <= column_length as usize,
+            "n_rows must be <= column_length"
+        );
+        assert!(
+            trace_cols.len() >= 39,
+            "add_opcode_small interaction expects at least 39 trace columns"
+        );
+        assert!(
+            trace_cols
+                .iter()
+                .take(39)
+                .all(|buffer| buffer.len == column_length as usize),
+            "add_opcode_small trace columns must match column_length"
+        );
+        assert!(
+            alpha_powers.len >= 30 * 4,
+            "add_opcode_small interaction expects at least 30 QM31 alpha powers"
+        );
+
+        let runtime = shared_runtime()?;
+        let num_buffers = (0..20)
+            .map(|_| Self::uninitialized_private(column_length as usize))
+            .collect::<Result<Vec<_>, _>>()?;
+        let denom_buffers = (0..5)
+            .map(|_| Self::uninitialized_private(column_length as usize * 4))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut trace_ptrs = trace_cols
+            .iter()
+            .take(39)
+            .map(|buffer| buffer.raw.as_ptr())
+            .collect::<Vec<_>>();
+        let mut num_ptrs = num_buffers
+            .iter()
+            .map(|buffer| buffer.raw.as_ptr())
+            .collect::<Vec<_>>();
+        let mut denom_ptrs = denom_buffers
+            .iter()
+            .map(|buffer| buffer.raw.as_ptr())
+            .collect::<Vec<_>>();
+        unsafe {
+            ffi::witness_add_opcode_small_interaction_raw_columns(
+                runtime.raw.as_ptr(),
+                trace_ptrs.as_mut_ptr(),
+                num_ptrs.as_mut_ptr(),
+                denom_ptrs.as_mut_ptr(),
+                alpha_powers.raw.as_ptr(),
+                z_limbs.as_ptr(),
+                n_rows,
+                column_length,
+                wait_until_completed,
+                error_buffer_mut_ptr,
+            )?;
+        }
+
+        let mut nums = num_buffers.into_iter();
+        let mut denoms = denom_buffers.into_iter();
+        Ok((0..5)
+            .map(|_| {
+                let numerator = std::array::from_fn(|_| {
+                    nums.next()
+                        .expect("add_opcode_small interaction numerator buffer count")
+                });
+                let denominator = denoms
+                    .next()
+                    .expect("add_opcode_small interaction denominator buffer count");
+                (numerator, denominator)
+            })
+            .collect())
+    }
+
+    pub fn witness_add_opcode_small_interaction_raw_columns(
+        trace_cols: &[&Self],
+        alpha_powers: &Self,
+        z_limbs: [u32; 4],
+        n_rows: u32,
+        column_length: u32,
+    ) -> Result<Vec<([Self; 4], Self)>, MetalError> {
+        Self::witness_add_opcode_small_interaction_raw_columns_with_wait(
+            trace_cols,
+            alpha_powers,
+            z_limbs,
+            n_rows,
+            column_length,
+            true,
+        )
+    }
+
+    pub fn witness_add_opcode_small_interaction_raw_columns_async(
+        trace_cols: &[&Self],
+        alpha_powers: &Self,
+        z_limbs: [u32; 4],
+        n_rows: u32,
+        column_length: u32,
+    ) -> Result<Vec<([Self; 4], Self)>, MetalError> {
+        Self::witness_add_opcode_small_interaction_raw_columns_with_wait(
+            trace_cols,
+            alpha_powers,
+            z_limbs,
+            n_rows,
+            column_length,
+            false,
+        )
+    }
+
+    /// Generate the trace for the assert_eq_opcode witness component on GPU.
+    ///
+    /// # Returns
+    ///
+    /// Column-major output buffer with 12 columns * `column_length` entries.
+    pub fn witness_assert_eq_opcode_trace(
+        inputs: &Self,
+        address_to_id: &Self,
+        big_values: &Self,
+        small_values: &Self,
+        n_rows: u32,
+        column_length: u32,
+    ) -> Result<Self, MetalError> {
+        assert!(
+            column_length.is_power_of_two(),
+            "column_length must be a power of two"
+        );
+        assert!(
+            n_rows as usize <= column_length as usize,
+            "n_rows must be <= column_length"
+        );
+        assert!(
+            inputs.len >= n_rows as usize * 3,
+            "inputs length must be >= n_rows * 3"
+        );
+        let n_trace_columns: usize = 12;
+        let output_len = n_trace_columns * column_length as usize;
+        let runtime = shared_runtime()?;
+        let dst = Self::uninitialized(output_len)?;
+        unsafe {
+            ffi::witness_assert_eq_opcode_trace(
+                runtime.raw.as_ptr(),
+                inputs.raw.as_ptr(),
+                address_to_id.raw.as_ptr(),
+                big_values.raw.as_ptr(),
+                small_values.raw.as_ptr(),
+                dst.raw.as_ptr(),
+                n_rows,
+                column_length,
+                error_buffer_mut_ptr,
+            )?;
+        }
+        Ok(dst)
+    }
+
+    fn witness_assert_eq_opcode_trace_columns_with_wait(
+        inputs: &Self,
+        address_to_id: &Self,
+        big_values: &Self,
+        small_values: &Self,
+        n_rows: u32,
+        column_length: u32,
+        wait_until_completed: bool,
+    ) -> Result<Vec<Self>, MetalError> {
+        assert!(
+            column_length.is_power_of_two(),
+            "column_length must be a power of two"
+        );
+        assert!(
+            n_rows as usize <= column_length as usize,
+            "n_rows must be <= column_length"
+        );
+        assert!(
+            inputs.len >= n_rows as usize * 3,
+            "inputs length must be >= n_rows * 3"
+        );
+        let n_trace_columns: usize = 12;
+        let runtime = shared_runtime()?;
+        let output_buffers = (0..n_trace_columns)
+            .map(|_| Self::uninitialized_private(column_length as usize))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut output_ptrs = output_buffers
+            .iter()
+            .map(|buffer| buffer.raw.as_ptr())
+            .collect::<Vec<_>>();
+        unsafe {
+            ffi::witness_assert_eq_opcode_trace_columns(
+                runtime.raw.as_ptr(),
+                inputs.raw.as_ptr(),
+                address_to_id.raw.as_ptr(),
+                big_values.raw.as_ptr(),
+                small_values.raw.as_ptr(),
+                output_ptrs.as_mut_ptr(),
+                n_rows,
+                column_length,
+                wait_until_completed,
+                error_buffer_mut_ptr,
+            )?;
+        }
+        Ok(output_buffers)
+    }
+
+    pub fn witness_assert_eq_opcode_trace_columns(
+        inputs: &Self,
+        address_to_id: &Self,
+        big_values: &Self,
+        small_values: &Self,
+        n_rows: u32,
+        column_length: u32,
+    ) -> Result<Vec<Self>, MetalError> {
+        Self::witness_assert_eq_opcode_trace_columns_with_wait(
+            inputs,
+            address_to_id,
+            big_values,
+            small_values,
+            n_rows,
+            column_length,
+            true,
+        )
+    }
+
+    pub fn witness_assert_eq_opcode_trace_columns_async(
+        inputs: &Self,
+        address_to_id: &Self,
+        big_values: &Self,
+        small_values: &Self,
+        n_rows: u32,
+        column_length: u32,
+    ) -> Result<Vec<Self>, MetalError> {
+        Self::witness_assert_eq_opcode_trace_columns_with_wait(
+            inputs,
+            address_to_id,
+            big_values,
+            small_values,
+            n_rows,
+            column_length,
+            false,
+        )
+    }
+
+    fn witness_assert_eq_opcode_interaction_raw_with_wait(
+        trace: &Self,
+        alpha_powers: &Self,
+        z_limbs: [u32; 4],
+        n_rows: u32,
+        column_length: u32,
+        wait_until_completed: bool,
+    ) -> Result<Vec<([Self; 4], Self)>, MetalError> {
+        assert!(
+            column_length.is_power_of_two(),
+            "column_length must be a power of two"
+        );
+        assert!(
+            n_rows as usize <= column_length as usize,
+            "n_rows must be <= column_length"
+        );
+        assert_eq!(
+            trace.len,
+            12 * column_length as usize,
+            "assert_eq_opcode trace length must be 12 * column_length"
+        );
+        assert!(
+            alpha_powers.len >= 8 * 4,
+            "assert_eq_opcode interaction expects at least 8 QM31 alpha powers"
+        );
+
+        let runtime = shared_runtime()?;
+        let num_buffers = (0..12)
+            .map(|_| Self::uninitialized_private(column_length as usize))
+            .collect::<Result<Vec<_>, _>>()?;
+        let denom_buffers = (0..3)
+            .map(|_| Self::uninitialized_private(column_length as usize * 4))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut num_ptrs = num_buffers
+            .iter()
+            .map(|buffer| buffer.raw.as_ptr())
+            .collect::<Vec<_>>();
+        let mut denom_ptrs = denom_buffers
+            .iter()
+            .map(|buffer| buffer.raw.as_ptr())
+            .collect::<Vec<_>>();
+        unsafe {
+            ffi::witness_assert_eq_opcode_interaction_raw(
+                runtime.raw.as_ptr(),
+                trace.raw.as_ptr(),
+                num_ptrs.as_mut_ptr(),
+                denom_ptrs.as_mut_ptr(),
+                alpha_powers.raw.as_ptr(),
+                z_limbs.as_ptr(),
+                n_rows,
+                column_length,
+                wait_until_completed,
+                error_buffer_mut_ptr,
+            )?;
+        }
+
+        let mut nums = num_buffers.into_iter();
+        let mut denoms = denom_buffers.into_iter();
+        Ok((0..3)
+            .map(|_| {
+                let numerator = std::array::from_fn(|_| {
+                    nums.next()
+                        .expect("assert_eq_opcode interaction numerator buffer count")
+                });
+                let denominator = denoms
+                    .next()
+                    .expect("assert_eq_opcode interaction denominator buffer count");
+                (numerator, denominator)
+            })
+            .collect())
+    }
+
+    pub fn witness_assert_eq_opcode_interaction_raw(
+        trace: &Self,
+        alpha_powers: &Self,
+        z_limbs: [u32; 4],
+        n_rows: u32,
+        column_length: u32,
+    ) -> Result<Vec<([Self; 4], Self)>, MetalError> {
+        Self::witness_assert_eq_opcode_interaction_raw_with_wait(
+            trace,
+            alpha_powers,
+            z_limbs,
+            n_rows,
+            column_length,
+            true,
+        )
+    }
+
+    pub fn witness_assert_eq_opcode_interaction_raw_async(
+        trace: &Self,
+        alpha_powers: &Self,
+        z_limbs: [u32; 4],
+        n_rows: u32,
+        column_length: u32,
+    ) -> Result<Vec<([Self; 4], Self)>, MetalError> {
+        Self::witness_assert_eq_opcode_interaction_raw_with_wait(
+            trace,
+            alpha_powers,
+            z_limbs,
+            n_rows,
+            column_length,
+            false,
+        )
+    }
+
+    fn witness_assert_eq_opcode_interaction_raw_columns_with_wait(
+        trace_cols: &[&Self],
+        alpha_powers: &Self,
+        z_limbs: [u32; 4],
+        n_rows: u32,
+        column_length: u32,
+        wait_until_completed: bool,
+    ) -> Result<Vec<([Self; 4], Self)>, MetalError> {
+        assert!(
+            column_length.is_power_of_two(),
+            "column_length must be a power of two"
+        );
+        assert!(
+            n_rows as usize <= column_length as usize,
+            "n_rows must be <= column_length"
+        );
+        assert!(
+            trace_cols.len() >= 12,
+            "assert_eq_opcode interaction expects at least 12 trace columns"
+        );
+        assert!(
+            trace_cols
+                .iter()
+                .take(12)
+                .all(|buffer| buffer.len == column_length as usize),
+            "assert_eq_opcode trace columns must match column_length"
+        );
+        assert!(
+            alpha_powers.len >= 8 * 4,
+            "assert_eq_opcode interaction expects at least 8 QM31 alpha powers"
+        );
+
+        let runtime = shared_runtime()?;
+        let num_buffers = (0..12)
+            .map(|_| Self::uninitialized_private(column_length as usize))
+            .collect::<Result<Vec<_>, _>>()?;
+        let denom_buffers = (0..3)
+            .map(|_| Self::uninitialized_private(column_length as usize * 4))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut trace_ptrs = trace_cols
+            .iter()
+            .take(12)
+            .map(|buffer| buffer.raw.as_ptr())
+            .collect::<Vec<_>>();
+        let mut num_ptrs = num_buffers
+            .iter()
+            .map(|buffer| buffer.raw.as_ptr())
+            .collect::<Vec<_>>();
+        let mut denom_ptrs = denom_buffers
+            .iter()
+            .map(|buffer| buffer.raw.as_ptr())
+            .collect::<Vec<_>>();
+        unsafe {
+            ffi::witness_assert_eq_opcode_interaction_raw_columns(
+                runtime.raw.as_ptr(),
+                trace_ptrs.as_mut_ptr(),
+                num_ptrs.as_mut_ptr(),
+                denom_ptrs.as_mut_ptr(),
+                alpha_powers.raw.as_ptr(),
+                z_limbs.as_ptr(),
+                n_rows,
+                column_length,
+                wait_until_completed,
+                error_buffer_mut_ptr,
+            )?;
+        }
+
+        let mut nums = num_buffers.into_iter();
+        let mut denoms = denom_buffers.into_iter();
+        Ok((0..3)
+            .map(|_| {
+                let numerator = std::array::from_fn(|_| {
+                    nums.next()
+                        .expect("assert_eq_opcode interaction numerator buffer count")
+                });
+                let denominator = denoms
+                    .next()
+                    .expect("assert_eq_opcode interaction denominator buffer count");
+                (numerator, denominator)
+            })
+            .collect())
+    }
+
+    pub fn witness_assert_eq_opcode_interaction_raw_columns(
+        trace_cols: &[&Self],
+        alpha_powers: &Self,
+        z_limbs: [u32; 4],
+        n_rows: u32,
+        column_length: u32,
+    ) -> Result<Vec<([Self; 4], Self)>, MetalError> {
+        Self::witness_assert_eq_opcode_interaction_raw_columns_with_wait(
+            trace_cols,
+            alpha_powers,
+            z_limbs,
+            n_rows,
+            column_length,
+            true,
+        )
+    }
+
+    pub fn witness_assert_eq_opcode_interaction_raw_columns_async(
+        trace_cols: &[&Self],
+        alpha_powers: &Self,
+        z_limbs: [u32; 4],
+        n_rows: u32,
+        column_length: u32,
+    ) -> Result<Vec<([Self; 4], Self)>, MetalError> {
+        Self::witness_assert_eq_opcode_interaction_raw_columns_with_wait(
+            trace_cols,
+            alpha_powers,
+            z_limbs,
+            n_rows,
+            column_length,
+            false,
+        )
     }
 
     /// Generate the trace for the assert_eq_opcode_double_deref witness
@@ -2144,7 +3573,7 @@ impl U32Buffer {
     ///
     /// # Arguments
     ///
-    /// * `inputs` - Flat buffer of (pc, ap, fp) tuples, row-major [n_rows * 3].
+    /// * `inputs` - Flat buffer of padded (pc, ap, fp) tuples, row-major [column_length * 3].
     /// * `address_to_id` - The address-to-raw-ID lookup table.
     /// * `big_values` - Row-major [n_big][8] u32 F252 values.
     /// * `small_values` - Row-major [n_small][4] u32 small values.
@@ -2171,8 +3600,8 @@ impl U32Buffer {
             "n_rows must be <= column_length"
         );
         assert!(
-            inputs.len >= n_rows as usize * 3,
-            "inputs length must be >= n_rows * 3"
+            inputs.len >= column_length as usize * 3,
+            "inputs length must be >= column_length * 3"
         );
         let n_trace_columns: usize = 16;
         let output_len = n_trace_columns * column_length as usize;
@@ -2192,6 +3621,186 @@ impl U32Buffer {
             )?;
         }
         Ok(dst)
+    }
+
+    fn witness_ret_opcode_trace_columns_with_wait(
+        inputs: &Self,
+        address_to_id: &Self,
+        big_values: &Self,
+        small_values: &Self,
+        n_rows: u32,
+        column_length: u32,
+        wait_until_completed: bool,
+    ) -> Result<Vec<Self>, MetalError> {
+        assert!(
+            column_length.is_power_of_two(),
+            "column_length must be a power of two"
+        );
+        assert!(
+            n_rows as usize <= column_length as usize,
+            "n_rows must be <= column_length"
+        );
+        assert!(
+            inputs.len >= column_length as usize * 3,
+            "inputs length must be >= column_length * 3"
+        );
+        let n_trace_columns: usize = 16;
+        let runtime = shared_runtime()?;
+        let output_buffers = (0..n_trace_columns)
+            .map(|_| Self::uninitialized_private(column_length as usize))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut output_ptrs = output_buffers
+            .iter()
+            .map(|buffer| buffer.raw.as_ptr())
+            .collect::<Vec<_>>();
+        unsafe {
+            ffi::witness_ret_opcode_trace_columns(
+                runtime.raw.as_ptr(),
+                inputs.raw.as_ptr(),
+                address_to_id.raw.as_ptr(),
+                big_values.raw.as_ptr(),
+                small_values.raw.as_ptr(),
+                output_ptrs.as_mut_ptr(),
+                n_rows,
+                column_length,
+                wait_until_completed,
+                error_buffer_mut_ptr,
+            )?;
+        }
+        Ok(output_buffers)
+    }
+
+    pub fn witness_ret_opcode_trace_columns(
+        inputs: &Self,
+        address_to_id: &Self,
+        big_values: &Self,
+        small_values: &Self,
+        n_rows: u32,
+        column_length: u32,
+    ) -> Result<Vec<Self>, MetalError> {
+        Self::witness_ret_opcode_trace_columns_with_wait(
+            inputs,
+            address_to_id,
+            big_values,
+            small_values,
+            n_rows,
+            column_length,
+            true,
+        )
+    }
+
+    pub fn witness_ret_opcode_trace_columns_async(
+        inputs: &Self,
+        address_to_id: &Self,
+        big_values: &Self,
+        small_values: &Self,
+        n_rows: u32,
+        column_length: u32,
+    ) -> Result<Vec<Self>, MetalError> {
+        Self::witness_ret_opcode_trace_columns_with_wait(
+            inputs,
+            address_to_id,
+            big_values,
+            small_values,
+            n_rows,
+            column_length,
+            false,
+        )
+    }
+
+    fn witness_ret_opcode_interaction_raw_with_wait(
+        trace_cols: &[&Self],
+        alpha_powers: &Self,
+        z_limbs: [u32; 4],
+        wait_until_completed: bool,
+    ) -> Result<Vec<([Self; 4], Self)>, MetalError> {
+        assert!(
+            trace_cols.len() >= 16,
+            "ret opcode interaction needs 16 trace columns"
+        );
+        let column_length = trace_cols[0].len;
+        assert!(
+            column_length.is_power_of_two(),
+            "column_length must be a power of two"
+        );
+        assert!(
+            trace_cols
+                .iter()
+                .take(16)
+                .all(|col| col.len == column_length),
+            "ret opcode trace columns must have equal length"
+        );
+        assert!(
+            alpha_powers.len >= 30 * 4,
+            "ret opcode interaction expects at least 30 QM31 alpha powers"
+        );
+
+        let runtime = shared_runtime()?;
+        let num_buffers = (0..16)
+            .map(|_| Self::uninitialized_private(column_length))
+            .collect::<Result<Vec<_>, _>>()?;
+        let denom_buffers = (0..4)
+            .map(|_| Self::uninitialized_private(column_length * 4))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut trace_ptrs = trace_cols
+            .iter()
+            .take(16)
+            .map(|buffer| buffer.raw.as_ptr())
+            .collect::<Vec<_>>();
+        let mut num_ptrs = num_buffers
+            .iter()
+            .map(|buffer| buffer.raw.as_ptr())
+            .collect::<Vec<_>>();
+        let mut denom_ptrs = denom_buffers
+            .iter()
+            .map(|buffer| buffer.raw.as_ptr())
+            .collect::<Vec<_>>();
+        unsafe {
+            ffi::witness_ret_opcode_interaction_raw(
+                runtime.raw.as_ptr(),
+                trace_ptrs.as_mut_ptr(),
+                num_ptrs.as_mut_ptr(),
+                denom_ptrs.as_mut_ptr(),
+                alpha_powers.raw.as_ptr(),
+                z_limbs.as_ptr(),
+                column_length
+                    .try_into()
+                    .expect("ret opcode interaction column length should fit in u32"),
+                wait_until_completed,
+                error_buffer_mut_ptr,
+            )?;
+        }
+
+        let mut nums = num_buffers.into_iter();
+        let mut denoms = denom_buffers.into_iter();
+        Ok((0..4)
+            .map(|_| {
+                let numerator = std::array::from_fn(|_| {
+                    nums.next()
+                        .expect("ret opcode interaction numerator buffer count")
+                });
+                let denominator = denoms
+                    .next()
+                    .expect("ret opcode interaction denominator buffer count");
+                (numerator, denominator)
+            })
+            .collect())
+    }
+
+    pub fn witness_ret_opcode_interaction_raw(
+        trace_cols: &[&Self],
+        alpha_powers: &Self,
+        z_limbs: [u32; 4],
+    ) -> Result<Vec<([Self; 4], Self)>, MetalError> {
+        Self::witness_ret_opcode_interaction_raw_with_wait(trace_cols, alpha_powers, z_limbs, true)
+    }
+
+    pub fn witness_ret_opcode_interaction_raw_async(
+        trace_cols: &[&Self],
+        alpha_powers: &Self,
+        z_limbs: [u32; 4],
+    ) -> Result<Vec<([Self; 4], Self)>, MetalError> {
+        Self::witness_ret_opcode_interaction_raw_with_wait(trace_cols, alpha_powers, z_limbs, false)
     }
 
     /// Dispatch an opcode interaction-values kernel.
@@ -4148,6 +5757,61 @@ impl U32Buffer {
         Ok([coord_0, coord_1, coord_2, coord_3])
     }
 
+    /// Fused trace-column blit plus composition dispatch.
+    ///
+    /// Copies the first `row_count` elements from each column into a temporary
+    /// column-major trace buffer and runs the fused composition kernel in the
+    /// same command buffer, replacing a per-column synchronous blit loop.
+    #[allow(clippy::too_many_arguments)]
+    pub fn eval_compiled_fused_composition_blit_v1(
+        shader_source: &str,
+        kernel_name: &str,
+        column_buffers: &[&Self],
+        interaction_offsets: &Self,
+        preprocessed_values: &Self,
+        base_params: &Self,
+        ext_params: &Self,
+        random_coeff_powers: &Self,
+        denom_inv: &Self,
+        row_count: usize,
+        log_n_rows: u32,
+    ) -> Result<[Self; 4], MetalError> {
+        let runtime = shared_runtime()?;
+        let coord_0 = Self::uninitialized(row_count)?;
+        let coord_1 = Self::uninitialized(row_count)?;
+        let coord_2 = Self::uninitialized(row_count)?;
+        let coord_3 = Self::uninitialized(row_count)?;
+        let raw_ptrs: Vec<*mut std::ffi::c_void> = column_buffers
+            .iter()
+            .map(|buffer| buffer.raw.as_ptr())
+            .collect();
+        unsafe {
+            ffi::eval_compiled_fused_composition_blit_v1(
+                runtime.raw.as_ptr(),
+                shader_source.as_ptr(),
+                shader_source.len(),
+                kernel_name.as_ptr(),
+                kernel_name.len(),
+                raw_ptrs.as_ptr(),
+                raw_ptrs.len(),
+                interaction_offsets.raw.as_ptr(),
+                preprocessed_values.raw.as_ptr(),
+                base_params.raw.as_ptr(),
+                ext_params.raw.as_ptr(),
+                random_coeff_powers.raw.as_ptr(),
+                denom_inv.raw.as_ptr(),
+                coord_0.raw.as_ptr(),
+                coord_1.raw.as_ptr(),
+                coord_2.raw.as_ptr(),
+                coord_3.raw.as_ptr(),
+                row_count.try_into().expect("row_count should fit in u32"),
+                log_n_rows,
+                error_buffer_mut_ptr,
+            )?;
+        }
+        Ok([coord_0, coord_1, coord_2, coord_3])
+    }
+
     pub fn eval_compiled_program_v1_u32x4_tg(
         shader_source: &str,
         kernel_name: &str,
@@ -4640,8 +6304,8 @@ fn decode_error_buffer(buffer: &[i8; ERROR_BUFFER_LEN]) -> String {
 #[cfg(stwo_metal_link)]
 pub mod ffi {
     use super::{
-        c_void, decode_error_buffer, BatchEvalGroupDescriptor, MetalError, NonNull,
-        ERROR_BUFFER_LEN,
+        c_void, decode_error_buffer, BatchEvalGroupDescriptor, LogupFractionChainDescriptor,
+        MetalError, NonNull, ERROR_BUFFER_LEN,
     };
 
     unsafe extern "C" {
@@ -5005,6 +6669,40 @@ pub mod ffi {
             error_message: *mut i8,
             error_message_len: usize,
         ) -> bool;
+        fn stwo_metal_inclusive_prefix_sum_bit_rev_circle_domain_4col_u32(
+            runtime: *mut c_void,
+            col0: *mut c_void,
+            col1: *mut c_void,
+            col2: *mut c_void,
+            col3: *mut c_void,
+            log_len: u32,
+            error_message: *mut i8,
+            error_message_len: usize,
+        ) -> bool;
+        fn stwo_metal_logup_fraction_chain_u32x4(
+            runtime: *mut c_void,
+            num0: *mut c_void,
+            num1: *mut c_void,
+            num2: *mut c_void,
+            num3: *mut c_void,
+            denom_packed: *mut c_void,
+            prev0: *mut c_void,
+            prev1: *mut c_void,
+            prev2: *mut c_void,
+            prev3: *mut c_void,
+            n_elements: u32,
+            wait_until_completed: bool,
+            error_message: *mut i8,
+            error_message_len: usize,
+        ) -> bool;
+        fn stwo_metal_logup_fraction_chain_batch_u32x4(
+            runtime: *mut c_void,
+            descriptors: *const LogupFractionChainDescriptor,
+            n_columns: u32,
+            n_elements: u32,
+            error_message: *mut i8,
+            error_message_len: usize,
+        ) -> bool;
         fn stwo_metal_reduce_sum_m31_4col(
             runtime: *mut c_void,
             col0: *mut c_void,
@@ -5023,6 +6721,17 @@ pub mod ffi {
             col2: *mut c_void,
             col3: *mut c_void,
             cumsum_shifts: *const u32,
+            n_elements: u32,
+            error_message: *mut i8,
+            error_message_len: usize,
+        ) -> bool;
+        fn stwo_metal_subtract_m31_4col(
+            runtime: *mut c_void,
+            col0: *mut c_void,
+            col1: *mut c_void,
+            col2: *mut c_void,
+            col3: *mut c_void,
+            shifts: *const u32,
             n_elements: u32,
             error_message: *mut i8,
             error_message_len: usize,
@@ -5199,6 +6908,17 @@ pub mod ffi {
             error_message: *mut i8,
             error_message_len: usize,
         ) -> bool;
+        fn stwo_metal_witness_memory_id_to_big_trace_columns(
+            runtime: *mut c_void,
+            big_values: *mut c_void,
+            mults: *mut c_void,
+            trace_cols: *mut *mut c_void,
+            n_values: u32,
+            column_length: u32,
+            wait_until_completed: bool,
+            error_message: *mut i8,
+            error_message_len: usize,
+        ) -> bool;
         fn stwo_metal_witness_memory_id_to_big_small_trace(
             runtime: *mut c_void,
             small_values: *mut c_void,
@@ -5206,6 +6926,68 @@ pub mod ffi {
             trace: *mut c_void,
             n_values: u32,
             column_length: u32,
+            error_message: *mut i8,
+            error_message_len: usize,
+        ) -> bool;
+        fn stwo_metal_witness_memory_id_to_big_small_trace_columns(
+            runtime: *mut c_void,
+            small_values: *mut c_void,
+            mults: *mut c_void,
+            trace_cols: *mut *mut c_void,
+            n_values: u32,
+            column_length: u32,
+            wait_until_completed: bool,
+            error_message: *mut i8,
+            error_message_len: usize,
+        ) -> bool;
+        fn stwo_metal_witness_memory_rc99_count(
+            runtime: *mut c_void,
+            limb_cols: *mut *mut c_void,
+            input_to_row_lut: *mut c_void,
+            counts: *mut c_void,
+            n_pairs: u32,
+            column_length: u32,
+            rc_table_size: u32,
+            error_message: *mut i8,
+            error_message_len: usize,
+        ) -> bool;
+        fn stwo_metal_witness_memory_rc_pair_logup(
+            runtime: *mut c_void,
+            limb_a: *mut c_void,
+            limb_b: *mut c_void,
+            limb_c: *mut c_void,
+            limb_d: *mut c_void,
+            denom_packed: *mut c_void,
+            num0: *mut c_void,
+            num1: *mut c_void,
+            num2: *mut c_void,
+            num3: *mut c_void,
+            alpha_powers: *mut c_void,
+            z_limbs: *const u32,
+            rel_id0: u32,
+            rel_id1: u32,
+            column_length: u32,
+            wait_until_completed: bool,
+            error_message: *mut i8,
+            error_message_len: usize,
+        ) -> bool;
+        fn stwo_metal_witness_memory_logup_inputs(
+            runtime: *mut c_void,
+            limb_cols: *mut *mut c_void,
+            mults: *mut c_void,
+            denom_packed: *mut c_void,
+            num0: *mut c_void,
+            num1: *mut c_void,
+            num2: *mut c_void,
+            num3: *mut c_void,
+            alpha_powers: *mut c_void,
+            z_limbs: *const u32,
+            relation_id: u32,
+            id_offset: u32,
+            id_tag: u32,
+            n_limbs: u32,
+            column_length: u32,
+            wait_until_completed: bool,
             error_message: *mut i8,
             error_message_len: usize,
         ) -> bool;
@@ -5220,6 +7002,32 @@ pub mod ffi {
             error_message: *mut i8,
             error_message_len: usize,
         ) -> bool;
+        fn stwo_metal_witness_memory_addr_to_id_trace_columns(
+            runtime: *mut c_void,
+            ids: *mut c_void,
+            mults: *mut c_void,
+            trace_cols: *mut *mut c_void,
+            n_ids: u32,
+            column_length: u32,
+            split: u32,
+            wait_until_completed: bool,
+            error_message: *mut i8,
+            error_message_len: usize,
+        ) -> bool;
+        fn stwo_metal_witness_memory_addr_to_id_interaction_raw(
+            runtime: *mut c_void,
+            trace_cols: *mut *mut c_void,
+            num_cols: *mut *mut c_void,
+            denom_cols: *mut *mut c_void,
+            alpha_powers: *mut c_void,
+            z_limbs: *const u32,
+            relation_id: u32,
+            column_length: u32,
+            split: u32,
+            wait_until_completed: bool,
+            error_message: *mut i8,
+            error_message_len: usize,
+        ) -> bool;
         fn stwo_metal_witness_add_opcode_small_trace(
             runtime: *mut c_void,
             inputs: *mut c_void,
@@ -5229,6 +7037,96 @@ pub mod ffi {
             trace: *mut c_void,
             n_rows: u32,
             column_length: u32,
+            error_message: *mut i8,
+            error_message_len: usize,
+        ) -> bool;
+        fn stwo_metal_witness_add_opcode_small_trace_columns(
+            runtime: *mut c_void,
+            inputs: *mut c_void,
+            address_to_id: *mut c_void,
+            big_values: *mut c_void,
+            small_values: *mut c_void,
+            trace_cols: *mut *mut c_void,
+            n_rows: u32,
+            column_length: u32,
+            wait_until_completed: bool,
+            error_message: *mut i8,
+            error_message_len: usize,
+        ) -> bool;
+        fn stwo_metal_witness_add_opcode_small_interaction_raw(
+            runtime: *mut c_void,
+            trace: *mut c_void,
+            num_cols: *mut *mut c_void,
+            denom_cols: *mut *mut c_void,
+            alpha_powers: *mut c_void,
+            z_limbs: *const u32,
+            n_rows: u32,
+            column_length: u32,
+            wait_until_completed: bool,
+            error_message: *mut i8,
+            error_message_len: usize,
+        ) -> bool;
+        fn stwo_metal_witness_add_opcode_small_interaction_raw_columns(
+            runtime: *mut c_void,
+            trace_cols: *mut *mut c_void,
+            num_cols: *mut *mut c_void,
+            denom_cols: *mut *mut c_void,
+            alpha_powers: *mut c_void,
+            z_limbs: *const u32,
+            n_rows: u32,
+            column_length: u32,
+            wait_until_completed: bool,
+            error_message: *mut i8,
+            error_message_len: usize,
+        ) -> bool;
+        fn stwo_metal_witness_assert_eq_opcode_trace(
+            runtime: *mut c_void,
+            inputs: *mut c_void,
+            address_to_id: *mut c_void,
+            big_values: *mut c_void,
+            small_values: *mut c_void,
+            trace: *mut c_void,
+            n_rows: u32,
+            column_length: u32,
+            error_message: *mut i8,
+            error_message_len: usize,
+        ) -> bool;
+        fn stwo_metal_witness_assert_eq_opcode_trace_columns(
+            runtime: *mut c_void,
+            inputs: *mut c_void,
+            address_to_id: *mut c_void,
+            big_values: *mut c_void,
+            small_values: *mut c_void,
+            trace_cols: *mut *mut c_void,
+            n_rows: u32,
+            column_length: u32,
+            wait_until_completed: bool,
+            error_message: *mut i8,
+            error_message_len: usize,
+        ) -> bool;
+        fn stwo_metal_witness_assert_eq_opcode_interaction_raw(
+            runtime: *mut c_void,
+            trace: *mut c_void,
+            num_cols: *mut *mut c_void,
+            denom_cols: *mut *mut c_void,
+            alpha_powers: *mut c_void,
+            z_limbs: *const u32,
+            n_rows: u32,
+            column_length: u32,
+            wait_until_completed: bool,
+            error_message: *mut i8,
+            error_message_len: usize,
+        ) -> bool;
+        fn stwo_metal_witness_assert_eq_opcode_interaction_raw_columns(
+            runtime: *mut c_void,
+            trace_cols: *mut *mut c_void,
+            num_cols: *mut *mut c_void,
+            denom_cols: *mut *mut c_void,
+            alpha_powers: *mut c_void,
+            z_limbs: *const u32,
+            n_rows: u32,
+            column_length: u32,
+            wait_until_completed: bool,
             error_message: *mut i8,
             error_message_len: usize,
         ) -> bool;
@@ -5289,6 +7187,31 @@ pub mod ffi {
             trace: *mut c_void,
             n_rows: u32,
             column_length: u32,
+            error_message: *mut i8,
+            error_message_len: usize,
+        ) -> bool;
+        fn stwo_metal_witness_ret_opcode_trace_columns(
+            runtime: *mut c_void,
+            inputs: *mut c_void,
+            address_to_id: *mut c_void,
+            big_values: *mut c_void,
+            small_values: *mut c_void,
+            trace_cols: *mut *mut c_void,
+            n_rows: u32,
+            column_length: u32,
+            wait_until_completed: bool,
+            error_message: *mut i8,
+            error_message_len: usize,
+        ) -> bool;
+        fn stwo_metal_witness_ret_opcode_interaction_raw(
+            runtime: *mut c_void,
+            trace_cols: *mut *mut c_void,
+            num_cols: *mut *mut c_void,
+            denom_cols: *mut *mut c_void,
+            alpha_powers: *mut c_void,
+            z_limbs: *const u32,
+            column_length: u32,
+            wait_until_completed: bool,
             error_message: *mut i8,
             error_message_len: usize,
         ) -> bool;
@@ -5819,6 +7742,29 @@ pub mod ffi {
             kernel_name: *const u8,
             kernel_name_len: usize,
             trace_values: *mut c_void,
+            interaction_offsets: *mut c_void,
+            preprocessed_values: *mut c_void,
+            base_params: *mut c_void,
+            ext_params: *mut c_void,
+            random_coeff_powers: *mut c_void,
+            denom_inv: *mut c_void,
+            coord_0: *mut c_void,
+            coord_1: *mut c_void,
+            coord_2: *mut c_void,
+            coord_3: *mut c_void,
+            row_count: u32,
+            log_n_rows: u32,
+            error_message: *mut i8,
+            error_message_len: usize,
+        ) -> bool;
+        fn stwo_metal_eval_compiled_fused_composition_blit_v1(
+            runtime: *mut c_void,
+            shader_source: *const u8,
+            shader_source_len: usize,
+            kernel_name: *const u8,
+            kernel_name_len: usize,
+            column_buffer_ptrs: *const *mut c_void,
+            n_columns: usize,
             interaction_offsets: *mut c_void,
             preprocessed_values: *mut c_void,
             base_params: *mut c_void,
@@ -7290,6 +9236,83 @@ pub mod ffi {
         }
     }
 
+    pub unsafe fn inclusive_prefix_sum_bit_rev_circle_domain_4col_u32(
+        runtime: *mut c_void,
+        cols: [*mut c_void; 4],
+        log_len: u32,
+        error_ptr: fn(&mut [i8; ERROR_BUFFER_LEN]) -> *mut i8,
+    ) -> Result<(), MetalError> {
+        let mut error = [0i8; ERROR_BUFFER_LEN];
+        if stwo_metal_inclusive_prefix_sum_bit_rev_circle_domain_4col_u32(
+            runtime,
+            cols[0],
+            cols[1],
+            cols[2],
+            cols[3],
+            log_len,
+            error_ptr(&mut error),
+            error.len(),
+        ) {
+            Ok(())
+        } else {
+            Err(MetalError::new(decode_error_buffer(&error)))
+        }
+    }
+
+    pub unsafe fn logup_fraction_chain_u32x4(
+        runtime: *mut c_void,
+        cols: [*mut c_void; 4],
+        denom_packed: *mut c_void,
+        prev: [*mut c_void; 4],
+        n_elements: u32,
+        wait_until_completed: bool,
+        error_ptr: fn(&mut [i8; ERROR_BUFFER_LEN]) -> *mut i8,
+    ) -> Result<(), MetalError> {
+        let mut error = [0i8; ERROR_BUFFER_LEN];
+        if stwo_metal_logup_fraction_chain_u32x4(
+            runtime,
+            cols[0],
+            cols[1],
+            cols[2],
+            cols[3],
+            denom_packed,
+            prev[0],
+            prev[1],
+            prev[2],
+            prev[3],
+            n_elements,
+            wait_until_completed,
+            error_ptr(&mut error),
+            error.len(),
+        ) {
+            Ok(())
+        } else {
+            Err(MetalError::new(decode_error_buffer(&error)))
+        }
+    }
+
+    pub unsafe fn logup_fraction_chain_batch_u32x4(
+        runtime: *mut c_void,
+        descriptors: *const LogupFractionChainDescriptor,
+        n_columns: u32,
+        n_elements: u32,
+        error_ptr: fn(&mut [i8; ERROR_BUFFER_LEN]) -> *mut i8,
+    ) -> Result<(), MetalError> {
+        let mut error = [0i8; ERROR_BUFFER_LEN];
+        if stwo_metal_logup_fraction_chain_batch_u32x4(
+            runtime,
+            descriptors,
+            n_columns,
+            n_elements,
+            error_ptr(&mut error),
+            error.len(),
+        ) {
+            Ok(())
+        } else {
+            Err(MetalError::new(decode_error_buffer(&error)))
+        }
+    }
+
     pub unsafe fn reduce_sum_m31_4col(
         runtime: *mut c_void,
         cols: [*mut c_void; 4],
@@ -7330,6 +9353,31 @@ pub mod ffi {
             cols[2],
             cols[3],
             cumsum_shifts.as_ptr(),
+            n_elements,
+            error_ptr(&mut error),
+            error.len(),
+        ) {
+            Ok(())
+        } else {
+            Err(MetalError::new(decode_error_buffer(&error)))
+        }
+    }
+
+    pub unsafe fn subtract_m31_4col(
+        runtime: *mut c_void,
+        cols: [*mut c_void; 4],
+        shifts: &[u32; 4],
+        n_elements: u32,
+        error_ptr: fn(&mut [i8; ERROR_BUFFER_LEN]) -> *mut i8,
+    ) -> Result<(), MetalError> {
+        let mut error = [0i8; ERROR_BUFFER_LEN];
+        if stwo_metal_subtract_m31_4col(
+            runtime,
+            cols[0],
+            cols[1],
+            cols[2],
+            cols[3],
+            shifts.as_ptr(),
             n_elements,
             error_ptr(&mut error),
             error.len(),
@@ -7599,6 +9647,34 @@ pub mod ffi {
         }
     }
 
+    pub unsafe fn witness_memory_id_to_big_trace_columns(
+        runtime: *mut c_void,
+        big_values: *mut c_void,
+        mults: *mut c_void,
+        trace_cols: *mut *mut c_void,
+        n_values: u32,
+        column_length: u32,
+        wait_until_completed: bool,
+        error_ptr: fn(&mut [i8; ERROR_BUFFER_LEN]) -> *mut i8,
+    ) -> Result<(), MetalError> {
+        let mut error = [0i8; ERROR_BUFFER_LEN];
+        if stwo_metal_witness_memory_id_to_big_trace_columns(
+            runtime,
+            big_values,
+            mults,
+            trace_cols,
+            n_values,
+            column_length,
+            wait_until_completed,
+            error_ptr(&mut error),
+            error.len(),
+        ) {
+            Ok(())
+        } else {
+            Err(MetalError::new(decode_error_buffer(&error)))
+        }
+    }
+
     pub unsafe fn witness_memory_id_to_big_small_trace(
         runtime: *mut c_void,
         small_values: *mut c_void,
@@ -7616,6 +9692,156 @@ pub mod ffi {
             trace,
             n_values,
             column_length,
+            error_ptr(&mut error),
+            error.len(),
+        ) {
+            Ok(())
+        } else {
+            Err(MetalError::new(decode_error_buffer(&error)))
+        }
+    }
+
+    pub unsafe fn witness_memory_id_to_big_small_trace_columns(
+        runtime: *mut c_void,
+        small_values: *mut c_void,
+        mults: *mut c_void,
+        trace_cols: *mut *mut c_void,
+        n_values: u32,
+        column_length: u32,
+        wait_until_completed: bool,
+        error_ptr: fn(&mut [i8; ERROR_BUFFER_LEN]) -> *mut i8,
+    ) -> Result<(), MetalError> {
+        let mut error = [0i8; ERROR_BUFFER_LEN];
+        if stwo_metal_witness_memory_id_to_big_small_trace_columns(
+            runtime,
+            small_values,
+            mults,
+            trace_cols,
+            n_values,
+            column_length,
+            wait_until_completed,
+            error_ptr(&mut error),
+            error.len(),
+        ) {
+            Ok(())
+        } else {
+            Err(MetalError::new(decode_error_buffer(&error)))
+        }
+    }
+
+    pub unsafe fn witness_memory_rc99_count(
+        runtime: *mut c_void,
+        limb_cols: *mut *mut c_void,
+        input_to_row_lut: *mut c_void,
+        counts: *mut c_void,
+        n_pairs: u32,
+        column_length: u32,
+        rc_table_size: u32,
+        error_ptr: fn(&mut [i8; ERROR_BUFFER_LEN]) -> *mut i8,
+    ) -> Result<(), MetalError> {
+        let mut error = [0i8; ERROR_BUFFER_LEN];
+        if stwo_metal_witness_memory_rc99_count(
+            runtime,
+            limb_cols,
+            input_to_row_lut,
+            counts,
+            n_pairs,
+            column_length,
+            rc_table_size,
+            error_ptr(&mut error),
+            error.len(),
+        ) {
+            Ok(())
+        } else {
+            Err(MetalError::new(decode_error_buffer(&error)))
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn witness_memory_rc_pair_logup(
+        runtime: *mut c_void,
+        limb_a: *mut c_void,
+        limb_b: *mut c_void,
+        limb_c: *mut c_void,
+        limb_d: *mut c_void,
+        denom_packed: *mut c_void,
+        num0: *mut c_void,
+        num1: *mut c_void,
+        num2: *mut c_void,
+        num3: *mut c_void,
+        alpha_powers: *mut c_void,
+        z_limbs: *const u32,
+        rel_id0: u32,
+        rel_id1: u32,
+        column_length: u32,
+        wait_until_completed: bool,
+        error_ptr: fn(&mut [i8; ERROR_BUFFER_LEN]) -> *mut i8,
+    ) -> Result<(), MetalError> {
+        let mut error = [0i8; ERROR_BUFFER_LEN];
+        if stwo_metal_witness_memory_rc_pair_logup(
+            runtime,
+            limb_a,
+            limb_b,
+            limb_c,
+            limb_d,
+            denom_packed,
+            num0,
+            num1,
+            num2,
+            num3,
+            alpha_powers,
+            z_limbs,
+            rel_id0,
+            rel_id1,
+            column_length,
+            wait_until_completed,
+            error_ptr(&mut error),
+            error.len(),
+        ) {
+            Ok(())
+        } else {
+            Err(MetalError::new(decode_error_buffer(&error)))
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn witness_memory_logup_inputs(
+        runtime: *mut c_void,
+        limb_cols: *mut *mut c_void,
+        mults: *mut c_void,
+        denom_packed: *mut c_void,
+        num0: *mut c_void,
+        num1: *mut c_void,
+        num2: *mut c_void,
+        num3: *mut c_void,
+        alpha_powers: *mut c_void,
+        z_limbs: *const u32,
+        relation_id: u32,
+        id_offset: u32,
+        id_tag: u32,
+        n_limbs: u32,
+        column_length: u32,
+        wait_until_completed: bool,
+        error_ptr: fn(&mut [i8; ERROR_BUFFER_LEN]) -> *mut i8,
+    ) -> Result<(), MetalError> {
+        let mut error = [0i8; ERROR_BUFFER_LEN];
+        if stwo_metal_witness_memory_logup_inputs(
+            runtime,
+            limb_cols,
+            mults,
+            denom_packed,
+            num0,
+            num1,
+            num2,
+            num3,
+            alpha_powers,
+            z_limbs,
+            relation_id,
+            id_offset,
+            id_tag,
+            n_limbs,
+            column_length,
+            wait_until_completed,
             error_ptr(&mut error),
             error.len(),
         ) {
@@ -7653,6 +9879,71 @@ pub mod ffi {
         }
     }
 
+    pub unsafe fn witness_memory_addr_to_id_trace_columns(
+        runtime: *mut c_void,
+        ids: *mut c_void,
+        mults: *mut c_void,
+        trace_cols: *mut *mut c_void,
+        n_ids: u32,
+        column_length: u32,
+        split: u32,
+        wait_until_completed: bool,
+        error_ptr: fn(&mut [i8; ERROR_BUFFER_LEN]) -> *mut i8,
+    ) -> Result<(), MetalError> {
+        let mut error = [0i8; ERROR_BUFFER_LEN];
+        if stwo_metal_witness_memory_addr_to_id_trace_columns(
+            runtime,
+            ids,
+            mults,
+            trace_cols,
+            n_ids,
+            column_length,
+            split,
+            wait_until_completed,
+            error_ptr(&mut error),
+            error.len(),
+        ) {
+            Ok(())
+        } else {
+            Err(MetalError::new(decode_error_buffer(&error)))
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn witness_memory_addr_to_id_interaction_raw(
+        runtime: *mut c_void,
+        trace_cols: *mut *mut c_void,
+        num_cols: *mut *mut c_void,
+        denom_cols: *mut *mut c_void,
+        alpha_powers: *mut c_void,
+        z_limbs: *const u32,
+        relation_id: u32,
+        column_length: u32,
+        split: u32,
+        wait_until_completed: bool,
+        error_ptr: fn(&mut [i8; ERROR_BUFFER_LEN]) -> *mut i8,
+    ) -> Result<(), MetalError> {
+        let mut error = [0i8; ERROR_BUFFER_LEN];
+        if stwo_metal_witness_memory_addr_to_id_interaction_raw(
+            runtime,
+            trace_cols,
+            num_cols,
+            denom_cols,
+            alpha_powers,
+            z_limbs,
+            relation_id,
+            column_length,
+            split,
+            wait_until_completed,
+            error_ptr(&mut error),
+            error.len(),
+        ) {
+            Ok(())
+        } else {
+            Err(MetalError::new(decode_error_buffer(&error)))
+        }
+    }
+
     pub unsafe fn witness_add_opcode_small_trace(
         runtime: *mut c_void,
         inputs: *mut c_void,
@@ -7674,6 +9965,234 @@ pub mod ffi {
             trace,
             n_rows,
             column_length,
+            error_ptr(&mut error),
+            error.len(),
+        ) {
+            Ok(())
+        } else {
+            Err(MetalError::new(decode_error_buffer(&error)))
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn witness_add_opcode_small_trace_columns(
+        runtime: *mut c_void,
+        inputs: *mut c_void,
+        address_to_id: *mut c_void,
+        big_values: *mut c_void,
+        small_values: *mut c_void,
+        trace_cols: *mut *mut c_void,
+        n_rows: u32,
+        column_length: u32,
+        wait_until_completed: bool,
+        error_ptr: fn(&mut [i8; ERROR_BUFFER_LEN]) -> *mut i8,
+    ) -> Result<(), MetalError> {
+        let mut error = [0i8; ERROR_BUFFER_LEN];
+        if stwo_metal_witness_add_opcode_small_trace_columns(
+            runtime,
+            inputs,
+            address_to_id,
+            big_values,
+            small_values,
+            trace_cols,
+            n_rows,
+            column_length,
+            wait_until_completed,
+            error_ptr(&mut error),
+            error.len(),
+        ) {
+            Ok(())
+        } else {
+            Err(MetalError::new(decode_error_buffer(&error)))
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn witness_add_opcode_small_interaction_raw(
+        runtime: *mut c_void,
+        trace: *mut c_void,
+        num_cols: *mut *mut c_void,
+        denom_cols: *mut *mut c_void,
+        alpha_powers: *mut c_void,
+        z_limbs: *const u32,
+        n_rows: u32,
+        column_length: u32,
+        wait_until_completed: bool,
+        error_ptr: fn(&mut [i8; ERROR_BUFFER_LEN]) -> *mut i8,
+    ) -> Result<(), MetalError> {
+        let mut error = [0i8; ERROR_BUFFER_LEN];
+        if stwo_metal_witness_add_opcode_small_interaction_raw(
+            runtime,
+            trace,
+            num_cols,
+            denom_cols,
+            alpha_powers,
+            z_limbs,
+            n_rows,
+            column_length,
+            wait_until_completed,
+            error_ptr(&mut error),
+            error.len(),
+        ) {
+            Ok(())
+        } else {
+            Err(MetalError::new(decode_error_buffer(&error)))
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn witness_add_opcode_small_interaction_raw_columns(
+        runtime: *mut c_void,
+        trace_cols: *mut *mut c_void,
+        num_cols: *mut *mut c_void,
+        denom_cols: *mut *mut c_void,
+        alpha_powers: *mut c_void,
+        z_limbs: *const u32,
+        n_rows: u32,
+        column_length: u32,
+        wait_until_completed: bool,
+        error_ptr: fn(&mut [i8; ERROR_BUFFER_LEN]) -> *mut i8,
+    ) -> Result<(), MetalError> {
+        let mut error = [0i8; ERROR_BUFFER_LEN];
+        if stwo_metal_witness_add_opcode_small_interaction_raw_columns(
+            runtime,
+            trace_cols,
+            num_cols,
+            denom_cols,
+            alpha_powers,
+            z_limbs,
+            n_rows,
+            column_length,
+            wait_until_completed,
+            error_ptr(&mut error),
+            error.len(),
+        ) {
+            Ok(())
+        } else {
+            Err(MetalError::new(decode_error_buffer(&error)))
+        }
+    }
+
+    pub unsafe fn witness_assert_eq_opcode_trace(
+        runtime: *mut c_void,
+        inputs: *mut c_void,
+        address_to_id: *mut c_void,
+        big_values: *mut c_void,
+        small_values: *mut c_void,
+        trace: *mut c_void,
+        n_rows: u32,
+        column_length: u32,
+        error_ptr: fn(&mut [i8; ERROR_BUFFER_LEN]) -> *mut i8,
+    ) -> Result<(), MetalError> {
+        let mut error = [0i8; ERROR_BUFFER_LEN];
+        if stwo_metal_witness_assert_eq_opcode_trace(
+            runtime,
+            inputs,
+            address_to_id,
+            big_values,
+            small_values,
+            trace,
+            n_rows,
+            column_length,
+            error_ptr(&mut error),
+            error.len(),
+        ) {
+            Ok(())
+        } else {
+            Err(MetalError::new(decode_error_buffer(&error)))
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn witness_assert_eq_opcode_trace_columns(
+        runtime: *mut c_void,
+        inputs: *mut c_void,
+        address_to_id: *mut c_void,
+        big_values: *mut c_void,
+        small_values: *mut c_void,
+        trace_cols: *mut *mut c_void,
+        n_rows: u32,
+        column_length: u32,
+        wait_until_completed: bool,
+        error_ptr: fn(&mut [i8; ERROR_BUFFER_LEN]) -> *mut i8,
+    ) -> Result<(), MetalError> {
+        let mut error = [0i8; ERROR_BUFFER_LEN];
+        if stwo_metal_witness_assert_eq_opcode_trace_columns(
+            runtime,
+            inputs,
+            address_to_id,
+            big_values,
+            small_values,
+            trace_cols,
+            n_rows,
+            column_length,
+            wait_until_completed,
+            error_ptr(&mut error),
+            error.len(),
+        ) {
+            Ok(())
+        } else {
+            Err(MetalError::new(decode_error_buffer(&error)))
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn witness_assert_eq_opcode_interaction_raw(
+        runtime: *mut c_void,
+        trace: *mut c_void,
+        num_cols: *mut *mut c_void,
+        denom_cols: *mut *mut c_void,
+        alpha_powers: *mut c_void,
+        z_limbs: *const u32,
+        n_rows: u32,
+        column_length: u32,
+        wait_until_completed: bool,
+        error_ptr: fn(&mut [i8; ERROR_BUFFER_LEN]) -> *mut i8,
+    ) -> Result<(), MetalError> {
+        let mut error = [0i8; ERROR_BUFFER_LEN];
+        if stwo_metal_witness_assert_eq_opcode_interaction_raw(
+            runtime,
+            trace,
+            num_cols,
+            denom_cols,
+            alpha_powers,
+            z_limbs,
+            n_rows,
+            column_length,
+            wait_until_completed,
+            error_ptr(&mut error),
+            error.len(),
+        ) {
+            Ok(())
+        } else {
+            Err(MetalError::new(decode_error_buffer(&error)))
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn witness_assert_eq_opcode_interaction_raw_columns(
+        runtime: *mut c_void,
+        trace_cols: *mut *mut c_void,
+        num_cols: *mut *mut c_void,
+        denom_cols: *mut *mut c_void,
+        alpha_powers: *mut c_void,
+        z_limbs: *const u32,
+        n_rows: u32,
+        column_length: u32,
+        wait_until_completed: bool,
+        error_ptr: fn(&mut [i8; ERROR_BUFFER_LEN]) -> *mut i8,
+    ) -> Result<(), MetalError> {
+        let mut error = [0i8; ERROR_BUFFER_LEN];
+        if stwo_metal_witness_assert_eq_opcode_interaction_raw_columns(
+            runtime,
+            trace_cols,
+            num_cols,
+            denom_cols,
+            alpha_powers,
+            z_limbs,
+            n_rows,
+            column_length,
+            wait_until_completed,
             error_ptr(&mut error),
             error.len(),
         ) {
@@ -7824,6 +10343,69 @@ pub mod ffi {
             trace,
             n_rows,
             column_length,
+            error_ptr(&mut error),
+            error.len(),
+        ) {
+            Ok(())
+        } else {
+            Err(MetalError::new(decode_error_buffer(&error)))
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn witness_ret_opcode_trace_columns(
+        runtime: *mut c_void,
+        inputs: *mut c_void,
+        address_to_id: *mut c_void,
+        big_values: *mut c_void,
+        small_values: *mut c_void,
+        trace_cols: *mut *mut c_void,
+        n_rows: u32,
+        column_length: u32,
+        wait_until_completed: bool,
+        error_ptr: fn(&mut [i8; ERROR_BUFFER_LEN]) -> *mut i8,
+    ) -> Result<(), MetalError> {
+        let mut error = [0i8; ERROR_BUFFER_LEN];
+        if stwo_metal_witness_ret_opcode_trace_columns(
+            runtime,
+            inputs,
+            address_to_id,
+            big_values,
+            small_values,
+            trace_cols,
+            n_rows,
+            column_length,
+            wait_until_completed,
+            error_ptr(&mut error),
+            error.len(),
+        ) {
+            Ok(())
+        } else {
+            Err(MetalError::new(decode_error_buffer(&error)))
+        }
+    }
+
+    pub unsafe fn witness_ret_opcode_interaction_raw(
+        runtime: *mut c_void,
+        trace_cols: *mut *mut c_void,
+        num_cols: *mut *mut c_void,
+        denom_cols: *mut *mut c_void,
+        alpha_powers: *mut c_void,
+        z_limbs: *const u32,
+        column_length: u32,
+        wait_until_completed: bool,
+        error_ptr: fn(&mut [i8; ERROR_BUFFER_LEN]) -> *mut i8,
+    ) -> Result<(), MetalError> {
+        let mut error = [0i8; ERROR_BUFFER_LEN];
+        if stwo_metal_witness_ret_opcode_interaction_raw(
+            runtime,
+            trace_cols,
+            num_cols,
+            denom_cols,
+            alpha_powers,
+            z_limbs,
+            column_length,
+            wait_until_completed,
             error_ptr(&mut error),
             error.len(),
         ) {
@@ -9143,6 +11725,59 @@ pub mod ffi {
             kernel_name,
             kernel_name_len,
             trace_values,
+            interaction_offsets,
+            preprocessed_values,
+            base_params,
+            ext_params,
+            random_coeff_powers,
+            denom_inv,
+            coord_0,
+            coord_1,
+            coord_2,
+            coord_3,
+            row_count,
+            log_n_rows,
+            error_ptr(&mut error),
+            error.len(),
+        ) {
+            Ok(())
+        } else {
+            Err(MetalError::new(decode_error_buffer(&error)))
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn eval_compiled_fused_composition_blit_v1(
+        runtime: *mut c_void,
+        shader_source: *const u8,
+        shader_source_len: usize,
+        kernel_name: *const u8,
+        kernel_name_len: usize,
+        column_buffer_ptrs: *const *mut c_void,
+        n_columns: usize,
+        interaction_offsets: *mut c_void,
+        preprocessed_values: *mut c_void,
+        base_params: *mut c_void,
+        ext_params: *mut c_void,
+        random_coeff_powers: *mut c_void,
+        denom_inv: *mut c_void,
+        coord_0: *mut c_void,
+        coord_1: *mut c_void,
+        coord_2: *mut c_void,
+        coord_3: *mut c_void,
+        row_count: u32,
+        log_n_rows: u32,
+        error_ptr: fn(&mut [i8; ERROR_BUFFER_LEN]) -> *mut i8,
+    ) -> Result<(), MetalError> {
+        let mut error = [0i8; ERROR_BUFFER_LEN];
+        if stwo_metal_eval_compiled_fused_composition_blit_v1(
+            runtime,
+            shader_source,
+            shader_source_len,
+            kernel_name,
+            kernel_name_len,
+            column_buffer_ptrs,
+            n_columns,
             interaction_offsets,
             preprocessed_values,
             base_params,
@@ -10674,6 +13309,43 @@ pub mod ffi {
         ))
     }
 
+    pub unsafe fn inclusive_prefix_sum_bit_rev_circle_domain_4col_u32(
+        _runtime: *mut c_void,
+        _cols: [*mut c_void; 4],
+        _log_len: u32,
+        _error_ptr: fn(&mut [i8; 512]) -> *mut i8,
+    ) -> Result<(), MetalError> {
+        Err(MetalError::new(
+            "Metal support was not linked into stwo-metal-sys.",
+        ))
+    }
+
+    pub unsafe fn logup_fraction_chain_u32x4(
+        _runtime: *mut c_void,
+        _cols: [*mut c_void; 4],
+        _denom_packed: *mut c_void,
+        _prev: [*mut c_void; 4],
+        _n_elements: u32,
+        _wait_until_completed: bool,
+        _error_ptr: fn(&mut [i8; 512]) -> *mut i8,
+    ) -> Result<(), MetalError> {
+        Err(MetalError::new(
+            "Metal support was not linked into stwo-metal-sys.",
+        ))
+    }
+
+    pub unsafe fn logup_fraction_chain_batch_u32x4(
+        _runtime: *mut c_void,
+        _descriptors: *const LogupFractionChainDescriptor,
+        _n_columns: u32,
+        _n_elements: u32,
+        _error_ptr: fn(&mut [i8; 512]) -> *mut i8,
+    ) -> Result<(), MetalError> {
+        Err(MetalError::new(
+            "Metal support was not linked into stwo-metal-sys.",
+        ))
+    }
+
     pub unsafe fn reduce_sum_m31_4col(
         _runtime: *mut c_void,
         _cols: [*mut c_void; 4],
@@ -10690,6 +13362,18 @@ pub mod ffi {
         _runtime: *mut c_void,
         _cols: [*mut c_void; 4],
         _cumsum_shifts: &[u32; 4],
+        _n_elements: u32,
+        _error_ptr: fn(&mut [i8; 512]) -> *mut i8,
+    ) -> Result<(), MetalError> {
+        Err(MetalError::new(
+            "Metal support was not linked into stwo-metal-sys.",
+        ))
+    }
+
+    pub unsafe fn subtract_m31_4col(
+        _runtime: *mut c_void,
+        _cols: [*mut c_void; 4],
+        _shifts: &[u32; 4],
         _n_elements: u32,
         _error_ptr: fn(&mut [i8; 512]) -> *mut i8,
     ) -> Result<(), MetalError> {
@@ -10835,6 +13519,21 @@ pub mod ffi {
         ))
     }
 
+    pub unsafe fn witness_memory_id_to_big_trace_columns(
+        _runtime: *mut c_void,
+        _big_values: *mut c_void,
+        _mults: *mut c_void,
+        _trace_cols: *mut *mut c_void,
+        _n_values: u32,
+        _column_length: u32,
+        _wait_until_completed: bool,
+        _error_ptr: fn(&mut [i8; 512]) -> *mut i8,
+    ) -> Result<(), MetalError> {
+        Err(MetalError::new(
+            "Metal support was not linked into stwo-metal-sys.",
+        ))
+    }
+
     pub unsafe fn witness_memory_id_to_big_small_trace(
         _runtime: *mut c_void,
         _small_values: *mut c_void,
@@ -10842,6 +13541,86 @@ pub mod ffi {
         _trace: *mut c_void,
         _n_values: u32,
         _column_length: u32,
+        _error_ptr: fn(&mut [i8; 512]) -> *mut i8,
+    ) -> Result<(), MetalError> {
+        Err(MetalError::new(
+            "Metal support was not linked into stwo-metal-sys.",
+        ))
+    }
+
+    pub unsafe fn witness_memory_id_to_big_small_trace_columns(
+        _runtime: *mut c_void,
+        _small_values: *mut c_void,
+        _mults: *mut c_void,
+        _trace_cols: *mut *mut c_void,
+        _n_values: u32,
+        _column_length: u32,
+        _wait_until_completed: bool,
+        _error_ptr: fn(&mut [i8; 512]) -> *mut i8,
+    ) -> Result<(), MetalError> {
+        Err(MetalError::new(
+            "Metal support was not linked into stwo-metal-sys.",
+        ))
+    }
+
+    pub unsafe fn witness_memory_rc99_count(
+        _runtime: *mut c_void,
+        _limb_cols: *mut *mut c_void,
+        _input_to_row_lut: *mut c_void,
+        _counts: *mut c_void,
+        _n_pairs: u32,
+        _column_length: u32,
+        _rc_table_size: u32,
+        _error_ptr: fn(&mut [i8; 512]) -> *mut i8,
+    ) -> Result<(), MetalError> {
+        Err(MetalError::new(
+            "Metal support was not linked into stwo-metal-sys.",
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn witness_memory_rc_pair_logup(
+        _runtime: *mut c_void,
+        _limb_a: *mut c_void,
+        _limb_b: *mut c_void,
+        _limb_c: *mut c_void,
+        _limb_d: *mut c_void,
+        _denom_packed: *mut c_void,
+        _num0: *mut c_void,
+        _num1: *mut c_void,
+        _num2: *mut c_void,
+        _num3: *mut c_void,
+        _alpha_powers: *mut c_void,
+        _z_limbs: *const u32,
+        _rel_id0: u32,
+        _rel_id1: u32,
+        _column_length: u32,
+        _wait_until_completed: bool,
+        _error_ptr: fn(&mut [i8; 512]) -> *mut i8,
+    ) -> Result<(), MetalError> {
+        Err(MetalError::new(
+            "Metal support was not linked into stwo-metal-sys.",
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn witness_memory_logup_inputs(
+        _runtime: *mut c_void,
+        _limb_cols: *mut *mut c_void,
+        _mults: *mut c_void,
+        _denom_packed: *mut c_void,
+        _num0: *mut c_void,
+        _num1: *mut c_void,
+        _num2: *mut c_void,
+        _num3: *mut c_void,
+        _alpha_powers: *mut c_void,
+        _z_limbs: *const u32,
+        _relation_id: u32,
+        _id_offset: u32,
+        _id_tag: u32,
+        _n_limbs: u32,
+        _column_length: u32,
+        _wait_until_completed: bool,
         _error_ptr: fn(&mut [i8; 512]) -> *mut i8,
     ) -> Result<(), MetalError> {
         Err(MetalError::new(
@@ -10864,6 +13643,41 @@ pub mod ffi {
         ))
     }
 
+    pub unsafe fn witness_memory_addr_to_id_trace_columns(
+        _runtime: *mut c_void,
+        _ids: *mut c_void,
+        _mults: *mut c_void,
+        _trace_cols: *mut *mut c_void,
+        _n_ids: u32,
+        _column_length: u32,
+        _split: u32,
+        _wait_until_completed: bool,
+        _error_ptr: fn(&mut [i8; 512]) -> *mut i8,
+    ) -> Result<(), MetalError> {
+        Err(MetalError::new(
+            "Metal support was not linked into stwo-metal-sys.",
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn witness_memory_addr_to_id_interaction_raw(
+        _runtime: *mut c_void,
+        _trace_cols: *mut *mut c_void,
+        _num_cols: *mut *mut c_void,
+        _denom_cols: *mut *mut c_void,
+        _alpha_powers: *mut c_void,
+        _z_limbs: *const u32,
+        _relation_id: u32,
+        _column_length: u32,
+        _split: u32,
+        _wait_until_completed: bool,
+        _error_ptr: fn(&mut [i8; 512]) -> *mut i8,
+    ) -> Result<(), MetalError> {
+        Err(MetalError::new(
+            "Metal support was not linked into stwo-metal-sys.",
+        ))
+    }
+
     pub unsafe fn witness_add_opcode_small_trace(
         _runtime: *mut c_void,
         _inputs: *mut c_void,
@@ -10873,6 +13687,130 @@ pub mod ffi {
         _trace: *mut c_void,
         _n_rows: u32,
         _column_length: u32,
+        _error_ptr: fn(&mut [i8; 512]) -> *mut i8,
+    ) -> Result<(), MetalError> {
+        Err(MetalError::new(
+            "Metal support was not linked into stwo-metal-sys.",
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn witness_add_opcode_small_trace_columns(
+        _runtime: *mut c_void,
+        _inputs: *mut c_void,
+        _address_to_id: *mut c_void,
+        _big_values: *mut c_void,
+        _small_values: *mut c_void,
+        _trace_cols: *mut *mut c_void,
+        _n_rows: u32,
+        _column_length: u32,
+        _wait_until_completed: bool,
+        _error_ptr: fn(&mut [i8; 512]) -> *mut i8,
+    ) -> Result<(), MetalError> {
+        Err(MetalError::new(
+            "Metal support was not linked into stwo-metal-sys.",
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn witness_add_opcode_small_interaction_raw(
+        _runtime: *mut c_void,
+        _trace: *mut c_void,
+        _num_cols: *mut *mut c_void,
+        _denom_cols: *mut *mut c_void,
+        _alpha_powers: *mut c_void,
+        _z_limbs: *const u32,
+        _n_rows: u32,
+        _column_length: u32,
+        _wait_until_completed: bool,
+        _error_ptr: fn(&mut [i8; 512]) -> *mut i8,
+    ) -> Result<(), MetalError> {
+        Err(MetalError::new(
+            "Metal support was not linked into stwo-metal-sys.",
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn witness_add_opcode_small_interaction_raw_columns(
+        _runtime: *mut c_void,
+        _trace_cols: *mut *mut c_void,
+        _num_cols: *mut *mut c_void,
+        _denom_cols: *mut *mut c_void,
+        _alpha_powers: *mut c_void,
+        _z_limbs: *const u32,
+        _n_rows: u32,
+        _column_length: u32,
+        _wait_until_completed: bool,
+        _error_ptr: fn(&mut [i8; 512]) -> *mut i8,
+    ) -> Result<(), MetalError> {
+        Err(MetalError::new(
+            "Metal support was not linked into stwo-metal-sys.",
+        ))
+    }
+
+    pub unsafe fn witness_assert_eq_opcode_trace(
+        _runtime: *mut c_void,
+        _inputs: *mut c_void,
+        _address_to_id: *mut c_void,
+        _big_values: *mut c_void,
+        _small_values: *mut c_void,
+        _trace: *mut c_void,
+        _n_rows: u32,
+        _column_length: u32,
+        _error_ptr: fn(&mut [i8; 512]) -> *mut i8,
+    ) -> Result<(), MetalError> {
+        Err(MetalError::new(
+            "Metal support was not linked into stwo-metal-sys.",
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn witness_assert_eq_opcode_trace_columns(
+        _runtime: *mut c_void,
+        _inputs: *mut c_void,
+        _address_to_id: *mut c_void,
+        _big_values: *mut c_void,
+        _small_values: *mut c_void,
+        _trace_cols: *mut *mut c_void,
+        _n_rows: u32,
+        _column_length: u32,
+        _wait_until_completed: bool,
+        _error_ptr: fn(&mut [i8; 512]) -> *mut i8,
+    ) -> Result<(), MetalError> {
+        Err(MetalError::new(
+            "Metal support was not linked into stwo-metal-sys.",
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn witness_assert_eq_opcode_interaction_raw(
+        _runtime: *mut c_void,
+        _trace: *mut c_void,
+        _num_cols: *mut *mut c_void,
+        _denom_cols: *mut *mut c_void,
+        _alpha_powers: *mut c_void,
+        _z_limbs: *const u32,
+        _n_rows: u32,
+        _column_length: u32,
+        _wait_until_completed: bool,
+        _error_ptr: fn(&mut [i8; 512]) -> *mut i8,
+    ) -> Result<(), MetalError> {
+        Err(MetalError::new(
+            "Metal support was not linked into stwo-metal-sys.",
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn witness_assert_eq_opcode_interaction_raw_columns(
+        _runtime: *mut c_void,
+        _trace_cols: *mut *mut c_void,
+        _num_cols: *mut *mut c_void,
+        _denom_cols: *mut *mut c_void,
+        _alpha_powers: *mut c_void,
+        _z_limbs: *const u32,
+        _n_rows: u32,
+        _column_length: u32,
+        _wait_until_completed: bool,
         _error_ptr: fn(&mut [i8; 512]) -> *mut i8,
     ) -> Result<(), MetalError> {
         Err(MetalError::new(
@@ -10953,6 +13891,40 @@ pub mod ffi {
         _trace: *mut c_void,
         _n_rows: u32,
         _column_length: u32,
+        _error_ptr: fn(&mut [i8; 512]) -> *mut i8,
+    ) -> Result<(), MetalError> {
+        Err(MetalError::new(
+            "Metal support was not linked into stwo-metal-sys.",
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn witness_ret_opcode_trace_columns(
+        _runtime: *mut c_void,
+        _inputs: *mut c_void,
+        _address_to_id: *mut c_void,
+        _big_values: *mut c_void,
+        _small_values: *mut c_void,
+        _trace_cols: *mut *mut c_void,
+        _n_rows: u32,
+        _column_length: u32,
+        _wait_until_completed: bool,
+        _error_ptr: fn(&mut [i8; 512]) -> *mut i8,
+    ) -> Result<(), MetalError> {
+        Err(MetalError::new(
+            "Metal support was not linked into stwo-metal-sys.",
+        ))
+    }
+
+    pub unsafe fn witness_ret_opcode_interaction_raw(
+        _runtime: *mut c_void,
+        _trace_cols: *mut *mut c_void,
+        _num_cols: *mut *mut c_void,
+        _denom_cols: *mut *mut c_void,
+        _alpha_powers: *mut c_void,
+        _z_limbs: *const u32,
+        _column_length: u32,
+        _wait_until_completed: bool,
         _error_ptr: fn(&mut [i8; 512]) -> *mut i8,
     ) -> Result<(), MetalError> {
         Err(MetalError::new(
@@ -11558,6 +14530,34 @@ pub mod ffi {
         _kernel_name: *const u8,
         _kernel_name_len: usize,
         _trace_values: *mut c_void,
+        _interaction_offsets: *mut c_void,
+        _preprocessed_values: *mut c_void,
+        _base_params: *mut c_void,
+        _ext_params: *mut c_void,
+        _random_coeff_powers: *mut c_void,
+        _denom_inv: *mut c_void,
+        _coord_0: *mut c_void,
+        _coord_1: *mut c_void,
+        _coord_2: *mut c_void,
+        _coord_3: *mut c_void,
+        _row_count: u32,
+        _log_n_rows: u32,
+        _error_ptr: fn(&mut [i8; 512]) -> *mut i8,
+    ) -> Result<(), MetalError> {
+        Err(MetalError::new(
+            "Metal support was not linked into stwo-metal-sys.",
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn eval_compiled_fused_composition_blit_v1(
+        _runtime: *mut c_void,
+        _shader_source: *const u8,
+        _shader_source_len: usize,
+        _kernel_name: *const u8,
+        _kernel_name_len: usize,
+        _column_buffer_ptrs: *const *mut c_void,
+        _n_columns: usize,
         _interaction_offsets: *mut c_void,
         _preprocessed_values: *mut c_void,
         _base_params: *mut c_void,

@@ -15,8 +15,9 @@ mod recording;
 mod shader;
 
 use program::{
-    execute_fused_composition_v1, lower_framework_eval_to_v1_with_logup,
-    MetalEvaluationProgramExecutionError, MetalEvaluationProgramLoweringError,
+    execute_fused_composition_blit_v1, execute_fused_composition_v1,
+    lower_framework_eval_to_v1_with_logup, MetalEvaluationProgramExecutionError,
+    MetalEvaluationProgramLoweringError,
 };
 use stwo::core::air::Component;
 use stwo::prover::secure_column::SecureColumnByCoords;
@@ -80,11 +81,57 @@ pub fn evaluate_constraint_quotients_via_jit<E: FrameworkEval>(
     // column-major GPU buffer of `n_rows` rows per column, in tree order. Columns in
     // SubDomain mode are longer than `n_rows`; the first `n_rows` bit-reversed entries
     // form the evaluation subdomain (same prefix the CPU lane indexes).
+    //
+    // `STWO_METAL_JIT_FUSED_BLIT=1` enables the experimental single-command-buffer
+    // blit+composition path. It removes per-column copy waits, but benchmarked slower
+    // on the Cairo fib workload because temporary private allocation/blit setup
+    // dominated the saved synchronization.
     let n_columns: usize = trace.iter().map(|interaction| interaction.len()).sum();
-    let mut flat = U32Buffer::uninitialized(n_columns * n_rows)
-        .map_err(|e| JitUnavailable::Shape(format!("trace concat alloc: {}", e.message())))?;
     let mut interaction_offsets: Vec<u32> = Vec::with_capacity(trace.len());
     let mut next_column = 0u32;
+    if std::env::var_os("STWO_METAL_JIT_FUSED_BLIT").is_some() {
+        let mut column_buffers: Vec<&U32Buffer> = Vec::with_capacity(n_columns);
+        for interaction in trace.iter() {
+            interaction_offsets.push(next_column);
+            for column in interaction.iter() {
+                assert!(
+                    column.values.len() >= n_rows,
+                    "column shorter than eval domain"
+                );
+                column_buffers.push(column.values.gpu_buffer());
+                next_column += 1;
+            }
+        }
+
+        let [mut accum] =
+            evaluation_accumulator.columns([(eval_domain.log_size(), component.n_constraints())]);
+        accum.random_coeff_powers.reverse();
+
+        let coords = execute_fused_composition_blit_v1(
+            &program,
+            &column_buffers,
+            &interaction_offsets,
+            n_rows,
+            &accum.random_coeff_powers,
+            &denom_inv,
+            trace_domain.log_size(),
+        )
+        .map_err(JitUnavailable::Execution)?;
+
+        let jit_column = SecureColumnByCoords::<MetalBackend> {
+            columns: coords.map(BaseFieldVec::from_buffer),
+        };
+        debug_assert_eq!(
+            stwo::prover::backend::Column::len(&jit_column.columns[0]),
+            stwo::prover::backend::Column::len(&accum.col.columns[0])
+        );
+        <MetalBackend as AccumulationOps>::accumulate(accum.col, &jit_column);
+
+        return Ok(());
+    }
+
+    let mut flat = U32Buffer::uninitialized(n_columns * n_rows)
+        .map_err(|e| JitUnavailable::Shape(format!("trace concat alloc: {}", e.message())))?;
     for interaction in trace.iter() {
         interaction_offsets.push(next_column);
         for column in interaction.iter() {

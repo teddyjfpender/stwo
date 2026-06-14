@@ -31,6 +31,8 @@ const METAL_SOURCES: &[&str] = &[
     "fri",
     "mle",
     "gkr",
+    "logup_finalize",
+    "witness",
     "prefix_sum",
     "bit_reverse",
     "poly_order",

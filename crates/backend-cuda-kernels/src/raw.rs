@@ -263,6 +263,14 @@ extern "C" {
         row_count: u32,
         log_n_rows: u32,
     ) -> bool;
+    /// Compile (if not cached) and cache a fused constraint kernel WITHOUT launching.
+    /// Thread-safe: callers run it concurrently across components to parallelize the
+    /// one-time NVRTC cold-start cost. Returns false on compile failure.
+    pub fn stwo_cuda_jit_compile(
+        source: *const core::ffi::c_char,
+        kernel_name: *const core::ffi::c_char,
+        semantic_hash: u64,
+    ) -> bool;
     /// Per-component constraint-quotient kernel dispatch (NitrooZK lineage). The first
     /// 4 bytes behind `eval` are an FNV1a hash of the component name selecting the
     /// kernel; the rest is the raw `FrameworkEval` struct the kernel's generated code

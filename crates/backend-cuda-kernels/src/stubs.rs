@@ -1019,6 +1019,15 @@ pub unsafe extern "C" fn stwo_cuda_jit_eval_fused(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_cuda_jit_compile(
+    _source: *const core::ffi::c_char,
+    _kernel_name: *const core::ffi::c_char,
+    _semantic_hash: u64,
+) -> bool {
+    no_cuda_symbol("stwo_cuda_jit_compile")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn gen_seq_column_on_gpu(_output: *mut u32, _log_size: u32) {
     no_cuda_symbol("gen_seq_column_on_gpu")
 }

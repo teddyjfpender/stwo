@@ -1,4 +1,4 @@
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
@@ -9,7 +9,7 @@ use super::SecureFieldVec;
 
 #[derive(Debug)]
 pub struct BaseFieldVec {
-    pub(crate) buffer: U32Buffer,
+    pub(crate) buffer: Arc<U32Buffer>,
     size: usize,
     host_cache: OnceLock<Vec<BaseField>>,
 }
@@ -53,10 +53,14 @@ impl BaseFieldVec {
     pub fn from_buffer(buffer: U32Buffer) -> Self {
         let size = buffer.len();
         Self {
-            buffer,
+            buffer: Arc::new(buffer),
             size,
             host_cache: OnceLock::new(),
         }
+    }
+
+    pub(crate) fn into_buffer(self) -> U32Buffer {
+        Arc::try_unwrap(self.buffer).unwrap_or_else(|buffer| (*buffer).clone())
     }
 
     pub fn from_vec(host_array: Vec<BaseField>) -> Self {
@@ -71,7 +75,7 @@ impl BaseFieldVec {
         let host_cache = OnceLock::new();
         let _ = host_cache.set(cached);
         Self {
-            buffer,
+            buffer: Arc::new(buffer),
             size,
             host_cache,
         }
@@ -81,7 +85,7 @@ impl BaseFieldVec {
         let buffer = U32Buffer::uninitialized(size)
             .expect("Metal BaseFieldVec allocation should initialize");
         Self {
-            buffer,
+            buffer: Arc::new(buffer),
             size,
             host_cache: OnceLock::new(),
         }
@@ -99,7 +103,7 @@ impl BaseFieldVec {
         let buffer = U32Buffer::from_slice_private(&raw)
             .expect("Metal BaseFieldVec private upload should succeed");
         Self {
-            buffer,
+            buffer: Arc::new(buffer),
             size,
             host_cache: OnceLock::new(),
         }
@@ -113,7 +117,7 @@ impl BaseFieldVec {
         let buffer = U32Buffer::from_slice_private(raw)
             .expect("Metal BaseFieldVec private upload from u32 slice should succeed");
         Self {
-            buffer,
+            buffer: Arc::new(buffer),
             size,
             host_cache: OnceLock::new(),
         }
@@ -124,7 +128,7 @@ impl BaseFieldVec {
         let buffer = U32Buffer::uninitialized_private(size)
             .expect("Metal BaseFieldVec private allocation should succeed");
         Self {
-            buffer,
+            buffer: Arc::new(buffer),
             size,
             host_cache: OnceLock::new(),
         }
@@ -142,7 +146,7 @@ impl BaseFieldVec {
             return;
         }
         let _ = self.host_cache.take();
-        self.buffer
+        Arc::make_mut(&mut self.buffer)
             .promote_to_private()
             .expect("Metal BaseFieldVec promote-to-private should succeed");
     }
@@ -151,7 +155,7 @@ impl BaseFieldVec {
         let buffer =
             U32Buffer::zeroed(size).expect("Metal BaseFieldVec zero allocation should initialize");
         Self {
-            buffer,
+            buffer: Arc::new(buffer),
             size,
             host_cache: OnceLock::new(),
         }
@@ -171,6 +175,22 @@ impl BaseFieldVec {
         &self.buffer
     }
 
+    pub(crate) fn gpu_buffer_mut(&mut self) -> &mut U32Buffer {
+        Arc::make_mut(&mut self.buffer)
+    }
+
+    pub fn clone_range(&self, start: usize, len: usize) -> Self {
+        let buffer = self
+            .buffer
+            .clone_range(start, len)
+            .expect("Metal BaseFieldVec range clone should succeed");
+        Self {
+            buffer: Arc::new(buffer),
+            size: len,
+            host_cache: OnceLock::new(),
+        }
+    }
+
     pub fn get_data(&self, index: usize) -> BaseField {
         if let Some(values) = self.host_cache.get() {
             return values[index];
@@ -180,20 +200,20 @@ impl BaseFieldVec {
 
     pub fn set_data(&mut self, index: usize, value: BaseField) {
         let _ = self.host_cache.take();
-        self.buffer.set(index, value.0);
+        self.gpu_buffer_mut().set(index, value.0);
     }
 
     pub fn copy_from(&mut self, other: &Self) {
         let _ = self.host_cache.take();
-        self.buffer
-            .copy_from(&other.buffer)
+        self.gpu_buffer_mut()
+            .copy_from(other.gpu_buffer())
             .expect("Metal BaseFieldVec copy should succeed");
     }
 
     pub fn copy_from_offset(&mut self, other: &Self, offset: usize) {
         let _ = self.host_cache.take();
-        self.buffer
-            .copy_from_offset(&other.buffer, offset)
+        self.gpu_buffer_mut()
+            .copy_from_offset(other.gpu_buffer(), offset)
             .expect("Metal BaseFieldVec offset copy should succeed");
     }
 
@@ -226,7 +246,7 @@ impl BaseFieldVec {
 
     pub fn bit_reverse(&mut self) {
         let _ = self.host_cache.take();
-        self.buffer
+        self.gpu_buffer_mut()
             .bit_reverse()
             .expect("Metal BaseFieldVec bit reverse should succeed");
     }
@@ -237,7 +257,7 @@ impl BaseFieldVec {
             .permute_coset_to_circle_domain_bit_reversed()
             .expect("Metal BaseFieldVec permutation should succeed");
         Self {
-            buffer,
+            buffer: Arc::new(buffer),
             size: self.size,
             host_cache: OnceLock::new(),
         }
@@ -260,7 +280,7 @@ impl BaseFieldVec {
         denominators: &SecureFieldVec,
     ) -> (SecureFieldVec, SecureFieldVec) {
         let (next_numerators, next_denominators) =
-            U32Buffer::gkr_next_logup_multiplicities_layer(&self.buffer, &denominators.buffer)
+            U32Buffer::gkr_next_logup_multiplicities_layer(self.gpu_buffer(), &denominators.buffer)
                 .expect("Metal base-field multiplicities next-layer generation should succeed");
         (
             SecureFieldVec::from_buffer(next_numerators),
@@ -268,9 +288,162 @@ impl BaseFieldVec {
         )
     }
 
+    pub fn witness_memory_id_to_big_trace_columns(
+        big_values: &Self,
+        mults: &Self,
+        n_values: u32,
+        column_length: u32,
+    ) -> Vec<Self> {
+        U32Buffer::witness_memory_id_to_big_trace_columns(
+            big_values.gpu_buffer(),
+            mults.gpu_buffer(),
+            n_values,
+            column_length,
+        )
+        .expect("Metal memory_id_to_big witness column trace should succeed")
+        .into_iter()
+        .map(Self::from_buffer)
+        .collect()
+    }
+
+    pub fn witness_memory_id_to_big_trace_columns_async(
+        big_values: &Self,
+        mults: &Self,
+        n_values: u32,
+        column_length: u32,
+    ) -> Vec<Self> {
+        U32Buffer::witness_memory_id_to_big_trace_columns_async(
+            big_values.gpu_buffer(),
+            mults.gpu_buffer(),
+            n_values,
+            column_length,
+        )
+        .expect("Metal memory_id_to_big async witness column trace should succeed")
+        .into_iter()
+        .map(Self::from_buffer)
+        .collect()
+    }
+
+    pub fn witness_memory_id_to_big_small_trace_columns(
+        small_values: &Self,
+        mults: &Self,
+        n_values: u32,
+        column_length: u32,
+    ) -> Vec<Self> {
+        U32Buffer::witness_memory_id_to_big_small_trace_columns(
+            small_values.gpu_buffer(),
+            mults.gpu_buffer(),
+            n_values,
+            column_length,
+        )
+        .expect("Metal memory_id_to_big small witness column trace should succeed")
+        .into_iter()
+        .map(Self::from_buffer)
+        .collect()
+    }
+
+    pub fn witness_memory_id_to_big_small_trace_columns_async(
+        small_values: &Self,
+        mults: &Self,
+        n_values: u32,
+        column_length: u32,
+    ) -> Vec<Self> {
+        U32Buffer::witness_memory_id_to_big_small_trace_columns_async(
+            small_values.gpu_buffer(),
+            mults.gpu_buffer(),
+            n_values,
+            column_length,
+        )
+        .expect("Metal memory_id_to_big small async witness column trace should succeed")
+        .into_iter()
+        .map(Self::from_buffer)
+        .collect()
+    }
+
+    pub fn witness_memory_rc99_count(
+        limb_cols: &[Self],
+        input_to_row_lut: &Self,
+        column_length: u32,
+        n_pairs: u32,
+        rc_table_size: u32,
+    ) -> Vec<u32> {
+        let limb_refs = limb_cols
+            .iter()
+            .map(|col| col.gpu_buffer())
+            .collect::<Vec<_>>();
+        U32Buffer::witness_memory_rc99_count(
+            &limb_refs,
+            input_to_row_lut.gpu_buffer(),
+            column_length,
+            n_pairs,
+            rc_table_size,
+        )
+        .expect("Metal memory rc_9_9 count should succeed")
+        .to_vec()
+        .expect("Metal memory rc_9_9 count readback should succeed")
+    }
+
+    pub fn witness_memory_addr_to_id_trace(
+        ids: &Self,
+        mults: &Self,
+        n_ids: u32,
+        column_length: u32,
+        split: u32,
+    ) -> Self {
+        let buffer = U32Buffer::witness_memory_addr_to_id_trace(
+            ids.gpu_buffer(),
+            mults.gpu_buffer(),
+            n_ids,
+            column_length,
+            split,
+        )
+        .expect("Metal memory_address_to_id witness trace should succeed");
+        Self::from_buffer(buffer)
+    }
+
+    pub fn witness_memory_addr_to_id_trace_columns(
+        ids: &Self,
+        mults: &Self,
+        n_ids: u32,
+        column_length: u32,
+        split: u32,
+    ) -> Vec<Self> {
+        U32Buffer::witness_memory_addr_to_id_trace_columns(
+            ids.gpu_buffer(),
+            mults.gpu_buffer(),
+            n_ids,
+            column_length,
+            split,
+        )
+        .expect("Metal memory_address_to_id witness column trace should succeed")
+        .into_iter()
+        .map(Self::from_buffer)
+        .collect()
+    }
+
+    pub fn witness_memory_addr_to_id_trace_columns_async(
+        ids: &Self,
+        mults: &Self,
+        n_ids: u32,
+        column_length: u32,
+        split: u32,
+    ) -> Vec<Self> {
+        U32Buffer::witness_memory_addr_to_id_trace_columns_async(
+            ids.gpu_buffer(),
+            mults.gpu_buffer(),
+            n_ids,
+            column_length,
+            split,
+        )
+        .expect("Metal memory_address_to_id async witness column trace should succeed")
+        .into_iter()
+        .map(Self::from_buffer)
+        .collect()
+    }
+
     pub fn inclusive_prefix_sum_bit_rev_circle_domain(&mut self) {
         let _ = self.host_cache.take();
-        self.buffer
+        self.gpu_buffer_mut()
             .inclusive_prefix_sum_bit_rev_circle_domain_in_place()
             .expect("Metal BaseFieldVec prefix sum should succeed");
     }
@@ -283,7 +456,7 @@ impl BaseFieldVec {
     ) -> (SecureField, SecureField) {
         let (eval_at_0, eval_at_2) = U32Buffer::gkr_sum_logup_multiplicities(
             &eq_evals.buffer,
-            &self.buffer,
+            self.gpu_buffer(),
             &denominators.buffer,
             lambda.to_m31_array().map(|limb| limb.0),
         )
@@ -348,7 +521,7 @@ impl BaseFieldVec {
         let buffer = U32Buffer::from_slice(raw_u32_slice)
             .expect("Metal BaseFieldVec upload should initialize");
         Self {
-            buffer,
+            buffer: Arc::new(buffer),
             size,
             host_cache: OnceLock::new(),
         }
@@ -368,7 +541,7 @@ impl BaseFieldVec {
         let buffer = U32Buffer::from_slice_private(raw_u32_slice)
             .expect("Metal BaseFieldVec private upload should succeed");
         Self {
-            buffer,
+            buffer: Arc::new(buffer),
             size,
             host_cache: OnceLock::new(),
         }
@@ -427,7 +600,7 @@ impl BaseFieldVec {
 impl Clone for BaseFieldVec {
     fn clone(&self) -> Self {
         let cloned = Self {
-            buffer: self.buffer.clone(),
+            buffer: Arc::clone(&self.buffer),
             size: self.size,
             host_cache: OnceLock::new(),
         };

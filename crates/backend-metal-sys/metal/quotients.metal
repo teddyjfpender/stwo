@@ -16,6 +16,34 @@ static inline uint stwo_metal_lifted_index(uint index, uint log_ratio) {
     return (index >> (log_ratio + 1u) << 1u) + (index & 1u);
 }
 
+kernel void generate_wide_fibonacci_trace_u32(
+    device const uint *input_a [[buffer(0)]],
+    device const uint *input_b [[buffer(1)]],
+    device uint *trace [[buffer(2)]],
+    constant uint &input_len [[buffer(3)]],
+    constant uint &n_columns [[buffer(4)]],
+    uint row_index [[thread_position_in_grid]]
+) {
+    if (row_index >= input_len) {
+        return;
+    }
+
+    uint prev = input_a[row_index];
+    uint curr = input_b[row_index];
+    trace[row_index] = prev;
+    trace[input_len + row_index] = curr;
+
+    for (uint column_index = 2u; column_index < n_columns; ++column_index) {
+        uint next = stwo_metal_m31_add(
+            stwo_metal_m31_square(prev),
+            stwo_metal_m31_square(curr)
+        );
+        trace[column_index * input_len + row_index] = next;
+        prev = curr;
+        curr = next;
+    }
+}
+
 kernel void accumulate_secure_columns_coords_u32x4(
     device const uint *lhs_0 [[buffer(0)]],
     device const uint *lhs_1 [[buffer(1)]],
