@@ -51,7 +51,14 @@ static std::string ptx_cache_path(uint64_t semantic_hash, int major, int minor) 
         base = std::string(home) + "/.cache/stwo-jit";
     }
     char name[128];
-    snprintf(name, sizeof(name), "/sm%d%d_%016llx.ptx", major, minor,
+    // Cache CUBIN (final SASS), not PTX. PTX is an IR: cuModuleLoadDataEx JIT-
+    // assembles it to SASS on EVERY load (the driver runs ptxas), which for the
+    // monster constraint kernels (partial_ec_mul / pedersen / poseidon) costs
+    // 30-160s each — paid on every cold process, GPU idle throughout. A cubin is
+    // already-assembled SASS for this exact arch, so the load is milliseconds; the
+    // one-time ptxas cost moves into the (disk-cached) compile. Arch-specific, so the
+    // sm%d%d key keeps per-GPU cubins separate.
+    snprintf(name, sizeof(name), "/sm%d%d_%016llx.cubin", major, minor,
              (unsigned long long)semantic_hash);
     return base + name;
 }
@@ -74,7 +81,7 @@ bool compile_kernel(const char *source, const char *kernel_name, uint64_t semant
     cudaDeviceProp props;
     cudaGetDeviceProperties(&props, device);
 
-    std::vector<char> ptx;
+    std::vector<char> image;
     std::string cache_file = ptx_cache_path(semantic_hash, props.major, props.minor);
     if (!cache_file.empty()) {
         if (FILE *f = fopen(cache_file.c_str(), "rb")) {
@@ -82,22 +89,26 @@ bool compile_kernel(const char *source, const char *kernel_name, uint64_t semant
             long len = ftell(f);
             fseek(f, 0, SEEK_SET);
             if (len > 0) {
-                ptx.resize((size_t)len);
-                if (fread(ptx.data(), 1, (size_t)len, f) != (size_t)len) ptx.clear();
+                image.resize((size_t)len);
+                if (fread(image.data(), 1, (size_t)len, f) != (size_t)len) image.clear();
             }
             fclose(f);
-            from_disk = !ptx.empty();
+            from_disk = !image.empty();
         }
     }
 
-    if (ptx.empty()) {
+    if (image.empty()) {
         nvrtcProgram program;
         if (nvrtcCreateProgram(&program, source, "stwo_jit.cu", 0, nullptr, nullptr) !=
             NVRTC_SUCCESS) {
             return false;
         }
+        // Real arch (sm_XX), not virtual (compute_XX): NVRTC then compiles all the
+        // way through ptxas to SASS, and nvrtcGetCUBIN returns the final cubin. (A
+        // virtual arch only yields PTX, which would defer ptxas to load time — the
+        // very cost this caches away.)
         char arch_flag[64];
-        snprintf(arch_flag, sizeof(arch_flag), "--gpu-architecture=compute_%d%d",
+        snprintf(arch_flag, sizeof(arch_flag), "--gpu-architecture=sm_%d%d",
                  props.major, props.minor);
         const char *options[] = {arch_flag, "--std=c++14"};
         nvrtcResult compile_result = nvrtcCompileProgram(program, 2, options);
@@ -110,10 +121,18 @@ bool compile_kernel(const char *source, const char *kernel_name, uint64_t semant
             nvrtcDestroyProgram(&program);
             return false;
         }
-        size_t ptx_size = 0;
-        nvrtcGetPTXSize(program, &ptx_size);
-        ptx.resize(ptx_size);
-        nvrtcGetPTX(program, ptx.data());
+        size_t cubin_size = 0;
+        if (nvrtcGetCUBINSize(program, &cubin_size) != NVRTC_SUCCESS || cubin_size == 0) {
+            fprintf(stderr, "stwo JIT: nvrtcGetCUBINSize failed\n");
+            nvrtcDestroyProgram(&program);
+            return false;
+        }
+        image.resize(cubin_size);
+        if (nvrtcGetCUBIN(program, image.data()) != NVRTC_SUCCESS) {
+            fprintf(stderr, "stwo JIT: nvrtcGetCUBIN failed\n");
+            nvrtcDestroyProgram(&program);
+            return false;
+        }
         nvrtcDestroyProgram(&program);
 
         if (!cache_file.empty()) {
@@ -124,7 +143,7 @@ bool compile_kernel(const char *source, const char *kernel_name, uint64_t semant
             mkdir(dir.c_str(), 0755);
             std::string tmp = cache_file + ".tmp";
             if (FILE *f = fopen(tmp.c_str(), "wb")) {
-                fwrite(ptx.data(), 1, ptx.size(), f);
+                fwrite(image.data(), 1, image.size(), f);
                 fclose(f);
                 rename(tmp.c_str(), cache_file.c_str());
             }
@@ -134,7 +153,8 @@ bool compile_kernel(const char *source, const char *kernel_name, uint64_t semant
     // Ensure the runtime API's primary context is current for the driver API.
     cudaFree(0);
     CUmodule module;
-    if (cuModuleLoadDataEx(&module, ptx.data(), 0, nullptr, nullptr) != CUDA_SUCCESS) {
+    // image is a cubin (final SASS): cuModuleLoadDataEx loads it directly, no JIT.
+    if (cuModuleLoadDataEx(&module, image.data(), 0, nullptr, nullptr) != CUDA_SUCCESS) {
         fprintf(stderr, "stwo JIT: cuModuleLoadDataEx failed\n");
         return false;
     }
@@ -147,7 +167,7 @@ bool compile_kernel(const char *source, const char *kernel_name, uint64_t semant
                       std::chrono::steady_clock::now() - t_start)
                       .count();
         fprintf(stderr, "stwo JIT: %s ready in %lld ms (%s)\n", kernel_name, (long long)ms,
-                from_disk ? "disk PTX cache" : "NVRTC compile");
+                from_disk ? "disk cubin cache" : "NVRTC->cubin");
     }
     return true;
 }
