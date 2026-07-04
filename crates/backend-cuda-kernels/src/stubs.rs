@@ -80,6 +80,21 @@ pub unsafe extern "C" fn copy_uint32_t_vec_from_host_to_device_into(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn copy_uint32_t_vec_from_host_to_device_into_async(
+    host_ptr: *const u32,
+    device_ptr: *const u32,
+    n_words: u64,
+) {
+    let _ = (host_ptr, device_ptr, n_words);
+    no_cuda_symbol("copy_uint32_t_vec_from_host_to_device_into_async")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_legacy_stream_sync() {
+    no_cuda_symbol("stwo_legacy_stream_sync")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn inclusive_prefix_sum_x4(
     c0: *const u32,
     c1: *const u32,
@@ -126,6 +141,32 @@ pub unsafe extern "C" fn logup_fraction_chain(
         size,
     );
     no_cuda_symbol("logup_fraction_chain")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_logup_pairs_from_flats(
+    _flats: *const u32,
+    _n_rows: u32,
+    _descs_host: *const u32,
+    _n_cols: u32,
+    _alphas_host: *const u32,
+    _n_alphas: u32,
+    _z_host: *const u32,
+    _num_cols_device_table: *const *mut u32,
+    _den_dense_device_table: *const *mut u32,
+) -> bool {
+    let _ = (
+        _flats,
+        _n_rows,
+        _descs_host,
+        _n_cols,
+        _alphas_host,
+        _n_alphas,
+        _z_host,
+        _num_cols_device_table,
+        _den_dense_device_table,
+    );
+    no_cuda_symbol("stwo_logup_pairs_from_flats")
 }
 
 #[unsafe(no_mangle)]
@@ -271,6 +312,28 @@ pub unsafe extern "C" fn memory_rc_pair_logup(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn exec_deduce_output(
+    addr_to_id: *const u32,
+    big_limbs: *const *const u32,
+    small_limbs: *const *const u32,
+    addresses: *const u32,
+    n_queries: u32,
+    out_ids: *mut u32,
+    out_limbs: *const *mut u32,
+) {
+    let _ = (
+        addr_to_id,
+        big_limbs,
+        small_limbs,
+        addresses,
+        n_queries,
+        out_ids,
+        out_limbs,
+    );
+    no_cuda_symbol("exec_deduce_output")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn logup_shift_secure_coords(
     c0: *const u32,
     c1: *const u32,
@@ -281,6 +344,169 @@ pub unsafe extern "C" fn logup_shift_secure_coords(
 ) {
     let _ = (c0, c1, c2, c3, shift, size);
     no_cuda_symbol("logup_shift_secure_coords")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn blake_g_write_trace(
+    inputs: *const u32,
+    n_rows: u32,
+    column_length: u32,
+    cols: *const *const u32,
+) {
+    let _ = (inputs, n_rows, column_length, cols);
+    no_cuda_symbol("blake_g_write_trace")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn blake_g_xor_count(
+    a_cols: *const *const u32,
+    b_cols: *const *const u32,
+    rel_idx: *const u32,
+    n_pairs: u32,
+    column_length: u32,
+    shift: u32,
+    lut: *const u32,
+    table_size: u32,
+    counts: *mut u32,
+) {
+    let _ = (
+        a_cols,
+        b_cols,
+        rel_idx,
+        n_pairs,
+        column_length,
+        shift,
+        lut,
+        table_size,
+        counts,
+    );
+    no_cuda_symbol("blake_g_xor_count")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn blake_g_xor12_count(
+    a_cols: *const *const u32,
+    b_cols: *const *const u32,
+    n_pairs: u32,
+    column_length: u32,
+    limb_bits: u32,
+    expand_bits: u32,
+    table_size: u32,
+    counts: *mut u32,
+) {
+    let _ = (
+        a_cols,
+        b_cols,
+        n_pairs,
+        column_length,
+        limb_bits,
+        expand_bits,
+        table_size,
+        counts,
+    );
+    no_cuda_symbol("blake_g_xor12_count")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn blake_g_pair_logup(
+    a0: *const u32,
+    b0: *const u32,
+    x0: *const u32,
+    a1: *const u32,
+    b1: *const u32,
+    x1: *const u32,
+    rel0: u32,
+    rel1: u32,
+    column_length: u32,
+    alpha: *const u32,
+    z: CudaSecureField,
+    denoms: *const u32,
+    num0: *const u32,
+    num1: *const u32,
+    num2: *const u32,
+    num3: *const u32,
+) {
+    let _ = (a0, b0, x0, a1, b1, x1, rel0, rel1, column_length);
+    let _ = (alpha, z, denoms, num0, num1, num2, num3);
+    no_cuda_symbol("blake_g_pair_logup")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn blake_g_final_logup(
+    val_cols: *const *const u32,
+    enabler: *const u32,
+    rel: u32,
+    column_length: u32,
+    alpha: *const u32,
+    z: CudaSecureField,
+    denoms: *const u32,
+    num0: *const u32,
+    num1: *const u32,
+    num2: *const u32,
+    num3: *const u32,
+) {
+    let _ = (val_cols, enabler, rel, column_length);
+    let _ = (alpha, z, denoms, num0, num1, num2, num3);
+    no_cuda_symbol("blake_g_final_logup")
+}
+
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn pedersen_pair_logup(
+    vals0: *const *const u32,
+    rel0: u32,
+    vals1: *const *const u32,
+    rel1: u32,
+    n_vals: u32,
+    m0: *const u32,
+    m1: *const u32,
+    sign0: i32,
+    sign1: i32,
+    column_length: u32,
+    alpha: *const u32,
+    z: CudaSecureField,
+    denoms: *const u32,
+    num0: *const u32,
+    num1: *const u32,
+    num2: *const u32,
+    num3: *const u32,
+) {
+    let _ = (
+        vals0,
+        rel0,
+        vals1,
+        rel1,
+        n_vals,
+        m0,
+        m1,
+        sign0,
+        sign1,
+        column_length,
+    );
+    let _ = (alpha, z, denoms, num0, num1, num2, num3);
+    no_cuda_symbol("pedersen_pair_logup")
+}
+
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn pedersen_multi_logup(
+    vals: *const *const u32,
+    n_vals: u32,
+    rel: u32,
+    mult: *const u32,
+    neg_num: i32,
+    column_length: u32,
+    alpha: *const u32,
+    z: CudaSecureField,
+    denoms: *const u32,
+    num0: *const u32,
+    num1: *const u32,
+    num2: *const u32,
+    num3: *const u32,
+) {
+    let _ = (vals, n_vals, rel, mult, neg_num, column_length);
+    let _ = (alpha, z, denoms, num0, num1, num2, num3);
+    no_cuda_symbol("pedersen_multi_logup")
 }
 
 #[unsafe(no_mangle)]
@@ -340,6 +566,11 @@ pub unsafe extern "C" fn cuda_alloc_zeroes_blake_2s_hash(size: usize) -> *const 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cuda_free_memory(device_ptr: *const c_void) {
     no_cuda_symbol("cuda_free_memory")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cuda_pool_highwater(used_high: *mut usize, reserved_high: *mut usize) {
+    no_cuda_symbol("cuda_pool_highwater")
 }
 
 #[unsafe(no_mangle)]
@@ -529,6 +760,15 @@ pub unsafe extern "C" fn commit_on_layer_with_previous(
     result: *mut Blake2sHash,
 ) {
     no_cuda_symbol("commit_on_layer_with_previous")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn commit_on_two_layers_with_previous(
+    size: usize,
+    previous_layer: *const Blake2sHash,
+    result: *mut Blake2sHash,
+) {
+    no_cuda_symbol("commit_on_two_layers_with_previous")
 }
 
 #[unsafe(no_mangle)]
@@ -969,8 +1209,31 @@ pub unsafe extern "C" fn stwo_cuda_jit_eval_fused(
     _coord_3: *mut u32,
     _row_count: u32,
     _log_n_rows: u32,
+    _rc_base: u32,
+    _relax_opt: bool,
 ) -> bool {
     no_cuda_symbol("stwo_cuda_jit_eval_fused")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_cuda_jit_precompile(
+    _source: *const core::ffi::c_char,
+    _kernel_name: *const core::ffi::c_char,
+    _semantic_hash: u64,
+    _relax_opt: bool,
+) -> bool {
+    no_cuda_symbol("stwo_cuda_jit_precompile")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_cuda_jit_precompile_batch(
+    _sources: *const *const core::ffi::c_char,
+    _kernel_names: *const *const core::ffi::c_char,
+    _cache_keys: *const u64,
+    _relax_opts: *const bool,
+    _count: u32,
+) -> bool {
+    no_cuda_symbol("stwo_cuda_jit_precompile_batch")
 }
 
 #[unsafe(no_mangle)]
@@ -994,4 +1257,39 @@ pub unsafe extern "C" fn gen_bitwise_xor_columns_on_gpu(
     _n_bits: u32,
 ) {
     no_cuda_symbol("gen_bitwise_xor_columns_on_gpu")
+}
+
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn stwo_cuda_jit_witness_launch(
+    _source: *const core::ffi::c_char,
+    _kernel_name: *const core::ffi::c_char,
+    _cache_key: u64,
+    _input_cols: *const *const u32,
+    _table_bases: *const *const u32,
+    _table_strides: *const u32,
+    _out_cols: *const *mut u32,
+    _mult_counts: *const *mut u32,
+    _lookup_words: *mut u32,
+    sub_words: *mut u32,
+    _row_count: u32,
+    _relax_opt: bool,
+    _stream: *mut core::ffi::c_void,
+) -> bool {
+    no_cuda_symbol("stwo_cuda_jit_witness_launch")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_fanout_stream(_i: i32) -> *mut core::ffi::c_void {
+    no_cuda_symbol("stwo_fanout_stream")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_fanout_fork(_stream: *mut core::ffi::c_void) {
+    no_cuda_symbol("stwo_fanout_fork")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_fanout_join(_stream: *mut core::ffi::c_void) {
+    no_cuda_symbol("stwo_fanout_join")
 }

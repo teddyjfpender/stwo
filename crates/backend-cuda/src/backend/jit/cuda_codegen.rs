@@ -18,8 +18,10 @@ use super::program::{
 /// emitted source for a fixed program changes.
 ///
 /// History: 1 = initial scratch-writing kernel; 2 = fused accumulate (the kernel adds
-/// into the accumulator coordinates in place).
-pub const CODEGEN_VERSION: u64 = 2;
+/// into the accumulator coordinates in place); 3 = `rc_base` runtime kernel parameter
+/// (random-coeff power indices are now `rc_base + i`, enabling size-governed kernel
+/// splitting — old fused PTX and new split-aware PTX must never collide on disk).
+pub const CODEGEN_VERSION: u64 = 3;
 
 /// Cache key for compiled kernels: the program's content semantic hash mixed (FNV-1a)
 /// with [`CODEGEN_VERSION`]. This is the key for both the in-process function cache
@@ -64,7 +66,8 @@ pub fn compile_v1_to_cuda_source(program: &OwnedMetalEvaluationProgramV1) -> Opt
          \x20   unsigned *coord_2,\n\
          \x20   unsigned *coord_3,\n\
          \x20   unsigned row_count,\n\
-         \x20   unsigned log_n_rows\n\
+         \x20   unsigned log_n_rows,\n\
+         \x20   unsigned rc_base\n\
          ) {{\n\
          \x20   unsigned row_index = blockIdx.x * blockDim.x + threadIdx.x;\n\
          \x20   if (row_index >= row_count) {{ return; }}\n\n"
@@ -208,12 +211,14 @@ fn emit_instruction_body(program: &OwnedMetalEvaluationProgramV1, src: &mut Stri
     }
     src.push('\n');
 
-    src.push_str("    // Constraint accumulation.\n");
+    src.push_str("    // Constraint accumulation. rc_base is the global index of this\n");
+    src.push_str("    // kernel's first constraint within the component's random-coeff\n");
+    src.push_str("    // powers (non-zero only for split kernels).\n");
     src.push_str("    StwoCudaQm31 acc = StwoCudaQm31{0u, 0u, 0u, 0u};\n");
     for (i, &root) in program.constraint_roots().iter().enumerate() {
         src.push_str(&format!(
             "    acc = stwo_qm31_add(acc, stwo_qm31_mul(e{root}, \
-             stwo_load_qm31(random_coeff_powers, {i}u)));\n"
+             stwo_load_qm31(random_coeff_powers, rc_base + {i}u)));\n"
         ));
     }
     src.push('\n');

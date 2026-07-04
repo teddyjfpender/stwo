@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use hashbrown::HashMap;
 use itertools::Itertools;
 use tracing::{span, Level};
@@ -184,7 +186,7 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
         // Prepare output buffers.
         let mut queried_values: ColumnVec<Vec<BaseField>> = vec![];
         let mut decommitment = MerkleDecommitmentLifted::<H>::default();
-        let mut all_node_values: Vec<HashMap<usize, <H as MerkleHasherLifted>::Hash>> = vec![];
+        let mut all_node_values: Vec<BTreeMap<usize, <H as MerkleHasherLifted>::Hash>> = vec![];
 
         // Compute the queried values.
         let max_log_size = self.leaf_log_size as usize;
@@ -212,13 +214,33 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
         };
         let mut node_memo = HashMap::<(usize, usize), H::Hash>::new();
 
+        // Batched retained-layer reads (Stage A': STWO_CUDA_ASYNC_SPINE): collect
+        // every (level, idx) the walk below will read from a RETAINED layer (the
+        // mirror is `retained_node_reads`, same idiom as `unretained_leaf_indices`),
+        // fetch them in ONE backend call, and let `node_hash` consult the prefetch.
+        // Values are exactly `layers[level].at(idx)`; a miss falls back to the
+        // per-element read, so the worst case is today's behavior.
+        let prefetch: HashMap<(usize, usize), H::Hash> =
+            if std::env::var("STWO_CUDA_ASYNC_SPINE").as_deref() == Ok("1") {
+                let pairs = self.retained_node_reads(query_positions);
+                let layer_refs: Vec<&Col<B, H::Hash>> = self.layers.iter().collect();
+                let values = B::batch_layer_reads(&layer_refs, &pairs);
+                pairs
+                    .iter()
+                    .map(|&(l, i)| (l as usize, i as usize))
+                    .zip(values)
+                    .collect()
+            } else {
+                HashMap::new()
+            };
+
         let mut prev_layer_queries = query_positions.to_vec();
         prev_layer_queries.dedup();
         // We start iterating from the layer of log size `self.leaf_log_size - 1`, reading the
         // hashes of the previous (one larger) layer.
         for layer_log_size in (0..self.leaf_log_size as usize).rev() {
             let mut all_node_values_for_layer =
-                HashMap::<usize, <H as MerkleHasherLifted>::Hash>::new();
+                BTreeMap::<usize, <H as MerkleHasherLifted>::Hash>::new();
             // Prepare write buffer for queries to the current layer. This will propagate to the
             // next layer.
             let mut curr_layer_queries: Vec<usize> = vec![];
@@ -235,6 +257,7 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
                         columns,
                         &sorted_columns,
                         &mut node_memo,
+                        &prefetch,
                         prev_level,
                         first ^ 1,
                     ))
@@ -249,6 +272,7 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
                         columns,
                         &sorted_columns,
                         &mut node_memo,
+                        &prefetch,
                         prev_level,
                         2 * curr_index,
                     ),
@@ -259,6 +283,7 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
                         columns,
                         &sorted_columns,
                         &mut node_memo,
+                        &prefetch,
                         prev_level,
                         2 * curr_index + 1,
                     ),
@@ -282,15 +307,20 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
     ///
     /// Retained layers are read directly; nodes of unretained bottom layers are recomputed from
     /// the committed columns (and memoized, as decommit paths of nearby queries share subtrees).
+    #[allow(clippy::too_many_arguments)]
     fn node_hash(
         &self,
         columns: &impl ColumnAccess,
         sorted_columns: &[usize],
         memo: &mut HashMap<(usize, usize), H::Hash>,
+        prefetch: &HashMap<(usize, usize), H::Hash>,
         level: usize,
         idx: usize,
     ) -> H::Hash {
         if let Some(layer) = self.layers.get(level) {
+            if let Some(hash) = prefetch.get(&(level, idx)) {
+                return *hash;
+            }
             return layer.at(idx);
         }
         if let Some(hash) = memo.get(&(level, idx)) {
@@ -300,12 +330,52 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
             leaf_hash::<H>(columns, sorted_columns, self.leaf_log_size, idx)
         } else {
             H::hash_children((
-                self.node_hash(columns, sorted_columns, memo, level + 1, 2 * idx),
-                self.node_hash(columns, sorted_columns, memo, level + 1, 2 * idx + 1),
+                self.node_hash(columns, sorted_columns, memo, prefetch, level + 1, 2 * idx),
+                self.node_hash(
+                    columns,
+                    sorted_columns,
+                    memo,
+                    prefetch,
+                    level + 1,
+                    2 * idx + 1,
+                ),
             ))
         };
         memo.insert((level, idx), hash);
         hash
+    }
+
+    /// The retained-layer read set of [`Self::decommit`]'s walk for these queries:
+    /// every `(level, idx)` that `node_hash` will read DIRECTLY from a stored layer
+    /// (witness reads `first ^ 1` plus the two aux reads per chunk, at levels the
+    /// tree retains; recursion below unretained levels never touches stored layers
+    /// — pruning is bottom-up, so everything under an unretained level is also
+    /// unretained). MUST mirror the walk's index arithmetic exactly — same rule as
+    /// [`Self::unretained_leaf_indices`]. A drifted mirror is safe (missed pairs
+    /// fall back to per-element reads), just slower.
+    fn retained_node_reads(&self, query_positions: &[usize]) -> Vec<(u32, u32)> {
+        let mut pairs = Vec::new();
+        let mut prev_layer_queries = query_positions.to_vec();
+        prev_layer_queries.dedup();
+        for layer_log_size in (0..self.leaf_log_size as usize).rev() {
+            let prev_level = layer_log_size + 1;
+            let retained = self.layers.get(prev_level).is_some();
+            let mut curr_layer_queries: Vec<usize> = vec![];
+            for queries_chunk in prev_layer_queries.as_slice().chunk_by(|a, b| a ^ 1 == *b) {
+                let first = queries_chunk[0];
+                let curr_index = first >> 1;
+                curr_layer_queries.push(curr_index);
+                if retained {
+                    if queries_chunk.len() == 1 {
+                        pairs.push((prev_level as u32, (first ^ 1) as u32));
+                    }
+                    pairs.push((prev_level as u32, (2 * curr_index) as u32));
+                    pairs.push((prev_level as u32, (2 * curr_index + 1) as u32));
+                }
+            }
+            prev_layer_queries = curr_layer_queries;
+        }
+        pairs
     }
 
     /// Returns the (sorted, deduplicated) leaf indices covered by tree nodes that
@@ -681,13 +751,13 @@ mod test {
             },
         ) = merkle_prover.decommit(&[1], columns.iter().collect_vec());
 
-        let mut expected: Vec<HashMap<usize, Blake2sHash>> = vec![];
+        let mut expected: Vec<BTreeMap<usize, Blake2sHash>> = vec![];
         merkle_prover
             .layers
             .iter()
             .skip(1)
             .rev()
-            .for_each(|layer| expected.push(HashMap::from_iter([(0, layer[0]), (1, layer[1])])));
+            .for_each(|layer| expected.push(BTreeMap::from_iter([(0, layer[0]), (1, layer[1])])));
         assert_eq!(expected, aux.all_node_values);
     }
 }

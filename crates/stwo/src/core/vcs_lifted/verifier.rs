@@ -1,7 +1,6 @@
-use hashbrown::HashMap;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
-use std_shims::{vec, Vec};
+use std_shims::{vec, BTreeMap, Vec};
 use thiserror::Error;
 
 use crate::core::fields::m31::BaseField;
@@ -33,8 +32,11 @@ impl<H: MerkleHasherLifted> MerkleDecommitmentLifted<H> {
 /// Auxiliary data for Merkle decommitment.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MerkleDecommitmentLiftedAux<H: MerkleHasherLifted> {
-    /// For each layer, a map from node index to its hash value.
-    pub all_node_values: Vec<HashMap<usize, H::Hash>>,
+    /// For each layer, a map from node index to its hash value. `BTreeMap` so the
+    /// serialized proof bytes are CANONICAL (a `HashMap` here serialized in iteration
+    /// order, making byte-identical reproving impossible — KNOWN_ISSUES §4). Content
+    /// and verifier semantics are unchanged: reads are by key.
+    pub all_node_values: Vec<BTreeMap<usize, H::Hash>>,
 }
 
 pub struct ExtendedMerkleDecommitmentLifted<H: MerkleHasherLifted> {

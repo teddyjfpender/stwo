@@ -2,6 +2,12 @@
 #include "poly_utils.cuh"
 #include "utils.cuh"
 
+// CUDA caps grid.y and grid.z at 65535 (maxGridSize[1]/[2]). Every batched NTT
+// launcher maps the column (batch) axis onto grid.y or grid.z, so a same-log_size
+// column group larger than this overflows the launch configuration. The column
+// (batch) set is tiled into chunks of at most this many columns.
+static constexpr unsigned MAX_NTT_BATCH_COLUMNS = 65535;
+
 // log_stride = 4,3,2,1,0
 template <unsigned LOG_VALS_PER_THREAD>
 DEVICE_FORCEINLINE void shfl_xor_bf(m31* vals, const unsigned log_stride,
@@ -66,6 +72,7 @@ void evaluate(int eval_domain_size, m31 *values, m31 *twiddles_tree, int twiddle
     while (i > 0) {
         rfft_line_part<<<num_blocks, block_dim>>>(values, twiddles_tree, values_size, layer_domain_size,
                                                   layer_domain_offset, i);
+        ASSERT_CUDA_SUCCESS(cudaGetLastError());
         layer_domain_size <<= 1;
         layer_domain_offset -= layer_domain_size;
         i -= 1;
@@ -77,8 +84,10 @@ void evaluate(int eval_domain_size, m31 *values, m31 *twiddles_tree, int twiddle
 }
 
 
-__global__ void batch_rfft_circle_part(m31 **values, m31 *inverse_twiddles_tree, int number_of_columns, int number_of_rows) {
-    int idx = blockIdx.y * blockDim.x + threadIdx.x;
+// row_block_offset: index of this launch's first row-block along the (tiled)
+// grid.y axis; idx is identical to a single launch with blockIdx.y + offset.
+__global__ void batch_rfft_circle_part(m31 **values, m31 *inverse_twiddles_tree, int number_of_columns, int number_of_rows, int row_block_offset) {
+    int idx = (blockIdx.y + row_block_offset) * blockDim.x + threadIdx.x;
     unsigned int column_index = blockIdx.x;
 
     if (idx < (number_of_rows >> 1) && column_index < number_of_columns) {
@@ -96,9 +105,10 @@ __global__ void batch_rfft_circle_part(m31 **values, m31 *inverse_twiddles_tree,
 }
 
 __global__ void batch_rfft_line_part(
-        m31 **values, m31 *inverse_twiddles_tree, int number_of_columns, int number_of_rows, int layer_domain_offset, int layer
+        m31 **values, m31 *inverse_twiddles_tree, int number_of_columns, int number_of_rows, int layer_domain_offset, int layer,
+        int row_block_offset
 ) {
-    int idx = blockIdx.y * blockDim.x + threadIdx.x;
+    int idx = (blockIdx.y + row_block_offset) * blockDim.x + threadIdx.x;
     unsigned int column_index = blockIdx.x;
 
     if (idx < (number_of_rows >> 1) && column_index < number_of_columns) {
@@ -132,7 +142,13 @@ void evaluate_columns(const int *eval_domain_sizes, m31 **values, m31 *twiddles_
 
     int block_size = 1024;
     int number_of_blocks = ((number_of_rows >> 1) + block_size - 1) / block_size;
-    dim3 grid_dimensions(number_of_columns, number_of_blocks);
+
+    // The row-block axis is grid.y (CUDA cap 65535); columns ride grid.x
+    // (cap 2^31-1, never workload-limited here). Tile the row-block axis:
+    // each chunk covers disjoint idx values via row_block_offset, so the
+    // union of the tiled launches touches exactly the same (column, idx)
+    // pairs as one big launch would.
+    constexpr int MAX_Y_BLOCKS = 65535;
 
     int log_number_of_rows = log_2(number_of_rows);
     int layer_domain_size = 1;
@@ -140,15 +156,23 @@ void evaluate_columns(const int *eval_domain_sizes, m31 **values, m31 *twiddles_
     int i = log_number_of_rows - 1;
 
     while (i > 0) {
-        batch_rfft_line_part<<<grid_dimensions, block_size>>>(
-                device_values, twiddles_tree, number_of_columns, number_of_rows, layer_domain_offset, i
-        );
+        for (int y_base = 0; y_base < number_of_blocks; y_base += MAX_Y_BLOCKS) {
+            dim3 grid_dimensions(number_of_columns, min(number_of_blocks - y_base, MAX_Y_BLOCKS));
+            batch_rfft_line_part<<<grid_dimensions, block_size>>>(
+                    device_values, twiddles_tree, number_of_columns, number_of_rows, layer_domain_offset, i, y_base
+            );
+            ASSERT_CUDA_SUCCESS(cudaGetLastError());
+        }
         layer_domain_size <<= 1;
         layer_domain_offset -= layer_domain_size;
         i -= 1;
     }
 
-    batch_rfft_circle_part<<<grid_dimensions, block_size>>>(device_values, twiddles_tree, number_of_columns, number_of_rows);
+    for (int y_base = 0; y_base < number_of_blocks; y_base += MAX_Y_BLOCKS) {
+        dim3 grid_dimensions(number_of_columns, min(number_of_blocks - y_base, MAX_Y_BLOCKS));
+        batch_rfft_circle_part<<<grid_dimensions, block_size>>>(device_values, twiddles_tree, number_of_columns, number_of_rows, y_base);
+        ASSERT_CUDA_SUCCESS(cudaGetLastError());
+    }
     stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
     cuda_proving_free(device_values);
@@ -679,16 +703,14 @@ EXTERN void ntt_n2b_native_batch(m31** value,
     cuda_proving_free(device_values);
 }
 
-EXTERN void ntt_n2b_columns(
-    uint32_t** values_columns,
+static void ntt_n2b_columns_dispatch(
+    m31** device_values,
     unsigned log_n,
     unsigned num_poly,
     uint32_t* g_twiddles,
     unsigned twiddles_size,
     unsigned eval_domain_size
 ) {
-    m31 **device_values = cuda_proving_clone_to_device<m31*>(values_columns, num_poly);
-
     if (log_n < 13) {
         ntt_n2b_native_batch(device_values, log_n, num_poly, 1, log_n, g_twiddles, twiddles_size, eval_domain_size);
     } else if (log_n >= 13 && log_n <= 19) {
@@ -826,5 +848,34 @@ EXTERN void ntt_n2b_columns(
         fprintf(stderr, "n2b config too big\n");
         exit(EXIT_FAILURE);
     }
-    cuda_proving_free(device_values);
+}
+
+// Tile the column (batch) axis into chunks of at most MAX_NTT_BATCH_COLUMNS so the
+// per-launcher grid.y/grid.z (= num_poly) never exceeds CUDA's 65535 limit. Columns
+// are transformed independently -- num_poly is never used for indexing inside any
+// kernel; only blockIdx.{y,z} selects input[ntt_idx]/output[ntt_idx] -- so processing
+// a contiguous sub-range of columns is bit-for-bit identical to one big launch. Each
+// chunk is cloned from the host pointer array (values_columns + base) exactly as the
+// original single call did, so memory layout and math are unchanged. Any group with
+// num_poly <= 65535 (every workload before the 14M-step PIEs) runs a single iteration
+// with base == 0 and behaves exactly as before.
+EXTERN void ntt_n2b_columns(
+    uint32_t** values_columns,
+    unsigned log_n,
+    unsigned num_poly,
+    uint32_t* g_twiddles,
+    unsigned twiddles_size,
+    unsigned eval_domain_size
+) {
+    for (unsigned base = 0; base < num_poly; base += MAX_NTT_BATCH_COLUMNS) {
+        const unsigned chunk = min(num_poly - base, MAX_NTT_BATCH_COLUMNS);
+        m31 **device_values =
+            cuda_proving_clone_to_device<m31*>(values_columns + base, chunk);
+        // Surface any sticky error from an earlier async launch at this call site
+        // instead of letting it masquerade as a failure of the launches below.
+        ASSERT_CUDA_SUCCESS(cudaGetLastError());
+        ntt_n2b_columns_dispatch(device_values, log_n, chunk, g_twiddles,
+                                 twiddles_size, eval_domain_size);
+        cuda_proving_free(device_values);
+    }
 }

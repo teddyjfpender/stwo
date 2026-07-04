@@ -1,4 +1,5 @@
-use hashbrown::HashMap;
+use std::collections::BTreeMap;
+
 use itertools::Itertools;
 use num_traits::Zero;
 use tracing::instrument;
@@ -428,10 +429,10 @@ fn compute_decommitment_positions_and_witness_evals(
     column: &SecureColumnByCoords<impl PolyOps>,
     query_positions: &[usize],
     fold_step: u32,
-) -> (Vec<usize>, Vec<QM31>, HashMap<usize, QM31>) {
+) -> (Vec<usize>, Vec<QM31>, BTreeMap<usize, QM31>) {
     let mut decommitment_positions = Vec::new();
     let mut witness_evals = Vec::new();
-    let mut value_map = HashMap::new();
+    let mut value_map = BTreeMap::new();
 
     // Group queries by the folding coset they reside in.
     for subset_queries in query_positions.chunk_by(|a, b| a >> fold_step == b >> fold_step) {

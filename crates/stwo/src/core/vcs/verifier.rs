@@ -1,4 +1,3 @@
-use hashbrown::HashMap;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use std_shims::{vec, BTreeMap, Vec};
@@ -33,7 +32,8 @@ impl<H: MerkleHasher> MerkleDecommitment<H> {
 #[derive(Clone, Debug)]
 pub struct MerkleDecommitmentAux<H: MerkleHasher> {
     /// For each layer, a map from node index to its hash value.
-    pub all_node_values: Vec<HashMap<usize, H::Hash>>,
+    /// `BTreeMap` for canonical proof-byte order (see the lifted variant's note).
+    pub all_node_values: Vec<BTreeMap<usize, H::Hash>>,
 }
 
 pub struct ExtendedMerkleDecommitment<H: MerkleHasher> {

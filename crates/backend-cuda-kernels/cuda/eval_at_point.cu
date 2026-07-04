@@ -307,14 +307,9 @@ __global__ void batch_eval_at_point_second_pass(
     }
 }
 
-// Host function: evaluate multiple same-size polynomials at the same point.
-// coeffs_ptrs: device array of num_polys device pointers (each pointing to m31 coefficients)
-// coeffs_size: size of each polynomial (all must be the same)
-// num_polys: number of polynomials
-// point_x, point_y: the evaluation point (shared across all polys)
-// results: host buffer for num_polys qm31 results
-extern "C"
-void batch_eval_at_points(
+// One launch-bounded chunk of batch_eval_at_points: num_polys here must be
+// <= 65535 because the batch axis is grid.y (capped at 65535 by CUDA).
+static void batch_eval_at_points_chunk(
     m31 **coeffs_ptrs,
     int coeffs_size,
     int num_polys,
@@ -425,4 +420,35 @@ void batch_eval_at_points(
     cuda_proving_free(device_mappings);
     free(level_sizes);
     free(level_offsets);
+}
+
+// Host function: evaluate multiple same-size polynomials at the same point.
+// coeffs_ptrs: device array of num_polys device pointers (each pointing to m31 coefficients)
+// coeffs_size: size of each polynomial (all must be the same)
+// num_polys: number of polynomials
+// point_x, point_y: the evaluation point (shared across all polys)
+// results: host buffer for num_polys qm31 results
+//
+// The polynomial (batch) axis is grid.y in both batch kernels, which CUDA caps
+// at 65535 — so the batch is tiled into chunks. Polynomials are evaluated
+// independently (poly_idx = blockIdx.y only selects coeffs_ptrs[poly_idx] and a
+// disjoint temp/results slice), so evaluating a contiguous sub-range with offset
+// pointer/result bases is bit-for-bit identical to one big launch.
+extern "C"
+void batch_eval_at_points(
+    m31 **coeffs_ptrs,
+    int coeffs_size,
+    int num_polys,
+    qm31 point_x,
+    qm31 point_y,
+    qm31 *results
+) {
+    constexpr int MAX_BATCH_POLYS = 65535;
+    for (int base = 0; base < num_polys; base += MAX_BATCH_POLYS) {
+        const int chunk = min(num_polys - base, MAX_BATCH_POLYS);
+        // coeffs_ptrs is a device array: offsetting the pointer is plain
+        // address arithmetic, no dereference on the host.
+        batch_eval_at_points_chunk(coeffs_ptrs + base, coeffs_size, chunk,
+                                   point_x, point_y, results + base);
+    }
 }

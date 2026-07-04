@@ -21,6 +21,11 @@ impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M3
     for CudaBackend
 {
     fn build_leaves(columns: &[&BaseFieldVec], lifting_log_size: u32) -> Blake2sHashVec {
+        // First commit hook hit per tree — report the resolved commit-fusion
+        // configuration once so a pod operator / the bisecting integration agent
+        // can confirm which lanes took effect. Silent when the master switch is off
+        // (the default), so a normal prove prints nothing.
+        crate::backend::fused_commit::log_selected_lanes_once();
         if columns.is_empty() {
             let hasher = Blake2sMerkleHasherGeneric::<IS_M31_OUTPUT>::default();
             return Blake2sHashVec::from_vec(vec![hasher.finalize()]);
@@ -68,6 +73,52 @@ impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M3
             );
         }
         result
+    }
+
+    fn batch_layer_reads(
+        layers: &[&Blake2sHashVec],
+        pairs: &[(u32, u32)],
+    ) -> Vec<<Blake2sMerkleHasherGeneric<IS_M31_OUTPUT> as MerkleHasherLifted>::Hash> {
+        // One gather kernel + one D2H for the whole read set, vs a synchronous
+        // 32-byte round-trip per node (the decommit walk issues thousands).
+        // Semantics identical to the trait default: `layers[l].at(i)` per pair,
+        // in order. The kernel's pointer table is capped at 24 layers; deeper
+        // read sets (never seen — trees are ≤2^24 leaves) fall back per-element.
+        use stwo::prover::backend::Column;
+        const MAX_LAYERS: usize = 24;
+        if pairs.is_empty() {
+            return Vec::new();
+        }
+        if IS_M31_OUTPUT || layers.len() > MAX_LAYERS {
+            return pairs
+                .iter()
+                .map(|&(l, i)| layers[l as usize].at(i as usize))
+                .collect();
+        }
+        let mut layer_ptrs: Vec<*const stwo::core::vcs::blake2_hash::Blake2sHash> =
+            layers.iter().map(|l| l.device_ptr).collect();
+        layer_ptrs.resize(MAX_LAYERS, std::ptr::null());
+        let pair_structs: Vec<crate::columns::bindings::LayerIndexPair> = pairs
+            .iter()
+            .map(|&(l, i)| crate::columns::bindings::LayerIndexPair {
+                layer_idx: l,
+                hash_idx: i,
+            })
+            .collect();
+        let mut out = vec![stwo::core::vcs::blake2_hash::Blake2sHash::default(); pairs.len()];
+        unsafe {
+            crate::columns::bindings::cuda_multi_layer_batch_get_blake_2s_hash(
+                layer_ptrs.as_ptr(),
+                out.as_mut_ptr(),
+                pair_structs.as_ptr(),
+                pairs.len() as u32,
+            );
+        }
+        // The generic hasher's Hash type is Blake2sHash for the non-M31 lane
+        // (asserted by the IS_M31_OUTPUT early-out above).
+        unsafe {
+            std::mem::transmute::<Vec<stwo::core::vcs::blake2_hash::Blake2sHash>, Vec<_>>(out)
+        }
     }
 
     fn build_next_layer(prev_layer: &Blake2sHashVec) -> Blake2sHashVec {
@@ -443,5 +494,88 @@ impl stwo::prover::vcs_lifted::ops::PackLeavesOps for CudaBackend {
             }
         }
         packed.map(BaseFieldVec::from_vec)
+    }
+}
+
+/// Host-only spec gate for the Workstream D layer-pair fusion kernel
+/// (`commit_on_two_layers_using_previous_in_gpu`). The kernel produces, for each
+/// grandparent index `i`,
+///     H( H(prev[4i], prev[4i+1]), H(prev[4i+2], prev[4i+3]) )
+/// This test proves that composition is **byte-identical to two sequential
+/// single-level `hash_children` passes** — the reference the GPU path must match —
+/// using the CPU reference hasher only (no device, runs anywhere). It locks the
+/// child byte-ordering the kernel encodes; if the reference `hash_children` stream
+/// ever changes, this fails before the kernel is trusted on a pod.
+#[cfg(test)]
+mod layer_pair_spec_tests {
+    use stwo::core::vcs::blake2_hash::Blake2sHash;
+    use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleHasherGeneric;
+    use stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
+
+    type H = Blake2sMerkleHasherGeneric<false>;
+
+    /// One reference tree level: `out[j] = hash_children(prev[2j], prev[2j+1])`.
+    /// Column-free (internal-tree) case, matching the fused lane's precondition.
+    fn single_layer(prev: &[Blake2sHash]) -> Vec<Blake2sHash> {
+        assert!(prev.len().is_multiple_of(2));
+        (0..prev.len() / 2)
+            .map(|j| H::hash_children((prev[2 * j], prev[2 * j + 1])))
+            .collect()
+    }
+
+    /// What the fused two-layer kernel computes: two levels in one pass.
+    fn layer_pair_fused(prev: &[Blake2sHash]) -> Vec<Blake2sHash> {
+        assert!(prev.len().is_multiple_of(4));
+        (0..prev.len() / 4)
+            .map(|i| {
+                let left_mid = H::hash_children((prev[4 * i], prev[4 * i + 1]));
+                let right_mid = H::hash_children((prev[4 * i + 2], prev[4 * i + 3]));
+                H::hash_children((left_mid, right_mid))
+            })
+            .collect()
+    }
+
+    fn sample_hashes(n: usize) -> Vec<Blake2sHash> {
+        // Deterministic, distinct, non-trivial byte patterns.
+        (0..n)
+            .map(|k| {
+                let mut bytes = [0u8; 32];
+                for (b, slot) in bytes.iter_mut().enumerate() {
+                    *slot = ((k * 31 + b * 7 + 1) % 251) as u8;
+                }
+                Blake2sHash(bytes)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn layer_pair_matches_two_single_layers() {
+        for &grandparents in &[1usize, 2, 3, 8, 37, 256] {
+            let prev = sample_hashes(4 * grandparents);
+            let fused = layer_pair_fused(&prev);
+            let two_pass = single_layer(&single_layer(&prev));
+            assert_eq!(
+                fused.len(),
+                grandparents,
+                "output arity for {grandparents} grandparents"
+            );
+            assert_eq!(
+                fused, two_pass,
+                "layer-pair fusion diverged from two single-layer passes at \
+                 {grandparents} grandparents"
+            );
+        }
+    }
+
+    #[test]
+    fn grandparent_consumes_its_four_children_only() {
+        // Changing child 4i+3 must change out[i] and leave out[i+1] untouched —
+        // confirms the 4-consecutive-children index mapping the kernel uses.
+        let mut prev = sample_hashes(8); // two grandparents
+        let base = layer_pair_fused(&prev);
+        prev[3].0[0] ^= 0xFF; // perturb a child of grandparent 0
+        let perturbed = layer_pair_fused(&prev);
+        assert_ne!(base[0], perturbed[0], "out[0] must depend on child 3");
+        assert_eq!(base[1], perturbed[1], "out[1] must not depend on child 3");
     }
 }

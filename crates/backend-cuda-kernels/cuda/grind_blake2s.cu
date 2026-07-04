@@ -147,6 +147,21 @@ uint64_t grind_blake2s(const uint32_t* host_prefixed_digest, uint32_t pow_bits) 
         stwo_maybe_debug_sync();
         ASSERT_CUDA_SUCCESS(cudaGetLastError());
 
+        // Determinism gate (KNOWN_ISSUES #4). `result_low` is the atomicMin over EVERY
+        // thread in this hi-chunk; it holds the true minimal qualifying `low` only once
+        // the whole launch has retired. Reading it before the batch drains could observe
+        // a non-minimal in-flight nonce, which would still verify but shift the FRI
+        // query positions -> a divergent decommit tail vs the SIMD proof (breaking the
+        // byte-equality gate). Drain the full batch before the read.
+        //
+        // The synchronous D2H copy below is itself ordered after this kernel on the
+        // (default) stream and would already drain it; this explicit synchronize makes
+        // the "never early-read a partial atomicMin result" contract independent of the
+        // copy's stream, so it survives a future move of the grind onto a private stream
+        // (P3 stream overlap). It runs once per hi-chunk (~tens of times for pow_bits=26)
+        // — negligible, and it changes no proof bytes.
+        ASSERT_CUDA_SUCCESS(cudaDeviceSynchronize());
+
         // Check if a valid nonce was found in this hi chunk.
         ASSERT_CUDA_SUCCESS(cudaMemcpy(&host_result_low, d_result_low,
                                        sizeof(unsigned long long), cudaMemcpyDeviceToHost));

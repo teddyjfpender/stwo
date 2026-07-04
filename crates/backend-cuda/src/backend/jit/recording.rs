@@ -45,6 +45,13 @@ pub(crate) struct RecordingState {
     columns_per_interaction: Vec<u32>,
     n_base_params: u32,
     n_ext_params: u32,
+    /// Memoized result of [`Self::ensure_zero_const`]. The instruction list is
+    /// append-only, so once a scan has found (or created) the first `Const(0)`, every
+    /// later scan would find exactly the same instruction — caching the register is
+    /// bit-identical to rescanning. Without the memo the scan is O(insts) per
+    /// base→ext promotion, which goes quadratic on PIE-scale components
+    /// (pedersen partial_ec_mul-class recording spun for hours on one core).
+    zero_const_reg: Option<u16>,
 }
 
 impl RecordingState {
@@ -59,6 +66,31 @@ impl RecordingState {
             columns_per_interaction: Vec::new(),
             n_base_params: 0,
             n_ext_params: 0,
+            zero_const_reg: None,
+        }
+    }
+
+    /// Rebuild a state from raw parts. Used by the kernel splitter to compact and
+    /// package an instruction slice; the recording-only bookkeeping (column tracker,
+    /// param counts) is irrelevant at that point and left at defaults.
+    pub(crate) fn from_parts(
+        base_insts: Vec<MetalEvaluationProgramBaseInstV1>,
+        ext_insts: Vec<MetalEvaluationProgramExtInstV1>,
+        constraint_roots: Vec<u32>,
+        n_base_regs: u32,
+        n_ext_regs: u32,
+    ) -> Self {
+        Self {
+            base_insts,
+            ext_insts,
+            constraint_roots,
+            next_base_reg: u16::try_from(n_base_regs).expect("base register count overflow"),
+            next_ext_reg: u16::try_from(n_ext_regs).expect("ext register count overflow"),
+            max_interaction: 0,
+            columns_per_interaction: Vec::new(),
+            n_base_params: 0,
+            n_ext_params: 0,
+            zero_const_reg: None,
         }
     }
 
@@ -84,15 +116,25 @@ impl RecordingState {
     }
 
     /// Ensure there is a `Const(0)` base instruction and return its register.
+    ///
+    /// The first scan's result is memoized: `base_insts` only ever grows, so the
+    /// first matching instruction is stable and the memo returns the identical
+    /// register the scan would — same bytecode, same semantic hash. (Rescanning per
+    /// call was O(insts) and dominated recording time on very wide components.)
     fn ensure_zero_const(&mut self) -> u16 {
+        if let Some(reg) = self.zero_const_reg {
+            return reg;
+        }
         for inst in &self.base_insts {
             if inst.op == MetalEvaluationProgramBaseOpcodeV1::Const as u8 && inst.a == 0 {
+                self.zero_const_reg = Some(inst.dst);
                 return inst.dst;
             }
         }
         let dst = self.alloc_base_reg();
         self.base_insts
             .push(MetalEvaluationProgramBaseInstV1::const_value(dst, 0));
+        self.zero_const_reg = Some(dst);
         dst
     }
 

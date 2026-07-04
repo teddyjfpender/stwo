@@ -63,8 +63,11 @@ extern "C" {
     );
     pub fn gen_bitwise_xor_columns_on_gpu(output_columns: *const *mut u32, n_bits: u32);
     /// JIT-compile (NVRTC; cached by the CONTENT semantic hash, never pointers) and
-    /// launch a generated fused constraint kernel. Returns false on any compile or
-    /// launch failure; the caller falls back to the CPU lane.
+    /// launch a generated fused constraint kernel. `rc_base` is the kernel's first
+    /// constraint's global index into `random_coeff_powers` (non-zero only for split
+    /// kernels); `relax_opt` compiles with optimization disabled (nvrtc --dopt=off,
+    /// ptxas -O0) for kernels too large to optimize in reasonable time. Returns false
+    /// on any compile or launch failure; the caller falls back to the CPU lane.
     #[allow(clippy::too_many_arguments)]
     pub fn stwo_cuda_jit_eval_fused(
         source: *const core::ffi::c_char,
@@ -82,6 +85,32 @@ extern "C" {
         coord_3: *mut u32,
         row_count: u32,
         log_n_rows: u32,
+        rc_base: u32,
+        relax_opt: bool,
+    ) -> bool;
+    /// Compile a generated kernel into the JIT cache WITHOUT launching it. Used to
+    /// compile every kernel of a split component before the first launch, so a
+    /// compile failure can still fall back to the CPU lane with an untouched
+    /// accumulator. Returns false on compile failure.
+    pub fn stwo_cuda_jit_precompile(
+        source: *const core::ffi::c_char,
+        kernel_name: *const core::ffi::c_char,
+        semantic_hash: u64,
+        relax_opt: bool,
+    ) -> bool;
+    /// Precompile a batch of kernels into the JIT cache without launching, compiling
+    /// across a worker pool when `STWO_JIT_PARALLEL_COMPILE` is enabled (default; set to
+    /// `0` to force sequential, or to a positive integer to cap workers). The arrays are
+    /// parallel (length `count`): `sources[i]`/`kernel_names[i]` are NUL-terminated,
+    /// `cache_keys[i]` is the content semantic hash, `relax_opts[i]` the optimization
+    /// relief flag. Returns false if ANY kernel fails to compile (caller falls back to
+    /// the CPU lane). The populated cache is identical to a sequential precompile.
+    pub fn stwo_cuda_jit_precompile_batch(
+        sources: *const *const core::ffi::c_char,
+        kernel_names: *const *const core::ffi::c_char,
+        cache_keys: *const u64,
+        relax_opts: *const bool,
+        count: u32,
     ) -> bool;
     /// Per-component constraint-quotient kernel dispatch (NitrooZK lineage). The first
     /// 4 bytes behind `eval` are an FNV1a hash of the component name selecting the
@@ -143,6 +172,14 @@ extern "C" {
         n_words: u64,
     );
 
+    pub fn copy_uint32_t_vec_from_host_to_device_into_async(
+        host_ptr: *const u32,
+        device_ptr: *const u32,
+        n_words: u64,
+    );
+
+    pub fn stwo_legacy_stream_sync();
+
     pub fn cuda_gather_uint32_t(
         device_src: *const u32,
         host_indices: *const u32,
@@ -169,6 +206,7 @@ extern "C" {
     pub fn cuda_free_memory(device_ptr: *const c_void);
 
     pub fn cuda_get_memory_info(free_mem: *mut usize, total_mem: *mut usize);
+    pub fn cuda_pool_highwater(used_high: *mut usize, reserved_high: *mut usize);
 
     pub fn bit_reverse_base_field(array: *const u32, size: usize);
 
@@ -285,6 +323,14 @@ extern "C" {
         size: usize,
         amount_of_columns: usize,
         columns: *const *const u32,
+        previous_layer: *const Blake2sHash,
+        result: *mut Blake2sHash,
+    );
+
+    /// Workstream D layer-pair fusion: hash two internal (column-free) tree levels
+    /// per launch. `size` = grandparent hash count; `previous_layer` holds 4*size.
+    pub fn commit_on_two_layers_with_previous(
+        size: usize,
         previous_layer: *const Blake2sHash,
         result: *mut Blake2sHash,
     );
@@ -532,6 +578,20 @@ extern "C" {
         size: u32,
     );
 
+    /// Device logup pair generation from word-major witness-lane lookup flats
+    /// (ENDGAME 6a). See cuda/logup_pairs.cu for the descriptor layout.
+    pub fn stwo_logup_pairs_from_flats(
+        flats: *const u32,
+        n_rows: u32,
+        descs_host: *const u32,
+        n_cols: u32,
+        alphas_host: *const u32,
+        n_alphas: u32,
+        z_host: *const u32,
+        num_cols_device_table: *const *mut u32,
+        den_dense_device_table: *const *mut u32,
+    ) -> bool;
+
     pub fn logup_fraction_chain_dense(
         num0: *const u32,
         num1: *const u32,
@@ -610,6 +670,22 @@ extern "C" {
         num3: *const u32,
     );
 
+    /// Composed device `deduce_output` (ENDGAME §2 keystone): for each queried address,
+    /// read the raw encoded id from `addr_to_id`, decode the tag, and gather the 28
+    /// 9-bit value limbs from the device-resident big/small split tables — the device
+    /// equivalent of the host `memory_address_to_id` + `memory_id_to_big` deduction.
+    /// `big_limbs`/`small_limbs`/`out_limbs` are device-resident arrays of device
+    /// column pointers (28 / 8 / 28). Addresses must be non-empty cells.
+    pub fn exec_deduce_output(
+        addr_to_id: *const u32,
+        big_limbs: *const *const u32,
+        small_limbs: *const *const u32,
+        addresses: *const u32,
+        n_queries: u32,
+        out_ids: *mut u32,
+        out_limbs: *const *mut u32,
+    );
+
     pub fn logup_shift_secure_coords(
         c0: *const u32,
         c1: *const u32,
@@ -617,6 +693,111 @@ extern "C" {
         c3: *const u32,
         shift: CudaSecureField,
         size: u32,
+    );
+
+    pub fn blake_g_write_trace(
+        inputs: *const u32,
+        n_rows: u32,
+        column_length: u32,
+        cols: *const *const u32,
+    );
+
+    pub fn blake_g_xor_count(
+        a_cols: *const *const u32,
+        b_cols: *const *const u32,
+        rel_idx: *const u32,
+        n_pairs: u32,
+        column_length: u32,
+        shift: u32,
+        lut: *const u32,
+        table_size: u32,
+        counts: *mut u32,
+    );
+
+    pub fn blake_g_xor12_count(
+        a_cols: *const *const u32,
+        b_cols: *const *const u32,
+        n_pairs: u32,
+        column_length: u32,
+        limb_bits: u32,
+        expand_bits: u32,
+        table_size: u32,
+        counts: *mut u32,
+    );
+
+    pub fn blake_g_pair_logup(
+        a0: *const u32,
+        b0: *const u32,
+        x0: *const u32,
+        a1: *const u32,
+        b1: *const u32,
+        x1: *const u32,
+        rel0: u32,
+        rel1: u32,
+        column_length: u32,
+        alpha: *const u32,
+        z: CudaSecureField,
+        denoms: *const u32,
+        num0: *const u32,
+        num1: *const u32,
+        num2: *const u32,
+        num3: *const u32,
+    );
+
+    pub fn blake_g_final_logup(
+        val_cols: *const *const u32,
+        enabler: *const u32,
+        rel: u32,
+        column_length: u32,
+        alpha: *const u32,
+        z: CudaSecureField,
+        denoms: *const u32,
+        num0: *const u32,
+        num1: *const u32,
+        num2: *const u32,
+        num3: *const u32,
+    );
+
+    // Pedersen family witness-on-GPU (partial_ec_mul / pedersen_aggregator).
+    // See `cuda/pedersen_witness.cu` for the scope contract; these are the
+    // reusable interaction/logup kernels (base-trace gadget kernels land per
+    // component on hardware behind the STWO_CUDA_WITNESS_VERIFY differential).
+    #[allow(clippy::too_many_arguments)]
+    pub fn pedersen_pair_logup(
+        vals0: *const *const u32,
+        rel0: u32,
+        vals1: *const *const u32,
+        rel1: u32,
+        n_vals: u32,
+        m0: *const u32,
+        m1: *const u32,
+        sign0: i32,
+        sign1: i32,
+        column_length: u32,
+        alpha: *const u32,
+        z: CudaSecureField,
+        denoms: *const u32,
+        num0: *const u32,
+        num1: *const u32,
+        num2: *const u32,
+        num3: *const u32,
+    );
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn pedersen_multi_logup(
+        vals: *const *const u32,
+        n_vals: u32,
+        rel: u32,
+        mult: *const u32,
+        neg_num: i32,
+        column_length: u32,
+        alpha: *const u32,
+        z: CudaSecureField,
+        denoms: *const u32,
+        num0: *const u32,
+        num1: *const u32,
+        num2: *const u32,
+        num3: *const u32,
     );
 
     // Poseidon252 CUDA acceleration functions
@@ -681,4 +862,41 @@ extern "C" {
         offset: i32,
         n: u32,
     );
+
+    /// Witness-JIT lane: NVRTC-compile (cached by `cache_key`, the CONTENT hash — never
+    /// pointers) and launch a generated per-row witness kernel. The ABI matches
+    /// `stwo-backend-cuda::backend::jit_witness::codegen`: one thread per row reads the
+    /// packed input columns, replays the recorded decode in registers, writes committed
+    /// trace columns, atomic-adds multiplicities, and stores lookup words.
+    ///
+    /// Pointer tables are device-resident arrays of device pointers (the pointer-table
+    /// trace ABI — no flatten copies, no u32 length overflow at log >= 23). `relax_opt`
+    /// compiles with optimization disabled for oversized kernels. Returns false on any
+    /// compile or launch failure; the caller falls back to the host writer with an
+    /// untouched output (this lane is default OFF and pod-gated — see
+    /// `STWO_CUDA_WITNESS_JIT`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn stwo_cuda_jit_witness_launch(
+        source: *const core::ffi::c_char,
+        kernel_name: *const core::ffi::c_char,
+        cache_key: u64,
+        input_cols: *const *const u32,
+        table_bases: *const *const u32,
+        table_strides: *const u32,
+        out_cols: *const *mut u32,
+        mult_counts: *const *mut u32,
+        lookup_words: *mut u32,
+        sub_words: *mut u32,
+        row_count: u32,
+        relax_opt: bool,
+        // Stage B′: stream to launch on. Null = legacy default stream (pre-B′).
+        stream: *mut core::ffi::c_void,
+    ) -> bool;
+
+    // Stage B′ fan-out primitives (see cuda_mem_pool.cu). `stwo_fanout_stream`
+    // returns pool stream `i` (round-robin) as an opaque handle; `fork`/`join`
+    // are the thread-safe (fresh-event) bridges around a lane's stream work.
+    pub fn stwo_fanout_stream(i: i32) -> *mut core::ffi::c_void;
+    pub fn stwo_fanout_fork(stream: *mut core::ffi::c_void);
+    pub fn stwo_fanout_join(stream: *mut core::ffi::c_void);
 }

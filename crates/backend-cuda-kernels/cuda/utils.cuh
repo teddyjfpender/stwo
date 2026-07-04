@@ -280,26 +280,27 @@ T* cuda_malloc(unsigned int size) {
 
 template<typename T>
 void cuda_mem_copy_host_to_device(const T* host_data, T* device_data, unsigned int data_size) {
-    cudaError_t err = cudaMemcpy(device_data, host_data, sizeof(T) * data_size, cudaMemcpyHostToDevice);
-    if (err != cudaSuccess) {
-        printf("Error copying memory: %s\n", cudaGetErrorString(err));
-    }
+    // A failed copy must abort at its origin: continuing would compute on
+    // uninitialized device memory AND leave a sticky last-error that then
+    // surfaces at an unrelated later check, mis-attributing the failure.
+    ASSERT_CUDA_SUCCESS(
+        cudaMemcpy(device_data, host_data, sizeof(T) * data_size, cudaMemcpyHostToDevice));
 }
 
 template<typename T>
 void cuda_mem_copy_device_to_device(T* device_data_from, T* device_data_to, unsigned int data_size) {
-    cudaError_t err = cudaMemcpy(device_data_to, device_data_from, sizeof(T) * data_size, cudaMemcpyDeviceToDevice);
-    if (err != cudaSuccess) {
-        printf("Error copying memory: %s\n", cudaGetErrorString(err));
-    }
+    // See cuda_mem_copy_host_to_device: fail at origin instead of leaving a
+    // sticky error that misfires at a later unrelated check.
+    ASSERT_CUDA_SUCCESS(
+        cudaMemcpy(device_data_to, device_data_from, sizeof(T) * data_size, cudaMemcpyDeviceToDevice));
 }
 
 template<typename T>
 void cuda_mem_copy_device_to_host(T* device_data, T* host_data, unsigned int data_size) {
-    cudaError_t err = cudaMemcpy(host_data, device_data, sizeof(T) * data_size, cudaMemcpyDeviceToHost);
-    if (err != cudaSuccess) {
-        printf("Error copying memory: %s\n", cudaGetErrorString(err));
-    }
+    // See cuda_mem_copy_host_to_device: fail at origin instead of leaving a
+    // sticky error that misfires at a later unrelated check.
+    ASSERT_CUDA_SUCCESS(
+        cudaMemcpy(host_data, device_data, sizeof(T) * data_size, cudaMemcpyDeviceToHost));
 }
 
 template<typename T>

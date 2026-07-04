@@ -723,6 +723,59 @@ pub fn lower_framework_eval_to_v1_with_logup<F: FrameworkEval>(
     log_size: u32,
 ) -> Result<(OwnedMetalEvaluationProgramV1, Vec<SecureField>), MetalEvaluationProgramLoweringError>
 {
+    // Uncapped: always the single fused program (the historical pipeline —
+    // record, hoist, compact, build — unchanged byte-for-byte).
+    let (mut parts, ext_param_values) = lower_framework_eval_to_v1_split(
+        eval,
+        n_interactions,
+        n_base_params,
+        n_ext_params,
+        claimed_sum,
+        log_size,
+        usize::MAX,
+    )?;
+    debug_assert_eq!(parts.len(), 1);
+    let part = parts.pop().expect("uncapped lowering yields one program");
+    Ok((part.program, ext_param_values))
+}
+
+/// One kernel of a (possibly split) lowering.
+///
+/// `rc_base` is the global index of this kernel's first constraint root within the
+/// component's `random_coeff_powers` sequence: kernel-local constraint `j` accumulates
+/// with `random_coeff_powers[rc_base + j]` — the exact power the fused kernel used for
+/// the same constraint. Splitting only regroups the exact modular sum
+/// `Σ_i rc[i]·constraint_i(row)` into per-kernel partial sums, each multiplied by the
+/// same `denom_inv[row >> log]` and added into the same accumulator coordinates on the
+/// same stream in root order; M31/QM31 addition and distributivity are exact, so the
+/// accumulated coordinates are bit-identical to the fused kernel's.
+pub struct JitKernelPart {
+    pub program: OwnedMetalEvaluationProgramV1,
+    pub rc_base: u32,
+}
+
+/// Lower a [`FrameworkEval`] like [`lower_framework_eval_to_v1_with_logup`], but when
+/// the recorded program exceeds `max_kernel_instrs` (total base + ext instructions)
+/// split it into K sequential kernels, each at most that size (best effort: a single
+/// constraint whose dependency cone alone exceeds the cap stays whole).
+///
+/// The split is by whole constraint roots: each part gets the backward slice
+/// (dependency cone) of its contiguous root group, instructions kept in original
+/// program order. Shared subexpressions are RECOMPUTED by every part that needs them —
+/// there are no intermediate spill buffers, so the split costs zero extra VRAM; the
+/// price is redundant arithmetic, not memory.
+///
+/// When the program fits under the cap the pipeline (and hence bytecode and semantic
+/// hash) is identical to the unsplit entry point.
+pub fn lower_framework_eval_to_v1_split<F: FrameworkEval>(
+    eval: &F,
+    n_interactions: u32,
+    n_base_params: u32,
+    n_ext_params: u32,
+    claimed_sum: SecureField,
+    log_size: u32,
+    max_kernel_instrs: usize,
+) -> Result<(Vec<JitKernelPart>, Vec<SecureField>), MetalEvaluationProgramLoweringError> {
     validate_eval_program_abi_layout_v1()?;
 
     let mut recorder = RecordingEvaluator::new();
@@ -770,6 +823,47 @@ pub fn lower_framework_eval_to_v1_with_logup<F: FrameworkEval>(
     }
     let n_ext_params = n_ext_params.max(ext_param_values.len() as u32);
 
+    // Size governor: split the still-SSA state (each register written exactly once,
+    // so backward slicing is trivial) into root groups BEFORE register compaction;
+    // each part is then compacted and built independently.
+    let total_instrs = state.base_insts.len() + state.ext_insts.len();
+    if total_instrs <= max_kernel_instrs || state.constraint_roots.len() <= 1 {
+        let program =
+            finalize_recording_state(state, n_interactions, n_base_params, n_ext_params, log_size);
+        return Ok((
+            vec![JitKernelPart {
+                program,
+                rc_base: 0,
+            }],
+            ext_param_values,
+        ));
+    }
+
+    let parts = split_recording_state(&state, max_kernel_instrs)
+        .into_iter()
+        .map(|(slice, rc_base)| JitKernelPart {
+            program: finalize_recording_state(
+                slice,
+                n_interactions,
+                n_base_params,
+                n_ext_params,
+                log_size,
+            ),
+            rc_base,
+        })
+        .collect();
+    Ok((parts, ext_param_values))
+}
+
+/// Compact registers, sanity-check operands, and build the owned program. This is the
+/// tail of the historical single-kernel pipeline, shared verbatim by the split path.
+fn finalize_recording_state(
+    mut state: super::recording::RecordingState,
+    n_interactions: u32,
+    n_base_params: u32,
+    n_ext_params: u32,
+    log_size: u32,
+) -> OwnedMetalEvaluationProgramV1 {
     // Compact registers (linear-scan reuse) so big components don't spill: the
     // recorder's monotonic SSA allocation can produce hundreds of live slots.
     state.compact_registers();
@@ -830,7 +924,7 @@ pub fn lower_framework_eval_to_v1_with_logup<F: FrameworkEval>(
         }
     }
 
-    let program = build_owned_program_v1(
+    build_owned_program_v1(
         STWO_METAL_EVAL_PROGRAM_CAP_BASE_INV_V1
             | STWO_METAL_EVAL_PROGRAM_CAP_EXT_MUL_V1
             | STWO_METAL_EVAL_PROGRAM_CAP_PREFINALIZED_LOGUP_V1,
@@ -845,6 +939,502 @@ pub fn lower_framework_eval_to_v1_with_logup<F: FrameworkEval>(
         state.ext_insts,
         state.constraint_roots,
         log_size,
+    )
+}
+
+/// Split an SSA recording state (pre-compaction: every register written exactly once)
+/// into contiguous constraint-root groups whose backward slices each stay at or under
+/// `max_kernel_instrs` (base + ext instructions), except when a single root's cone
+/// alone exceeds the cap. Returns `(slice_state, rc_base)` pairs in root order;
+/// `rc_base` is the group's first root's index in the original root list.
+///
+/// Each slice keeps its instructions in original program order, so every root's
+/// dataflow — and therefore its value — is exactly the original's. Instructions
+/// shared between groups are duplicated (recomputed per kernel), never spilled.
+fn split_recording_state(
+    state: &super::recording::RecordingState,
+    max_kernel_instrs: usize,
+) -> Vec<(super::recording::RecordingState, u32)> {
+    use {MetalEvaluationProgramBaseOpcodeV1 as B, MetalEvaluationProgramExtOpcodeV1 as X};
+
+    let n_base_regs = state.max_base_regs() as usize;
+    let n_ext_regs = state.max_ext_regs() as usize;
+
+    // SSA def maps: register -> defining instruction index.
+    let mut base_def = vec![usize::MAX; n_base_regs];
+    for (i, inst) in state.base_insts.iter().enumerate() {
+        base_def[inst.dst as usize] = i;
+    }
+    let mut ext_def = vec![usize::MAX; n_ext_regs];
+    for (i, inst) in state.ext_insts.iter().enumerate() {
+        ext_def[inst.dst as usize] = i;
+    }
+
+    // Mark the dependency cone of `root` into the needed sets; newly marked registers
+    // are recorded for undo. Returns the number of newly needed instructions.
+    let mark_cone = |root: u32,
+                     needed_base: &mut [bool],
+                     needed_ext: &mut [bool],
+                     added_base: &mut Vec<u32>,
+                     added_ext: &mut Vec<u32>|
+     -> usize {
+        let before = added_base.len() + added_ext.len();
+        let mut ext_stack: Vec<u32> = Vec::new();
+        let mut base_stack: Vec<u32> = Vec::new();
+        if !needed_ext[root as usize] {
+            needed_ext[root as usize] = true;
+            added_ext.push(root);
+            ext_stack.push(root);
+        }
+        while let Some(reg) = ext_stack.pop() {
+            let inst = &state.ext_insts[ext_def[reg as usize]];
+            match X::from_raw(inst.op) {
+                Some(X::Add) | Some(X::Sub) | Some(X::Mul) => {
+                    for src in [inst.a, inst.b] {
+                        if !needed_ext[src as usize] {
+                            needed_ext[src as usize] = true;
+                            added_ext.push(src);
+                            ext_stack.push(src);
+                        }
+                    }
+                }
+                Some(X::Neg) => {
+                    if !needed_ext[inst.a as usize] {
+                        needed_ext[inst.a as usize] = true;
+                        added_ext.push(inst.a);
+                        ext_stack.push(inst.a);
+                    }
+                }
+                Some(X::SecureCol) => {
+                    for src in [inst.a, inst.b, inst.c, inst.d] {
+                        if !needed_base[src as usize] {
+                            needed_base[src as usize] = true;
+                            added_base.push(src);
+                            base_stack.push(src);
+                        }
+                    }
+                }
+                // Param/Const are leaves.
+                _ => {}
+            }
+        }
+        while let Some(reg) = base_stack.pop() {
+            let inst = &state.base_insts[base_def[reg as usize]];
+            let srcs: &[u32] = match B::from_raw(inst.op) {
+                Some(B::Add) | Some(B::Sub) | Some(B::Mul) => &[inst.a, inst.b],
+                Some(B::Neg) | Some(B::Inv) => &[inst.a],
+                // TraceCol/PreprocessedCol/Param/Const are leaves.
+                _ => &[],
+            };
+            for &src in srcs {
+                if !needed_base[src as usize] {
+                    needed_base[src as usize] = true;
+                    added_base.push(src);
+                    base_stack.push(src);
+                }
+            }
+        }
+        added_base.len() + added_ext.len() - before
+    };
+
+    let roots = &state.constraint_roots;
+    let mut out: Vec<(super::recording::RecordingState, u32)> = Vec::new();
+    let mut needed_base = vec![false; n_base_regs];
+    let mut needed_ext = vec![false; n_ext_regs];
+    let mut count = 0usize;
+    let mut group_start = 0usize;
+
+    let flush = |start: usize,
+                 end: usize,
+                 needed_base: &[bool],
+                 needed_ext: &[bool],
+                 out: &mut Vec<(super::recording::RecordingState, u32)>| {
+        let slice_base: Vec<MetalEvaluationProgramBaseInstV1> = state
+            .base_insts
+            .iter()
+            .filter(|inst| needed_base[inst.dst as usize])
+            .copied()
+            .collect();
+        let slice_ext: Vec<MetalEvaluationProgramExtInstV1> = state
+            .ext_insts
+            .iter()
+            .filter(|inst| needed_ext[inst.dst as usize])
+            .copied()
+            .collect();
+        out.push((
+            super::recording::RecordingState::from_parts(
+                slice_base,
+                slice_ext,
+                roots[start..end].to_vec(),
+                state.max_base_regs(),
+                state.max_ext_regs(),
+            ),
+            start as u32,
+        ));
+    };
+
+    let mut i = 0usize;
+    while i < roots.len() {
+        let mut added_base: Vec<u32> = Vec::new();
+        let mut added_ext: Vec<u32> = Vec::new();
+        let added = mark_cone(
+            roots[i],
+            &mut needed_base,
+            &mut needed_ext,
+            &mut added_base,
+            &mut added_ext,
+        );
+        if i > group_start && count + added > max_kernel_instrs {
+            // This root does not fit: undo its marginal cone, flush the group,
+            // and retry the root against a fresh group.
+            for reg in &added_ext {
+                needed_ext[*reg as usize] = false;
+            }
+            for reg in &added_base {
+                needed_base[*reg as usize] = false;
+            }
+            flush(group_start, i, &needed_base, &needed_ext, &mut out);
+            needed_base.fill(false);
+            needed_ext.fill(false);
+            count = 0;
+            group_start = i;
+            continue;
+        }
+        count += added;
+        i += 1;
+    }
+    flush(
+        group_start,
+        roots.len(),
+        &needed_base,
+        &needed_ext,
+        &mut out,
     );
-    Ok((program, ext_param_values))
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use num_traits::Zero;
+    use stwo::core::fields::m31::BaseField;
+
+    use super::super::recording::RecordingState;
+    use super::*;
+
+    const P: u64 = (1 << 31) - 1;
+
+    /// Deterministic synthetic trace value for the reference interpreter.
+    fn trace_value(interaction: u8, column: u32, offset: i32) -> BaseField {
+        let mix = (interaction as u64 + 1) * 1_000_003
+            + (column as u64 + 1) * 7919
+            + (offset + 64) as u64 * 31;
+        BaseField::from_u32_unchecked((mix % P) as u32)
+    }
+
+    /// Reference interpreter for V1 programs: executes the bytecode with exact
+    /// M31/QM31 field arithmetic and returns the constraint-root values. Used to
+    /// prove that the split kernels' concatenated semantics equal the fused
+    /// program's.
+    fn interpret(
+        program: &OwnedMetalEvaluationProgramV1,
+        ext_params: &[SecureField],
+    ) -> Vec<SecureField> {
+        use {MetalEvaluationProgramBaseOpcodeV1 as B, MetalEvaluationProgramExtOpcodeV1 as X};
+        let header = program.header();
+        let mut base = vec![BaseField::zero(); header.max_base_regs as usize];
+        let mut ext = vec![SecureField::zero(); header.max_ext_regs as usize];
+        for inst in program.base_insts() {
+            let value = match B::from_raw(inst.op).unwrap() {
+                B::TraceCol => trace_value(inst.interaction, inst.a, inst.imm),
+                B::Param | B::PreprocessedCol => unreachable!("not emitted by these tests"),
+                B::Const => BaseField::from_u32_unchecked(inst.a),
+                B::Add => base[inst.a as usize] + base[inst.b as usize],
+                B::Sub => base[inst.a as usize] - base[inst.b as usize],
+                B::Mul => base[inst.a as usize] * base[inst.b as usize],
+                B::Neg => -base[inst.a as usize],
+                B::Inv => base[inst.a as usize].inverse(),
+            };
+            base[inst.dst as usize] = value;
+        }
+        for inst in program.ext_insts() {
+            let value = match X::from_raw(inst.op).unwrap() {
+                X::SecureCol => SecureField::from_m31_array([
+                    base[inst.a as usize],
+                    base[inst.b as usize],
+                    base[inst.c as usize],
+                    base[inst.d as usize],
+                ]),
+                X::Param => ext_params[inst.a as usize],
+                X::Const => SecureField::from_m31_array(
+                    [inst.a, inst.b, inst.c, inst.d].map(BaseField::from_u32_unchecked),
+                ),
+                X::Add => ext[inst.a as usize] + ext[inst.b as usize],
+                X::Sub => ext[inst.a as usize] - ext[inst.b as usize],
+                X::Mul => ext[inst.a as usize] * ext[inst.b as usize],
+                X::Neg => -ext[inst.a as usize],
+            };
+            ext[inst.dst as usize] = value;
+        }
+        program
+            .constraint_roots()
+            .iter()
+            .map(|&root| ext[root as usize])
+            .collect()
+    }
+
+    /// Builder for synthetic SSA states (each register written exactly once), the
+    /// same invariant the recorder guarantees before compaction.
+    struct SsaBuilder {
+        base: Vec<MetalEvaluationProgramBaseInstV1>,
+        ext: Vec<MetalEvaluationProgramExtInstV1>,
+        roots: Vec<u32>,
+        next_base: u16,
+        next_ext: u16,
+    }
+
+    impl SsaBuilder {
+        fn new() -> Self {
+            Self {
+                base: Vec::new(),
+                ext: Vec::new(),
+                roots: Vec::new(),
+                next_base: 0,
+                next_ext: 0,
+            }
+        }
+
+        fn trace(&mut self, interaction: u8, column: u32, offset: i32) -> u16 {
+            let dst = self.next_base;
+            self.next_base += 1;
+            self.base.push(MetalEvaluationProgramBaseInstV1::trace_col(
+                dst,
+                interaction,
+                column,
+                offset,
+            ));
+            dst
+        }
+
+        fn bop(&mut self, op: MetalEvaluationProgramBaseOpcodeV1, a: u16, b: u16) -> u16 {
+            let dst = self.next_base;
+            self.next_base += 1;
+            self.base.push(MetalEvaluationProgramBaseInstV1::binary(
+                op, dst, a as u32, b as u32,
+            ));
+            dst
+        }
+
+        fn secure_col(&mut self, regs: [u16; 4]) -> u16 {
+            let dst = self.next_ext;
+            self.next_ext += 1;
+            self.ext.push(MetalEvaluationProgramExtInstV1::secure_col(
+                dst,
+                regs[0] as u32,
+                regs[1] as u32,
+                regs[2] as u32,
+                regs[3] as u32,
+            ));
+            dst
+        }
+
+        fn eparam(&mut self, slot: u32) -> u16 {
+            let dst = self.next_ext;
+            self.next_ext += 1;
+            self.ext.push(MetalEvaluationProgramExtInstV1 {
+                op: MetalEvaluationProgramExtOpcodeV1::Param as u8,
+                reserved0: 0,
+                dst,
+                a: slot,
+                b: 0,
+                c: 0,
+                d: 0,
+            });
+            dst
+        }
+
+        fn eop(&mut self, op: MetalEvaluationProgramExtOpcodeV1, a: u16, b: u16) -> u16 {
+            let dst = self.next_ext;
+            self.next_ext += 1;
+            self.ext.push(MetalEvaluationProgramExtInstV1 {
+                op: op as u8,
+                reserved0: 0,
+                dst,
+                a: a as u32,
+                b: b as u32,
+                c: 0,
+                d: 0,
+            });
+            dst
+        }
+
+        fn root(&mut self, reg: u16) {
+            self.roots.push(reg as u32);
+        }
+
+        fn build(self) -> RecordingState {
+            RecordingState::from_parts(
+                self.base,
+                self.ext,
+                self.roots,
+                self.next_base as u32,
+                self.next_ext as u32,
+            )
+        }
+    }
+
+    /// A synthetic wide component: `n_roots` constraints, each a `chain`-long op
+    /// chain over trace columns, mixed with a subexpression SHARED by every root
+    /// (exercising cone duplication across split kernels) and a shared ext param
+    /// (hoisted-constant leaf).
+    fn synthetic_state(n_roots: usize, chain: usize) -> RecordingState {
+        use {MetalEvaluationProgramBaseOpcodeV1 as B, MetalEvaluationProgramExtOpcodeV1 as X};
+        let mut b = SsaBuilder::new();
+        let t0 = b.trace(0, 0, 0);
+        let t1 = b.trace(0, 1, 0);
+        let shared = b.bop(B::Mul, t0, t1);
+        let param = b.eparam(0);
+        for r in 0..n_roots {
+            let mut cur = b.trace(1, r as u32, 0);
+            for k in 0..chain {
+                let t = b.trace(
+                    0,
+                    ((r + k) % 5) as u32,
+                    if k.is_multiple_of(2) { 0 } else { -1 },
+                );
+                cur = b.bop(if k.is_multiple_of(3) { B::Add } else { B::Mul }, cur, t);
+            }
+            let mixed = b.bop(B::Sub, cur, shared);
+            let lifted = b.secure_col([mixed, cur, shared, t0]);
+            let constrained = b.eop(X::Mul, lifted, param);
+            b.root(constrained);
+        }
+        b.build()
+    }
+
+    fn finalize(state: RecordingState) -> OwnedMetalEvaluationProgramV1 {
+        finalize_recording_state(state, 2, 0, 1, 6)
+    }
+
+    fn test_ext_params() -> Vec<SecureField> {
+        vec![SecureField::from_m31_array(
+            [7, 11, 13, 17].map(BaseField::from_u32_unchecked),
+        )]
+    }
+
+    /// Deterministic "random" coefficient powers for accumulation checks.
+    fn rc_powers(n: usize) -> Vec<SecureField> {
+        let alpha = SecureField::from_m31_array([3, 1, 4, 1].map(BaseField::from_u32_unchecked));
+        let mut powers = Vec::with_capacity(n);
+        let mut cur = SecureField::from(BaseField::from_u32_unchecked(1));
+        for _ in 0..n {
+            powers.push(cur);
+            cur *= alpha;
+        }
+        powers
+    }
+
+    #[test]
+    fn split_concatenated_semantics_equal_fused() {
+        let ext_params = test_ext_params();
+        let fused = finalize(synthetic_state(16, 8));
+        let fused_roots = interpret(&fused, &ext_params);
+        assert_eq!(fused_roots.len(), 16);
+
+        const CAP: usize = 60;
+        let full_state = synthetic_state(16, 8);
+        assert!(full_state.base_insts.len() + full_state.ext_insts.len() > CAP);
+        let parts = split_recording_state(&full_state, CAP);
+        assert!(parts.len() > 1, "expected an actual split");
+
+        let rc = rc_powers(fused_roots.len());
+        let mut concatenated: Vec<SecureField> = Vec::new();
+        let mut split_acc = SecureField::zero();
+        for (slice, rc_base) in parts {
+            // rc_base bookkeeping: each part's first root continues where the
+            // previous part stopped.
+            assert_eq!(rc_base as usize, concatenated.len());
+            let program = finalize(slice);
+            let instrs = program.base_insts().len() + program.ext_insts().len();
+            assert!(
+                instrs <= CAP,
+                "split kernel has {instrs} instrs, cap is {CAP}"
+            );
+            let roots = interpret(&program, &ext_params);
+            for (j, value) in roots.iter().enumerate() {
+                split_acc += *value * rc[rc_base as usize + j];
+            }
+            concatenated.extend(roots);
+        }
+        // Root-by-root equality: every constraint value is bit-identical.
+        assert_eq!(concatenated, fused_roots);
+        // Accumulator equality: the per-kernel partial sums (each kernel's
+        // in-place accumulate) combine to exactly the fused kernel's sum.
+        let fused_acc = fused_roots
+            .iter()
+            .zip(&rc)
+            .fold(SecureField::zero(), |acc, (value, coeff)| {
+                acc + *value * *coeff
+            });
+        assert_eq!(split_acc, fused_acc);
+    }
+
+    #[test]
+    fn single_group_split_is_identical_to_fused_program() {
+        // With a cap that fits everything, the slice of all roots must reproduce the
+        // fused program exactly (the synthetic state has no dead instructions).
+        let fused = finalize(synthetic_state(12, 6));
+        let state = synthetic_state(12, 6);
+        let mut parts = split_recording_state(&state, usize::MAX);
+        assert_eq!(parts.len(), 1);
+        let (slice, rc_base) = parts.pop().unwrap();
+        assert_eq!(rc_base, 0);
+        let program = finalize(slice);
+        assert_eq!(program, fused);
+        assert_eq!(program.header().semantic_hash, fused.header().semantic_hash);
+    }
+
+    #[test]
+    fn oversized_single_cone_stays_whole_and_correct() {
+        use {MetalEvaluationProgramBaseOpcodeV1 as B, MetalEvaluationProgramExtOpcodeV1 as X};
+        // Root 0 alone exceeds the cap; the splitter must keep it whole (one
+        // oversized kernel) and still split the remaining small roots off.
+        let build = || {
+            let mut b = SsaBuilder::new();
+            let param = b.eparam(0);
+            let mut cur = b.trace(0, 0, 0);
+            for k in 0..100 {
+                let t = b.trace(0, (k % 7) as u32, 0);
+                cur = b.bop(B::Mul, cur, t);
+            }
+            let zero = b.trace(0, 8, 0);
+            let big = b.secure_col([cur, zero, zero, zero]);
+            let big = b.eop(X::Mul, big, param);
+            b.root(big);
+            for r in 0..4 {
+                let t = b.trace(1, r, 0);
+                let z = b.trace(0, 9 + r, 0);
+                let small = b.secure_col([t, z, z, z]);
+                b.root(small);
+            }
+            b.build()
+        };
+        const CAP: usize = 32;
+        let ext_params = test_ext_params();
+        let fused = finalize(build());
+        let fused_roots = interpret(&fused, &ext_params);
+
+        let parts = split_recording_state(&build(), CAP);
+        assert!(parts.len() >= 2);
+        // First part is the irreducible oversized cone.
+        assert!(
+            parts[0].0.base_insts.len() + parts[0].0.ext_insts.len() > CAP,
+            "oversized cone should exceed the cap"
+        );
+        let mut concatenated: Vec<SecureField> = Vec::new();
+        for (slice, rc_base) in parts {
+            assert_eq!(rc_base as usize, concatenated.len());
+            concatenated.extend(interpret(&finalize(slice), &ext_params));
+        }
+        assert_eq!(concatenated, fused_roots);
+    }
 }

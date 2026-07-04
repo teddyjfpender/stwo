@@ -2,11 +2,10 @@ use core::fmt::Debug;
 use core::iter::zip;
 use core::ops::RangeInclusive;
 
-use hashbrown::HashMap;
 use itertools::Itertools;
 use num_traits::Zero;
 use serde::{Deserialize, Serialize};
-use std_shims::{vec, Vec};
+use std_shims::{vec, BTreeMap, Vec};
 use thiserror::Error;
 
 use super::channel::{Channel, MerkleChannel};
@@ -404,7 +403,9 @@ pub struct FriLayerProofAux<H: MerkleHasherLifted> {
     /// For each column (of different size), the values of all nodes that participate in the
     /// decommitment.
     // TODO(lior): Remove the `Vec<>` once mixed-degree Merkle is removed.
-    pub all_values: Vec<HashMap<usize, QM31>>,
+    /// `BTreeMap` for canonical proof bytes (same rule as `MerkleDecommitmentLiftedAux`
+    /// — a serialized `HashMap` iterates in nondeterministic order).
+    pub all_values: Vec<BTreeMap<usize, QM31>>,
     /// The auxiliary data for the merkle decommitment.
     pub decommitment: MerkleDecommitmentLiftedAux<H>,
 }

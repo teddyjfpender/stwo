@@ -1,7 +1,6 @@
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
 
-use hashbrown::HashMap;
 use itertools::Itertools;
 use tracing::{span, Level};
 
@@ -86,7 +85,7 @@ impl<B: MerkleOps<H>, H: MerkleHasher> MerkleProver<B, H> {
         // Prepare output buffers.
         let mut queried_values = vec![];
         let mut decommitment = MerkleDecommitment::empty();
-        let mut all_node_values: Vec<HashMap<usize, <H as MerkleHasher>::Hash>> = vec![];
+        let mut all_node_values: Vec<BTreeMap<usize, <H as MerkleHasher>::Hash>> = vec![];
 
         // Sort columns by layer.
         let mut columns_by_layer = columns
@@ -96,7 +95,7 @@ impl<B: MerkleOps<H>, H: MerkleHasher> MerkleProver<B, H> {
 
         let mut last_layer_queries = vec![];
         for layer_log_size in (0..self.layers.len() as u32).rev() {
-            let mut all_node_values_for_layer = HashMap::<usize, <H as MerkleHasher>::Hash>::new();
+            let mut all_node_values_for_layer = BTreeMap::<usize, <H as MerkleHasher>::Hash>::new();
 
             // Prepare write buffer for queries to the current layer. This will propagate to the
             // next layer.

@@ -90,6 +90,24 @@ void copy_uint32_t_vec_from_host_to_device_into(const uint32_t *host_ptr, uint32
         cudaMemcpy(device_ptr, host_ptr, n_words * sizeof(uint32_t), cudaMemcpyHostToDevice));
 }
 
+// Async H2D into a pre-allocated device buffer, on the legacy default stream. The
+// SOURCE MUST BE PINNED and MUST STAY VALID until the copy drains — the caller
+// fences via stwo_legacy_stream_sync() before reusing/freeing the source. Ordered
+// on stream 0 exactly like the sync variant (consumers on stream 0 see it
+// complete), so device bytes are identical; only the host stops blocking per copy.
+// The async-spine lever (STWO_CUDA_ASYNC_SPINE) routes the from_simd_evals staging
+// loop here, collapsing ~2,500 per-column queue drains into one fence per batch.
+extern "C" void copy_uint32_t_vec_from_host_to_device_into_async(
+    const uint32_t *host_ptr, uint32_t *device_ptr, uint64_t n_words) {
+    ASSERT_CUDA_SUCCESS(cudaMemcpyAsync(device_ptr, host_ptr, n_words * sizeof(uint32_t),
+                                        cudaMemcpyHostToDevice, 0));
+}
+
+// Block the host until all previously-enqueued legacy-default-stream work
+// completes — the explicit fence for the async-spine batching (replaces the
+// implicit per-copy drain of the synchronous cudaMemcpy).
+extern "C" void stwo_legacy_stream_sync() { ASSERT_CUDA_SUCCESS(cudaStreamSynchronize(0)); }
+
 // Zero `n_words` u32 words starting at `ptr + offset_words`. Used to zero-pad the
 // extension tail of NTT buffers in place of allocating a fresh zeroed buffer and
 // copying into it (which costs a full extra device pass per column).
@@ -441,5 +459,27 @@ extern "C" void cuda_get_memory_info(size_t* free_mem, size_t* total_mem) {
         printf("cudaMemGetInfo failed: %s\n", cudaGetErrorString(err));
         *free_mem = 0;
         *total_mem = 0;
+    }
+}
+
+// Declared in cuda_mem_pool.cuh (the never-release default pool all allocations
+// route through).
+cudaMemPool_t stwo_default_mem_pool();
+
+// Pool high-water marks since process start (driver-maintained, exact — unlike
+// the harness's 25ms sampler, which measured up to 11GB low on SN_PIE_2):
+// used = peak bytes allocated from the pool in flight; reserved = peak bytes the
+// pool held from the device. Zeros on any error. These are the VRAM-diet metric.
+extern "C" void cuda_pool_highwater(size_t* used_high, size_t* reserved_high) {
+    *used_high = 0;
+    *reserved_high = 0;
+    cudaMemPool_t pool = stwo_default_mem_pool();
+    unsigned long long used = 0, reserved = 0;
+    if (cudaMemPoolGetAttribute(pool, cudaMemPoolAttrUsedMemHigh, &used) == cudaSuccess) {
+        *used_high = (size_t)used;
+    }
+    if (cudaMemPoolGetAttribute(pool, cudaMemPoolAttrReservedMemHigh, &reserved) ==
+        cudaSuccess) {
+        *reserved_high = (size_t)reserved;
     }
 }

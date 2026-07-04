@@ -18,7 +18,7 @@ use crate::core::utils::MaybeOwned;
 use crate::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
 use crate::core::vcs_lifted::verifier::ExtendedMerkleDecommitmentLifted;
 use crate::core::ColumnVec;
-use crate::prover::air::component_prover::{Poly, Trace, WeightsHashMap};
+use crate::prover::air::component_prover::{oods_cache_cap, Poly, Trace, WeightsCache};
 use crate::prover::backend::{Backend, BackendForChannel, Col, Column};
 use crate::prover::fri::{FriDecommitResult, FriProver};
 use crate::prover::mempool::BaseColumnPool;
@@ -38,6 +38,8 @@ pub struct CommitmentSchemeProver<'a, B: BackendForChannel<MC>, MC: MerkleChanne
     pub store_polynomials_coefficients: bool,
     /// See [`Self::set_low_memory`].
     pub low_memory: bool,
+    /// See [`Self::set_stream_lde`].
+    pub stream_lde: bool,
     /// Pre-allocated base field column pool for polynomial evaluation during commit.
     pub base_column_pool: MaybeOwned<'a, BaseColumnPool<B>>,
 }
@@ -51,6 +53,7 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
             twiddles,
             store_polynomials_coefficients: false,
             low_memory: false,
+            stream_lde: false,
             base_column_pool: MaybeOwned::Owned(BaseColumnPool::new()),
         }
     }
@@ -66,6 +69,7 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
             twiddles,
             store_polynomials_coefficients: false,
             low_memory: false,
+            stream_lde: false,
             base_column_pool: MaybeOwned::Borrowed(base_column_pool),
         }
     }
@@ -99,6 +103,53 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         self.low_memory = true;
     }
 
+    /// Streamed-LDE mode (the VRAM diet): each owned tree's full-domain evaluations are
+    /// released back to the pool IMMEDIATELY after its Merkle root is computed, instead
+    /// of being retained until after the FRI quotients. Requires (and asserts)
+    /// `store_polynomials_coefficients`: every later consumer runs from coefficients —
+    /// composition via `EvaluationMode::ExtendToEvalDomain` (force it via
+    /// `STWO_FORCE_EXTEND_EVAL_MODE=1`), OODS via coefficient `eval_at_point`, FRI
+    /// quotients via `QuotientColumnSource::Coeffs` per-group regeneration, and
+    /// decommit via the compact-tree machinery (which, with coefficients present, is a
+    /// free `Original(coeffs)` wrapper). Peak pool drops by the committed-LDE
+    /// retention term (measured 35.2GB → target ≤20GB on SN_PIE_2); cost is one extra
+    /// NTT pass per consumer. Values are bit-identical: regeneration is the same
+    /// `evaluate_with_twiddles` NTT that produced the committed evaluations, and every
+    /// accumulation it feeds is an exact-field sum (associativity ⇒ grouping-invariant).
+    pub fn set_stream_lde(&mut self) {
+        assert!(
+            self.store_polynomials_coefficients,
+            "stream_lde requires store_polynomials_coefficients (later phases run from \
+             coefficients)"
+        );
+        self.stream_lde = true;
+    }
+
+    /// Releases a just-committed owned tree's full-domain evaluation buffers back to the
+    /// pool (streamed-LDE mode). Coefficients and evaluation DOMAIN metadata are
+    /// retained; only the value buffers are dropped. Borrowed trees (e.g. the cached
+    /// preprocessed tree) are left untouched — their owner decides their lifetime.
+    fn release_committed_evals(&mut self) {
+        let Some(MaybeOwned::Owned(tree)) = self.trees.0.last_mut() else {
+            return;
+        };
+        for poly in tree.polynomials.iter_mut() {
+            debug_assert!(
+                poly.coeffs.is_some(),
+                "stream_lde: committed poly must retain coefficients"
+            );
+            // DROP the buffers (freeing them to the backend allocator) rather than
+            // giving them back to the BaseColumnPool: the column pool HOARDS returned
+            // buffers (still allocated from the device pool's perspective), while the
+            // streamed transients (per-component composition, per-group quotients,
+            // decommit regeneration) allocate fresh device memory — measured as
+            // 45.3GB used-high vs the 35.2GB baseline, i.e. double-booking. A real
+            // free makes the memory reusable by every later transient.
+            let values = std::mem::replace(&mut poly.evals.values, Col::<B, BaseField>::zeros(0));
+            drop(values);
+        }
+    }
+
     /// Evaluates the given polynomials, commits them into a Merkle tree, mixes the root into
     /// the channel, and appends the resulting tree to the scheme.
     fn commit(&mut self, polynomials: ColumnVec<CircleCoefficients<B>>, channel: &mut MC::C) {
@@ -113,6 +164,9 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         );
         MC::mix_root(channel, tree.commitment.root());
         self.trees.push(MaybeOwned::Owned(tree));
+        if self.stream_lde {
+            self.release_committed_evals();
+        }
     }
 
     /// Appends an externally constructed [`CommitmentTreeProver`] to the scheme and mixes its
@@ -124,6 +178,11 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
     ) {
         MC::mix_root(channel, tree.commitment.root());
         self.trees.push(tree);
+        if self.stream_lde {
+            // Owned externally built trees (e.g. a freshly generated preprocessed tree)
+            // release their evaluations too; borrowed (cached) trees are untouched.
+            self.release_committed_evals();
+        }
     }
 
     pub fn tree_builder(&mut self) -> TreeBuilder<'_, 'a, B, MC> {
@@ -161,11 +220,23 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         &self,
         sampled_points: &TreeVec<ColumnVec<Vec<CirclePoint<SecureField>>>>,
         max_log_size: u32,
-    ) -> WeightsHashMap<B>
+    ) -> WeightsCache<B>
     where
         Col<B, SecureField>: Send + Sync,
     {
-        let weights_dashmap = WeightsHashMap::<B>::new();
+        // Bounded mode: skip the eager pre-build entirely and hand back an empty,
+        // capacity-bounded LRU that computes weights lazily on demand during OODS
+        // evaluation. This caps peak (device) memory at ~`cap` weight columns instead
+        // of one per distinct (log_size, point) pair. Value-identical by construction
+        // (see `oods_cache_cap`); this is the kill-switch-gated diet path.
+        if let Some(cap) = oods_cache_cap() {
+            return WeightsCache::new_bounded(cap);
+        }
+
+        // Default (unbounded): eager, parallel, deduped pre-build — unchanged.
+        let WeightsCache::Unbounded(weights_dashmap) = WeightsCache::<B>::new_unbounded() else {
+            unreachable!("new_unbounded constructs the Unbounded variant");
+        };
 
         self.polynomials()
             .zip_cols(sampled_points)
@@ -196,7 +267,7 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
                 });
             });
 
-        weights_dashmap
+        WeightsCache::Unbounded(weights_dashmap)
     }
 
     pub fn prove_values(
@@ -255,22 +326,65 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
             .map_cols(|x| x.iter().map(|o| o.value).collect());
         channel.mix_felts(&sampled_values.clone().flatten_cols());
 
-        let columns = self.evaluations();
-        print_column_size_histogram::<B, MC>(&columns);
         // Compute oods quotients for boundary constraints on the sampled points.
-        let quotients = compute_fri_quotients(
-            &columns,
-            &samples,
-            channel.draw_secure_felt(),
-            lifting_log_size,
-            self.twiddles,
-            self.config.fri_config.log_blowup_factor,
-        );
+        // Streamed-LDE mode: the committed evaluations were released at commit time;
+        // feed the quotient computation coefficient sources instead — each log-size
+        // group is regenerated transiently inside (bit-exact, grouping-invariant
+        // exact-field accumulation; see `QuotientColumnSource`).
+        let quotients = if self.stream_lde {
+            let sources: TreeVec<Vec<quotient_ops::QuotientColumnSource<'_, B>>> = TreeVec(
+                self.trees
+                    .as_ref()
+                    .0
+                    .iter()
+                    .map(|tree| {
+                        tree.polynomials
+                            .iter()
+                            .map(|poly| match &poly.coeffs {
+                                Some(coeffs) => quotient_ops::QuotientColumnSource::Coeffs(
+                                    coeffs,
+                                    poly.evals.domain,
+                                ),
+                                // Borrowed/cached trees keep their evaluations resident.
+                                None => quotient_ops::QuotientColumnSource::Eval(&poly.evals),
+                            })
+                            .collect()
+                    })
+                    .collect(),
+            );
+            quotient_ops::compute_fri_quotients_streamed(
+                sources,
+                &samples,
+                channel.draw_secure_felt(),
+                lifting_log_size,
+                self.twiddles,
+                self.config.fri_config.log_blowup_factor,
+            )
+        } else {
+            let columns = self.evaluations();
+            print_column_size_histogram::<B, MC>(&columns);
+            compute_fri_quotients(
+                &columns,
+                &samples,
+                channel.draw_secure_felt(),
+                lifting_log_size,
+                self.twiddles,
+                self.config.fri_config.log_blowup_factor,
+            )
+        };
 
         // In low-memory mode, the full column evaluations have now served their last bulk
         // consumer (the FRI quotients above): compact each owned tree's columns. They are
         // regenerated transiently — and bit-exactly — at decommit time.
-        let mut compact_trees: Vec<Option<CompactTreeColumns<B>>> = if self.low_memory {
+        // Streamed-LDE mode routes decommit through the same compact machinery: the
+        // evaluations were released at commit, so the normal gather path would read
+        // empty buffers; with coefficients present, compaction is a free
+        // `Original(coeffs)` wrapper and `decommit_compact_tree` regenerates
+        // bit-exactly per queried column (the give_back of the already-empty eval
+        // buffers inside `compact_tree_columns` is a harmless no-op).
+        let mut compact_trees: Vec<Option<CompactTreeColumns<B>>> = if self.low_memory
+            || self.stream_lde
+        {
             let _span = span!(Level::INFO, "Eval compaction", class = "EvalCompaction").entered();
             self.trees
                 .0
@@ -557,7 +671,11 @@ fn compact_tree_columns<B: Backend>(
             let domain = poly.evals.domain;
             if let Some(coeffs) = poly.coeffs {
                 // The original coefficients are sufficient; recycle the evaluation buffer.
-                pool.give_back(domain.log_size(), poly.evals.values);
+                // (Streamed-LDE mode already released it at commit — len 0 — and an
+                // empty buffer must not enter the pool's freelist.)
+                if !poly.evals.values.is_empty() {
+                    pool.give_back(domain.log_size(), poly.evals.values);
+                }
                 return (CompactColumn::Original(coeffs), domain);
             }
             // In-place interpolation: reuses the evaluation buffer.

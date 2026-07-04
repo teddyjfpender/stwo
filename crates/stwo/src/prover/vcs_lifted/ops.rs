@@ -4,7 +4,7 @@ use crate::core::fields::m31::BaseField;
 use crate::core::fields::qm31::SECURE_EXTENSION_DEGREE;
 use crate::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
 use crate::core::vcs_lifted::verifier::PACKED_LEAF_SIZE;
-use crate::prover::backend::{Col, ColumnOps};
+use crate::prover::backend::{Col, Column, ColumnOps};
 
 /// Trait for performing Merkle operations on a commitment scheme.
 pub trait MerkleOpsLifted<H: MerkleHasherLifted>:
@@ -17,6 +17,18 @@ pub trait MerkleOpsLifted<H: MerkleHasherLifted>:
     /// Given a layer of hashes as input, computes a new layer by hashing pairs
     /// of adjacent elements of the input, as in a standard Merkle tree.
     fn build_next_layer(prev_layer: &Col<Self, H::Hash>) -> Col<Self, H::Hash>;
+
+    /// Reads `pairs = [(layer_index_into `layers`, hash_index)]` in one batch.
+    /// Semantics are EXACTLY `layers[l].at(i)` per pair, in order — the default
+    /// does just that; device backends override with a single gather + one D2H
+    /// instead of a synchronous 32-byte round-trip per node (the decommit walk
+    /// issues thousands of these).
+    fn batch_layer_reads(layers: &[&Col<Self, H::Hash>], pairs: &[(u32, u32)]) -> Vec<H::Hash> {
+        pairs
+            .iter()
+            .map(|&(l, i)| layers[l as usize].at(i as usize))
+            .collect()
+    }
 }
 
 pub trait PackLeavesOps: ColumnOps<BaseField> {

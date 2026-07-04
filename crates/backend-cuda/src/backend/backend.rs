@@ -100,6 +100,15 @@ fn pinned_staging() -> &'static std::sync::Mutex<PinnedStaging> {
     })
 }
 
+/// STWO_CUDA_ASYNC_SPINE=1 (Stage A′): route the staging-loop H2D through
+/// `cudaMemcpyAsync` on the legacy stream with ONE fence per batch, instead of a
+/// synchronous copy (full queue drain) per column. Byte-identical — same stream-0
+/// ordering, same bytes — only the host stops blocking ~2,500 times per prove.
+fn async_spine_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("STWO_CUDA_ASYNC_SPINE").as_deref() == Ok("1"))
+}
+
 impl stwo::prover::backend::FromSimdColumns for CudaBackend {
     fn from_simd_base_column(
         column: stwo::prover::backend::Col<SimdBackend, stwo::core::fields::m31::BaseField>,
@@ -215,20 +224,36 @@ impl stwo::prover::backend::FromSimdColumns for CudaBackend {
                 });
 
             // Upload each column from its pinned staging offset into its own buffer.
+            // Async spine: enqueue all uploads async (disjoint pinned source regions,
+            // ordered on stream 0), then a SINGLE fence before the next batch reuses
+            // the staging buffer — vs a synchronous drain per column. The fence also
+            // guarantees the pinned buffer is free before the mutex unlocks.
+            let async_spine = async_spine_enabled();
             for (i, eval) in batch.iter().enumerate() {
                 let len = eval.values.len();
                 let column = crate::columns::BaseFieldVec::new_uninitialized(len);
                 unsafe {
-                    crate::columns::bindings::copy_uint32_t_vec_from_host_to_device_into(
-                        staging.ptr.add(offsets[i]),
-                        column.device_ptr,
-                        len as u64,
-                    );
+                    if async_spine {
+                        crate::columns::bindings::copy_uint32_t_vec_from_host_to_device_into_async(
+                            staging.ptr.add(offsets[i]),
+                            column.device_ptr,
+                            len as u64,
+                        );
+                    } else {
+                        crate::columns::bindings::copy_uint32_t_vec_from_host_to_device_into(
+                            staging.ptr.add(offsets[i]),
+                            column.device_ptr,
+                            len as u64,
+                        );
+                    }
                 }
                 results.push(stwo::prover::poly::circle::CircleEvaluation::new(
                     eval.domain,
                     column,
                 ));
+            }
+            if async_spine {
+                unsafe { crate::columns::bindings::stwo_legacy_stream_sync() };
             }
             batch_start = batch_end;
         }

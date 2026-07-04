@@ -688,6 +688,7 @@ extern "C" void initialize_pedersen_table() {
             d_columns, block_start, INIT_PEDERSEN_ROWS_PER_WINDOW,
             POINT_P0, window
         );
+        ASSERT_CUDA_SUCCESS(cudaGetLastError());
     }
     stwo_maybe_debug_sync();
 
@@ -696,6 +697,7 @@ extern "C" void initialize_pedersen_table() {
     gen_pedersen_small_section_kernel_init<<<1, 16>>>(
         d_columns, INIT_PEDERSEN_P1_START, 16, POINT_P1
     );
+    ASSERT_CUDA_SUCCESS(cudaGetLastError());
     stwo_maybe_debug_sync();
 
     // Generate P2 section (14 windows × 262144 rows each)
@@ -708,6 +710,7 @@ extern "C" void initialize_pedersen_table() {
             d_columns, block_start, INIT_PEDERSEN_ROWS_PER_WINDOW,
             POINT_P2, window
         );
+        ASSERT_CUDA_SUCCESS(cudaGetLastError());
     }
     stwo_maybe_debug_sync();
 
@@ -716,10 +719,12 @@ extern "C" void initialize_pedersen_table() {
     gen_pedersen_small_section_kernel_init<<<1, 16>>>(
         d_columns, INIT_PEDERSEN_P3_START, 16, POINT_P3
     );
+    ASSERT_CUDA_SUCCESS(cudaGetLastError());
     stwo_maybe_debug_sync();
 
     // Set global device symbol pointers (same symbols used by pedersen_table.cuh)
     set_global_pedersen_table_pointers_kernel<<<1, 1>>>(d_columns, n_rows);
+    ASSERT_CUDA_SUCCESS(cudaGetLastError());
     stwo_maybe_debug_sync();
 
     pedersen_runtime_release_uploaded_column_ptrs(d_columns);

@@ -20,6 +20,27 @@ use stwo::prover::secure_column::SecureColumnByCoords;
 
 use crate::backend::{CudaBackend, UploadedDevicePointerVec};
 use crate::columns::bindings::CudaSecureField;
+
+/// CUDA caps `grid.y` and `grid.z` at 65535 (`maxGridSize[1]`/`[2]`). The batched NTT
+/// launchers (`ntt_n2b_columns`, `ntt_b2n_column`) map the column (batch) axis onto
+/// `grid.y`/`grid.z`, so a same-`log_size` column group larger than this overflows the
+/// launch configuration (observed as an `invalid argument` failure in `rfft.cu` when
+/// proving 14M-step PIEs). Columns transform independently, so a group is split into
+/// contiguous chunks of at most this many columns. Mirrors `MAX_NTT_BATCH_COLUMNS` in
+/// the CUDA launchers; the CUDA side re-applies the same tiling defensively.
+const MAX_NTT_BATCH_COLUMNS: usize = 65535;
+
+/// Partition `num_poly` columns into contiguous `(offset, len)` chunks of at most
+/// `max` columns each. Pure launch-geometry arithmetic (no device state); see
+/// [`MAX_NTT_BATCH_COLUMNS`]. `num_poly <= max` yields a single `(0, num_poly)` chunk,
+/// so the common case is unchanged.
+fn ntt_batch_chunks(num_poly: usize, max: usize) -> impl Iterator<Item = (usize, usize)> {
+    assert!(max > 0, "chunk size must be positive");
+    (0..num_poly)
+        .step_by(max)
+        .map(move |base| (base, core::cmp::min(max, num_poly - base)))
+}
+
 pub trait CudaVariable<T> {
     /// # Safety
     /// do not dereference if the memory is located on the device
@@ -311,7 +332,6 @@ impl PolyOps for CudaBackend {
                     results.push((item.0, CirclePoly::<Self>::new(cuda_coeffs)));
                 }
             } else {
-                let num_poly = group.len();
                 let eval_domain_size = group[0].3.half_coset.size() as u32;
 
                 let mut ptrs: Vec<*mut u32> = group
@@ -319,15 +339,18 @@ impl PolyOps for CudaBackend {
                     .map(|item| item.2.device_ptr as *mut u32)
                     .collect();
 
-                unsafe {
-                    interface::bindings::ntt_b2n_column(
-                        ptrs.as_mut_ptr(),
-                        log_size,
-                        num_poly as u32,
-                        twiddles.itwiddles.device_ptr,
-                        twiddles.itwiddles.len() as u32,
-                        eval_domain_size,
-                    );
+                // Tile the batch axis so no launch's grid.y/grid.z exceeds 65535.
+                for (base, len) in ntt_batch_chunks(ptrs.len(), MAX_NTT_BATCH_COLUMNS) {
+                    unsafe {
+                        interface::bindings::ntt_b2n_column(
+                            ptrs[base..base + len].as_mut_ptr(),
+                            log_size,
+                            len as u32,
+                            twiddles.itwiddles.device_ptr,
+                            twiddles.itwiddles.len() as u32,
+                            eval_domain_size,
+                        );
+                    }
                 }
 
                 for item in group.iter_mut() {
@@ -546,15 +569,18 @@ impl PolyOps for CudaBackend {
                     .iter()
                     .map(|(.., buffer)| buffer.device_ptr as *mut u32)
                     .collect();
-                unsafe {
-                    interface::bindings::ntt_n2b_columns(
-                        ptrs.as_mut_ptr(),
-                        log_eval_size,
-                        group.len() as u32,
-                        twiddles.twiddles.device_ptr,
-                        twiddles.twiddles.len() as u32,
-                        domain.half_coset.size() as u32,
-                    );
+                // Tile the batch axis so no launch's grid.y/grid.z exceeds 65535.
+                for (base, len) in ntt_batch_chunks(ptrs.len(), MAX_NTT_BATCH_COLUMNS) {
+                    unsafe {
+                        interface::bindings::ntt_n2b_columns(
+                            ptrs[base..base + len].as_mut_ptr(),
+                            log_eval_size,
+                            len as u32,
+                            twiddles.twiddles.device_ptr,
+                            twiddles.twiddles.len() as u32,
+                            domain.half_coset.size() as u32,
+                        );
+                    }
                 }
             }
             group_start = group_end;
@@ -1488,5 +1514,88 @@ impl CudaBackend {
         point: CirclePoint<SecureField>,
     ) -> Vec<SecureField> {
         cuda_batch_eval_at_point(polys, point)
+    }
+}
+
+#[cfg(test)]
+mod ntt_batch_chunks_tests {
+    use super::{ntt_batch_chunks, MAX_NTT_BATCH_COLUMNS};
+
+    fn collect(num_poly: usize, max: usize) -> Vec<(usize, usize)> {
+        ntt_batch_chunks(num_poly, max).collect()
+    }
+
+    #[test]
+    fn empty_group_produces_no_launches() {
+        assert!(collect(0, MAX_NTT_BATCH_COLUMNS).is_empty());
+    }
+
+    #[test]
+    fn within_limit_is_a_single_unchanged_launch() {
+        assert_eq!(collect(1, MAX_NTT_BATCH_COLUMNS), vec![(0, 1)]);
+        assert_eq!(collect(230, MAX_NTT_BATCH_COLUMNS), vec![(0, 230)]);
+        assert_eq!(
+            collect(MAX_NTT_BATCH_COLUMNS, MAX_NTT_BATCH_COLUMNS),
+            vec![(0, MAX_NTT_BATCH_COLUMNS)]
+        );
+    }
+
+    #[test]
+    fn one_past_the_grid_cap_splits_in_two() {
+        // 65536 columns: grid.y = 65536 > 65535 would fail as one launch.
+        assert_eq!(
+            collect(MAX_NTT_BATCH_COLUMNS + 1, MAX_NTT_BATCH_COLUMNS),
+            vec![(0, MAX_NTT_BATCH_COLUMNS), (MAX_NTT_BATCH_COLUMNS, 1)]
+        );
+    }
+
+    #[test]
+    fn chunks_partition_the_range_and_respect_the_cap() {
+        let max = 7;
+        for num_poly in 0..60 {
+            let chunks = collect(num_poly, max);
+            let mut expected_base = 0;
+            let mut total = 0;
+            for &(base, len) in &chunks {
+                assert_eq!(base, expected_base, "chunks must be contiguous");
+                assert!(len > 0 && len <= max, "each chunk within the cap");
+                expected_base += len;
+                total += len;
+            }
+            assert_eq!(
+                total, num_poly,
+                "chunks must cover every column exactly once"
+            );
+            // Only the final chunk may be short.
+            for &(_, len) in chunks.iter().take(chunks.len().saturating_sub(1)) {
+                assert_eq!(len, max);
+            }
+        }
+    }
+
+    #[test]
+    fn row_block_axis_tiling_at_log_26() {
+        // Mirrors the CUDA-side MAX_Y_BLOCKS row-block tiling in the legacy
+        // batch NTT paths (`evaluate_columns`/`interpolate_columns`): a 2^26-row
+        // domain with 1024-thread blocks yields 65536 row-blocks, one past the
+        // grid.y cap, and must split into exactly two contiguous chunks.
+        let row_blocks = (1usize << 26) / 1024; // 65536
+        assert_eq!(
+            collect(row_blocks, MAX_NTT_BATCH_COLUMNS),
+            vec![(0, MAX_NTT_BATCH_COLUMNS), (MAX_NTT_BATCH_COLUMNS, 1)]
+        );
+        // One block fewer fits in a single launch.
+        assert_eq!(collect(row_blocks - 1, MAX_NTT_BATCH_COLUMNS).len(), 1);
+    }
+
+    #[test]
+    fn oversized_pie_group_never_exceeds_grid_cap() {
+        // Representative of a same-log_size column family in a 14M-step PIE that
+        // exceeds the CUDA grid.y/grid.z cap and previously failed at rfft.cu.
+        let num_poly = 200_000;
+        let chunks = collect(num_poly, MAX_NTT_BATCH_COLUMNS);
+        assert_eq!(chunks.len(), num_poly.div_ceil(MAX_NTT_BATCH_COLUMNS));
+        assert!(chunks.iter().all(|&(_, len)| len <= MAX_NTT_BATCH_COLUMNS));
+        assert_eq!(chunks.iter().map(|&(_, l)| l).sum::<usize>(), num_poly);
     }
 }

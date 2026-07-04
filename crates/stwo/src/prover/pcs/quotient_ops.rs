@@ -83,8 +83,60 @@ pub struct AccumulatedNumerators<B: ColumnOps<BaseField>> {
     pub first_linear_term_acc: SecureField,
 }
 
+/// A quotient input column: a resident evaluation (borrowed), or coefficients to be
+/// materialized transiently — per log-size group — inside the quotient computation.
+/// The `Coeffs` variant is the quotient half of the streamed-LDE VRAM diet: the full
+/// set of committed-LDE evaluations never has to be resident simultaneously; each
+/// group is regenerated (bit-exactly, via the same `evaluate_with_twiddles` NTT that
+/// produced the committed evaluations), accumulated, and dropped. Accumulation is a
+/// field sum per (log_size, sample_point), so group-at-a-time processing is
+/// value-identical to the all-resident path by exact-field associativity — provided
+/// the (column, randomness) pairing and intra-group column order are preserved, which
+/// this construction keeps positional and stable-sorted exactly like the original.
+pub enum QuotientColumnSource<'a, B: QuotientOps> {
+    Eval(&'a CircleEvaluation<B, BaseField, BitReversedOrder>),
+    Coeffs(
+        &'a crate::prover::poly::circle::CircleCoefficients<B>,
+        crate::core::poly::circle::CircleDomain,
+    ),
+}
+
+impl<B: QuotientOps> QuotientColumnSource<'_, B> {
+    fn domain_log_size(&self) -> u32 {
+        match self {
+            QuotientColumnSource::Eval(c) => c.domain.log_size(),
+            QuotientColumnSource::Coeffs(_, domain) => domain.log_size(),
+        }
+    }
+}
+
 pub fn compute_fri_quotients<B: QuotientOps + AccumulationOps>(
     columns: &TreeVec<Vec<&CircleEvaluation<B, BaseField, BitReversedOrder>>>,
+    samples: &TreeVec<Vec<Vec<PointSample>>>,
+    random_coeff: SecureField,
+    lifting_log_size: u32,
+    twiddles: &TwiddleTree<B>,
+    log_blowup_factor: u32,
+) -> SecureEvaluation<B, BitReversedOrder> {
+    let sources: TreeVec<Vec<QuotientColumnSource<'_, B>>> = TreeVec(
+        columns
+            .0
+            .iter()
+            .map(|tree| tree.iter().map(|c| QuotientColumnSource::Eval(c)).collect())
+            .collect(),
+    );
+    compute_fri_quotients_streamed(
+        sources,
+        samples,
+        random_coeff,
+        lifting_log_size,
+        twiddles,
+        log_blowup_factor,
+    )
+}
+
+pub fn compute_fri_quotients_streamed<B: QuotientOps + AccumulationOps>(
+    sources: TreeVec<Vec<QuotientColumnSource<'_, B>>>,
     samples: &TreeVec<Vec<Vec<PointSample>>>,
     random_coeff: SecureField,
     lifting_log_size: u32,
@@ -95,10 +147,10 @@ pub fn compute_fri_quotients<B: QuotientOps + AccumulationOps>(
     let mut accumulated_numerators_vec: Vec<AccumulatedNumerators<B>> = vec![];
     let samples_with_randomness = build_samples_with_randomness_and_periodicity(
         samples,
-        columns
+        sources
             .0
             .iter()
-            .map(|x| x.iter().map(|c| c.domain.log_size()))
+            .map(|x| x.iter().map(|c| c.domain_log_size()))
             .collect(),
         lifting_log_size,
         random_coeff,
@@ -110,14 +162,35 @@ pub fn compute_fri_quotients<B: QuotientOps + AccumulationOps>(
     //   ∑_k (# of distinct sample points per log size k).
     //
     zip(
-        columns.iter().flatten(),
+        sources.0.into_iter().flatten(),
         samples_with_randomness.iter().flatten(),
     )
-    .sorted_by_key(|(c, _)| c.domain.log_size())
-    .group_by(|(c, _)| c.domain.log_size())
+    .sorted_by_key(|(c, _)| c.domain_log_size())
+    .group_by(|(c, _)| c.domain_log_size())
     .into_iter()
     .for_each(|(_, tuples)| {
-        let (columns, samples_with_randomness): (Vec<_>, Vec<_>) = tuples.unzip();
+        let (group_sources, samples_with_randomness): (Vec<_>, Vec<_>) = tuples.unzip();
+        // Materialize this group's `Coeffs` sources transiently (dropped at group end);
+        // `Eval` sources are borrowed as-is. Two-step (owned buffer, then refs) keeps
+        // the exact `&[&CircleEvaluation]` ABI of `accumulate_numerators`.
+        let materialized: Vec<Option<CircleEvaluation<B, BaseField, BitReversedOrder>>> =
+            group_sources
+                .iter()
+                .map(|s| match s {
+                    QuotientColumnSource::Eval(_) => None,
+                    QuotientColumnSource::Coeffs(poly, domain) => {
+                        Some(poly.evaluate_with_twiddles(*domain, twiddles))
+                    }
+                })
+                .collect();
+        let columns: Vec<&CircleEvaluation<B, BaseField, BitReversedOrder>> = group_sources
+            .iter()
+            .zip(materialized.iter())
+            .map(|(s, m)| match s {
+                QuotientColumnSource::Eval(c) => *c,
+                QuotientColumnSource::Coeffs(..) => m.as_ref().unwrap(),
+            })
+            .collect();
         // TODO: slice.
         let sample_batches = ColumnSampleBatch::new_vec(&samples_with_randomness);
         B::accumulate_numerators(

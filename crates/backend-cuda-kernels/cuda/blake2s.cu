@@ -239,6 +239,69 @@ __global__ void commit_on_layer_using_previous_in_gpu(
     blake2s_finalize(&state, &result[index]);
 }
 
+// ---------------------------------------------------------------------------
+// Commit-path fusion (Workstream D) — layer-pair Merkle hashing.
+//
+// Additive: the kernels above are untouched. This hashes TWO internal tree levels
+// per launch. For output index i it produces
+//     out[i] = H( H(prev[4i], prev[4i+1]), H(prev[4i+2], prev[4i+3]) )
+// which is *exactly* two sequential applications of
+// `commit_on_layer_using_previous_in_gpu` with number_of_columns == 0 — i.e.
+// byte-identical to the reference by construction, no hash-function or ordering
+// change. It is only valid where BOTH fused levels inject zero columns (the common
+// internal-tree case in the lifted Merkle tree); the caller must not use it across
+// a level that injects columns. Gated OFF behind STWO_CUDA_FUSED_COMMIT +
+// STWO_CUDA_FUSED_COMMIT_LAYER_PAIR (default OFF) until the pod gates pass.
+// ---------------------------------------------------------------------------
+
+// Hash a pair of child digests into one, matching the column-free byte stream of
+// `commit_on_layer_using_previous_in_gpu` (left.s[0..8] then right.s[0..8], each
+// word little-endian) exactly.
+__device__ __forceinline__ Blake2sHash blake2s_hash_children_device(
+    const Blake2sHash& left,
+    const Blake2sHash& right
+) {
+    Blake2sState state;
+    blake2s_init(&state);
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        uint32_t word = left.s[i];
+        uint8_t bytes[4];
+        bytes[0] = (word >>  0) & 0xFF;
+        bytes[1] = (word >>  8) & 0xFF;
+        bytes[2] = (word >> 16) & 0xFF;
+        bytes[3] = (word >> 24) & 0xFF;
+        blake2s_update(&state, bytes, sizeof(bytes));
+    }
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        uint32_t word = right.s[i];
+        uint8_t bytes[4];
+        bytes[0] = (word >>  0) & 0xFF;
+        bytes[1] = (word >>  8) & 0xFF;
+        bytes[2] = (word >> 16) & 0xFF;
+        bytes[3] = (word >> 24) & 0xFF;
+        blake2s_update(&state, bytes, sizeof(bytes));
+    }
+    Blake2sHash out;
+    blake2s_finalize(&state, &out);
+    return out;
+}
+
+__global__ void commit_on_two_layers_using_previous_in_gpu(
+    uint32_t size,                 // number of OUTPUT (grandparent) hashes
+    Blake2sHash *prev_layer,       // size == 4 * `size`
+    Blake2sHash *result
+) {
+    uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= size) return;
+    Blake2sHash left_mid =
+        blake2s_hash_children_device(prev_layer[4 * index + 0], prev_layer[4 * index + 1]);
+    Blake2sHash right_mid =
+        blake2s_hash_children_device(prev_layer[4 * index + 2], prev_layer[4 * index + 3]);
+    result[index] = blake2s_hash_children_device(left_mid, right_mid);
+}
+
 uint32_t number_of_blocks_for(uint32_t size) {
     return (size + BLOCK_SIZE - 1) / BLOCK_SIZE;
 }
@@ -279,6 +342,20 @@ void commit_on_layer_with_previous(
 ) {
     commit_on_layer_using_previous_in_gpu<<<number_of_blocks_for(size), BLOCK_SIZE>>>(
         size, number_of_columns, device_columns, previous_layer, result);
+    ASSERT_CUDA_SUCCESS(cudaGetLastError());
+    stwo_maybe_debug_sync();
+    ASSERT_CUDA_SUCCESS(cudaGetLastError());
+}
+
+// Layer-pair fusion (Workstream D). `size` is the number of grandparent hashes to
+// produce; `previous_layer` must hold `4 * size` child hashes. Column-free only.
+void commit_on_two_layers_with_previous(
+    uint32_t size,
+    Blake2sHash* previous_layer,
+    Blake2sHash* result
+) {
+    commit_on_two_layers_using_previous_in_gpu<<<number_of_blocks_for(size), BLOCK_SIZE>>>(
+        size, previous_layer, result);
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
     stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());

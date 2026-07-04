@@ -137,11 +137,12 @@ pub use sys_raw::{
     copy_device_pointer_vec_from_host_to_device, copy_uint32_t_vec_from_device_to_device,
     copy_uint32_t_vec_from_device_to_device_offset, copy_uint32_t_vec_from_device_to_host,
     copy_uint32_t_vec_from_host_to_device, copy_uint32_t_vec_from_host_to_device_into,
-    cuda_alloc_pinned_host_u32, cuda_alloc_zeroes_uint32_t, cuda_free_memory,
-    cuda_free_pinned_host_u32, cuda_gather_uint32_t, cuda_get_memory_info, cuda_get_uint32_t,
-    cuda_increase_at, cuda_malloc_uint32_t, cuda_release_uploaded_pointer_vec, cuda_set_uint32_t,
+    copy_uint32_t_vec_from_host_to_device_into_async, cuda_alloc_pinned_host_u32,
+    cuda_alloc_zeroes_uint32_t, cuda_free_memory, cuda_free_pinned_host_u32, cuda_gather_uint32_t,
+    cuda_get_memory_info, cuda_get_uint32_t, cuda_increase_at, cuda_malloc_uint32_t,
+    cuda_pool_highwater, cuda_release_uploaded_pointer_vec, cuda_set_uint32_t,
     cuda_zero_device_region, lift_accumulate_secure_columns, logup_fraction_chain, ntt_b2n_column,
-    ntt_n2b_columns,
+    ntt_n2b_columns, stwo_legacy_stream_sync,
 };
 
 pub unsafe fn cuda_get_secure_field(device_ptr: *const c_void, index: usize) -> CudaSecureField {
@@ -329,6 +330,21 @@ pub unsafe fn commit_on_first_layer_lifted(
         columns,
         column_log_sizes,
         lifting_log_size,
+        raw_blake2s_mut_ptr(result),
+    );
+}
+
+/// Workstream D layer-pair fusion: hash two internal (column-free) tree levels per
+/// launch. `size` = grandparent hash count; `previous_layer` holds `4 * size`.
+/// Byte-identical to two `commit_on_layer_with_previous` calls with zero columns.
+pub unsafe fn commit_on_two_layers_with_previous(
+    size: usize,
+    previous_layer: *const Blake2sHash,
+    result: *mut Blake2sHash,
+) {
+    sys_raw::commit_on_two_layers_with_previous(
+        size,
+        raw_blake2s_ptr(previous_layer),
         raw_blake2s_mut_ptr(result),
     );
 }

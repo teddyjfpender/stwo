@@ -34,6 +34,7 @@ extern "C" void gen_seq_column_on_gpu(
     uint32_t num_blocks = (n_elements + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
     gen_seq_column_kernel<<<num_blocks, BLOCK_SIZE>>>(output, n_elements);
+    ASSERT_CUDA_SUCCESS(cudaGetLastError());
 }
 
 // ============================================================================
@@ -91,6 +92,7 @@ extern "C" void gen_range_check_columns_on_gpu(
     gen_range_check_columns_kernel<<<num_blocks, BLOCK_SIZE>>>(
         d_columns, n_columns, d_bits_per_segment, n_segments, n_elements
     );
+    ASSERT_CUDA_SUCCESS(cudaGetLastError());
 
     cuda_free_memory(d_bits_per_segment);
     cuda_free_memory(d_columns);
@@ -137,6 +139,7 @@ extern "C" void gen_bitwise_xor_columns_on_gpu(
     gen_bitwise_xor_columns_kernel<<<num_blocks, BLOCK_SIZE>>>(
         d_columns, n_bits, n_elements
     );
+    ASSERT_CUDA_SUCCESS(cudaGetLastError());
 
     cuda_free_memory(d_columns);
 }

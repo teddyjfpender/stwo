@@ -264,3 +264,74 @@ extern "C" void memory_rc_pair_logup(
     stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 }
+
+namespace {
+
+// Composed device `deduce_output` — the ENDGAME_ARCHITECTURE.md §2 keystone primitive.
+//
+// addr -> raw encoded id (addr_to_id LUT) -> decode -> 28 9-bit value limbs,
+// reproducing the host `memory_address_to_id.deduce_output` followed by
+// `memory_id_to_big.deduce_output`. The big/small limb tables are the SAME
+// device-resident column-major split tables the memory component commits
+// (memory_limb_split_big/small), so the value a witness kernel deduces on device is
+// bit-identical to the host HashMap deduction — this is the "device table read"
+// that replaces the host `sub_state.deduce_output(key)`.
+//
+// Encoding (stwo-cairo-common::memory::EncodedMemoryValueId): the raw id's top two
+// bits are the tag. tag == 1 => F252: value index = id & 0x3FFFFFFF into the 28-limb
+// big table. tag == 0 => Small: index into the 8-limb small table, zero-extended to 28
+// (the host builds [small_limbs, 0..] since a small value is < 2^72). DEFAULT_ID
+// (0x3FFFFFFF, an empty cell) must never be queried; the host caller filters it, as
+// `memory_id_to_big.deduce_output` itself panics on Empty. One thread per query.
+__global__ void exec_deduce_output_kernel(
+    const uint32_t *addr_to_id,          // [n_addrs] raw encoded id per address
+    const uint32_t *const *big_limbs,    // 28 device columns
+    const uint32_t *const *small_limbs,  // 8 device columns
+    const uint32_t *addresses,           // [n_queries]
+    uint32_t n_queries,
+    uint32_t *out_ids,                   // [n_queries]
+    uint32_t *const *out_limbs           // 28 device columns, [n_queries]
+) {
+    uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
+    if (q >= n_queries) {
+        return;
+    }
+    uint32_t addr = addresses[q];
+    uint32_t id = addr_to_id[addr];
+    out_ids[q] = id;
+    uint32_t tag = id >> 30;
+    uint32_t val = id & 0x3FFFFFFFu;
+    for (int j = 0; j < 28; ++j) {
+        uint32_t limb;
+        if (tag == 1u) {
+            limb = big_limbs[j][val];
+        } else {
+            limb = (j < 8) ? small_limbs[j][val] : 0u;
+        }
+        out_limbs[j][q] = limb;
+    }
+}
+
+}  // namespace
+
+// Batched composed deduce_output over `addresses` (see exec_deduce_output_kernel).
+// `out_ids` receives the raw encoded id per query; `out_limbs` the 28 value limbs
+// (column-major, one device column per limb). All addresses must be non-empty cells.
+extern "C" void exec_deduce_output(
+    const uint32_t *addr_to_id,
+    const uint32_t *const *big_limbs,
+    const uint32_t *const *small_limbs,
+    const uint32_t *addresses,
+    uint32_t n_queries,
+    uint32_t *out_ids,
+    uint32_t *const *out_limbs
+) {
+    if (n_queries == 0) {
+        return;
+    }
+    uint32_t blocks = (n_queries + MW_BLOCK - 1) / MW_BLOCK;
+    exec_deduce_output_kernel<<<blocks, MW_BLOCK>>>(
+        addr_to_id, big_limbs, small_limbs, addresses, n_queries, out_ids, out_limbs);
+    stwo_maybe_debug_sync();
+    ASSERT_CUDA_SUCCESS(cudaGetLastError());
+}

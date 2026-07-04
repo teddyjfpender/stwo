@@ -13,6 +13,24 @@ use stwo::prover::QuotientOps;
 use crate::backend::{CudaBackend, UploadedDevicePointerVec};
 use crate::columns::bindings::{self, CirclePointSecureField, CudaSecureField};
 
+/// Kill switch for Workstream-E quotient-combine + first-FRI-fold fusion (the "VRAM
+/// diet"). Default **OFF** — the fused device path is not yet pod-validated, so until
+/// its differential gate (`STWO_CUDA_WITNESS_VERIFY`-style: fused vs. the proven
+/// combine→interpolate→evaluate→fold pipeline, column byte-compare) passes on hardware,
+/// the switch must default off per the round-9 gating rules.
+///
+/// `STWO_CUDA_FUSED_QUOTIENT_FOLD=1` (or any non-empty, non-`0` value) opts in; unset /
+/// empty / `0` keeps the byte-identical reference path. The integration agent bisects
+/// with this switch, so it gates exactly one lane.
+pub fn fused_quotient_fold_enabled() -> bool {
+    parse_fused_quotient_fold(std::env::var("STWO_CUDA_FUSED_QUOTIENT_FOLD").ok())
+}
+
+/// Pure parser for the fusion kill switch, factored out for unit testing.
+pub(crate) fn parse_fused_quotient_fold(raw: Option<String>) -> bool {
+    matches!(raw.as_deref().map(str::trim), Some(v) if !v.is_empty() && v != "0")
+}
+
 impl QuotientOps for CudaBackend {
     fn accumulate_numerators(
         columns: &[&CircleEvaluation<Self, BaseField, BitReversedOrder>],
@@ -214,6 +232,40 @@ impl QuotientOps for CudaBackend {
                 subdomain_twiddles.itwiddles.len() as u32,
                 eval_subdomain.half_coset.size() as u32,
             );
+        }
+
+        // ── Workstream-E fusion seam (STWO_CUDA_FUSED_QUOTIENT_FOLD) ──────────────
+        // The lines below materialize the FULL secure-field quotient LDE (`eval_columns`,
+        // 4 coordinate columns of `eval_domain.size()`). At `lifting_log_size = 24` that
+        // is 4 × 2^24 × 4 B = 1 GiB, and it is the allocation that pushes 14M-step PIEs
+        // past 46 GB (RESULTS.md round 8). The fusion goal is to never hold this buffer:
+        // emit the forward-NTT output straight into (a) the first-layer Merkle leaf hash
+        // and (b) the first `fold_circle_into_line`, streaming per tile.
+        //
+        // IMPORTANT (discovered while scoping): the first-layer `column` is consumed
+        // TWICE downstream — `FriFirstLayerProver::new` commits a Merkle tree over the
+        // full LDE (needed for query decommit), AND `fold_circle_into_line` folds it.
+        // So the fused kernel must feed the Merkle-leaf hash as well as the fold; it is a
+        // quotients.cu + fri.cu + first-layer-commit change, hence pod-gated and OFF by
+        // default. Value-identity plan: field add/sub/mul are exact (M31/QM31), the fold
+        // butterfly and combine arithmetic are already byte-equal-proven on device; the
+        // ONLY reordering is fusing the forward-NTT final stage with the fold read, which
+        // is value-identical because the fold reads each NTT output element exactly once
+        // in the same (bit-reversed) index order. Gate: differential vs. this reference
+        // path (below), then Cairo e2e byte-equality.
+        //
+        // Until that lands and its pod gate is green, enabling the switch keeps the
+        // proven path (below) so nothing regresses; the switch reserves the lane and lets
+        // the integration agent bisect once the kernel is wired.
+        if fused_quotient_fold_enabled() {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                eprintln!(
+                    "[stwo-cuda] STWO_CUDA_FUSED_QUOTIENT_FOLD is set but the fused \
+                     quotient+FRI-fold kernel is pod-gated and not yet wired; using the \
+                     proven combine→interpolate→evaluate path (no behavior change)."
+                );
+            });
         }
 
         // Batched evaluate: extend each coefficient column into a full-domain buffer
@@ -588,5 +640,24 @@ mod tests {
         );
         // Full equality check
         assert_eq!(gpu_result, cpu_result);
+    }
+}
+
+#[cfg(test)]
+mod fusion_flag_tests {
+    use super::parse_fused_quotient_fold;
+
+    #[test]
+    fn kill_switch_defaults_off_and_parses() {
+        // Default OFF: unset / empty / "0" / whitespace.
+        assert!(!parse_fused_quotient_fold(None));
+        assert!(!parse_fused_quotient_fold(Some("".into())));
+        assert!(!parse_fused_quotient_fold(Some("0".into())));
+        assert!(!parse_fused_quotient_fold(Some("  ".into())));
+        assert!(!parse_fused_quotient_fold(Some(" 0 ".into())));
+        // Opt in: any non-empty, non-"0" value.
+        assert!(parse_fused_quotient_fold(Some("1".into())));
+        assert!(parse_fused_quotient_fold(Some(" 1 ".into())));
+        assert!(parse_fused_quotient_fold(Some("on".into())));
     }
 }
