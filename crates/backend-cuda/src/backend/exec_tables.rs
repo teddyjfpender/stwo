@@ -561,8 +561,10 @@ impl StreamFork {
             use std::sync::Once;
             static ENGAGED: Once = Once::new();
             ENGAGED.call_once(|| {
+                // ASCII-only marker ("B2", not "B\u{2032}"): see the A2 marker note — a
+                // `B. engaged` grep matches one byte for `.` and can't span the 3-byte prime.
                 eprintln!(
-                    "STWO_CUDA_STREAM_FANOUT: B\u{2032} engaged — witness lanes fanning out across \
+                    "STWO_CUDA_STREAM_FANOUT: B2 engaged - witness lanes fanning out across \
                      {N_FANOUT_STREAMS} pool streams (fork/join bridged per lane)"
                 );
             });

@@ -207,6 +207,22 @@ const std::vector<std::string> &extra_nvrtc_options() {
     return options;
 }
 
+// NVRTC's `--dopt=off` is only accepted from CUDA 12; CUDA 11.x NVRTC rejects it with
+// "invalid argument for option --dopt: off" (device optimization is opt-IN there — `off`
+// is the default and not expressible as an argument). Passing it on 11.x FAILS the
+// compile, which was the silent cause of the ec_op / partial_ec_mul / pedersen
+// composition CPU-fallback: their oversized single-cone kernels take the relax path.
+// The relax speedup itself is the ptxas `CU_JIT_OPTIMIZATION_LEVEL=0` applied at module
+// load (unaffected by this), so on 11.x we simply omit the flag — device opt is already
+// off by default. Cached per process; nvrtcVersion is cheap but called on hot paths.
+static bool nvrtc_accepts_dopt_off() {
+    static const bool ok = [] {
+        int major = 0, minor = 0;
+        return nvrtcVersion(&major, &minor) == NVRTC_SUCCESS && major >= 12;
+    }();
+    return ok;
+}
+
 // CUBIN (SASS) fast path: emit/reuse a real-arch cubin and load it with
 // cuModuleLoadData, which does NOT run the driver's ptxas (the cubin is already SASS).
 // This is what turns a cold process's per-module PTX->SASS assembly (measured 56.4 s on
@@ -263,7 +279,7 @@ static bool try_cubin_path(const char *source, const char *kernel_name,
             options.push_back(opt.c_str());
         }
         if (relax_opt) {
-            options.push_back("--dopt=off");
+            if (nvrtc_accepts_dopt_off()) options.push_back("--dopt=off");
         }
         if (jit_log_enabled()) {
             fprintf(stderr,
@@ -420,7 +436,7 @@ bool compile_kernel(const char *source, const char *kernel_name, uint64_t semant
             options.push_back(opt.c_str());
         }
         if (relax_opt) {
-            options.push_back("--dopt=off");
+            if (nvrtc_accepts_dopt_off()) options.push_back("--dopt=off");
         }
         if (jit_log_enabled()) {
             fprintf(stderr,
@@ -488,7 +504,16 @@ bool compile_kernel(const char *source, const char *kernel_name, uint64_t semant
         load_result = cuModuleLoadDataEx(&module, ptx.data(), 0, nullptr, nullptr);
     }
     if (load_result != CUDA_SUCCESS) {
-        fprintf(stderr, "stwo JIT: cuModuleLoadDataEx failed\n");
+        // Surface WHICH kernel and WHY: an oversized single-constraint cone (fp256 EC /
+        // pedersen composition) can exceed ptxas's PTX->SASS limits here, which is the
+        // silent cause of the CPU fallback for those components. Include the driver
+        // error string + PTX size so the failure is attributable (registers/resources
+        // vs a real ptxas error) instead of a bare "failed".
+        const char *err_str = nullptr;
+        cuGetErrorString(load_result, &err_str);
+        fprintf(stderr,
+                "stwo JIT: cuModuleLoadDataEx failed for %s: %s (ptx_bytes=%zu relax_opt=%d)\n",
+                kernel_name, err_str ? err_str : "?", ptx.size(), relax_opt ? 1 : 0);
         return false;
     }
     if (cuModuleGetFunction(out, module, kernel_name) != CUDA_SUCCESS) {
