@@ -12,12 +12,12 @@
 //! layouts crossing the boundary, the same discipline that makes the constraint JIT
 //! kernels portable across AIR/compiler revisions.
 
-use super::isa::{WitnessOp, WitnessProgram};
+use super::isa::{DeduceKind, WitnessOp, WitnessProgram};
 
 /// Bumped whenever the emitted source for a fixed program changes, mixed into the
 /// cache key so new source can never collide with PTX an older build persisted for the
 /// same bytecode (same rule as the constraint lane's `CODEGEN_VERSION`).
-pub const WITNESS_CODEGEN_VERSION: u64 = 4;
+pub const WITNESS_CODEGEN_VERSION: u64 = 5;
 
 /// Cache key: program semantic hash mixed (FNV-1a) with [`WITNESS_CODEGEN_VERSION`].
 pub fn witness_jit_cache_key(semantic_hash: u64) -> u64 {
@@ -43,6 +43,64 @@ pub fn compile_witness_to_cuda_source(program: &WitnessProgram) -> Option<String
     let name = witness_kernel_name(program.semantic_hash());
     let mut src = String::with_capacity(8192);
     emit_preamble(&mut src);
+
+    // ISA-V3 computed deduces: embed the needed __device__ functions (transcribed
+    // 1:1 from the host fast_deduction routines; validated by the truth-oracle legs
+    // + the component differential on hardware). Kinds without an embedded device
+    // implementation yet (the fp256 EC family) return None — the caller falls back
+    // to the host lane, never a wrong kernel.
+    let mut kinds_used: Vec<DeduceKind> = Vec::new();
+    for inst in &program.insts {
+        if WitnessOp::from_raw(inst.op) == Some(WitnessOp::DeduceCall) {
+            let kind = DeduceKind::from_raw(inst.imm)?;
+            match kind {
+                DeduceKind::BlakeG | DeduceKind::BlakeRoundSigma => {}
+                // fp256/EC device functions land with the pod-session header.
+                DeduceKind::PartialEcMulW18 | DeduceKind::PedersenPointsTableW18 => {
+                    return None;
+                }
+            }
+            if !kinds_used.contains(&kind) {
+                kinds_used.push(kind);
+            }
+        }
+    }
+    if kinds_used.contains(&DeduceKind::BlakeG) {
+        // fast_deduction/blake.rs::PackedBlakeG::blake_g, verbatim on scalar u32
+        // (rotate = u32::rotate_right).
+        src.push_str(
+            "static __device__ __forceinline__ unsigned stwo_wit_rotr(unsigned x, unsigned n) {\n\
+             \x20   return (x >> n) | (x << (32u - n));\n\
+             }\n\
+             static __device__ __forceinline__ void stwo_wit_blake_g(\n\
+             \x20   const unsigned *in, unsigned *out) {\n\
+             \x20   unsigned a = in[0], b = in[1], c = in[2], d = in[3];\n\
+             \x20   const unsigned m0 = in[4], m1 = in[5];\n\
+             \x20   a = a + b + m0; d ^= a; d = stwo_wit_rotr(d, 16u);\n\
+             \x20   c += d; b ^= c; b = stwo_wit_rotr(b, 12u);\n\
+             \x20   a = a + b + m1; d ^= a; d = stwo_wit_rotr(d, 8u);\n\
+             \x20   c += d; b ^= c; b = stwo_wit_rotr(b, 7u);\n\
+             \x20   out[0] = a; out[1] = b; out[2] = c; out[3] = d;\n\
+             }\n\n",
+        );
+    }
+    if kinds_used.contains(&DeduceKind::BlakeRoundSigma) {
+        // preprocessed_columns/blake.rs::BLAKE_SIGMA, verbatim.
+        src.push_str(
+            "static __device__ const unsigned STWO_WIT_BLAKE_SIGMA[10][16] = {\n\
+             \x20   {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15},\n\
+             \x20   {14,10,4,8,9,15,13,6,1,12,0,2,11,7,5,3},\n\
+             \x20   {11,8,12,0,5,2,15,13,10,14,3,6,7,1,9,4},\n\
+             \x20   {7,9,3,1,13,12,11,14,2,6,5,10,4,0,15,8},\n\
+             \x20   {9,0,5,7,2,4,10,15,14,1,11,12,6,8,3,13},\n\
+             \x20   {2,12,6,10,0,11,8,3,4,13,7,5,15,14,1,9},\n\
+             \x20   {12,5,1,15,14,13,4,10,0,7,6,3,9,2,8,11},\n\
+             \x20   {13,11,7,14,12,1,3,9,5,0,15,4,8,6,2,10},\n\
+             \x20   {6,15,14,9,11,3,0,8,12,2,13,7,1,4,10,5},\n\
+             \x20   {10,2,8,4,7,6,1,5,15,11,9,14,3,12,13,0}\n\
+             };\n\n",
+        );
+    }
 
     // Value-limb deduce with the encoded-id tag dispatch (semantics proven by the
     // exec_deduce_output differential over real PIE memories). Table pointer layout:
@@ -94,6 +152,8 @@ pub fn compile_witness_to_cuda_source(program: &WitnessProgram) -> Option<String
 
 fn emit_body(program: &WitnessProgram, src: &mut String) -> Option<()> {
     let mut declared = vec![false; program.n_regs as usize];
+    let mut deduce_args: Vec<u32> = Vec::new();
+    let mut deduce_seq = 0usize;
 
     for inst in &program.insts {
         let op = WitnessOp::from_raw(inst.op)?;
@@ -126,6 +186,55 @@ fn emit_body(program: &WitnessProgram, src: &mut String) -> Option<()> {
                 src.push_str(&format!(
                     "    sub_words[{imm}u * row_count + row] = r{a};\n"
                 ));
+                continue;
+            }
+            WitnessOp::DeduceArg => {
+                deduce_args.push(a);
+                continue;
+            }
+            WitnessOp::DeduceCall => {
+                let kind = DeduceKind::from_raw(imm)?;
+                let (n_args, n_outs) = kind.shape();
+                if deduce_args.len() != n_args {
+                    return None; // malformed program — recorder bug; fall back.
+                }
+                let args_list = deduce_args
+                    .iter()
+                    .map(|r| format!("r{r}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let seq = deduce_seq;
+                deduce_seq += 1;
+                src.push_str(&format!(
+                    "    const unsigned dargs{seq}[{n_args}] = {{ {args_list} }};\n\
+                     \x20   unsigned douts{seq}[{n_outs}];\n"
+                ));
+                match kind {
+                    DeduceKind::BlakeG => {
+                        src.push_str(&format!("    stwo_wit_blake_g(dargs{seq}, douts{seq});\n"));
+                    }
+                    DeduceKind::BlakeRoundSigma => {
+                        src.push_str(&format!(
+                            "    for (int i = 0; i < 16; ++i) {{ douts{seq}[i] = \
+                             STWO_WIT_BLAKE_SIGMA[dargs{seq}[0]][i]; }}\n"
+                        ));
+                    }
+                    DeduceKind::PartialEcMulW18 | DeduceKind::PedersenPointsTableW18 => {
+                        return None; // device impl pends (fp256 header).
+                    }
+                }
+                let base = inst.dst as usize;
+                for i in 0..n_outs {
+                    let reg = base + i;
+                    let decl = if !declared[reg] {
+                        declared[reg] = true;
+                        "unsigned "
+                    } else {
+                        ""
+                    };
+                    src.push_str(&format!("    {decl}r{reg} = douts{seq}[{i}];\n"));
+                }
+                deduce_args.clear();
                 continue;
             }
             _ => {}
@@ -182,7 +291,9 @@ fn emit_body(program: &WitnessProgram, src: &mut String) -> Option<()> {
             WitnessOp::ColWrite
             | WitnessOp::MultPush
             | WitnessOp::LookupWord
-            | WitnessOp::SubWord => unreachable!(),
+            | WitnessOp::SubWord
+            | WitnessOp::DeduceArg
+            | WitnessOp::DeduceCall => unreachable!(),
         };
         src.push_str(&format!("    {decl}r{dst} = {expr};\n"));
     }
@@ -234,6 +345,82 @@ mod tests {
         // Distinct semantic hashes give distinct keys; the version is mixed in.
         assert_ne!(witness_jit_cache_key(1), witness_jit_cache_key(2));
         assert_ne!(witness_jit_cache_key(1), 1);
+    }
+
+    #[test]
+    fn deduce_codegen_and_interp_roundtrip() {
+        use super::super::interp::{interpret_row_with, DeduceHost};
+        use super::super::isa::DeduceKind;
+
+        // Record: g = blake_g(inputs 0..6); sigma = sigma(input 6); commit a few outs.
+        let mut r = WitnessRecorder::new("deduce_probe");
+        let ins: Vec<_> = (0..7).map(|i| r.input(i)).collect();
+        let g = r.deduce(DeduceKind::BlakeG, &ins[..6]);
+        let sg = r.deduce(DeduceKind::BlakeRoundSigma, &ins[6..7]);
+        r.col_write(0, g[0]);
+        r.col_write(1, g[3]);
+        r.col_write(2, sg[15]);
+        let prog = r.finish();
+
+        // Codegen: embeds both device fns + the call/bank pattern.
+        let src = compile_witness_to_cuda_source(&prog).expect("codegen succeeds");
+        assert!(src.contains("stwo_wit_blake_g"), "src: {src}");
+        assert!(src.contains("STWO_WIT_BLAKE_SIGMA"), "src: {src}");
+        assert!(src.contains("dargs0[6]"), "src: {src}");
+        assert!(src.contains("douts1[16]"), "src: {src}");
+
+        // Interp with a reference host: blake2s g + sigma row, straight math.
+        struct RefHost;
+        impl DeduceHost for RefHost {
+            fn deduce(&mut self, kind: u32, args: &[u32]) -> Vec<u32> {
+                match kind {
+                    0 => {
+                        let (mut a, mut b, mut c, mut d, m0, m1) =
+                            (args[0], args[1], args[2], args[3], args[4], args[5]);
+                        a = a.wrapping_add(b).wrapping_add(m0);
+                        d ^= a;
+                        d = d.rotate_right(16);
+                        c = c.wrapping_add(d);
+                        b ^= c;
+                        b = b.rotate_right(12);
+                        a = a.wrapping_add(b).wrapping_add(m1);
+                        d ^= a;
+                        d = d.rotate_right(8);
+                        c = c.wrapping_add(d);
+                        b ^= c;
+                        b = b.rotate_right(7);
+                        vec![a, b, c, d]
+                    }
+                    1 => {
+                        const SIGMA1: [u32; 16] =
+                            [14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3];
+                        assert_eq!(args[0], 1);
+                        SIGMA1.to_vec()
+                    }
+                    k => panic!("unexpected kind {k}"),
+                }
+            }
+        }
+        let inputs = [
+            0xdead_beefu32,
+            0x0123_4567,
+            0x89ab_cdef,
+            0x5555_aaaa,
+            7,
+            11,
+            1,
+        ];
+        let out = interpret_row_with(&prog, &inputs, &|_t, _k, _l| 0u32, &mut RefHost);
+        // Independent check of column 0 (a') for these inputs.
+        let mut a = 0xdead_beefu32.wrapping_add(0x0123_4567).wrapping_add(7);
+        let mut d = 0x5555_aaaa ^ a;
+        d = d.rotate_right(16);
+        let c = 0x89ab_cdefu32.wrapping_add(d);
+        let mut b = 0x0123_4567u32 ^ c;
+        b = b.rotate_right(12);
+        a = a.wrapping_add(b).wrapping_add(11);
+        assert_eq!(out.columns[0], a);
+        assert_eq!(out.columns[2], 3); // SIGMA[1][15]
     }
 
     #[test]

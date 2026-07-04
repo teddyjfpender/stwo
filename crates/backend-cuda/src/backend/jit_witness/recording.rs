@@ -14,7 +14,7 @@
 //! (each register written once), which is what makes the reference interpreter and the
 //! CUDA codegen a straight linear walk.
 
-use super::isa::{WitnessInst, WitnessOp, WitnessProgram};
+use super::isa::{DeduceKind, WitnessInst, WitnessOp, WitnessProgram};
 
 /// Handle to an SSA register produced by the recorder.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -208,6 +208,39 @@ impl WitnessRecorder {
     }
 
     /// Finish recording and package the program.
+    /// Computed deduce (ISA-V3): pushes `args` (fixed width per kind, asserted), then
+    /// one `DeduceCall` defining a contiguous bank of output registers. Argument and
+    /// output ORDER is the host `fast_deduction` signature order, felts flattened to
+    /// their 28 canonical limbs — the device functions and the `DeduceHost` reference
+    /// use exactly the same flattening.
+    pub fn deduce(&mut self, kind: DeduceKind, args: &[Val]) -> Vec<Val> {
+        let (n_args, n_outs) = kind.shape();
+        assert_eq!(
+            args.len(),
+            n_args,
+            "deduce {kind:?}: wrong arg count (recorder bug)"
+        );
+        for arg in args {
+            self.insts.push(WitnessInst::new(
+                WitnessOp::DeduceArg,
+                0,
+                arg.0 as u32,
+                0,
+                0,
+            ));
+        }
+        let base = self.next_reg;
+        let outs: Vec<Val> = (0..n_outs).map(|_| Val(self.alloc())).collect();
+        self.insts.push(WitnessInst::new(
+            WitnessOp::DeduceCall,
+            base,
+            0,
+            n_outs as u32,
+            kind as u32,
+        ));
+        outs
+    }
+
     pub fn finish(self) -> WitnessProgram {
         WitnessProgram {
             label: self.label,

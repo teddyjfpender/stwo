@@ -78,6 +78,25 @@ impl<F: Fn(u32, u32, u32) -> u32> TableOracle for F {
     }
 }
 
+/// Host implementations of the COMPUTED deduces (ISA-V3 `DeduceCall`). The interpreter
+/// delegates so its reference semantics come from the CALLER's own host functions
+/// (stwo-cairo's `fast_deduction`) — never a duplicated reimplementation the
+/// differential could not catch drifting.
+pub trait DeduceHost {
+    /// `kind` is the [`super::isa::DeduceKind`] discriminant; `args`/return follow the
+    /// fixed per-kind widths (felts flattened to 28 canonical limbs).
+    fn deduce(&mut self, kind: u32, args: &[u32]) -> Vec<u32>;
+}
+
+/// The no-deduce host: panics on any `DeduceCall`. For programs recorded from
+/// opcode-family bodies (which contain none) and legacy call sites.
+pub struct NoDeduceHost;
+impl DeduceHost for NoDeduceHost {
+    fn deduce(&mut self, kind: u32, _args: &[u32]) -> Vec<u32> {
+        panic!("program contains DeduceCall(kind={kind}) but no DeduceHost was provided")
+    }
+}
+
 /// The per-row outputs of an interpreted witness program.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RowOutputs {
@@ -101,7 +120,18 @@ pub fn interpret_row(
     inputs: &[u32],
     tables: &dyn TableOracle,
 ) -> RowOutputs {
+    interpret_row_with(program, inputs, tables, &mut NoDeduceHost)
+}
+
+/// [`interpret_row`] with a [`DeduceHost`] for ISA-V3 computed deduces.
+pub fn interpret_row_with(
+    program: &WitnessProgram,
+    inputs: &[u32],
+    tables: &dyn TableOracle,
+    host: &mut dyn DeduceHost,
+) -> RowOutputs {
     let mut regs = vec![0u32; program.n_regs as usize];
+    let mut deduce_args: Vec<u32> = Vec::new();
     let mut out = RowOutputs {
         columns: vec![0u32; program.n_cols as usize],
         mults: Vec::new(),
@@ -152,6 +182,23 @@ pub fn interpret_row(
                 out.sub_words[inst.imm as usize] = regs[a];
                 continue;
             }
+            WitnessOp::DeduceArg => {
+                deduce_args.push(regs[a]);
+                continue;
+            }
+            WitnessOp::DeduceCall => {
+                let outs = host.deduce(inst.imm, &deduce_args);
+                assert_eq!(
+                    outs.len(),
+                    inst.b as usize,
+                    "DeduceHost returned wrong output width for kind {}",
+                    inst.imm
+                );
+                let base = inst.dst as usize;
+                regs[base..base + outs.len()].copy_from_slice(&outs);
+                deduce_args.clear();
+                continue;
+            }
         };
         regs[inst.dst as usize] = value;
     }
@@ -167,6 +214,19 @@ pub fn interpret_rows(
     row_inputs
         .iter()
         .map(|inputs| interpret_row(program, inputs, tables))
+        .collect()
+}
+
+/// [`interpret_rows`] with a [`DeduceHost`].
+pub fn interpret_rows_with(
+    program: &WitnessProgram,
+    row_inputs: &[Vec<u32>],
+    tables: &dyn TableOracle,
+    host: &mut dyn DeduceHost,
+) -> Vec<RowOutputs> {
+    row_inputs
+        .iter()
+        .map(|inputs| interpret_row_with(program, inputs, tables, host))
         .collect()
 }
 

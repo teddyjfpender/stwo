@@ -104,6 +104,57 @@ pub enum WitnessOp {
     M31Inverse = 24,
     /// dst = (a == b) ? 1 : 0 — the 0/1-register mask representation (ISA-V2).
     M31Eq = 25,
+
+    // --- Computed deduces (ISA-V3, the fp256/EC/blake family — DEDUCE_DESIGN.md) ---
+    /// Push register `a` as the NEXT argument of the pending [`Self::DeduceCall`]
+    /// (argument order = push order). Writes no register.
+    DeduceArg = 26,
+    /// Run computed deduce `imm` (a [`DeduceKind`] discriminant) over the accumulated
+    /// [`Self::DeduceArg`]s (consumed), defining `b` consecutive OUTPUT registers
+    /// `dst..dst+b`. The device lowering calls a `__device__` function transcribed
+    /// from the corresponding host `fast_deduction` routine; the interpreter delegates
+    /// to a caller-supplied [`super::interp::DeduceHost`] (so the reference
+    /// implementation is the HOST's own, never a duplicate).
+    DeduceCall = 27,
+}
+
+/// Computed-deduce discriminants (the `imm` of [`WitnessOp::DeduceCall`]). Arg/output
+/// widths are FIXED per kind — a mismatch is a recorder bug, asserted at record time.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum DeduceKind {
+    /// `fast_deduction::blake::PackedBlakeG`: `[a,b,c,d,m0,m1] -> [a',b',c',d']`
+    /// (full 32-bit words).
+    BlakeG = 0,
+    /// `fast_deduction::blake::PackedBlakeRoundSigma`: `round -> [sigma; 16]` (M31s).
+    BlakeRoundSigma = 1,
+    /// `fast_deduction::pedersen::PackedPartialEcMulWindowBits18`: one windowed EC-mul
+    /// round; args = chain, round, 14 windows, 2 accumulator felts as 28 limbs each
+    /// (2+14+56 = 72), outputs the same shape (72).
+    PartialEcMulW18 = 2,
+    /// `fast_deduction::pedersen::PackedPedersenPointsTableWindowBits18`:
+    /// `index -> [x_felt, y_felt]` as 56 limb words.
+    PedersenPointsTableW18 = 3,
+}
+
+impl DeduceKind {
+    pub const fn from_raw(value: u32) -> Option<Self> {
+        Some(match value {
+            0 => Self::BlakeG,
+            1 => Self::BlakeRoundSigma,
+            2 => Self::PartialEcMulW18,
+            3 => Self::PedersenPointsTableW18,
+            _ => return None,
+        })
+    }
+    /// (n_args, n_outs) — the fixed widths.
+    pub const fn shape(self) -> (usize, usize) {
+        match self {
+            Self::BlakeG => (6, 4),
+            Self::BlakeRoundSigma => (1, 16),
+            Self::PartialEcMulW18 => (72, 72),
+            Self::PedersenPointsTableW18 => (1, 56),
+        }
+    }
 }
 
 impl WitnessOp {
@@ -135,15 +186,18 @@ impl WitnessOp {
             23 => Self::SubWord,
             24 => Self::M31Inverse,
             25 => Self::M31Eq,
+            26 => Self::DeduceArg,
+            27 => Self::DeduceCall,
             _ => return None,
         })
     }
 
-    /// True for opcodes that write a new SSA register in `dst`.
+    /// True for opcodes that write a new SSA register in `dst` (`DeduceCall` defines
+    /// a BANK of `b` registers starting at `dst`; `DeduceArg` defines none).
     pub const fn writes_dst(self) -> bool {
         !matches!(
             self,
-            Self::ColWrite | Self::MultPush | Self::LookupWord | Self::SubWord
+            Self::ColWrite | Self::MultPush | Self::LookupWord | Self::SubWord | Self::DeduceArg
         )
     }
 }
@@ -284,7 +338,7 @@ mod tests {
             let op = WitnessOp::from_raw(raw).expect("known opcode");
             assert_eq!(op as u8, raw);
         }
-        assert!(WitnessOp::from_raw(26).is_none());
+        assert!(WitnessOp::from_raw(28).is_none());
     }
 
     #[test]
