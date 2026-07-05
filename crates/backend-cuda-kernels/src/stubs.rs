@@ -1310,6 +1310,16 @@ pub unsafe extern "C" fn pedersen_table_init(_columns: *const *mut u32, _n_rows:
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_blake2s_tail(
+    _first_dev: *const Blake2sHash,
+    _first_size: u32,
+    _out_levels_dev: *const *mut Blake2sHash,
+    _n_levels: u32,
+) -> i32 {
+    no_cuda_symbol("stwo_blake2s_tail")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stwo_witness_edge_gather(
     _producer_sub_dev: *const u32,
     _producer_rows: u32,

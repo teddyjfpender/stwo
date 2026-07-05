@@ -924,6 +924,16 @@ extern "C" {
     // kernel's word-major sub buffer (see witness_feed_counts.cu). All pointer
     // args are DEVICE pointers; descs is the flat 11-u32-stride descriptor
     // array. Returns 0 on success.
+    // Commit fusion (C2): the top K Merkle levels in one launch (see the tail
+    // kernel in blake2s.cu). out_levels is a DEVICE array of per-level output
+    // pointers; level l holds first_size >> (l+1) hashes.
+    pub fn stwo_blake2s_tail(
+        first_dev: *const Blake2sHash,
+        first_size: u32,
+        out_levels_dev: *const *mut Blake2sHash,
+        n_levels: u32,
+    ) -> i32;
+
     // Device DAG (B3): gather a consumer's input columns from a producer's
     // word-major sub buffer (see witness_edge_gather.cu). Padding rows
     // replicate the first packed row, matching the host resize rule.

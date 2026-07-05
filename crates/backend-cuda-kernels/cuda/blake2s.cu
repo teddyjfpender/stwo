@@ -1,4 +1,5 @@
 #include "blake2s.cuh"
+#include <cstdio>
 #include "utils.cuh"
 
 __device__ __constant__ uint32_t blake2s_IV[8] = {
@@ -359,4 +360,59 @@ void commit_on_two_layers_with_previous(
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
     stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
+}
+
+// ---------------------------------------------------------------------------
+// Merkle TAIL fusion (commit fusion, C2): the top K levels in ONE launch. The
+// per-level launches this replaces are tiny (<= 4096 nodes) — their cost is
+// the launch gap, not the hashing — so a single block with __syncthreads
+// between levels replaces ~K launches. Levels write into caller-provided
+// per-level buffers (the same layout the per-layer path produces, so tree
+// readers are unchanged). Hashing delegates to blake2s_hash_children_device —
+// the SAME routine the per-layer kernel uses: a scheduling change, not a new
+// hash.
+__global__ void blake2s_tail_kernel(
+    const Blake2sHash *first,
+    uint32_t first_size,
+    Blake2sHash *const *out_levels,
+    uint32_t n_levels
+) {
+    const Blake2sHash *prev = first;
+    uint32_t size = first_size;
+    for (uint32_t l = 0; l < n_levels; ++l) {
+        uint32_t next = size / 2;
+        for (uint32_t i = threadIdx.x; i < next; i += blockDim.x) {
+            out_levels[l][i] =
+                blake2s_hash_children_device(prev[2 * i], prev[2 * i + 1]);
+        }
+        __syncthreads();
+        prev = out_levels[l];
+        size = next;
+    }
+}
+
+// Returns 0 on success. `out_levels_dev` is a DEVICE array of n_levels device
+// pointers; level l holds first_size >> (l+1) hashes. first_size must be a
+// power of two with first_size >> n_levels >= 1.
+extern "C" int stwo_blake2s_tail(
+    const Blake2sHash *first_dev,
+    uint32_t first_size,
+    Blake2sHash *const *out_levels_dev,
+    uint32_t n_levels
+) {
+    if (n_levels == 0) {
+        return 0;
+    }
+    if (first_size == 0 || (first_size & (first_size - 1)) != 0 ||
+        (first_size >> n_levels) == 0) {
+        fprintf(stderr, "stwo_blake2s_tail: bad sizes (first=%u levels=%u)\n",
+                first_size, n_levels);
+        return 1;
+    }
+    blake2s_tail_kernel<<<1, 1024>>>(first_dev, first_size, out_levels_dev, n_levels);
+    if (cudaGetLastError() != cudaSuccess) {
+        fprintf(stderr, "stwo_blake2s_tail: launch failed\n");
+        return 1;
+    }
+    return 0;
 }

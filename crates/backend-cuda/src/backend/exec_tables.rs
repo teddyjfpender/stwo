@@ -731,7 +731,13 @@ pub fn launch_recorded_builtin_mixed(
     n: usize,
     tables: &DeviceExecutionTables,
     want_host_lookup: bool,
-) -> Option<(Vec<BaseFieldVec>, BaseFieldVec, Vec<u32>, BaseFieldVec, Vec<u32>)> {
+) -> Option<(
+    Vec<BaseFieldVec>,
+    BaseFieldVec,
+    Vec<u32>,
+    BaseFieldVec,
+    Vec<u32>,
+)> {
     if !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
         return None;
     }
