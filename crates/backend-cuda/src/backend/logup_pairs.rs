@@ -311,29 +311,52 @@ mod tests {
                 kind: 0,
                 off_a: 0,
                 width_a: 8,
-                mult_a: 115,
+                mult_a: MultSrc::Flat(115),
+                neg_a: false,
                 off_b: 8,
                 width_b: 3,
-                mult_b: 115
+                mult_b: MultSrc::Flat(115),
+                neg_b: false,
             }
         );
         // The pair holding the first opcodes field mixes mults_0 and mults_1.
-        assert_eq!(descs[3].mult_a, 115);
-        assert_eq!(descs[3].mult_b, 116);
+        assert_eq!(descs[3].mult_a, MultSrc::Flat(115));
+        assert_eq!(descs[3].mult_b, MultSrc::Flat(116));
         assert_eq!(descs[3].off_b, 8 + 3 + 30 + 3 + 30 + 3 + 30);
-        // Trailing solo: the last opcodes field, negated mults_1.
+        // Trailing solo: the last opcodes field, EXPLICITLY negated mults_1.
         assert_eq!(
             descs[4],
             LogupColDesc {
                 kind: 1,
                 off_a: 111,
                 width_a: 4,
-                mult_a: 116,
+                mult_a: MultSrc::Flat(116),
+                neg_a: true,
                 off_b: 0,
                 width_b: 0,
-                mult_b: 0
+                mult_b: MultSrc::One,
+                neg_b: false,
             }
         );
+    }
+
+    /// The flags word encodes signs + mult kinds losslessly.
+    #[test]
+    fn desc_words_encode_flags() {
+        let d = LogupColDesc {
+            kind: 0,
+            off_a: 1,
+            width_a: 2,
+            mult_a: MultSrc::Enabler,
+            neg_a: true,
+            off_b: 3,
+            width_b: 4,
+            mult_b: MultSrc::One,
+            neg_b: false,
+        };
+        let w = d.to_words();
+        // bit0 negA=1, bit1 negB=0, bits2-3 kindA=2 (enabler), bits4-5 kindB=1 (one)
+        assert_eq!(w[7], 1 | (2 << 2) | (1 << 4));
     }
 
     /// Even field count (assert_eq-like): no solo column.
@@ -348,7 +371,7 @@ mod tests {
         let descs = descriptors_for_fields(fields, 19, 20);
         assert_eq!(descs.len(), 2);
         assert!(descs.iter().all(|d| d.kind == 0));
-        assert_eq!(descs[1].mult_a, 20);
-        assert_eq!(descs[1].mult_b, 20);
+        assert_eq!(descs[1].mult_a, MultSrc::Flat(20));
+        assert_eq!(descs[1].mult_b, MultSrc::Flat(20));
     }
 }

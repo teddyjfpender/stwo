@@ -117,28 +117,6 @@ extern "C" {
     /// kernel; the rest is the raw `FrameworkEval` struct the kernel's generated code
     /// reads. Returns false when no kernel matches (caller falls back to CPU).
     #[allow(clippy::too_many_arguments)]
-    pub fn evaluate_constraint_quotients_on_domain(
-        quotients_0: *const u32,
-        quotients_1: *const u32,
-        quotients_2: *const u32,
-        quotients_3: *const u32,
-        trace0_evaluations: *const *const u32,
-        trace0_evaluations_len: u32,
-        trace1_evaluations: *const *const u32,
-        trace1_evaluations_len: u32,
-        trace2_evaluations: *const *const u32,
-        trace2_evaluations_len: u32,
-        random_coeff_powers: *const u32,
-        denominator_inverses: *const u32,
-        domain_log_size: u32,
-        eval_domain_log_size: u32,
-        number_of_columns: u32,
-        logup_counts: u32,
-        eval: *mut c_void,
-        cumsum_shift: CudaSecureField,
-        should_accumulate: bool,
-        use_assert_evaluator: bool,
-    ) -> bool;
     pub fn copy_uint32_t_vec_from_device_to_host(
         device_ptr: *const u32,
         host_ptr: *const u32,

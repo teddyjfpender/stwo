@@ -1,14 +1,16 @@
-//! Per-component GPU constraint evaluation (NitrooZK lineage).
+//! Per-component GPU constraint evaluation.
 //!
-//! ~100 precompiled per-component kernels (generated from stwo-cairo's AIR) are
-//! dispatched by an FNV1a hash of the component's name; components without a kernel
-//! fall back to the generic CPU lane *on the same accumulator claim* (claiming twice
-//! would consume two random-coefficient ranges). The kernels read the component's
-//! `FrameworkEval` struct through a raw pointer, so their generated field layout must
-//! match this build's — the stwo-cairo e2e byte-equality gate is the arbiter for
-//! every component.
+//! The JIT/AOT lane (kernels generated from THIS build's AIR via the recording
+//! evaluator — NVRTC at prove time, or the embedded AOT pack compiled offline)
+//! with the generic CPU lane as fallback *on the same accumulator claim*
+//! (claiming twice would consume two random-coefficient ranges).
 //!
-//! `STWO_CUDA_DISABLE_CONSTRAINT_KERNELS=1` forces the CPU lane;
+//! The NitrooZK precompiled kernel set was DELETED (design §2, M3): generated
+//! against a foreign AIR revision with a raw Rust-struct ABI, it mismatched
+//! 100% of rows on every component and no kernel was ever qualified — the AOT
+//! pack is its correct replacement (same "precompiled" performance, generated
+//! from this build's AIR by construction).
+//!
 //! `STWO_CUDA_CONSTRAINT_LOG=1` logs the lane taken per component.
 
 use stwo::core::air::Component;
@@ -25,23 +27,8 @@ use stwo_constraint_framework::{
 use super::CudaBackend;
 use crate::columns::{BaseFieldVec, SecureFieldVec};
 
-/// FNV1a-32 over the component name; must match the dispatch table in
-/// `evaluate_constraints.cu`.
-fn fnv1a_eval_id(name: &str) -> u32 {
-    const FNV_OFFSET_BASIS: u32 = 0x811C_9DC5;
-    const FNV_PRIME: u32 = 0x0100_0193;
-    let mut hash = FNV_OFFSET_BASIS;
-    for byte in name.as_bytes() {
-        hash ^= u32::from(*byte);
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    hash
-}
-
-/// The kernel-dispatch name for a component: the module segment preceding the type
-/// name (e.g. `cairo_air::components::add_opcode::Eval` -> `add_opcode`), matching the
-/// names stwo-cairo components carry in the NitrooZK dispatch table. Components whose
-/// derived name has no kernel simply fall back to the CPU lane.
+/// The log-friendly component name: the module segment preceding the type name
+/// (e.g. `cairo_air::components::add_opcode::Eval` -> `add_opcode`).
 fn derived_eval_name<E>() -> &'static str {
     let full = core::any::type_name::<E>();
     let full = full.split('<').next().unwrap_or(full);
@@ -75,22 +62,9 @@ pub fn evaluate_constraint_quotients<E: FrameworkEval + Sync>(
 
     let eval_name = derived_eval_name::<E>();
     let log = std::env::var_os("STWO_CUDA_CONSTRAINT_LOG").is_some();
-    // Lane control without rebuilds: DISABLE wins; otherwise an ALLOWLIST (comma-
-    // separated component names) restricts the GPU lane to listed components — used to
-    // bisect kernels whose generated constraints don't match this AIR revision.
-    // OPT-IN: the ported kernel set was generated against NitrooZK's stwo v2.1.1 +
-    // their stwo-cairo AIR rev. Differential verification against this stack showed
-    // 100%-of-rows mismatches from row 0 on every component (the eval-struct
-    // layout/AIR-rev skew fingerprint), so no kernel is qualified by default.
-    // Qualification path for regenerated kernels: STWO_CUDA_CONSTRAINT_VERIFY=1 with
-    // an ALLOWLIST; components reporting 0 mismatches may be promoted.
-    let gpu_enabled = std::env::var_os("STWO_CUDA_DISABLE_CONSTRAINT_KERNELS").is_none()
-        && match std::env::var("STWO_CUDA_CONSTRAINT_ALLOWLIST") {
-            Ok(list) => list.split(',').any(|name| name.trim() == eval_name),
-            Err(_) => std::env::var_os("STWO_CUDA_ENABLE_CONSTRAINT_KERNELS").is_some(),
-        };
 
-    // Common GPU marshaling, shared by the precompiled and JIT lanes.
+    // GPU marshaling for the JIT/AOT lane: pointer-table trace ABI — the kernel
+    // indexes trace_cols[global_column][row], no flattening copies.
     let gpu_denom_inv = BaseFieldVec::from_vec(denom_inv.clone());
     let random_coeff_powers = SecureFieldVec::from_vec(accum.random_coeff_powers.clone());
     let trace_ptrs: Vec<Vec<*const u32>> = (0..3)
@@ -114,130 +88,6 @@ pub fn evaluate_constraint_quotients<E: FrameworkEval + Sync>(
                 .unwrap_or_default()
         })
         .collect();
-
-    if gpu_enabled {
-        // The dispatcher reads a 4-byte FNV1a id, then the raw eval struct (the
-        // generated kernel code mirrors the Rust field layout of its component).
-        let eval_id = fnv1a_eval_id(eval_name);
-        let eval_bytes = unsafe {
-            std::slice::from_raw_parts(
-                component.evaluator() as *const E as *const u8,
-                std::mem::size_of::<E>(),
-            )
-        };
-        let mut eval_buffer = Vec::with_capacity(4 + eval_bytes.len());
-        eval_buffer.extend_from_slice(&eval_id.to_ne_bytes());
-        eval_buffer.extend_from_slice(eval_bytes);
-
-        let trace_log_size = component.evaluator().log_size();
-        let logup_counts =
-            component.logup_counts().values().sum::<usize>() as u32 >> trace_log_size;
-        let cumsum_shift =
-            component.claimed_sum() / BaseField::from_u32_unchecked(1u32 << trace_log_size);
-
-        let accum_prev_snapshot = if std::env::var_os("STWO_CUDA_CONSTRAINT_VERIFY").is_some() {
-            SecureColumnByCoords {
-                columns: accum.col.columns.each_ref().map(|column| column.to_cpu()),
-            }
-        } else {
-            SecureColumnByCoords::zeros(0)
-        };
-
-        crate::columns::bindings::ensure_mem_pool_init();
-        let handled = unsafe {
-            stwo_backend_cuda_kernels::raw::evaluate_constraint_quotients_on_domain(
-                accum.col.columns[0].device_ptr,
-                accum.col.columns[1].device_ptr,
-                accum.col.columns[2].device_ptr,
-                accum.col.columns[3].device_ptr,
-                trace_ptrs[0].as_ptr(),
-                trace_ptrs[0].len() as u32,
-                trace_ptrs[1].as_ptr(),
-                trace_ptrs[1].len() as u32,
-                trace_ptrs[2].as_ptr(),
-                trace_ptrs[2].len() as u32,
-                random_coeff_powers.device_ptr,
-                gpu_denom_inv.device_ptr,
-                trace_domain.log_size(),
-                eval_domain.log_size(),
-                component.n_constraints() as u32,
-                logup_counts,
-                eval_buffer.as_mut_ptr().cast(),
-                {
-                    let limbs = cumsum_shift.to_m31_array();
-                    stwo_backend_cuda_kernels::raw::CudaSecureField {
-                        a: limbs[0].0,
-                        b: limbs[1].0,
-                        c: limbs[2].0,
-                        d: limbs[3].0,
-                    }
-                },
-                true,  // should_accumulate: proving accumulates into the column
-                false, // use_assert_evaluator: production
-            )
-        };
-        if log {
-            eprintln!(
-                "stwo-backend-cuda constraint eval: component={eval_name} id={eval_id:#x} lane={}",
-                if handled { "GPU" } else { "CPU-fallback" }
-            );
-        }
-        if handled {
-            // Differential-verify mode: recompute on CPU from the pre-GPU snapshot and
-            // compare, reporting the mismatch pattern. The CPU result is kept so the
-            // prove stays correct while kernels are being qualified.
-            if std::env::var_os("STWO_CUDA_CONSTRAINT_VERIFY").is_some() {
-                let gpu_result: Vec<Vec<BaseField>> = accum
-                    .col
-                    .columns
-                    .iter()
-                    .map(|column| column.to_cpu())
-                    .collect();
-                let trace_cols_cpu = trace.as_cols_ref().map_cols(|column| {
-                    CircleEvaluation::new(column.domain, column.values.to_cpu())
-                });
-                let cpu_result = accumulate_pointwise_cpu(
-                    component,
-                    trace_cols_cpu.as_cols_ref(),
-                    eval_domain.log_size(),
-                    trace_domain.log_size(),
-                    denom_inv.clone(),
-                    &accum.random_coeff_powers,
-                    &accum_prev_snapshot,
-                );
-                let mut mismatches = 0usize;
-                let mut first: Option<(usize, usize)> = None;
-                for (coord, gpu_column) in gpu_result.iter().enumerate() {
-                    for (row, (gpu, cpu)) in gpu_column
-                        .iter()
-                        .zip(cpu_result.columns[coord].iter())
-                        .enumerate()
-                    {
-                        if gpu != cpu {
-                            mismatches += 1;
-                            if first.is_none() {
-                                first = Some((coord, row));
-                            }
-                        }
-                    }
-                }
-                let total = 4 * gpu_result[0].len();
-                eprintln!(
-                    "VERIFY component={eval_name}: {mismatches}/{total} mismatched, first={first:?}"
-                );
-                if mismatches > 0 {
-                    *accum.col = SecureColumnByCoords {
-                        columns: cpu_result
-                            .columns
-                            .map(|values| values.into_iter().collect()),
-                    };
-                }
-            }
-            return;
-        }
-    } else if log {
-        eprintln!("stwo-backend-cuda constraint eval: component={eval_name} lane=CPU (disabled)");
-    }
 
     // JIT lane: kernels generated from THIS build's AIR via the recording evaluator
     // (NVRTC, content-hash cached) — consistent by construction, explicit C ABI.
