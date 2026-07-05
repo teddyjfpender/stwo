@@ -372,3 +372,57 @@ extern "C" void blake_g_final_logup(
     stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 }
+
+// Device edge (B3): build blake_g's ROW-MAJOR 6-word input buffer directly
+// from blake_round's word-major sub buffer (8 instances x 6 raw u32 words at
+// word_base) — the device-to-device replacement for the host input feed.
+// Instance-major stacking; padding rows replicate the first packed row's
+// lanes (the host resize rule) — identical layout to the host-built upload.
+__global__ void blake_g_inputs_from_sub_kernel(
+    const uint32_t *producer_sub,
+    uint32_t producer_rows,
+    uint32_t word_base,
+    uint32_t n_instances,
+    uint32_t consumer_rows,
+    uint32_t *out_row_major
+) {
+    uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= consumer_rows) {
+        return;
+    }
+    uint32_t real_rows = n_instances * producer_rows;
+    uint32_t src = row < real_rows ? row : (row & 15u);
+    uint32_t j = src / producer_rows;
+    uint32_t r = src % producer_rows;
+    for (uint32_t w = 0; w < 6; ++w) {
+        out_row_major[(size_t)row * 6 + w] =
+            producer_sub[(size_t)(word_base + j * 6 + w) * producer_rows + r];
+    }
+}
+
+extern "C" int stwo_blake_g_inputs_from_sub(
+    const uint32_t *producer_sub_dev,
+    uint32_t producer_rows,
+    uint32_t word_base,
+    uint32_t n_instances,
+    uint32_t consumer_rows,
+    uint32_t *out_row_major_dev
+) {
+    if (consumer_rows == 0) {
+        return 0;
+    }
+    if ((size_t)n_instances * producer_rows > consumer_rows) {
+        fprintf(stderr, "stwo_blake_g_inputs_from_sub: consumer_rows too small\n");
+        return 1;
+    }
+    const uint32_t block = 256;
+    uint32_t grid = (consumer_rows + block - 1) / block;
+    blake_g_inputs_from_sub_kernel<<<grid, block>>>(
+        producer_sub_dev, producer_rows, word_base, n_instances, consumer_rows,
+        out_row_major_dev);
+    if (cudaGetLastError() != cudaSuccess) {
+        fprintf(stderr, "stwo_blake_g_inputs_from_sub: launch failed\n");
+        return 1;
+    }
+    return 0;
+}

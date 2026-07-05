@@ -934,6 +934,17 @@ extern "C" {
         n_levels: u32,
     ) -> i32;
 
+    // Device edge (B3): blake_round's sub buffer -> blake_g's row-major input
+    // buffer (the certified hand lane's ABI). See blake_witness.cu.
+    pub fn stwo_blake_g_inputs_from_sub(
+        producer_sub_dev: *const u32,
+        producer_rows: u32,
+        word_base: u32,
+        n_instances: u32,
+        consumer_rows: u32,
+        out_row_major_dev: *mut u32,
+    ) -> i32;
+
     // Device DAG (B3): gather a consumer's input columns from a producer's
     // word-major sub buffer (see witness_edge_gather.cu). Padding rows
     // replicate the first packed row, matching the host resize rule.

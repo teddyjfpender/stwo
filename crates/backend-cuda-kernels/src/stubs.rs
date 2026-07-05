@@ -1320,6 +1320,18 @@ pub unsafe extern "C" fn stwo_blake2s_tail(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_blake_g_inputs_from_sub(
+    _producer_sub_dev: *const u32,
+    _producer_rows: u32,
+    _word_base: u32,
+    _n_instances: u32,
+    _consumer_rows: u32,
+    _out_row_major_dev: *mut u32,
+) -> i32 {
+    no_cuda_symbol("stwo_blake_g_inputs_from_sub")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stwo_witness_edge_gather(
     _producer_sub_dev: *const u32,
     _producer_rows: u32,
