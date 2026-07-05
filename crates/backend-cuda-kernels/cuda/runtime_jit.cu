@@ -248,12 +248,15 @@ static bool fill_witness_pedersen_globals(CUmodule module, const char *kernel_na
         return true;
     }
     if (!is_pedersen_table_initialized()) {
-        // Self-heal: generate the owned device table (the aggregator kernel
-        // compiling at all implies pedersen work is present in this prove).
-        initialize_pedersen_table();
-    }
-    if (!is_pedersen_table_initialized()) {
-        fprintf(stderr, "stwo JIT: %s needs the pedersen table but init failed\n",
+        // NO self-heal generation: the deduce-gate oracle falsified the
+        // GPU-generated table (144/256 rows vs the host PEDERSEN_TABLE_18,
+        // run 20260705T113615Z). The host-built table must be registered
+        // first (borrowed mode via `register_borrowed_pedersen_table`);
+        // otherwise fail the load closed — the caller falls back to the
+        // host lane rather than reading a wrong table.
+        fprintf(stderr,
+                "stwo JIT: %s needs the pedersen table but none is registered "
+                "(host-table registration required; GPU generation is quarantined)\n",
                 kernel_name);
         return false;
     }

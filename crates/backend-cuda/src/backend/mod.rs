@@ -15,6 +15,7 @@ mod logup;
 pub mod logup_pairs;
 mod lookups;
 pub mod memory_witness;
+pub mod pedersen_table;
 pub mod pedersen_witness;
 mod pointer_vec;
 mod poly;

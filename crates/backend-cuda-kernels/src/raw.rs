@@ -913,4 +913,10 @@ extern "C" {
         h_out: *mut u32,
         n_items: u32,
     ) -> i32;
+
+    // Register caller-owned DEVICE columns as the pedersen points table
+    // (borrowed mode; see pedersen_table_init.cu). 56 pointers, n_rows each.
+    // Registration publishes the pointers to the precompiled module's device
+    // globals; asserts if a different table was already registered.
+    pub fn pedersen_table_init(columns: *const *mut u32, n_rows: u32);
 }

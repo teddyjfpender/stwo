@@ -46,12 +46,14 @@ __global__ void oracle_pedersen_points_w18_kernel(
 }
 
 // Fill this module's copy of the witness table globals from the runtime table
-// state (self-healing: generates the owned device table on first use).
+// state. NO self-heal generation: the oracle itself falsified the GPU-generated
+// table (run 20260705T113615Z) — the host-built table must be registered first
+// (borrowed mode); an unregistered table is a hard oracle failure (rc=2).
 bool fill_oracle_table_globals() {
     if (!is_pedersen_table_initialized()) {
-        initialize_pedersen_table();
-    }
-    if (!is_pedersen_table_initialized()) {
+        fprintf(stderr,
+                "stwo deduce oracle: pedersen table not registered (host-table "
+                "registration required; GPU generation is quarantined)\n");
         return false;
     }
     m31* ptrs[56];

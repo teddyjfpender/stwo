@@ -1303,3 +1303,8 @@ pub unsafe extern "C" fn stwo_wit_deduce_oracle_run(
 ) -> i32 {
     no_cuda_symbol("stwo_wit_deduce_oracle_run")
 }
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pedersen_table_init(_columns: *const *mut u32, _n_rows: u32) {
+    no_cuda_symbol("pedersen_table_init")
+}

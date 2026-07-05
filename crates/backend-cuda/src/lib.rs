@@ -9,7 +9,7 @@ mod columns;
 
 pub use backend::{
     blake_witness, exec_tables, finalize_raw_logup, jit_witness, logup_pairs, memory_witness,
-    pedersen_witness, CudaBackend,
+    pedersen_table, pedersen_witness, CudaBackend,
 };
 pub use columns::{BaseFieldVec, Blake2sHashVec, SecureFieldVec};
 
