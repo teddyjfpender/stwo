@@ -590,7 +590,13 @@ pub fn launch_recorded_witness_for_prove(
     n_real: usize,
     tables: &DeviceExecutionTables,
     want_host_lookup: bool,
-) -> Option<(Vec<BaseFieldVec>, BaseFieldVec, Vec<u32>, Vec<u32>)> {
+) -> Option<(
+    Vec<BaseFieldVec>,
+    BaseFieldVec,
+    Vec<u32>,
+    BaseFieldVec,
+    Vec<u32>,
+)> {
     if !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
         return None;
     }
@@ -639,7 +645,13 @@ pub fn launch_recorded_builtin_for_prove(
     input_cols: &[Vec<u32>],
     tables: &DeviceExecutionTables,
     want_host_lookup: bool,
-) -> Option<(Vec<BaseFieldVec>, BaseFieldVec, Vec<u32>, Vec<u32>)> {
+) -> Option<(
+    Vec<BaseFieldVec>,
+    BaseFieldVec,
+    Vec<u32>,
+    BaseFieldVec,
+    Vec<u32>,
+)> {
     if !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
         return None;
     }
@@ -681,7 +693,13 @@ fn launch_witness_program_core(
     n: usize,
     tables: &DeviceExecutionTables,
     want_host_lookup: bool,
-) -> Option<(Vec<BaseFieldVec>, BaseFieldVec, Vec<u32>, Vec<u32>)> {
+) -> Option<(
+    Vec<BaseFieldVec>,
+    BaseFieldVec,
+    Vec<u32>,
+    BaseFieldVec,
+    Vec<u32>,
+)> {
     let n_cols = program.n_cols as usize;
     if program.n_mult_tables > 0 {
         // Multiplicity tables need real device columns + a host merge that this path
@@ -772,6 +790,8 @@ fn launch_witness_program_core(
         Vec::new()
     };
     let sub_host: Vec<u32> = sub_words.to_vec().into_iter().map(|f| f.0).collect();
+    // The DEVICE sub buffer rides along for the device-DAG count feed
+    // (witness_feed_counts.cu consumes it in place — no D2H on that path).
     // Tables may be dropped now (launch is synchronous through the D2H above); the
     // returned out_cols stay device-resident for the committed tree, and the DEVICE
     // lookup buffer rides along for the §6a device-interaction lane (born exactly
@@ -779,14 +799,13 @@ fn launch_witness_program_core(
     // call by the core's contract.
     drop((
         strides,
-        sub_words,
         mult_cols,
         input_table,
         base_table,
         out_table,
         mult_table,
     ));
-    Some((out_cols, lookup_words, lookup_host, sub_host))
+    Some((out_cols, lookup_words, lookup_host, sub_words, sub_host))
 }
 
 /// the committed columns (column-major, one Vec per column). `addr_to_idx` (stride 1)
