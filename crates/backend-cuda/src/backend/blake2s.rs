@@ -143,6 +143,46 @@ impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M3
 
         result
     }
+
+    /// Commit fusion (C2): the top `n_levels` in ONE fused launch
+    /// (`stwo_blake2s_tail` — same `blake2s_hash_children_device` routine as
+    /// the per-layer kernel; scheduling only). The M31-output lane keeps the
+    /// host default (its per-layer path is host-side already).
+    fn build_top_layers(first: &Blake2sHashVec, n_levels: u32) -> Vec<Blake2sHashVec> {
+        assert!(n_levels >= 1 && first.len() >> n_levels >= 1);
+        if IS_M31_OUTPUT || !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
+            // The trait default's exact loop (can't call it directly from an
+            // override): chained build_next_layer, parent-first.
+            let mut out = Vec::with_capacity(n_levels as usize);
+            let next_layer = <Self as MerkleOpsLifted<
+                Blake2sMerkleHasherGeneric<IS_M31_OUTPUT>,
+            >>::build_next_layer;
+            let mut current = next_layer(first);
+            for _ in 1..n_levels {
+                let next = next_layer(&current);
+                out.push(current);
+                current = next;
+            }
+            out.push(current);
+            return out;
+        }
+        let levels: Vec<Blake2sHashVec> = (1..=n_levels)
+            .map(|l| Blake2sHashVec::new_uninitialized(first.len() >> l))
+            .collect();
+        let ptrs: Vec<*const u32> = levels.iter().map(|l| l.device_ptr.cast::<u32>()).collect();
+        let table = crate::backend::UploadedDevicePointerVec::upload(&ptrs);
+        let rc = unsafe {
+            stwo_backend_cuda_kernels::raw::stwo_blake2s_tail(
+                first.device_ptr.cast(),
+                first.len() as u32,
+                table.as_ptr().cast(),
+                n_levels,
+            )
+        };
+        drop(table);
+        assert_eq!(rc, 0, "blake2s tail launch failed");
+        levels
+    }
 }
 
 /// Host-side leaf builder for the M31-output hasher: mirrors the CPU reference's byte

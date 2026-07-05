@@ -115,18 +115,35 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
         // Build the layers from the leaves up, dropping unretained bottom layers eagerly to
         // also reduce the transient memory of the commitment itself.
         let min_retained_log_size = lifting_log_size.saturating_sub(n_unretained_layers);
+        // Commit fusion: once every remaining level is retained AND the
+        // subtree fits one block, hand the rest to the backend in one
+        // `build_top_layers` call (default = the same per-level loop; the CUDA
+        // override fuses ~TAIL_LEVELS launches into one). Scheduling only —
+        // identical layer contents either way.
+        const TAIL_LEVELS: u32 = 12;
         let mut layers_top_down: Vec<Col<B, H::Hash>> = Vec::new();
-        let mut current = leaves;
+        let mut current = Some(leaves);
         for log_size in (0..lifting_log_size).rev() {
-            let next = B::build_next_layer(&current);
-            // `current` has log size `log_size + 1`.
-            if log_size < min_retained_log_size {
-                layers_top_down.push(current);
+            let cur = current.take().unwrap();
+            // `cur` has log size `log_size + 1`.
+            let cur_log = log_size + 1;
+            if cur_log <= TAIL_LEVELS && cur_log <= min_retained_log_size {
+                let tail = B::build_top_layers(&cur, cur_log);
+                layers_top_down.push(cur);
+                layers_top_down.extend(tail);
+                break;
             }
-            current = next;
+            let next = B::build_next_layer(&cur);
+            if log_size < min_retained_log_size {
+                layers_top_down.push(cur);
+            }
+            current = Some(next);
         }
-        // The root (log size 0) is always retained.
-        layers_top_down.push(current);
+        // The root (log size 0) is always retained; when the fused tail ran it
+        // is already the last pushed layer.
+        if let Some(cur) = current {
+            layers_top_down.push(cur);
+        }
         layers_top_down.reverse();
 
         Self {

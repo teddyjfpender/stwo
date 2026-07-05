@@ -29,6 +29,25 @@ pub trait MerkleOpsLifted<H: MerkleHasherLifted>:
             .map(|&(l, i)| layers[l as usize].at(i as usize))
             .collect()
     }
+
+    /// Builds the top `n_levels` layers above `first` (parent of `first`
+    /// first, root last). Semantics are EXACTLY `n_levels` chained
+    /// [`Self::build_next_layer`] calls — the default does just that; device
+    /// backends may override with one fused launch (the per-level launches at
+    /// the top of the tree cost launch gaps, not hashing). A scheduling
+    /// change only: layer contents are identical either way.
+    fn build_top_layers(first: &Col<Self, H::Hash>, n_levels: u32) -> Vec<Col<Self, H::Hash>> {
+        assert!(n_levels >= 1 && first.len() >> n_levels >= 1);
+        let mut out = Vec::with_capacity(n_levels as usize);
+        let mut current = Self::build_next_layer(first);
+        for _ in 1..n_levels {
+            let next = Self::build_next_layer(&current);
+            out.push(current);
+            current = next;
+        }
+        out.push(current);
+        out
+    }
 }
 
 pub trait PackLeavesOps: ColumnOps<BaseField> {
