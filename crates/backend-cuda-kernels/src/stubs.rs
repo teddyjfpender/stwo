@@ -1308,3 +1308,15 @@ pub unsafe extern "C" fn stwo_wit_deduce_oracle_run(
 pub unsafe extern "C" fn pedersen_table_init(_columns: *const *mut u32, _n_rows: u32) {
     no_cuda_symbol("pedersen_table_init")
 }
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_witness_feed_counts(
+    _sub_words_dev: *const u32,
+    _column_length: u32,
+    _descs_dev: *const u32,
+    _n_descs: u32,
+    _luts_dev: *const *const u32,
+    _counts_dev: *const *mut u32,
+) -> i32 {
+    no_cuda_symbol("stwo_witness_feed_counts")
+}

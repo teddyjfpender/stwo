@@ -919,4 +919,17 @@ extern "C" {
     // Registration publishes the pointers to the precompiled module's device
     // globals; asserts if a different table was already registered.
     pub fn pedersen_table_init(columns: *const *mut u32, n_rows: u32);
+
+    // Device DAG (B2): generalized multiplicity count feed over a witness
+    // kernel's word-major sub buffer (see witness_feed_counts.cu). All pointer
+    // args are DEVICE pointers; descs is the flat 11-u32-stride descriptor
+    // array. Returns 0 on success.
+    pub fn stwo_witness_feed_counts(
+        sub_words_dev: *const u32,
+        column_length: u32,
+        descs_dev: *const u32,
+        n_descs: u32,
+        luts_dev: *const *const u32,
+        counts_dev: *const *mut u32,
+    ) -> i32;
 }
