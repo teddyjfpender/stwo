@@ -924,6 +924,19 @@ extern "C" {
     // kernel's word-major sub buffer (see witness_feed_counts.cu). All pointer
     // args are DEVICE pointers; descs is the flat 11-u32-stride descriptor
     // array. Returns 0 on success.
+    // Device DAG (B3): gather a consumer's input columns from a producer's
+    // word-major sub buffer (see witness_edge_gather.cu). Padding rows
+    // replicate the first packed row, matching the host resize rule.
+    pub fn stwo_witness_edge_gather(
+        producer_sub_dev: *const u32,
+        producer_rows: u32,
+        word_base: u32,
+        words_per_instance: u32,
+        n_instances: u32,
+        consumer_rows: u32,
+        consumer_cols_dev: *const *mut u32,
+    ) -> i32;
+
     pub fn stwo_witness_feed_counts(
         sub_words_dev: *const u32,
         column_length: u32,

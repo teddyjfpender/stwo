@@ -1310,6 +1310,19 @@ pub unsafe extern "C" fn pedersen_table_init(_columns: *const *mut u32, _n_rows:
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_witness_edge_gather(
+    _producer_sub_dev: *const u32,
+    _producer_rows: u32,
+    _word_base: u32,
+    _words_per_instance: u32,
+    _n_instances: u32,
+    _consumer_rows: u32,
+    _consumer_cols_dev: *const *mut u32,
+) -> i32 {
+    no_cuda_symbol("stwo_witness_edge_gather")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stwo_witness_feed_counts(
     _sub_words_dev: *const u32,
     _column_length: u32,
