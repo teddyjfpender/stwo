@@ -51,9 +51,15 @@ __global__ void witness_feed_counts_kernel(
         uint32_t rel_index = e[7];
         uint32_t table_size = e[8];
         uint32_t lut_index = e[9];
+        // Memory safety FIRST: the key must be in the LUT/table domain BEFORE
+        // any dereference (an out-of-width tuple — impossible on a valid trace,
+        // where the host feed would panic — must never become an OOB read).
+        // LUT domains equal table_size for every registered family (the LUT
+        // covers the full tuple space).
+        if (key >= table_size) {
+            continue;
+        }
         uint32_t idx = (lut_index == WFC_NO_LUT) ? key : luts[lut_index][key];
-        // Memory safety on garbage keys (a poisoned row can't occur in a
-        // validated recording, but a wrong key must never corrupt memory).
         if (idx < table_size) {
             atomicAdd(&counts[e[10]][(size_t)rel_index * table_size + idx], 1u);
         }
