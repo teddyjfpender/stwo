@@ -8,7 +8,7 @@
 //! the failure mode that disqualified the precompiled NitrooZK kernel set cannot
 //! occur. Falls back to `false` (caller runs the CPU lane) on any failure.
 
-mod cuda_codegen;
+pub(crate) mod cuda_codegen;
 mod program;
 mod recording;
 
@@ -16,6 +16,7 @@ use std::ffi::CString;
 use std::os::raw::c_char;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+pub(crate) use program::lower_framework_eval_to_v1_split as lower_for_aot;
 use program::lower_framework_eval_to_v1_split;
 use stwo_constraint_framework::{FrameworkComponent, FrameworkEval};
 

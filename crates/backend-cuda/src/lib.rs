@@ -5,6 +5,8 @@
 //! (proof byte-equality vs CpuBackend on both Blake2s channels), run on a CUDA box.
 
 mod backend;
+
+pub use backend::aot;
 mod columns;
 
 pub use backend::{

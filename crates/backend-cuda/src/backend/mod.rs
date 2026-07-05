@@ -1,4 +1,5 @@
 mod accumulation;
+pub mod aot;
 #[allow(clippy::module_inception)]
 mod backend;
 mod blake2s;
