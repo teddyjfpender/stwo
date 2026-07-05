@@ -55,6 +55,13 @@ extern "C" bool is_pedersen_table_initialized();
 extern "C" void initialize_pedersen_table();
 extern "C" void get_pedersen_table_column_ptrs(unsigned **output_ptrs, uint32_t *out_n_rows);
 
+// The embedded AOT pack lookup (src/aot_pack.rs, populated by build.rs from
+// kernel_emit's cuda/generated/ sources): (cache_key, sm) -> offline -O3 cubin.
+// GLOBAL scope: extern "C" inside an anonymous namespace gets INTERNAL linkage
+// (the round-28 lesson, standard C13) and rust-lld fails on the Rust-side def.
+extern "C" bool stwo_aot_lookup(uint64_t cache_key, unsigned sm_major, unsigned sm_minor,
+                                const unsigned char **out_data, size_t *out_len);
+
 namespace {
 
 struct JitCache {
@@ -457,11 +464,6 @@ static bool try_cubin_path(const char *source, const char *kernel_name,
 // load) — the per-stage timing logs identify which one was actually spinning.
 // Optimization level changes SASS scheduling only, never the integer/modular values
 // the kernel computes.
-// The embedded AOT pack lookup (src/aot_pack.rs, populated by build.rs from
-// kernel_emit's cuda/generated/ sources): (cache_key, sm) -> offline -O3 cubin.
-extern "C" bool stwo_aot_lookup(uint64_t cache_key, unsigned sm_major, unsigned sm_minor,
-                                const unsigned char **out_data, size_t *out_len);
-
 bool compile_kernel(const char *source, const char *kernel_name, uint64_t semantic_hash,
                     bool relax_opt, CUfunction *out) {
     auto t_start = std::chrono::steady_clock::now();
