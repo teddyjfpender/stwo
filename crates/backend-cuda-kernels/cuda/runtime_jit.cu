@@ -45,6 +45,16 @@
 #include <cstdlib>
 #include <chrono>
 
+// pedersen_table_init.cu exports (same archive), used to fill the per-module
+// witness-deduce table globals. `m31` there is a typedef for uint32_t, so the
+// unsigned* ABI here is identical. MUST be declared at global scope: inside the
+// anonymous namespace below, `extern "C"` declarations still get internal
+// linkage and never resolve to the real symbols (measured: rust-lld undefined
+// `(anonymous namespace)::is_pedersen_table_initialized()`).
+extern "C" bool is_pedersen_table_initialized();
+extern "C" void initialize_pedersen_table();
+extern "C" void get_pedersen_table_column_ptrs(unsigned **output_ptrs, uint32_t *out_n_rows);
+
 namespace {
 
 struct JitCache {
@@ -222,13 +232,6 @@ static bool nvrtc_accepts_dopt_off() {
     }();
     return ok;
 }
-
-// pedersen_table_init.cu exports (same archive), used to fill the per-module
-// witness-deduce table globals. `m31` there is a typedef for uint32_t, so the
-// unsigned* ABI here is identical.
-extern "C" bool is_pedersen_table_initialized();
-extern "C" void initialize_pedersen_table();
-extern "C" void get_pedersen_table_column_ptrs(unsigned **output_ptrs, uint32_t *out_n_rows);
 
 // Witness-JIT modules that embed computed EC deduces (ISA-V3 kinds 2/3,
 // `stwo_wit_deduce.cuh`) declare per-module pedersen table globals — device
