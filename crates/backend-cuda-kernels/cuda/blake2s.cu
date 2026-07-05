@@ -371,7 +371,12 @@ void commit_on_two_layers_with_previous(
 // readers are unchanged). Hashing delegates to blake2s_hash_children_device —
 // the SAME routine the per-layer kernel uses: a scheduling change, not a new
 // hash.
-__global__ void blake2s_tail_kernel(
+// 256 threads, bounded: the inlined children hash is register-fat and a
+// 1024-thread block exceeds the SM register file (launch fails with
+// out-of-resources on H100). Width is irrelevant here — the whole tail is
+// <= 2^12 hashes and the per-level grid-stride loop covers any level width.
+#define STWO_TAIL_BLOCK 256u
+__global__ void __launch_bounds__(STWO_TAIL_BLOCK) blake2s_tail_kernel(
     const Blake2sHash *first,
     uint32_t first_size,
     Blake2sHash *const *out_levels,
@@ -409,7 +414,7 @@ extern "C" int stwo_blake2s_tail(
                 first_size, n_levels);
         return 1;
     }
-    blake2s_tail_kernel<<<1, 1024>>>(first_dev, first_size, out_levels_dev, n_levels);
+    blake2s_tail_kernel<<<1, STWO_TAIL_BLOCK>>>(first_dev, first_size, out_levels_dev, n_levels);
     if (cudaGetLastError() != cudaSuccess) {
         fprintf(stderr, "stwo_blake2s_tail: launch failed\n");
         return 1;
