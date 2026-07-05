@@ -720,6 +720,48 @@ pub fn launch_recorded_builtin_from_device_cols(
     )
 }
 
+/// Builtin launch with MIXED inputs (the B3 edge consumer): leading DEVICE
+/// column pointers (the gathered producer words) plus trailing HOST columns to
+/// upload (enabler/iota — cheap, size-n each). Positional: device cols occupy
+/// slots `0..device_ptrs.len()`, host cols follow.
+pub fn launch_recorded_builtin_mixed(
+    label: &str,
+    device_ptrs: &[*const u32],
+    host_tail_cols: &[Vec<u32>],
+    n: usize,
+    tables: &DeviceExecutionTables,
+    want_host_lookup: bool,
+) -> Option<(Vec<BaseFieldVec>, BaseFieldVec, Vec<u32>, BaseFieldVec, Vec<u32>)> {
+    if !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
+        return None;
+    }
+    let program = super::jit_witness::recorded_program(label)?;
+    let uploaded: Vec<UploadedUint32Vec> = host_tail_cols
+        .iter()
+        .map(|col| UploadedUint32Vec::upload(col))
+        .collect();
+    let mut input_ptrs: Vec<*const u32> = device_ptrs.to_vec();
+    input_ptrs.extend(uploaded.iter().map(|u| u.as_ptr()));
+    let n_inputs = program.n_inputs as usize;
+    if input_ptrs.len() < n_inputs {
+        eprintln!(
+            "jit_prove[{label}]: {} mixed input columns, program reads {n_inputs} — falling back",
+            input_ptrs.len()
+        );
+        return None;
+    }
+    let result = launch_witness_program_core(
+        label,
+        program,
+        &input_ptrs[..n_inputs],
+        n,
+        tables,
+        want_host_lookup,
+    );
+    drop(uploaded);
+    result
+}
+
 /// Gather a consumer's input columns on device from a producer's word-major
 /// sub buffer (witness_edge_gather.cu): allocates `words_per_instance` columns
 /// of `consumer_rows`, launches the gather, returns the device columns.
