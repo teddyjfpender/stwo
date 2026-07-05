@@ -19,30 +19,62 @@
 
 use stwo::core::fields::qm31::SecureField;
 
-/// One logup column's descriptor (see `cuda/logup_pairs.cu` for the device layout).
+/// A fraction side's multiplier source. The generated writers use three forms
+/// (surveyed exhaustively across the 27 lane components — the emitted
+/// `JIT_LOGUP_DESCS` facts): a scalar column in the flats (opcode `mults_0/1`,
+/// aggregator mults), the constant one (paired table lookups), or the real-row
+/// enabler (builtin own-relation columns, `row < n_real`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MultSrc {
+    /// Word offset of a scalar column in the flats.
+    Flat(u32),
+    One,
+    /// `1` for rows `< n_real`, else `0`.
+    Enabler,
+}
+
+/// One logup column's descriptor (see `cuda/logup_pairs.cu` for the device
+/// layout). Signs are EXPLICIT (`neg_*`): the generated writers negate yields in
+/// arbitrary positions (aggregator mid-stream, builtins' trailing enabler solo),
+/// so nothing is implicit — a solo "negated mult" column is `kind = 1` with
+/// `neg_a = true`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LogupColDesc {
-    /// 0 = pair, 1 = trailing solo (negated mult).
+    /// 0 = pair, 1 = solo (B side ignored).
     pub kind: u32,
     pub off_a: u32,
     pub width_a: u32,
-    pub mult_a: u32,
+    pub mult_a: MultSrc,
+    pub neg_a: bool,
     pub off_b: u32,
     pub width_b: u32,
-    pub mult_b: u32,
+    pub mult_b: MultSrc,
+    pub neg_b: bool,
 }
 
 impl LogupColDesc {
     fn to_words(self) -> [u32; 8] {
+        let (kind_a, off_ma) = match self.mult_a {
+            MultSrc::Flat(o) => (0u32, o),
+            MultSrc::One => (1, 0),
+            MultSrc::Enabler => (2, 0),
+        };
+        let (kind_b, off_mb) = match self.mult_b {
+            MultSrc::Flat(o) => (0u32, o),
+            MultSrc::One => (1, 0),
+            MultSrc::Enabler => (2, 0),
+        };
+        let flags =
+            (self.neg_a as u32) | ((self.neg_b as u32) << 1) | (kind_a << 2) | (kind_b << 4);
         [
             self.kind,
             self.off_a,
             self.width_a,
-            self.mult_a,
+            off_ma,
             self.off_b,
             self.width_b,
-            self.mult_b,
-            0,
+            off_mb,
+            flags,
         ]
     }
 }
@@ -77,22 +109,27 @@ pub fn descriptors_for_fields(
             kind: 0,
             off_a: offs[i],
             width_a: fields[i].1 as u32,
-            mult_a: mult_of(fields[i].0),
+            mult_a: MultSrc::Flat(mult_of(fields[i].0)),
+            neg_a: false,
             off_b: offs[i + 1],
             width_b: fields[i + 1].1 as u32,
-            mult_b: mult_of(fields[i + 1].0),
+            mult_b: MultSrc::Flat(mult_of(fields[i + 1].0)),
+            neg_b: false,
         });
         i += 2;
     }
     if i < fields.len() {
+        // The opcode trailing solo column: numerator = -mults_1 (explicit sign).
         descs.push(LogupColDesc {
             kind: 1,
             off_a: offs[i],
             width_a: fields[i].1 as u32,
-            mult_a: mult_of(fields[i].0),
+            mult_a: MultSrc::Flat(mult_of(fields[i].0)),
+            neg_a: true,
             off_b: 0,
             width_b: 0,
-            mult_b: 0,
+            mult_b: MultSrc::One,
+            neg_b: false,
         });
     }
     descs
@@ -109,6 +146,7 @@ pub fn descriptors_for_fields(
 pub fn device_interaction_from_flats(
     flats_device_ptr: *const u32,
     n_rows: usize,
+    n_real: usize,
     descs: &[LogupColDesc],
     alphas: &[SecureField],
     z: SecureField,
@@ -167,6 +205,7 @@ pub fn device_interaction_from_flats(
         stwo_backend_cuda_kernels::raw::stwo_logup_pairs_from_flats(
             flats_device_ptr,
             n_rows as u32,
+            n_real as u32,
             desc_words.as_ptr(),
             descs.len() as u32,
             alpha_words.as_ptr(),

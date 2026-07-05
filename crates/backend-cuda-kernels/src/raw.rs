@@ -583,6 +583,7 @@ extern "C" {
     pub fn stwo_logup_pairs_from_flats(
         flats: *const u32,
         n_rows: u32,
+        n_real: u32,
         descs_host: *const u32,
         n_cols: u32,
         alphas_host: *const u32,

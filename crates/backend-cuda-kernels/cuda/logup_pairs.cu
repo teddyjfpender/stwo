@@ -15,11 +15,15 @@
 // is the existing proven `logup_finalize.cu` path.
 //
 // Descriptor layout (8 u32 per logup column):
-//   [0] kind: 0 = pair, 1 = trailing solo (negated mult)
-//   [1] offA (word offset of tuple A), [2] widthA, [3] multA word offset
-//   [4] offB,                          [5] widthB, [6] multB word offset
-//   (solo columns use the A slots; B slots ignored)
-//   [7] pad/reserved
+//   [0] kind: 0 = pair, 1 = solo (B slots ignored)
+//   [1] offA (word offset of tuple A), [2] widthA, [3] multA word offset (FLAT kind)
+//   [4] offB,                          [5] widthB, [6] multB word offset (FLAT kind)
+//   [7] flags: bit0 negA, bit1 negB, bits2-3 multKindA, bits4-5 multKindB
+//       mult kinds: 0 = FLAT (scalar column at the mult word offset),
+//                   1 = ONE (constant 1), 2 = ENABLER (row < n_real).
+// Signs are explicit — the generated writers negate yields in arbitrary
+// positions; nothing is implicit (the old "solo = negated" rule is now
+// flags bit0 on the emitting side).
 //
 // Correctness gate: the device pairs + finalize must match the HOST
 // `write_interaction_trace` byte-for-byte per column and in claimed sum — the
@@ -52,9 +56,34 @@ static __device__ __forceinline__ qm31 combine_tuple(
     return acc;
 }
 
+// Multiplier fetch per the descriptor's mult kind; sign applied in-field.
+static __device__ __forceinline__ m31 fetch_mult(
+    const uint32_t *flats,
+    uint32_t n_rows,
+    uint32_t row,
+    uint32_t off,
+    uint32_t kind,
+    uint32_t n_real,
+    bool neg
+) {
+    m31 m;
+    if (kind == 1u) {
+        m = 1u;
+    } else if (kind == 2u) {
+        m = row < n_real ? 1u : 0u;
+    } else {
+        m = flats[off * n_rows + row];
+    }
+    if (neg && m != 0u) {
+        m = P - m;
+    }
+    return m;
+}
+
 __global__ void logup_pairs_from_flats_kernel(
     const uint32_t *flats,
     uint32_t n_rows,
+    uint32_t n_real,
     const uint32_t *descs,
     uint32_t n_cols,
     const qm31 *alphas,
@@ -68,18 +97,20 @@ __global__ void logup_pairs_from_flats_kernel(
     }
     for (uint32_t c = 0; c < n_cols; ++c) {
         const uint32_t *d = descs + c * DESC_WORDS;
+        uint32_t flags = d[7];
+        m31 ma = fetch_mult(flats, n_rows, row, d[3], (flags >> 2) & 3u, n_real,
+                            (flags & 1u) != 0u);
         qm31 num, den;
         if (d[0] == 0) {
             qm31 da = combine_tuple(flats, n_rows, row, d[1], d[2], alphas, z);
             qm31 db = combine_tuple(flats, n_rows, row, d[4], d[5], alphas, z);
-            m31 ma = flats[d[3] * n_rows + row];
-            m31 mb = flats[d[6] * n_rows + row];
+            m31 mb = fetch_mult(flats, n_rows, row, d[6], (flags >> 4) & 3u, n_real,
+                                (flags & 2u) != 0u);
+            // num/den = ma/da + mb/db (signs already folded into ma/mb).
             num = add(mul(mb, da), mul(ma, db));
             den = mul(da, db);
         } else {
-            m31 ma = flats[d[3] * n_rows + row];
-            m31 neg_ma = ma == 0 ? 0 : P - ma;
-            num = qm31{{neg_ma, 0}, {0, 0}};
+            num = qm31{{ma, 0}, {0, 0}};
             den = combine_tuple(flats, n_rows, row, d[1], d[2], alphas, z);
         }
         num_cols[c * 4 + 0][row] = num.a.a;
@@ -94,6 +125,7 @@ __global__ void logup_pairs_from_flats_kernel(
 extern "C" bool stwo_logup_pairs_from_flats(
     const uint32_t *flats,
     uint32_t n_rows,
+    uint32_t n_real,
     const uint32_t *descs_host,
     uint32_t n_cols,
     const uint32_t *alphas_host,  // n_alphas * 4 u32 (qm31 coords per power)
@@ -112,7 +144,7 @@ extern "C" bool stwo_logup_pairs_from_flats(
 
     uint32_t blocks = (n_rows + LOGUP_PAIRS_BLOCK - 1) / LOGUP_PAIRS_BLOCK;
     logup_pairs_from_flats_kernel<<<blocks, LOGUP_PAIRS_BLOCK>>>(
-        flats, n_rows, descs, n_cols, alphas, z,
+        flats, n_rows, n_real, descs, n_cols, alphas, z,
         num_cols_device_table, den_dense_device_table);
     cudaError_t err = cudaGetLastError();
     cuda_proving_free(descs);

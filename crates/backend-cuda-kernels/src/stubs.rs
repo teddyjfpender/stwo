@@ -147,6 +147,7 @@ pub unsafe extern "C" fn logup_fraction_chain(
 pub unsafe extern "C" fn stwo_logup_pairs_from_flats(
     _flats: *const u32,
     _n_rows: u32,
+    _n_real: u32,
     _descs_host: *const u32,
     _n_cols: u32,
     _alphas_host: *const u32,
