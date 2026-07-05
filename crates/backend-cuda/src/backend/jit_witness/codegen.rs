@@ -17,7 +17,7 @@ use super::isa::{DeduceKind, WitnessOp, WitnessProgram};
 /// Bumped whenever the emitted source for a fixed program changes, mixed into the
 /// cache key so new source can never collide with PTX an older build persisted for the
 /// same bytecode (same rule as the constraint lane's `CODEGEN_VERSION`).
-pub const WITNESS_CODEGEN_VERSION: u64 = 7;
+pub const WITNESS_CODEGEN_VERSION: u64 = 8;
 
 /// Cache key: program semantic hash mixed (FNV-1a) with [`WITNESS_CODEGEN_VERSION`].
 pub fn witness_jit_cache_key(semantic_hash: u64) -> u64 {
@@ -354,12 +354,17 @@ namespace std {}
 typedef unsigned int uint32_t;
 typedef unsigned long long uint64_t;
 typedef unsigned int m31;
+#define UINT32_MAX 0xFFFFFFFFu
 #if !defined(__align__)
 #define __align__(n) alignas(n)
 #endif
-#define HOST_INLINE __host__ __forceinline__
+// NVRTC compiles device code ONLY and its JIT mode hard-errors on any function
+// carrying __host__ (alone). HOST_* therefore lower to plain __device__ here:
+// host-only chain functions become dead device functions and are discarded,
+// while literal `__host__` sites in the chain sit behind !__CUDACC_RTC__ guards.
+#define HOST_INLINE __device__ __forceinline__
 #define DEVICE_INLINE __device__ __forceinline__
-#define HOST_DEVICE_INLINE __host__ __device__ __forceinline__
+#define HOST_DEVICE_INLINE __device__ __forceinline__
 extern \"C\" __device__ int printf(const char*, ...);
 
 ";

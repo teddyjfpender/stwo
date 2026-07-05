@@ -12,6 +12,10 @@ template <unsigned OPS_COUNT = UINT32_MAX, bool CARRY_IN = false, bool CARRY_OUT
     {
     }
 
+// NVRTC (the witness-JIT embed) compiles device-only: pure-__host__ functions are
+// hard errors in JIT mode, and no host caller can exist there. Offline nvcc builds
+// (which never define __CUDACC_RTC__) keep them verbatim.
+#if !defined(__CUDACC_RTC__)
     __host__ __forceinline__ uint32_t add(const uint32_t x, const uint32_t y, uint32_t &carry)
     {
         index++;
@@ -24,6 +28,7 @@ template <unsigned OPS_COUNT = UINT32_MAX, bool CARRY_IN = false, bool CARRY_OUT
         else
             return host_math::addc(x, y, carry);
     }
+#endif
 
     __device__ __forceinline__ uint32_t add(const uint32_t x, const uint32_t y)
     {
@@ -38,6 +43,7 @@ template <unsigned OPS_COUNT = UINT32_MAX, bool CARRY_IN = false, bool CARRY_OUT
             return ptx::addc(x, y);
     }
 
+#if !defined(__CUDACC_RTC__)
     __host__ __forceinline__ uint32_t sub(const uint32_t x, const uint32_t y, uint32_t &carry)
     {
         index++;
@@ -50,6 +56,7 @@ template <unsigned OPS_COUNT = UINT32_MAX, bool CARRY_IN = false, bool CARRY_OUT
         else
             return host_math::subc(x, y, carry);
     }
+#endif
 
     __device__ __forceinline__ uint32_t sub(const uint32_t x, const uint32_t y)
     {

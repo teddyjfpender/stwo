@@ -399,7 +399,7 @@ __device__ __forceinline__ void felt252_to_m31_limbs(const felt252& value, m31* 
         }
 
         // Extract 9 bits
-        limbs[result_idx] = (m31){(uint32_t)(accumulator & 0x1FF)};
+        limbs[result_idx] = m31{(uint32_t)(accumulator & 0x1FF)}; // brace-init: NVRTC has no compound literals
         accumulator >>= 9;
         bits_in_acc -= 9;
         result_idx++;

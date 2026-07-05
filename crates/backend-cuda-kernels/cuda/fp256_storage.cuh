@@ -13,7 +13,8 @@ template <unsigned LIMBS_COUNT> struct __align__(LIMBS_ALIGNMENT(LIMBS_COUNT)) f
 
 template <unsigned LIMBS_COUNT> struct __align__(LIMBS_ALIGNMENT(LIMBS_COUNT)) ff_storage_wide
 {
-    static_assert(LIMBS_COUNT ^ 1);
+    // Message form: NVRTC JIT mode (the witness embed) rejects one-arg static_assert.
+    static_assert(LIMBS_COUNT ^ 1, "ff_storage_wide requires LIMBS_COUNT != 1");
     static constexpr unsigned LC = LIMBS_COUNT;
     static constexpr unsigned LC2 = LIMBS_COUNT * 2;
     uint32_t limbs[LC2];

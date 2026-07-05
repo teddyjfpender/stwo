@@ -21,12 +21,13 @@ template <class FF_CONFIG> struct ff_dispatch_st
     // return number of bits in modulus
     static constexpr unsigned MBC = CONFIG::modulus_bits_count;
 
-    static constexpr uint32_t get_inv()
+    // HOST_DEVICE_INLINE (house style): NVRTC JIT mode rejects unannotated functions.
+    static constexpr HOST_DEVICE_INLINE uint32_t get_inv()
     {
         return FF_CONFIG::inv;
     }
 
-    static constexpr storage get_zero()
+    static constexpr HOST_DEVICE_INLINE storage get_zero()
     {
         return storage{0};
     }
@@ -535,7 +536,7 @@ template <class FF_CONFIG> struct ff_dispatch_st
     {
         // Forces us to think more carefully about the last carry bit if we use a modulus with fewer than 2 leading
         // zeroes of slack
-        static_assert(!(CONFIG::modulus.limbs[TLC - 1] >> 30));
+        static_assert(!(CONFIG::modulus.limbs[TLC - 1] >> 30), "modulus top limb must leave 2 spare bits");
         storage_wide rs = {0};
         multiply_raw(xs, ys, rs);
         return reduce_wide<REDUCTION_SIZE>(rs);
@@ -554,7 +555,7 @@ template <class FF_CONFIG> struct ff_dispatch_st
     {
         // Forces us to think more carefully about the last carry bit if we use a modulus with fewer than 2 leading
         // zeroes of slack
-        static_assert(!(CONFIG::modulus.limbs[TLC - 1] >> 30));
+        static_assert(!(CONFIG::modulus.limbs[TLC - 1] >> 30), "modulus top limb must leave 2 spare bits");
         storage rs = {0};
         montmul_raw(xs, ys, rs);
         return reduce<REDUCTION_SIZE>(rs);
@@ -564,7 +565,7 @@ template <class FF_CONFIG> struct ff_dispatch_st
     {
         // Forces us to think more carefully about the last carry bit if we use a modulus with fewer than 2 leading
         // zeroes of slack
-        static_assert(!(CONFIG::modulus.limbs[TLC - 1] >> 30));
+        static_assert(!(CONFIG::modulus.limbs[TLC - 1] >> 30), "modulus top limb must leave 2 spare bits");
         storage_wide rs = {0};
         sqr_raw(xs, rs);
         redc_wide_inplace(rs); // after reduce_twopass, tmp's low TLC limbs should represent a value in [0, 2*mod)
@@ -837,6 +838,8 @@ template <class FF_CONFIG> struct ff_dispatch_st
                xs.limbs[4], xs.limbs[5], xs.limbs[6], xs.limbs[7]);
     }
 
+    // Test-utility only; curand headers don't exist under NVRTC (the witness embed).
+#if !defined(__CUDACC_RTC__)
     static DEVICE_INLINE storage device_random(curandState *state)
     {
         storage ret;
@@ -846,6 +849,7 @@ template <class FF_CONFIG> struct ff_dispatch_st
         ret.limbs[7] = 0x3fffffff & ret.limbs[7];
         return reduce<1>(ret);
     }
+#endif
 };
 
 typedef ff_dispatch_st<ff_config_q> fd_q;
