@@ -91,7 +91,12 @@ fn main() {
     collect_dirs(std::path::Path::new("cuda"), &mut include_dirs);
     include_dirs.sort();
 
+    // Archive objects compile on the same bounded pool (independent TUs) with an
+    // mtime cache vs the SOURCE file only — header edits still dirty the build
+    // via cargo's rerun-if-changed on cuda/, which reruns this script into a
+    // fresh OUT_DIR fingerprint. A build.rs edit likewise re-fingerprints.
     let mut objects: Vec<PathBuf> = Vec::with_capacity(sources.len() + 1);
+    let mut obj_jobs: Vec<(PathBuf, PathBuf)> = Vec::new();
     for source in &sources {
         let object = out_dir.join(format!(
             "{}.o",
@@ -100,28 +105,69 @@ fn main() {
                 .expect("kernel file stem")
                 .to_string_lossy()
         ));
-        run_nvcc(
-            Command::new(&nvcc)
-                .arg("-dc")
-                .arg("-O3")
-                .arg("--std=c++17")
-                // The fp256/poseidon252 stack calls `constexpr __host__` accessors from
-                // device code (sppark lineage); nvcc requires this flag for that pattern.
-                .arg("--expt-relaxed-constexpr")
-                .args(
-                    include_dirs
-                        .iter()
-                        .flat_map(|dir| ["-I".to_string(), dir.clone()]),
-                )
-                .arg("-Xcompiler")
-                .arg("-fPIC")
-                .args(&gencode_flags)
-                .args(&extra_flags)
-                .arg(source)
-                .arg("-o")
-                .arg(&object),
-        );
+        let fresh = match (
+            std::fs::metadata(&object).and_then(|m| m.modified()),
+            std::fs::metadata(source).and_then(|m| m.modified()),
+        ) {
+            (Ok(o), Ok(s)) => o >= s,
+            _ => false,
+        };
+        if !fresh {
+            obj_jobs.push((source.clone(), object.clone()));
+        }
         objects.push(object);
+    }
+    if !obj_jobs.is_empty() {
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .min(16)
+            .min(obj_jobs.len());
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let jobs_ref = &obj_jobs;
+        let next_ref = &next;
+        let include_dirs_ref = &include_dirs;
+        let gencode_ref = &gencode_flags;
+        let extra_ref = &extra_flags;
+        let nvcc_ref = &nvcc;
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(move || loop {
+                    let i = next_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some((source, object)) = jobs_ref.get(i) else {
+                        break;
+                    };
+                    let output = Command::new(nvcc_ref)
+                        .arg("-dc")
+                        .arg("-O3")
+                        .arg("--std=c++17")
+                        // The fp256/poseidon252 stack calls `constexpr __host__`
+                        // accessors from device code (sppark lineage); nvcc
+                        // requires this flag for that pattern.
+                        .arg("--expt-relaxed-constexpr")
+                        .args(
+                            include_dirs_ref
+                                .iter()
+                                .flat_map(|dir| ["-I".to_string(), dir.clone()]),
+                        )
+                        .arg("-Xcompiler")
+                        .arg("-fPIC")
+                        .args(gencode_ref.iter())
+                        .args(extra_ref.iter())
+                        .arg(source)
+                        .arg("-o")
+                        .arg(object)
+                        .output()
+                        .expect("nvcc was detected but could not be launched");
+                    assert!(
+                        output.status.success(),
+                        "nvcc failed:\nstdout:\n{}\nstderr:\n{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                });
+            }
+        });
     }
     let dlink = out_dir.join("stwo_cuda_kernels_dlink.o");
     run_nvcc(
@@ -301,6 +347,8 @@ fn build_aot_pack(nvcc: &str, archs: &[String], extra_flags: &[String], out_dir:
         let next = std::sync::atomic::AtomicUsize::new(0);
         let jobs_ref = &jobs;
         let next_ref = &next;
+        let nvcc_ref = &nvcc;
+        let extra_ref = &extra_flags;
         std::thread::scope(|scope| {
             for _ in 0..workers {
                 scope.spawn(move || loop {
@@ -308,13 +356,13 @@ fn build_aot_pack(nvcc: &str, archs: &[String], extra_flags: &[String], out_dir:
                     let Some((source, arch, cubin)) = jobs_ref.get(i) else {
                         break;
                     };
-                    let output = Command::new(nvcc)
+                    let output = Command::new(nvcc_ref)
                         .arg("-cubin")
                         .arg("-O3")
                         .arg("--std=c++17")
                         .arg("--expt-relaxed-constexpr")
                         .arg(format!("-arch={arch}"))
-                        .args(extra_flags)
+                        .args(extra_ref.iter())
                         .arg(source)
                         .arg("-o")
                         .arg(cubin)
