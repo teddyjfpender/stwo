@@ -792,152 +792,152 @@
     "semantic_hash": "598b3f5cd7a508ff"
   },
   {
-    "cache_key": "9eb9f5ea73625198",
-    "file": "witness_add_opcode_9eb9f5ea73625198.cu",
+    "cache_key": "bdb4bcf37e519bb9",
+    "file": "witness_add_opcode_bdb4bcf37e519bb9.cu",
     "kernel_name": "stwo_jit_witness_1535458b582bc8dc",
     "kind": "witness",
     "label": "add_opcode",
     "semantic_hash": "1535458b582bc8dc"
   },
   {
-    "cache_key": "ad4d8011a03a2ff2",
-    "file": "witness_add_opcode_small_ad4d8011a03a2ff2.cu",
+    "cache_key": "cc48471aab297a13",
+    "file": "witness_add_opcode_small_cc48471aab297a13.cu",
     "kernel_name": "stwo_jit_witness_643d6ea7402e00f9",
     "kind": "witness",
     "label": "add_opcode_small",
     "semantic_hash": "643d6ea7402e00f9"
   },
   {
-    "cache_key": "f53350596179ed13",
-    "file": "witness_assert_eq_opcode_f53350596179ed13.cu",
+    "cache_key": "d6388950568aa2f2",
+    "file": "witness_assert_eq_opcode_d6388950568aa2f2.cu",
     "kernel_name": "stwo_jit_witness_c4b01b327c2ce2a3",
     "kind": "witness",
     "label": "assert_eq_opcode",
     "semantic_hash": "c4b01b327c2ce2a3"
   },
   {
-    "cache_key": "8d77850439b07812",
-    "file": "witness_assert_eq_opcode_double_deref_8d77850439b07812.cu",
+    "cache_key": "ac724c0d449fc233",
+    "file": "witness_assert_eq_opcode_double_deref_ac724c0d449fc233.cu",
     "kernel_name": "stwo_jit_witness_06f670fcbec124d8",
     "kind": "witness",
     "label": "assert_eq_opcode_double_deref",
     "semantic_hash": "06f670fcbec124d8"
   },
   {
-    "cache_key": "13f4b9e2a80ebf6d",
-    "file": "witness_assert_eq_opcode_imm_13f4b9e2a80ebf6d.cu",
+    "cache_key": "f4f9f2d99d1f754c",
+    "file": "witness_assert_eq_opcode_imm_f4f9f2d99d1f754c.cu",
     "kernel_name": "stwo_jit_witness_e17e872ded26ebd1",
     "kind": "witness",
     "label": "assert_eq_opcode_imm",
     "semantic_hash": "e17e872ded26ebd1"
   },
   {
-    "cache_key": "3364b8e6e6a8af6e",
-    "file": "witness_blake_round_3364b8e6e6a8af6e.cu",
+    "cache_key": "525f7feff197f98f",
+    "file": "witness_blake_round_525f7feff197f98f.cu",
     "kernel_name": "stwo_jit_witness_f18358c8a451335f",
     "kind": "witness",
     "label": "blake_round",
     "semantic_hash": "f18358c8a451335f"
   },
   {
-    "cache_key": "d3da2414794c88ee",
-    "file": "witness_call_opcode_abs_d3da2414794c88ee.cu",
+    "cache_key": "f2d4eb1d843bd30f",
+    "file": "witness_call_opcode_abs_f2d4eb1d843bd30f.cu",
     "kernel_name": "stwo_jit_witness_3343f9826788070c",
     "kind": "witness",
     "label": "call_opcode_abs",
     "semantic_hash": "3343f9826788070c"
   },
   {
-    "cache_key": "6ba09c522b434afc",
-    "file": "witness_call_opcode_rel_imm_6ba09c522b434afc.cu",
+    "cache_key": "8a9b635b3632951d",
+    "file": "witness_call_opcode_rel_imm_8a9b635b3632951d.cu",
     "kernel_name": "stwo_jit_witness_ce0ddfc37a60580e",
     "kind": "witness",
     "label": "call_opcode_rel_imm",
     "semantic_hash": "ce0ddfc37a60580e"
   },
   {
-    "cache_key": "78d156cb9a5c0090",
-    "file": "witness_cube_252_78d156cb9a5c0090.cu",
+    "cache_key": "97cc1dd4a54b4ab1",
+    "file": "witness_cube_252_97cc1dd4a54b4ab1.cu",
     "kernel_name": "stwo_jit_witness_22ad07ddaf1c1605",
     "kind": "witness",
     "label": "cube_252",
     "semantic_hash": "22ad07ddaf1c1605"
   },
   {
-    "cache_key": "cc0670176db1db84",
-    "file": "witness_jnz_opcode_non_taken_cc0670176db1db84.cu",
+    "cache_key": "eb01372078a125a5",
+    "file": "witness_jnz_opcode_non_taken_eb01372078a125a5.cu",
     "kernel_name": "stwo_jit_witness_1ab1e90dff938797",
     "kind": "witness",
     "label": "jnz_opcode_non_taken",
     "semantic_hash": "1ab1e90dff938797"
   },
   {
-    "cache_key": "3c2b99865851766e",
-    "file": "witness_jnz_opcode_taken_3c2b99865851766e.cu",
+    "cache_key": "5b26608f6340c08f",
+    "file": "witness_jnz_opcode_taken_5b26608f6340c08f.cu",
     "kernel_name": "stwo_jit_witness_b37424b6011f268e",
     "kind": "witness",
     "label": "jnz_opcode_taken",
     "semantic_hash": "b37424b6011f268e"
   },
   {
-    "cache_key": "dfe79c6fc6253636",
-    "file": "witness_jump_opcode_abs_dfe79c6fc6253636.cu",
+    "cache_key": "fee26378d1148057",
+    "file": "witness_jump_opcode_abs_fee26378d1148057.cu",
     "kernel_name": "stwo_jit_witness_5d42e07d1f98cef0",
     "kind": "witness",
     "label": "jump_opcode_abs",
     "semantic_hash": "5d42e07d1f98cef0"
   },
   {
-    "cache_key": "6a662603446527d0",
-    "file": "witness_jump_opcode_double_deref_6a662603446527d0.cu",
+    "cache_key": "8960ed0c4f5471f1",
+    "file": "witness_jump_opcode_double_deref_8960ed0c4f5471f1.cu",
     "kernel_name": "stwo_jit_witness_a2cb569f891013bf",
     "kind": "witness",
     "label": "jump_opcode_double_deref",
     "semantic_hash": "a2cb569f891013bf"
   },
   {
-    "cache_key": "c3a64cd16123918e",
-    "file": "witness_jump_opcode_rel_c3a64cd16123918e.cu",
+    "cache_key": "e2a113da6c12dbaf",
+    "file": "witness_jump_opcode_rel_e2a113da6c12dbaf.cu",
     "kernel_name": "stwo_jit_witness_c7457acb39874135",
     "kind": "witness",
     "label": "jump_opcode_rel",
     "semantic_hash": "c7457acb39874135"
   },
   {
-    "cache_key": "fa59b6ce9b6cbf3f",
-    "file": "witness_jump_opcode_rel_imm_fa59b6ce9b6cbf3f.cu",
+    "cache_key": "db5eefc5907d751e",
+    "file": "witness_jump_opcode_rel_imm_db5eefc5907d751e.cu",
     "kernel_name": "stwo_jit_witness_7db50b96e3fbaedb",
     "kind": "witness",
     "label": "jump_opcode_rel_imm",
     "semantic_hash": "7db50b96e3fbaedb"
   },
   {
-    "cache_key": "524da7936c667edd",
-    "file": "witness_partial_ec_mul_generic_524da7936c667edd.cu",
+    "cache_key": "3352e08a617734bc",
+    "file": "witness_partial_ec_mul_generic_3352e08a617734bc.cu",
     "kernel_name": "stwo_jit_witness_945de91f8879d0ac",
     "kind": "witness",
     "label": "partial_ec_mul_generic",
     "semantic_hash": "945de91f8879d0ac"
   },
   {
-    "cache_key": "53eab0e7262ffe42",
-    "file": "witness_partial_ec_mul_window_bits_18_53eab0e7262ffe42.cu",
+    "cache_key": "72e577f0311f4863",
+    "file": "witness_partial_ec_mul_window_bits_18_72e577f0311f4863.cu",
     "kernel_name": "stwo_jit_witness_d14e690e89d48795",
     "kind": "witness",
     "label": "partial_ec_mul_window_bits_18",
     "semantic_hash": "d14e690e89d48795"
   },
   {
-    "cache_key": "da768c46ab991b74",
-    "file": "witness_pedersen_aggregator_window_bits_18_da768c46ab991b74.cu",
+    "cache_key": "f971534fb6886595",
+    "file": "witness_pedersen_aggregator_window_bits_18_f971534fb6886595.cu",
     "kernel_name": "stwo_jit_witness_b0eb28f739a39f20",
     "kind": "witness",
     "label": "pedersen_aggregator_window_bits_18",
     "semantic_hash": "b0eb28f739a39f20"
   },
   {
-    "cache_key": "8708d462f49bd8ce",
-    "file": "witness_ret_opcode_8708d462f49bd8ce.cu",
+    "cache_key": "a6039b6bff8b22ef",
+    "file": "witness_ret_opcode_a6039b6bff8b22ef.cu",
     "kernel_name": "stwo_jit_witness_a290ddc144ee416a",
     "kind": "witness",
     "label": "ret_opcode",

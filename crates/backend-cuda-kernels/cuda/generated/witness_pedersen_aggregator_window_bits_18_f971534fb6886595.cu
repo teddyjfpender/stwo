@@ -22,7 +22,8 @@ __device__ __forceinline__ unsigned stwo_m31_mul(unsigned lhs, unsigned rhs) {
     return (unsigned)reduced;
 }
 
-// ---- fp256/EC embed prelude (NVRTC context: no headers resolved) ----
+// ---- fp256/EC embed prelude (self-contained TU: no headers resolved) ----
+#define STWO_WIT_EMBED 1
 namespace std {}
 typedef unsigned int uint32_t;
 typedef unsigned long long uint64_t;
@@ -1496,8 +1497,10 @@ template <class FF_CONFIG> struct ff_dispatch_st
                xs.limbs[4], xs.limbs[5], xs.limbs[6], xs.limbs[7]);
     }
 
-    // Test-utility only; curand headers don't exist under NVRTC (the witness embed).
-#if !defined(__CUDACC_RTC__)
+    // Test-utility only; curand headers don't exist in the witness embed —
+    // neither under NVRTC nor as an offline-nvcc self-contained TU (the AOT
+    // pack). STWO_WIT_EMBED is defined by the embed prelude in both modes.
+#if !defined(__CUDACC_RTC__) && !defined(STWO_WIT_EMBED)
     static DEVICE_INLINE storage device_random(curandState *state)
     {
         storage ret;
