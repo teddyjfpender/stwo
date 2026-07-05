@@ -263,7 +263,11 @@ fn build_aot_pack(nvcc: &str, archs: &[String], extra_flags: &[String], out_dir:
 
     let cubin_dir = out_dir.join("aot_cubins");
     std::fs::create_dir_all(&cubin_dir).expect("create aot cubin cache dir");
+    // Collect jobs, then compile stale ones on a bounded worker pool — cubins
+    // are independent TUs and SASS -O3 on the big fp256 kernels takes minutes
+    // each; serial nvcc dominated the first pod build.
     let mut entries: Vec<(u64, u32, PathBuf)> = Vec::new();
+    let mut jobs: Vec<(PathBuf, String, PathBuf)> = Vec::new();
     for source in &sources {
         let stem = source.file_stem().unwrap().to_string_lossy().to_string();
         let key = u64::from_str_radix(stem.rsplit('_').next().unwrap(), 16)
@@ -283,27 +287,48 @@ fn build_aot_pack(nvcc: &str, archs: &[String], extra_flags: &[String], out_dir:
                 _ => false,
             };
             if !fresh {
-                let output = Command::new(nvcc)
-                    .arg("-cubin")
-                    .arg("-O3")
-                    .arg("--std=c++17")
-                    .arg("--expt-relaxed-constexpr")
-                    .arg(format!("-arch={arch}"))
-                    .args(extra_flags)
-                    .arg(source)
-                    .arg("-o")
-                    .arg(&cubin)
-                    .output()
-                    .expect("nvcc launch for AOT cubin");
-                assert!(
-                    output.status.success(),
-                    "nvcc -cubin failed for {}:\n{}",
-                    source.display(),
-                    String::from_utf8_lossy(&output.stderr)
-                );
+                jobs.push((source.clone(), arch.clone(), cubin.clone()));
             }
             entries.push((key, num, cubin));
         }
+    }
+    if !jobs.is_empty() {
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .min(16)
+            .min(jobs.len());
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let jobs_ref = &jobs;
+        let next_ref = &next;
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(move || loop {
+                    let i = next_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some((source, arch, cubin)) = jobs_ref.get(i) else {
+                        break;
+                    };
+                    let output = Command::new(nvcc)
+                        .arg("-cubin")
+                        .arg("-O3")
+                        .arg("--std=c++17")
+                        .arg("--expt-relaxed-constexpr")
+                        .arg(format!("-arch={arch}"))
+                        .args(extra_flags)
+                        .arg(source)
+                        .arg("-o")
+                        .arg(cubin)
+                        .output()
+                        .expect("nvcc launch for AOT cubin");
+                    assert!(
+                        output.status.success(),
+                        "nvcc -cubin failed for {}:\n{}",
+                        source.display(),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                });
+            }
+        });
     }
     let refs: Vec<(u64, u32, &std::path::Path)> = entries
         .iter()
