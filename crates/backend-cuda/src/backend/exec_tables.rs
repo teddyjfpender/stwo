@@ -681,6 +681,56 @@ pub fn launch_recorded_builtin_for_prove(
     result
 }
 
+/// Run the device-DAG count feed (witness_feed_counts.cu) over a launch's
+/// DEVICE-resident sub buffer: uploads the flat descriptors, the LUTs, and one
+/// zeroed count buffer per entry of `count_sizes`, launches, then D2Hs the
+/// count buffers. Returns `None` on stub builds or launch failure — the caller
+/// falls back to host feeds (fail-closed). Synchronous: the returned counts
+/// are complete when this returns (legacy-stream ordering after the witness
+/// kernel that produced `sub_dev`).
+pub fn run_witness_feed_counts(
+    sub_dev: &BaseFieldVec,
+    n_rows: usize,
+    descs: &[u32],
+    luts: &[Vec<u32>],
+    count_sizes: &[usize],
+) -> Option<Vec<Vec<u32>>> {
+    if !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT || descs.is_empty() {
+        return None;
+    }
+    let descs_dev = UploadedUint32Vec::upload(descs);
+    let lut_bufs: Vec<UploadedUint32Vec> =
+        luts.iter().map(|l| UploadedUint32Vec::upload(l)).collect();
+    let lut_ptrs: Vec<*const u32> = lut_bufs.iter().map(|b| b.as_ptr()).collect();
+    let lut_table = UploadedDevicePointerVec::upload(&lut_ptrs);
+    let count_bufs: Vec<BaseFieldVec> = count_sizes
+        .iter()
+        .map(|&sz| BaseFieldVec::new_zeroes(sz))
+        .collect();
+    let count_ptrs: Vec<*const u32> = count_bufs.iter().map(|b| b.device_ptr).collect();
+    let count_table = UploadedDevicePointerVec::upload(&count_ptrs);
+    let rc = unsafe {
+        stwo_backend_cuda_kernels::raw::stwo_witness_feed_counts(
+            sub_dev.device_ptr,
+            n_rows as u32,
+            descs_dev.as_ptr(),
+            (descs.len() / 11) as u32,
+            lut_table.as_ptr(),
+            count_table.as_ptr().cast::<*mut u32>(),
+        )
+    };
+    if rc != 0 {
+        eprintln!("witness feed counts: kernel launch failed (rc={rc}) — host fallback");
+        return None;
+    }
+    let out: Vec<Vec<u32>> = count_bufs
+        .iter()
+        .map(|b| b.to_vec().into_iter().map(|f| f.0).collect())
+        .collect();
+    drop((descs_dev, lut_bufs, lut_table, count_bufs, count_table));
+    Some(out)
+}
+
 /// Component-agnostic launch core shared by the opcode and builtin entries:
 /// guards (mult tables, size governor), output/lookup/sub allocation, codegen,
 /// the Stage-B′ stream-forked launch, and the host D2Hs. `input_ptrs` are
