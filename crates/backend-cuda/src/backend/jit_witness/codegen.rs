@@ -17,7 +17,7 @@ use super::isa::{DeduceKind, WitnessOp, WitnessProgram};
 /// Bumped whenever the emitted source for a fixed program changes, mixed into the
 /// cache key so new source can never collide with PTX an older build persisted for the
 /// same bytecode (same rule as the constraint lane's `CODEGEN_VERSION`).
-pub const WITNESS_CODEGEN_VERSION: u64 = 5;
+pub const WITNESS_CODEGEN_VERSION: u64 = 6;
 
 /// Cache key: program semantic hash mixed (FNV-1a) with [`WITNESS_CODEGEN_VERSION`].
 pub fn witness_jit_cache_key(semantic_hash: u64) -> u64 {
@@ -46,24 +46,22 @@ pub fn compile_witness_to_cuda_source(program: &WitnessProgram) -> Option<String
 
     // ISA-V3 computed deduces: embed the needed __device__ functions (transcribed
     // 1:1 from the host fast_deduction routines; validated by the truth-oracle legs
-    // + the component differential on hardware). Kinds without an embedded device
-    // implementation yet (the fp256 EC family) return None — the caller falls back
-    // to the host lane, never a wrong kernel.
+    // + the component differential on hardware). Blake kinds embed small inline
+    // functions; the fp256/EC kinds pull in the kernels crate's fp256 chain +
+    // `stwo_wit_deduce.cuh` (see `emit_fp256_deduce_support`).
     let mut kinds_used: Vec<DeduceKind> = Vec::new();
     for inst in &program.insts {
         if WitnessOp::from_raw(inst.op) == Some(WitnessOp::DeduceCall) {
             let kind = DeduceKind::from_raw(inst.imm)?;
-            match kind {
-                DeduceKind::BlakeG | DeduceKind::BlakeRoundSigma => {}
-                // fp256/EC device functions land with the pod-session header.
-                DeduceKind::PartialEcMulW18 | DeduceKind::PedersenPointsTableW18 => {
-                    return None;
-                }
-            }
             if !kinds_used.contains(&kind) {
                 kinds_used.push(kind);
             }
         }
+    }
+    if kinds_used.contains(&DeduceKind::PartialEcMulW18)
+        || kinds_used.contains(&DeduceKind::PedersenPointsTableW18)
+    {
+        emit_fp256_deduce_support(&mut src);
     }
     if kinds_used.contains(&DeduceKind::BlakeG) {
         // fast_deduction/blake.rs::PackedBlakeG::blake_g, verbatim on scalar u32
@@ -219,8 +217,15 @@ fn emit_body(program: &WitnessProgram, src: &mut String) -> Option<()> {
                              STWO_WIT_BLAKE_SIGMA[dargs{seq}[0]][i]; }}\n"
                         ));
                     }
-                    DeduceKind::PartialEcMulW18 | DeduceKind::PedersenPointsTableW18 => {
-                        return None; // device impl pends (fp256 header).
+                    DeduceKind::PartialEcMulW18 => {
+                        src.push_str(&format!(
+                            "    stwo_wit_deduce_partial_ec_mul_w18(dargs{seq}, douts{seq});\n"
+                        ));
+                    }
+                    DeduceKind::PedersenPointsTableW18 => {
+                        src.push_str(&format!(
+                            "    stwo_wit_deduce_pedersen_points_w18(dargs{seq}, douts{seq});\n"
+                        ));
                     }
                 }
                 let base = inst.dst as usize;
@@ -298,6 +303,59 @@ fn emit_body(program: &WitnessProgram, src: &mut String) -> Option<()> {
         src.push_str(&format!("    {decl}r{dst} = {expr};\n"));
     }
     Some(())
+}
+
+/// fp256/EC computed-deduce support: the kernels crate's proven fp256 chain
+/// (storage → ptx carries → host math → carry chain → config → dispatch →
+/// ec_ops) plus the `stwo_wit_deduce.cuh` shim, textually embedded because
+/// NVRTC resolves no `#include`. The prelude supplies exactly what the stripped
+/// includes provided (`<cstdint>` typedefs, the `utils.cuh` inline macros, the
+/// `fields.cuh` m31 typedef, device printf for the chain's debug branches);
+/// `size_t` is an NVRTC builtin. Only emitted when a program actually carries
+/// EC deduces — the embed is ~70KB of source and only the pedersen-family
+/// kernels should pay the NVRTC time for it.
+///
+/// The embedded `stwo_wit_deduce.cuh` defines module-scope table globals
+/// (`g_stwo_wit_pedersen_cols` / `..._n_rows`) which `runtime_jit.cu` fills
+/// right after module load — device globals do not cross CUmodule boundaries.
+fn emit_fp256_deduce_support(src: &mut String) {
+    const PRELUDE: &str = "\
+// ---- fp256/EC embed prelude (NVRTC context: no headers resolved) ----
+namespace std {}
+typedef unsigned int uint32_t;
+typedef unsigned long long uint64_t;
+typedef unsigned int m31;
+#if !defined(__align__)
+#define __align__(n) alignas(n)
+#endif
+#define HOST_INLINE __host__ __forceinline__
+#define DEVICE_INLINE __device__ __forceinline__
+#define HOST_DEVICE_INLINE __host__ __device__ __forceinline__
+extern \"C\" __device__ int printf(const char*, ...);
+
+";
+    const CHAIN: [&str; 8] = [
+        include_str!("../../../../backend-cuda-kernels/cuda/fp256_storage.cuh"),
+        include_str!("../../../../backend-cuda-kernels/cuda/ptx.cuh"),
+        include_str!("../../../../backend-cuda-kernels/cuda/fp256_host_math.cuh"),
+        include_str!("../../../../backend-cuda-kernels/cuda/fp256_carry_chain.cuh"),
+        include_str!("../../../../backend-cuda-kernels/cuda/fp256_config.cuh"),
+        include_str!("../../../../backend-cuda-kernels/cuda/fp256_dispatch_st.cuh"),
+        include_str!("../../../../backend-cuda-kernels/cuda/ec_ops.cuh"),
+        include_str!("../../../../backend-cuda-kernels/cuda/stwo_wit_deduce.cuh"),
+    ];
+    src.push_str(PRELUDE);
+    for file in CHAIN {
+        for line in file.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("#include") || trimmed.starts_with("#pragma once") {
+                continue;
+            }
+            src.push_str(line);
+            src.push('\n');
+        }
+    }
+    src.push('\n');
 }
 
 fn emit_preamble(src: &mut String) {
@@ -421,6 +479,56 @@ mod tests {
         a = a.wrapping_add(b).wrapping_add(11);
         assert_eq!(out.columns[0], a);
         assert_eq!(out.columns[2], 3); // SIGMA[1][15]
+    }
+
+    #[test]
+    fn ec_deduce_codegen_embeds_fp256_support() {
+        use super::super::isa::DeduceKind;
+
+        // One W18 EC round chained into a points-table read — the aggregator shape.
+        let mut r = WitnessRecorder::new("ec_deduce_probe");
+        let ins: Vec<_> = (0..72).map(|i| r.input(i)).collect();
+        let round = r.deduce(DeduceKind::PartialEcMulW18, &ins);
+        let point = r.deduce(DeduceKind::PedersenPointsTableW18, &round[..1]);
+        r.col_write(0, round[71]);
+        r.col_write(1, point[55]);
+        let prog = r.finish();
+
+        let src = compile_witness_to_cuda_source(&prog).expect("EC deduce codegen succeeds");
+        assert!(
+            src.contains("stwo_wit_deduce_partial_ec_mul_w18(dargs0, douts0);"),
+            "missing W18 call"
+        );
+        assert!(
+            src.contains("stwo_wit_deduce_pedersen_points_w18(dargs1, douts1);"),
+            "missing points call"
+        );
+        // The full fp256 chain + shim + per-module table globals are embedded…
+        assert!(src.contains("ff_dispatch_st"));
+        assert!(src.contains("ec_add_affine"));
+        assert!(src.contains("g_stwo_wit_pedersen_cols"));
+        // …and self-contained: NVRTC resolves no includes.
+        assert!(!src.contains("#include"), "unstripped #include in embed");
+        assert!(src.contains("douts0[72]"));
+        assert!(src.contains("douts1[56]"));
+    }
+
+    #[test]
+    fn blake_only_programs_skip_fp256_embed() {
+        use super::super::isa::DeduceKind;
+
+        // Compile-size guard: the ~70KB fp256 chain must only be paid by kernels
+        // that actually carry EC deduces.
+        let mut r = WitnessRecorder::new("blake_only_probe");
+        let ins: Vec<_> = (0..6).map(|i| r.input(i)).collect();
+        let g = r.deduce(DeduceKind::BlakeG, &ins);
+        r.col_write(0, g[0]);
+        let prog = r.finish();
+
+        let src = compile_witness_to_cuda_source(&prog).expect("codegen succeeds");
+        assert!(src.contains("stwo_wit_blake_g"));
+        assert!(!src.contains("ff_dispatch_st"));
+        assert!(!src.contains("g_stwo_wit_pedersen_cols"));
     }
 
     #[test]

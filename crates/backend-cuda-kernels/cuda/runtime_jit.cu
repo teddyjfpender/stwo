@@ -223,6 +223,64 @@ static bool nvrtc_accepts_dopt_off() {
     return ok;
 }
 
+// pedersen_table_init.cu exports (same archive), used to fill the per-module
+// witness-deduce table globals. `m31` there is a typedef for uint32_t, so the
+// unsigned* ABI here is identical.
+extern "C" bool is_pedersen_table_initialized();
+extern "C" void initialize_pedersen_table();
+extern "C" void get_pedersen_table_column_ptrs(unsigned **output_ptrs, uint32_t *out_n_rows);
+
+// Witness-JIT modules that embed computed EC deduces (ISA-V3 kinds 2/3,
+// `stwo_wit_deduce.cuh`) declare per-module pedersen table globals — device
+// globals never cross CUmodule boundaries, so each loaded module needs its own
+// copy filled. Symbol absent = the kernel has no EC deduces (composition
+// kernels, non-EC witness kernels): nothing to do. Any failure fails the whole
+// load — the Rust caller then falls back to the host lane rather than
+// launching a kernel that would dereference null table pointers.
+static bool fill_witness_pedersen_globals(CUmodule module, const char *kernel_name) {
+    CUdeviceptr cols_sym;
+    size_t cols_size = 0;
+    if (cuModuleGetGlobal(&cols_sym, &cols_size, module, "g_stwo_wit_pedersen_cols") !=
+        CUDA_SUCCESS) {
+        return true;
+    }
+    if (!is_pedersen_table_initialized()) {
+        // Self-heal: generate the owned device table (the aggregator kernel
+        // compiling at all implies pedersen work is present in this prove).
+        initialize_pedersen_table();
+    }
+    if (!is_pedersen_table_initialized()) {
+        fprintf(stderr, "stwo JIT: %s needs the pedersen table but init failed\n",
+                kernel_name);
+        return false;
+    }
+    unsigned *ptrs[56];
+    uint32_t n_rows = 0;
+    get_pedersen_table_column_ptrs(ptrs, &n_rows);
+    // The deduce functions mask row indices with n_rows-1; a non-power-of-two
+    // count would silently alias rows, so reject it here instead.
+    if (cols_size < sizeof(ptrs) || n_rows == 0 || (n_rows & (n_rows - 1)) != 0) {
+        fprintf(stderr,
+                "stwo JIT: pedersen table globals malformed for %s (sym_bytes=%zu n_rows=%u)\n",
+                kernel_name, cols_size, n_rows);
+        return false;
+    }
+    CUdeviceptr rows_sym;
+    size_t rows_size = 0;
+    if (cuMemcpyHtoD(cols_sym, ptrs, sizeof(ptrs)) != CUDA_SUCCESS ||
+        cuModuleGetGlobal(&rows_sym, &rows_size, module, "g_stwo_wit_pedersen_n_rows") !=
+            CUDA_SUCCESS ||
+        rows_size < sizeof(n_rows) ||
+        cuMemcpyHtoD(rows_sym, &n_rows, sizeof(n_rows)) != CUDA_SUCCESS) {
+        fprintf(stderr, "stwo JIT: failed filling pedersen table globals for %s\n",
+                kernel_name);
+        return false;
+    }
+    // Table generation launches ran on the legacy stream via the runtime API;
+    // make their completion visible to witness launches on any stream.
+    return cudaDeviceSynchronize() == cudaSuccess;
+}
+
 // CUBIN (SASS) fast path: emit/reuse a real-arch cubin and load it with
 // cuModuleLoadData, which does NOT run the driver's ptxas (the cubin is already SASS).
 // This is what turns a cold process's per-module PTX->SASS assembly (measured 56.4 s on
@@ -367,6 +425,9 @@ static bool try_cubin_path(const char *source, const char *kernel_name,
         if (jit_log_enabled()) {
             fprintf(stderr, "stwo JIT: kernel %s not found in cubin module\n", kernel_name);
         }
+        return false;
+    }
+    if (!fill_witness_pedersen_globals(module, kernel_name)) {
         return false;
     }
     if (jit_log_enabled()) {
@@ -518,6 +579,9 @@ bool compile_kernel(const char *source, const char *kernel_name, uint64_t semant
     }
     if (cuModuleGetFunction(out, module, kernel_name) != CUDA_SUCCESS) {
         fprintf(stderr, "stwo JIT: kernel %s not found in module\n", kernel_name);
+        return false;
+    }
+    if (!fill_witness_pedersen_globals(module, kernel_name)) {
         return false;
     }
     if (jit_log_enabled()) {

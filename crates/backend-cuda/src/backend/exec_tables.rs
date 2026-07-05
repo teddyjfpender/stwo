@@ -596,7 +596,6 @@ pub fn launch_recorded_witness_for_prove(
     }
     let program = super::jit_witness::recorded_program(label)?;
     let n = samples.len();
-    let n_cols = program.n_cols as usize;
     if program.n_inputs > 4 {
         eprintln!(
             "jit_prove[{label}]: program has {} inputs (>4), falling back",
@@ -604,6 +603,86 @@ pub fn launch_recorded_witness_for_prove(
         );
         return None;
     }
+
+    // Input columns: pc/ap/fp + enabler (1 for real rows, 0 for padding).
+    let pc_col = BaseFieldVec::from_vec(samples.iter().map(|s| bf(s.0)).collect());
+    let ap_col = BaseFieldVec::from_vec(samples.iter().map(|s| bf(s.1)).collect());
+    let fp_col = BaseFieldVec::from_vec(samples.iter().map(|s| bf(s.2)).collect());
+    let enabler_col = BaseFieldVec::from_vec((0..n).map(|i| bf(u32::from(i < n_real))).collect());
+    let input_ptrs: Vec<*const u32> = vec![
+        pc_col.device_ptr,
+        ap_col.device_ptr,
+        fp_col.device_ptr,
+        enabler_col.device_ptr,
+    ];
+
+    let result =
+        launch_witness_program_core(label, program, &input_ptrs, n, tables, want_host_lookup);
+    // Inputs may be dropped now (the core launch is synchronous through its D2H).
+    drop((pc_col, ap_col, fp_col, enabler_col));
+    result
+}
+
+/// Builtin-family launch (the automated D′ lane): the CALLER provides the
+/// slot-layout input columns — `[flat input words 0..K | enabler K | iota K+1 |
+/// mults K+2+j]`, felt inputs pre-flattened to 28 consecutive 9-bit-limb
+/// columns — as RAW u32 host columns. Raw because blake message words exceed
+/// the M31 modulus and limb slices are bit-patterns: no BaseField
+/// canonicalization may touch them (the kernel reads plain `unsigned`).
+///
+/// The column count must equal the recording's `n_inputs` EXACTLY — the layout
+/// is positional, and a mismatch means the caller and the recording disagree
+/// about the slot contract, so this falls back (fail-closed) rather than
+/// launching a kernel that would read garbage slots.
+pub fn launch_recorded_builtin_for_prove(
+    label: &str,
+    input_cols: &[Vec<u32>],
+    tables: &DeviceExecutionTables,
+    want_host_lookup: bool,
+) -> Option<(Vec<BaseFieldVec>, BaseFieldVec, Vec<u32>, Vec<u32>)> {
+    if !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
+        return None;
+    }
+    let program = super::jit_witness::recorded_program(label)?;
+    if program.n_inputs as usize != input_cols.len() {
+        eprintln!(
+            "jit_prove[{label}]: {} input columns provided, program reads {} — falling back",
+            input_cols.len(),
+            program.n_inputs
+        );
+        return None;
+    }
+    let n = input_cols.first().map_or(0, Vec::len);
+    if n == 0 || input_cols.iter().any(|c| c.len() != n) {
+        eprintln!("jit_prove[{label}]: ragged or empty input columns — falling back");
+        return None;
+    }
+    let uploaded: Vec<UploadedUint32Vec> = input_cols
+        .iter()
+        .map(|col| UploadedUint32Vec::upload(col))
+        .collect();
+    let input_ptrs: Vec<*const u32> = uploaded.iter().map(|u| u.as_ptr()).collect();
+
+    let result =
+        launch_witness_program_core(label, program, &input_ptrs, n, tables, want_host_lookup);
+    drop(uploaded);
+    result
+}
+
+/// Component-agnostic launch core shared by the opcode and builtin entries:
+/// guards (mult tables, size governor), output/lookup/sub allocation, codegen,
+/// the Stage-B′ stream-forked launch, and the host D2Hs. `input_ptrs` are
+/// device column pointers in the program's slot order; the caller keeps their
+/// buffers alive across the call (the launch is synchronous through the D2H).
+fn launch_witness_program_core(
+    label: &str,
+    program: &super::jit_witness::isa::WitnessProgram,
+    input_ptrs: &[*const u32],
+    n: usize,
+    tables: &DeviceExecutionTables,
+    want_host_lookup: bool,
+) -> Option<(Vec<BaseFieldVec>, BaseFieldVec, Vec<u32>, Vec<u32>)> {
+    let n_cols = program.n_cols as usize;
     if program.n_mult_tables > 0 {
         // Multiplicity tables need real device columns + a host merge that this path
         // does not wire yet; launching with the selftest's 1-element dummies would be
@@ -630,18 +709,7 @@ pub fn launch_recorded_witness_for_prove(
         return None;
     }
 
-    // Input columns: pc/ap/fp + enabler (1 for real rows, 0 for padding).
-    let pc_col = BaseFieldVec::from_vec(samples.iter().map(|s| bf(s.0)).collect());
-    let ap_col = BaseFieldVec::from_vec(samples.iter().map(|s| bf(s.1)).collect());
-    let fp_col = BaseFieldVec::from_vec(samples.iter().map(|s| bf(s.2)).collect());
-    let enabler_col = BaseFieldVec::from_vec((0..n).map(|i| bf(u32::from(i < n_real))).collect());
-    let input_ptrs: Vec<*const u32> = vec![
-        pc_col.device_ptr,
-        ap_col.device_ptr,
-        fp_col.device_ptr,
-        enabler_col.device_ptr,
-    ];
-    let input_table = UploadedDevicePointerVec::upload(&input_ptrs);
+    let input_table = UploadedDevicePointerVec::upload(input_ptrs);
 
     let (table_ptrs, table_lens) = witness_table_pointers(tables);
     let base_table = UploadedDevicePointerVec::upload(&table_ptrs);
@@ -704,15 +772,12 @@ pub fn launch_recorded_witness_for_prove(
         Vec::new()
     };
     let sub_host: Vec<u32> = sub_words.to_vec().into_iter().map(|f| f.0).collect();
-    // Inputs/tables may be dropped now (launch is synchronous through the D2H above);
-    // the returned out_cols stay device-resident for the committed tree, and the
-    // DEVICE lookup buffer rides along for the §6a device-interaction lane (born
-    // exactly where `logup_pairs.cu` consumes it).
+    // Tables may be dropped now (launch is synchronous through the D2H above); the
+    // returned out_cols stay device-resident for the committed tree, and the DEVICE
+    // lookup buffer rides along for the §6a device-interaction lane (born exactly
+    // where `logup_pairs.cu` consumes it). Caller-owned input buffers outlive this
+    // call by the core's contract.
     drop((
-        pc_col,
-        ap_col,
-        fp_col,
-        enabler_col,
         strides,
         sub_words,
         mult_cols,

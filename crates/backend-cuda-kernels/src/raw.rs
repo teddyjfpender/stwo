@@ -899,4 +899,18 @@ extern "C" {
     pub fn stwo_fanout_stream(i: i32) -> *mut core::ffi::c_void;
     pub fn stwo_fanout_fork(stream: *mut core::ffi::c_void);
     pub fn stwo_fanout_join(stream: *mut core::ffi::c_void);
+
+    // Truth oracle for the witness-JIT computed EC deduces (ISA-V3 kinds 2/3):
+    // runs the exact `stwo_wit_deduce_*` device functions the JIT kernels embed
+    // from a precompiled kernel (see `stwo_wit_deduce_oracle.cu`), so the pod
+    // ladder can compare against the host `fast_deduction` before trusting any
+    // JIT kernel. Buffers are flat per the recorder shapes (kind 2: 72->72
+    // words per item; kind 3: 1->56). Returns 0 on success; nonzero means "no
+    // data" (unknown kind, table init failure, CUDA error) — never zeros.
+    pub fn stwo_wit_deduce_oracle_run(
+        kind: u32,
+        h_in: *const u32,
+        h_out: *mut u32,
+        n_items: u32,
+    ) -> i32;
 }

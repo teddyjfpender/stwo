@@ -1293,3 +1293,13 @@ pub unsafe extern "C" fn stwo_fanout_fork(_stream: *mut core::ffi::c_void) {
 pub unsafe extern "C" fn stwo_fanout_join(_stream: *mut core::ffi::c_void) {
     no_cuda_symbol("stwo_fanout_join")
 }
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_wit_deduce_oracle_run(
+    _kind: u32,
+    _h_in: *const u32,
+    _h_out: *mut u32,
+    _n_items: u32,
+) -> i32 {
+    no_cuda_symbol("stwo_wit_deduce_oracle_run")
+}
