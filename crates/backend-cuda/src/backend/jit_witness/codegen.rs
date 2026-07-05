@@ -17,7 +17,7 @@ use super::isa::{DeduceKind, WitnessOp, WitnessProgram};
 /// Bumped whenever the emitted source for a fixed program changes, mixed into the
 /// cache key so new source can never collide with PTX an older build persisted for the
 /// same bytecode (same rule as the constraint lane's `CODEGEN_VERSION`).
-pub const WITNESS_CODEGEN_VERSION: u64 = 6;
+pub const WITNESS_CODEGEN_VERSION: u64 = 7;
 
 /// Cache key: program semantic hash mixed (FNV-1a) with [`WITNESS_CODEGEN_VERSION`].
 pub fn witness_jit_cache_key(semantic_hash: u64) -> u64 {
@@ -58,9 +58,18 @@ pub fn compile_witness_to_cuda_source(program: &WitnessProgram) -> Option<String
             }
         }
     }
-    if kinds_used.contains(&DeduceKind::PartialEcMulW18)
-        || kinds_used.contains(&DeduceKind::PedersenPointsTableW18)
-    {
+    let uses_fp256 = |k: &DeduceKind| {
+        matches!(
+            k,
+            DeduceKind::PartialEcMulW18
+                | DeduceKind::PedersenPointsTableW18
+                | DeduceKind::FeltAdd
+                | DeduceKind::FeltSub
+                | DeduceKind::FeltMul
+                | DeduceKind::FeltDiv
+        )
+    };
+    if kinds_used.iter().any(uses_fp256) {
         emit_fp256_deduce_support(&mut src);
     }
     if kinds_used.contains(&DeduceKind::BlakeG) {
@@ -225,6 +234,26 @@ fn emit_body(program: &WitnessProgram, src: &mut String) -> Option<()> {
                     DeduceKind::PedersenPointsTableW18 => {
                         src.push_str(&format!(
                             "    stwo_wit_deduce_pedersen_points_w18(dargs{seq}, douts{seq});\n"
+                        ));
+                    }
+                    DeduceKind::FeltAdd => {
+                        src.push_str(&format!(
+                            "    stwo_wit_deduce_felt_add(dargs{seq}, douts{seq});\n"
+                        ));
+                    }
+                    DeduceKind::FeltSub => {
+                        src.push_str(&format!(
+                            "    stwo_wit_deduce_felt_sub(dargs{seq}, douts{seq});\n"
+                        ));
+                    }
+                    DeduceKind::FeltMul => {
+                        src.push_str(&format!(
+                            "    stwo_wit_deduce_felt_mul(dargs{seq}, douts{seq});\n"
+                        ));
+                    }
+                    DeduceKind::FeltDiv => {
+                        src.push_str(&format!(
+                            "    stwo_wit_deduce_felt_div(dargs{seq}, douts{seq});\n"
                         ));
                     }
                 }
@@ -511,6 +540,37 @@ mod tests {
         assert!(!src.contains("#include"), "unstripped #include in embed");
         assert!(src.contains("douts0[72]"));
         assert!(src.contains("douts1[56]"));
+    }
+
+    #[test]
+    fn felt_deduce_codegen_embeds_fp256_support() {
+        use super::super::isa::DeduceKind;
+
+        // A chained slope computation: div feeding mul feeding sub — the
+        // partial_ec_mul shape.
+        let mut r = WitnessRecorder::new("felt_deduce_probe");
+        let ins: Vec<_> = (0..112).map(|i| r.input(i)).collect();
+        let q = r.deduce(DeduceKind::FeltDiv, &ins[..56]);
+        let mut margs = q.clone();
+        margs.extend_from_slice(&ins[56..84]);
+        let m = r.deduce(DeduceKind::FeltMul, &margs);
+        let mut sargs = m.clone();
+        sargs.extend_from_slice(&ins[84..112]);
+        let d = r.deduce(DeduceKind::FeltSub, &sargs);
+        let mut aargs = d.clone();
+        aargs.extend_from_slice(&ins[..28]);
+        let a = r.deduce(DeduceKind::FeltAdd, &aargs);
+        r.col_write(0, a[27]);
+        let prog = r.finish();
+
+        let src = compile_witness_to_cuda_source(&prog).expect("felt codegen succeeds");
+        assert!(src.contains("stwo_wit_deduce_felt_div(dargs0, douts0);"));
+        assert!(src.contains("stwo_wit_deduce_felt_mul(dargs1, douts1);"));
+        assert!(src.contains("stwo_wit_deduce_felt_sub(dargs2, douts2);"));
+        assert!(src.contains("stwo_wit_deduce_felt_add(dargs3, douts3);"));
+        assert!(src.contains("ff_dispatch_st"), "fp256 chain embedded");
+        assert!(src.contains("douts0[28]"));
+        assert!(!src.contains("#include"));
     }
 
     #[test]

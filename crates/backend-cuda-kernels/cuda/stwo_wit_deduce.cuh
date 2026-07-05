@@ -83,4 +83,57 @@ static __device__ __forceinline__ void stwo_wit_deduce_partial_ec_mul_w18(
     felt252_to_m31_limbs(sum.y, out + 44);
 }
 
+// ---- DeduceKind::Felt{Add,Sub,Mul,Div} (4-7): fp256 body arithmetic ---------------
+//
+// in[56] = [a limbs 0..28 | b limbs 28..56], out[28] = result limbs. Host
+// reference: stwo-cairo `Felt252`'s operators, whose Montgomery compensation
+// factors make the limb encoding CANONICAL VALUES in and out (cpu.rs — the
+// `FELT252_MONT_MUL_FACTOR` construction). Add/sub are linear, so raw-word
+// modular add/sub is already canonical; mul/div convert to Montgomery, operate,
+// and convert back — the exact operand pattern `ec_add_affine` uses internally
+// (lambda = dy * dx^-1 with both operands in Montgomery form), so no novel
+// fp256 algebra is introduced here.
+//
+// Division by zero: the host PANICS ("Division by zero"). Real writer traces
+// never divide by zero (the sites are EC slope denominators, and padding rows
+// replicate real rows); on device `felt_inverse(0)` yields an unspecified word
+// and the differential gates fail loudly if that premise ever breaks.
+
+static __device__ __forceinline__ void stwo_wit_deduce_felt_add(
+    const unsigned* in, unsigned* out) {
+    felt252 a, b;
+    felt252_from_m31_limbs(a, in);
+    felt252_from_m31_limbs(b, in + 28);
+    felt252 r = felt_add(a, b);
+    felt252_to_m31_limbs(r, out);
+}
+
+static __device__ __forceinline__ void stwo_wit_deduce_felt_sub(
+    const unsigned* in, unsigned* out) {
+    felt252 a, b;
+    felt252_from_m31_limbs(a, in);
+    felt252_from_m31_limbs(b, in + 28);
+    felt252 r = felt_sub(a, b);
+    felt252_to_m31_limbs(r, out);
+}
+
+static __device__ __forceinline__ void stwo_wit_deduce_felt_mul(
+    const unsigned* in, unsigned* out) {
+    felt252 a, b;
+    felt252_from_m31_limbs(a, in);
+    felt252_from_m31_limbs(b, in + 28);
+    felt252 r = felt_from_mont(felt_mul(felt_to_mont(a), felt_to_mont(b)));
+    felt252_to_m31_limbs(r, out);
+}
+
+static __device__ __forceinline__ void stwo_wit_deduce_felt_div(
+    const unsigned* in, unsigned* out) {
+    felt252 a, b;
+    felt252_from_m31_limbs(a, in);
+    felt252_from_m31_limbs(b, in + 28);
+    felt252 r =
+        felt_from_mont(felt_mul(felt_to_mont(a), felt_inverse(felt_to_mont(b))));
+    felt252_to_m31_limbs(r, out);
+}
+
 #endif // STWO_WIT_DEDUCE_CUH

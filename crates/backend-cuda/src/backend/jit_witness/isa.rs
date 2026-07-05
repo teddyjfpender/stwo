@@ -134,6 +134,15 @@ pub enum DeduceKind {
     /// `fast_deduction::pedersen::PackedPedersenPointsTableWindowBits18`:
     /// `index -> [x_felt, y_felt]` as 56 limb words.
     PedersenPointsTableW18 = 3,
+    /// fp256 body arithmetic (the partial_ec_mul writers' inline `Felt252`
+    /// operators): args = `[a limbs | b limbs]` (56), out = result limbs (28).
+    /// Host semantics = `Felt252`'s canonical-value field ops (cpu.rs).
+    FeltAdd = 4,
+    FeltSub = 5,
+    FeltMul = 6,
+    /// Division by zero panics on the host; the writers only divide by EC slope
+    /// denominators, never zero on valid traces.
+    FeltDiv = 7,
 }
 
 impl DeduceKind {
@@ -143,6 +152,10 @@ impl DeduceKind {
             1 => Self::BlakeRoundSigma,
             2 => Self::PartialEcMulW18,
             3 => Self::PedersenPointsTableW18,
+            4 => Self::FeltAdd,
+            5 => Self::FeltSub,
+            6 => Self::FeltMul,
+            7 => Self::FeltDiv,
             _ => return None,
         })
     }
@@ -153,6 +166,7 @@ impl DeduceKind {
             Self::BlakeRoundSigma => (1, 16),
             Self::PartialEcMulW18 => (72, 72),
             Self::PedersenPointsTableW18 => (1, 56),
+            Self::FeltAdd | Self::FeltSub | Self::FeltMul | Self::FeltDiv => (56, 28),
         }
     }
 }
