@@ -12,6 +12,7 @@
 //! `stwo-backend-testkit` (proof byte-equality on both Blake2s channels), mirroring
 //! `stwo-backend-metal`.
 
+pub mod aot_pack;
 pub mod raw;
 #[cfg(not(stwo_cuda_link))]
 mod stubs;

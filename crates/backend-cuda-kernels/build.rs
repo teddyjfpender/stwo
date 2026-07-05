@@ -41,12 +41,12 @@ fn main() {
         .output()
         .map(|output| output.status.success())
         .unwrap_or(false);
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR must be set"));
     if !nvcc_available {
+        write_aot_pack(&out_dir, &[]);
         println!("cargo:rustc-env=STWO_CUDA_BUILD_MODE=no-cuda");
         return;
     }
-
-    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR must be set"));
     // STWO_CUDA_ARCH accepts a comma list (e.g. "sm_86,sm_90") to build a fat binary
     // that runs on multiple GPU generations — one release artifact for 3090 and H100.
     let archs: Vec<String> = env::var("STWO_CUDA_ARCH")
@@ -151,6 +151,8 @@ fn main() {
         String::from_utf8_lossy(&output.stderr)
     );
 
+    build_aot_pack(&nvcc, &archs, &extra_flags, &out_dir);
+
     println!("cargo:rustc-env=STWO_CUDA_BUILD_MODE=cuda");
     println!("cargo:rustc-cfg=stwo_cuda_link");
     println!("cargo:rustc-link-search=native={}", out_dir.display());
@@ -213,6 +215,12 @@ fn collect_cu(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).expect("cuda/ kernel directory must exist") {
         let path = entry.expect("readable cuda/ directory entry").path();
         if path.is_dir() {
+            // generated/ holds SELF-CONTAINED AOT module sources (kernel_emit):
+            // they redefine the field helpers, so they never join the archive —
+            // they compile to standalone cubins embedded in the AOT pack.
+            if path.file_name().is_some_and(|n| n == "generated") {
+                continue;
+            }
             collect_cu(&path, out);
         } else if path.extension().is_some_and(|ext| ext == "cu") {
             out.push(path);
@@ -228,4 +236,101 @@ fn collect_dirs(dir: &std::path::Path, out: &mut Vec<String>) {
             collect_dirs(&path, out);
         }
     }
+}
+
+/// Compile every `cuda/generated/*.cu` (kernel_emit output: self-contained AOT
+/// module sources named `<kind>_<label>_<cache_key:016x>.cu`) to a standalone
+/// cubin per arch at -O3, and embed them as one pack + index. The runtime's
+/// `stwo_aot_lookup` (src/aot_pack.rs) serves `get_or_compile`'s tier-0 — a
+/// cache-key miss falls back to NVRTC, which IS the drift check (design §4).
+///
+/// Cubins are cached in OUT_DIR by (source mtime): an unchanged kernel never
+/// recompiles. SASS generation for the biggest fused kernels is the expensive
+/// step — paid per AIR revision at build time, never at prove time.
+fn build_aot_pack(nvcc: &str, archs: &[String], extra_flags: &[String], out_dir: &PathBuf) {
+    let gen_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap())
+        .join("cuda")
+        .join("generated");
+    let mut sources: Vec<PathBuf> = std::fs::read_dir(&gen_dir)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().is_some_and(|x| x == "cu"))
+                .collect()
+        })
+        .unwrap_or_default();
+    sources.sort();
+
+    let cubin_dir = out_dir.join("aot_cubins");
+    std::fs::create_dir_all(&cubin_dir).expect("create aot cubin cache dir");
+    let mut entries: Vec<(u64, u32, PathBuf)> = Vec::new();
+    for source in &sources {
+        let stem = source.file_stem().unwrap().to_string_lossy().to_string();
+        let key = u64::from_str_radix(stem.rsplit('_').next().unwrap(), 16)
+            .expect("generated kernel file names end in _<cache_key:016x>");
+        let src_mtime = std::fs::metadata(source).and_then(|m| m.modified()).ok();
+        for arch in archs {
+            let num: u32 = arch
+                .trim_start_matches("sm_")
+                .parse()
+                .expect("STWO_CUDA_ARCH entries look like sm_90");
+            let cubin = cubin_dir.join(format!("{stem}_{arch}.cubin"));
+            let fresh = match (
+                std::fs::metadata(&cubin).and_then(|m| m.modified()),
+                src_mtime,
+            ) {
+                (Ok(c), Some(s)) => c >= s,
+                _ => false,
+            };
+            if !fresh {
+                let output = Command::new(nvcc)
+                    .arg("-cubin")
+                    .arg("-O3")
+                    .arg("--std=c++17")
+                    .arg("--expt-relaxed-constexpr")
+                    .arg(format!("-arch={arch}"))
+                    .args(extra_flags)
+                    .arg(source)
+                    .arg("-o")
+                    .arg(&cubin)
+                    .output()
+                    .expect("nvcc launch for AOT cubin");
+                assert!(
+                    output.status.success(),
+                    "nvcc -cubin failed for {}:\n{}",
+                    source.display(),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            entries.push((key, num, cubin));
+        }
+    }
+    let refs: Vec<(u64, u32, &std::path::Path)> = entries
+        .iter()
+        .map(|(k, a, p)| (*k, *a, p.as_path()))
+        .collect();
+    write_aot_pack(out_dir, &refs);
+}
+
+/// Concatenate cubins into `aot_pack.bin` + emit `aot_index.rs` (sorted by
+/// (cache_key, sm)). Always written — an empty pack keeps the stub build and
+/// include_bytes! happy.
+fn write_aot_pack(out_dir: &std::path::Path, entries: &[(u64, u32, &std::path::Path)]) {
+    let mut pack: Vec<u8> = Vec::new();
+    let mut index: Vec<(u64, u32, usize, usize)> = Vec::new();
+    for (key, sm, path) in entries {
+        let blob = std::fs::read(path).expect("read cubin");
+        index.push((*key, *sm, pack.len(), blob.len()));
+        pack.extend_from_slice(&blob);
+    }
+    index.sort();
+    std::fs::write(out_dir.join("aot_pack.bin"), &pack).expect("write aot pack");
+    let mut rs = String::from(
+        "// Generated by build.rs — (cache_key, sm, offset, len) into aot_pack.bin.\n         pub(crate) static AOT_INDEX: &[(u64, u32, usize, usize)] = &[\n",
+    );
+    for (key, sm, off, len) in &index {
+        rs.push_str(&format!("    (0x{key:016x}, {sm}, {off}, {len}),\n"));
+    }
+    rs.push_str("];\n");
+    std::fs::write(out_dir.join("aot_index.rs"), rs).expect("write aot index");
 }

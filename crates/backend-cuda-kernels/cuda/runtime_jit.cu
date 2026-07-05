@@ -457,6 +457,11 @@ static bool try_cubin_path(const char *source, const char *kernel_name,
 // load) — the per-stage timing logs identify which one was actually spinning.
 // Optimization level changes SASS scheduling only, never the integer/modular values
 // the kernel computes.
+// The embedded AOT pack lookup (src/aot_pack.rs, populated by build.rs from
+// kernel_emit's cuda/generated/ sources): (cache_key, sm) -> offline -O3 cubin.
+extern "C" bool stwo_aot_lookup(uint64_t cache_key, unsigned sm_major, unsigned sm_minor,
+                                const unsigned char **out_data, size_t *out_len);
+
 bool compile_kernel(const char *source, const char *kernel_name, uint64_t semantic_hash,
                     bool relax_opt, CUfunction *out) {
     auto t_start = std::chrono::steady_clock::now();
@@ -465,6 +470,45 @@ bool compile_kernel(const char *source, const char *kernel_name, uint64_t semant
     cudaGetDevice(&device);
     cudaDeviceProp props;
     cudaGetDeviceProperties(&props, device);
+
+    // Tier 0: the embedded AOT pack — offline -O3 SASS compiled at BUILD time
+    // (design §4). No NVRTC, no ptxas, no disk. A miss (drifted recording, new
+    // arch) falls through to the runtime lanes below — that miss IS the drift
+    // check. relax_opt kernels are governor overflow shapes the AOT pack never
+    // contains (it compiles uncapped at -O3), so skip the lookup for them.
+    if (!relax_opt) {
+        const unsigned char *blob = nullptr;
+        size_t blob_len = 0;
+        if (stwo_aot_lookup(semantic_hash, (unsigned)props.major, (unsigned)props.minor,
+                            &blob, &blob_len)) {
+            CUmodule module = nullptr;
+            CUresult r = cuModuleLoadData(&module, blob);
+            if (r == CUDA_SUCCESS) {
+                CUfunction function = nullptr;
+                if (cuModuleGetFunction(&function, module, kernel_name) == CUDA_SUCCESS &&
+                    fill_witness_pedersen_globals(module, kernel_name)) {
+                    // Fail-closed like the other load paths: an EC kernel whose
+                    // pedersen globals cannot fill must not launch.
+                    if (jit_log_enabled()) {
+                        fprintf(stderr,
+                                "stwo JIT: AOT pack hit kernel=%s key=%016llx (embedded "
+                                "sm_%d%d cubin)\n",
+                                kernel_name, (unsigned long long)semantic_hash, props.major,
+                                props.minor);
+                    }
+                    *out = function;
+                    return true;
+                }
+                cuModuleUnload(module);
+            }
+            if (jit_log_enabled()) {
+                fprintf(stderr,
+                        "stwo JIT: AOT pack entry for key=%016llx failed to load (%d) — "
+                        "falling back to runtime compile\n",
+                        (unsigned long long)semantic_hash, (int)r);
+            }
+        }
+    }
 
     // Cubin fast path (skips ptxas at load). On any failure, fall through to PTX.
     if (jit_cubin_cache_enabled() &&
