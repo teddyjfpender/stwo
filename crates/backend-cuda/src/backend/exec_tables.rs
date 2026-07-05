@@ -681,6 +681,84 @@ pub fn launch_recorded_builtin_for_prove(
     result
 }
 
+/// Builtin launch from DEVICE-resident input columns (the B3 edge path): the
+/// caller owns the device buffers (e.g. gathered from a producer's sub buffer
+/// via [`witness_edge_gather`]); the count/shape discipline is identical to
+/// the host-column variant (trailing-slot trim, exact program extent).
+pub fn launch_recorded_builtin_from_device_cols(
+    label: &str,
+    input_ptrs: &[*const u32],
+    n: usize,
+    tables: &DeviceExecutionTables,
+    want_host_lookup: bool,
+) -> Option<(
+    Vec<BaseFieldVec>,
+    BaseFieldVec,
+    Vec<u32>,
+    BaseFieldVec,
+    Vec<u32>,
+)> {
+    if !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
+        return None;
+    }
+    let program = super::jit_witness::recorded_program(label)?;
+    let n_inputs = program.n_inputs as usize;
+    if input_ptrs.len() < n_inputs {
+        eprintln!(
+            "jit_prove[{label}]: {} device input columns, program reads {n_inputs} — falling back",
+            input_ptrs.len()
+        );
+        return None;
+    }
+    launch_witness_program_core(
+        label,
+        program,
+        &input_ptrs[..n_inputs],
+        n,
+        tables,
+        want_host_lookup,
+    )
+}
+
+/// Gather a consumer's input columns on device from a producer's word-major
+/// sub buffer (witness_edge_gather.cu): allocates `words_per_instance` columns
+/// of `consumer_rows`, launches the gather, returns the device columns.
+/// `None` = stub build or launch failure (caller takes the host path).
+pub fn witness_edge_gather(
+    producer_sub: &BaseFieldVec,
+    producer_rows: usize,
+    word_base: usize,
+    words_per_instance: usize,
+    n_instances: usize,
+    consumer_rows: usize,
+) -> Option<Vec<BaseFieldVec>> {
+    if !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
+        return None;
+    }
+    let cols: Vec<BaseFieldVec> = (0..words_per_instance)
+        .map(|_| BaseFieldVec::new_zeroes(consumer_rows))
+        .collect();
+    let ptrs: Vec<*const u32> = cols.iter().map(|c| c.device_ptr).collect();
+    let table = UploadedDevicePointerVec::upload(&ptrs);
+    let rc = unsafe {
+        stwo_backend_cuda_kernels::raw::stwo_witness_edge_gather(
+            producer_sub.device_ptr,
+            producer_rows as u32,
+            word_base as u32,
+            words_per_instance as u32,
+            n_instances as u32,
+            consumer_rows as u32,
+            table.as_ptr().cast::<*mut u32>(),
+        )
+    };
+    drop(table);
+    if rc != 0 {
+        eprintln!("witness edge gather: launch failed (rc={rc})");
+        return None;
+    }
+    Some(cols)
+}
+
 /// Run the device-DAG count feed (witness_feed_counts.cu) over a launch's
 /// DEVICE-resident sub buffer: uploads the flat descriptors, the LUTs, and one
 /// zeroed count buffer per entry of `count_sizes`, launches, then D2Hs the
