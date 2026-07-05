@@ -17,7 +17,7 @@ use super::isa::{DeduceKind, WitnessOp, WitnessProgram};
 /// Bumped whenever the emitted source for a fixed program changes, mixed into the
 /// cache key so new source can never collide with PTX an older build persisted for the
 /// same bytecode (same rule as the constraint lane's `CODEGEN_VERSION`).
-pub const WITNESS_CODEGEN_VERSION: u64 = 8;
+pub const WITNESS_CODEGEN_VERSION: u64 = 9;
 
 /// Cache key: program semantic hash mixed (FNV-1a) with [`WITNESS_CODEGEN_VERSION`].
 pub fn witness_jit_cache_key(semantic_hash: u64) -> u64 {
@@ -349,7 +349,8 @@ fn emit_body(program: &WitnessProgram, src: &mut String) -> Option<()> {
 /// right after module load — device globals do not cross CUmodule boundaries.
 fn emit_fp256_deduce_support(src: &mut String) {
     const PRELUDE: &str = "\
-// ---- fp256/EC embed prelude (NVRTC context: no headers resolved) ----
+// ---- fp256/EC embed prelude (self-contained TU: no headers resolved) ----
+#define STWO_WIT_EMBED 1
 namespace std {}
 typedef unsigned int uint32_t;
 typedef unsigned long long uint64_t;
