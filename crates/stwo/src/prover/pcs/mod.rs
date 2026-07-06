@@ -474,8 +474,10 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         };
 
         // Run FRI commitment phase on the oods quotients.
+        let span_fc = span!(Level::INFO, "FRI commit", class = "FriCommit").entered();
         let fri_prover =
             FriProver::<B, MC>::commit(channel, self.config.fri_config, &quotients, self.twiddles);
+        span_fc.exit();
 
         // Proof of work.
         let span1 = span!(Level::INFO, "Grind", class = "Queries POW").entered();
@@ -484,11 +486,13 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         channel.mix_u64(proof_of_work);
 
         // FRI decommitment phase.
+        let span_fd = span!(Level::INFO, "FRI decommit", class = "FriDecommit").entered();
         let FriDecommitResult {
             fri_proof,
             query_positions,
             unsorted_query_locations,
         } = fri_prover.decommit(channel);
+        span_fd.exit();
         // Build the query position tree.
         let preprocessed_query_positions = prepare_preprocessed_query_positions(
             &query_positions,
@@ -509,6 +513,7 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
                 .collect::<Vec<_>>(),
         );
         let commitments = self.roots();
+        let span_td = span!(Level::INFO, "Trees decommit", class = "TreesDecommit").entered();
         let (queried_values, decommitments, aux): (Vec<_>, Vec<_>, Vec<_>) = self
             .trees
             .as_ref()
@@ -528,6 +533,7 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
             })
             .map(|(v, x)| (v, x.decommitment, x.aux))
             .multiunzip();
+        span_td.exit();
 
         // Return evaluation buffers to the memory pool for reuse (owned trees only).
         for tree in &mut self.trees.0 {
