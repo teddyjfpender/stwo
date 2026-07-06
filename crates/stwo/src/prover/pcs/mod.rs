@@ -482,6 +482,20 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
                             &self.base_column_pool,
                         ))
                     }
+                    // Borrowed (a cached &'static tree, e.g. the persistent preprocessed
+                    // artifact under stream_lde): its evals are released (size-0), so the
+                    // `_ => None` fallthrough would force `tree.decommit` to gather from an
+                    // empty buffer (OOB read). Route it through the SAME coeff-regen decommit
+                    // as owned diet trees by cloning a compact descriptor from its resident
+                    // coefficients — read-only (no `mem::take`, no `give_back`), so the shared
+                    // cached tree is never mutated. Requires coefficients (diet always stores
+                    // them); a coeff-less borrowed tree falls through to the resident-eval path.
+                    MaybeOwned::Borrowed(tree)
+                        if !tree.polynomials.is_empty()
+                            && tree.polynomials.iter().all(|p| p.coeffs.is_some()) =>
+                    {
+                        Some(compact_tree_columns_cloned(&tree.polynomials))
+                    }
                     _ => None,
                 })
                 .collect()
@@ -825,6 +839,37 @@ fn compact_tree_columns<B: Backend>(
             } else {
                 (CompactColumn::Full(B::join_at_mid(left, right)), domain)
             }
+        })
+        .collect();
+
+    CompactTreeColumns { columns }
+}
+
+/// Read-only variant of [`compact_tree_columns`] for a BORROWED cached tree (the
+/// persistent preprocessed artifact under stream_lde). It does not own the tree, so it
+/// cannot `mem::take` the polynomials or `give_back` their (already size-0) eval buffers;
+/// it CLONES each column's retained coefficients into a fresh `Original` descriptor (a
+/// device alloc + D2D copy) and preserves commit column order, so the regenerated domains,
+/// coefficients, and queried values align with `decommit_compact_tree` exactly as the
+/// owned path does. Every column must already carry coefficients (the diet stores them;
+/// the caller's match guard enforces it) — the `Original` arm never interpolates or
+/// touches the pool, so the shared cached tree is never mutated.
+fn compact_tree_columns_cloned<B: Backend>(
+    polynomials: &ColumnVec<Poly<B>>,
+) -> CompactTreeColumns<B> {
+    #[cfg(not(feature = "parallel"))]
+    let iter = polynomials.iter();
+    #[cfg(feature = "parallel")]
+    let iter = polynomials.par_iter();
+
+    let columns = iter
+        .map(|poly| {
+            let coeffs = poly
+                .coeffs
+                .as_ref()
+                .expect("cached preprocessed artifact column missing coefficients")
+                .clone();
+            (CompactColumn::Original(coeffs), poly.evals.domain)
         })
         .collect();
 
