@@ -33,6 +33,22 @@ impl<B: ColumnOps<F>, F: ExtensionOf<BaseField>, EvalOrder> CircleEvaluation<B, 
             _eval_order: PhantomData,
         }
     }
+
+    /// Constructs an evaluation whose value buffer is RELEASED (empty), retaining
+    /// only the domain — the streamed-LDE state produced by
+    /// [`crate::prover::CommitmentSchemeProver::set_stream_lde`]'s post-commit
+    /// release. Used by the streaming leaf-commit diet, which never materializes
+    /// all evaluations at once; downstream consumers regenerate values from the
+    /// retained coefficients (store-coeffs / stream_lde mode). Skips the
+    /// domain-size assertion by construction — the buffer is intentionally empty.
+    pub fn new_released(domain: CircleDomain) -> Self {
+        use crate::prover::backend::Column;
+        Self {
+            domain,
+            values: <Col<B, F> as Column<F>>::zeros(0),
+            _eval_order: PhantomData,
+        }
+    }
 }
 
 // Note: The concrete implementation of the poly operations is in the specific backend used.

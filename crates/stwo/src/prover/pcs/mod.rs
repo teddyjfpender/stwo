@@ -640,7 +640,9 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
                     .map(|coeffs| {
                         let domain = CanonicCoset::new(coeffs.log_size() + log_blowup_factor)
                             .circle_domain();
-                        let evals = CircleEvaluation::new(domain, Col::<B, BaseField>::zeros(0));
+                        // Evals released (empty, domain kept) — regenerated from the
+                        // retained coefficients downstream (stream_lde state).
+                        let evals = CircleEvaluation::new_released(domain);
                         Poly::new(Some(coeffs), evals)
                     })
                     .collect();
