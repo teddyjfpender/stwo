@@ -275,6 +275,20 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         sampled_points: TreeVec<ColumnVec<Vec<CirclePoint<SecureField>>>>,
         channel: &mut MC::C,
     ) -> ExtendedCommitmentSchemeProof<MC::H> {
+        // Subscriber-independent bisection timers (STWO_PVT=1): the bench trace
+        // subscriber only records spans with recognized `class` values, so new
+        // spans are dropped. These eprintln deltas pin the streamed-LDE cost.
+        let pvt_on = std::env::var("STWO_PVT").as_deref() == Ok("1");
+        #[allow(unused_assignments)]
+        let mut pvt_t = std::time::Instant::now();
+        macro_rules! pvt {
+            ($l:expr) => {
+                if pvt_on {
+                    eprintln!("PVT {} {:.3}", $l, pvt_t.elapsed().as_secs_f64());
+                    pvt_t = std::time::Instant::now();
+                }
+            };
+        }
         // Evaluate polynomials on open points.
         let span = span!(
             Level::INFO,
@@ -394,6 +408,7 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
             .as_cols_ref()
             .map_cols(|x| x.iter().map(|o| o.value).collect());
         channel.mix_felts(&sampled_values.clone().flatten_cols());
+        pvt!("oods");
 
         // Compute oods quotients for boundary constraints on the sampled points.
         // Streamed-LDE mode: the committed evaluations were released at commit time;
@@ -473,11 +488,13 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
             self.trees.iter().map(|_| None).collect()
         };
 
+        pvt!("quotients+compaction");
         // Run FRI commitment phase on the oods quotients.
         let span_fc = span!(Level::INFO, "FRI commit", class = "FriCommit").entered();
         let fri_prover =
             FriProver::<B, MC>::commit(channel, self.config.fri_config, &quotients, self.twiddles);
         span_fc.exit();
+        pvt!("fri_commit");
 
         // Proof of work.
         let span1 = span!(Level::INFO, "Grind", class = "Queries POW").entered();
@@ -493,6 +510,7 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
             unsorted_query_locations,
         } = fri_prover.decommit(channel);
         span_fd.exit();
+        pvt!("fri_decommit");
         // Build the query position tree.
         let preprocessed_query_positions = prepare_preprocessed_query_positions(
             &query_positions,
@@ -534,6 +552,7 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
             .map(|(v, x)| (v, x.decommitment, x.aux))
             .multiunzip();
         span_td.exit();
+        pvt!("trees_decommit");
 
         // Return evaluation buffers to the memory pool for reuse (owned trees only).
         for tree in &mut self.trees.0 {
