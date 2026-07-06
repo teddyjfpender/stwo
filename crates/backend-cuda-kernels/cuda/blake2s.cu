@@ -219,7 +219,7 @@ __device__ __forceinline__ void blake2s_hash_column_words(
 
 
 
-__global__ void commit_on_first_layer_in_gpu(
+__global__ void __launch_bounds__(BLOCK_SIZE) commit_on_first_layer_in_gpu(
     uint32_t size,
     uint32_t number_of_columns,
     uint32_t **data,
@@ -244,7 +244,7 @@ __device__ __forceinline__ uint32_t lifted_column_index(
     return ((lifted_index >> (log_ratio + 1)) << 1) + (lifted_index & 1);
 }
 
-__global__ void commit_on_first_layer_lifted_in_gpu(
+__global__ void __launch_bounds__(BLOCK_SIZE) commit_on_first_layer_lifted_in_gpu(
     uint32_t size,
     uint32_t number_of_columns,
     uint32_t **data,
@@ -287,7 +287,7 @@ __global__ void commit_on_first_layer_lifted_in_gpu(
     #pragma unroll
     for (int i = 0; i < 8; i++) result[index].s[i] = h[i];
 }
-__global__ void commit_on_layer_using_previous_in_gpu(
+__global__ void __launch_bounds__(BLOCK_SIZE) commit_on_layer_using_previous_in_gpu(
     uint32_t size,
     uint32_t number_of_columns,
     uint32_t **data,
@@ -354,7 +354,7 @@ __device__ __forceinline__ Blake2sHash blake2s_hash_children_device(
     return out;
 }
 
-__global__ void commit_on_two_layers_using_previous_in_gpu(
+__global__ void __launch_bounds__(BLOCK_SIZE) commit_on_two_layers_using_previous_in_gpu(
     uint32_t size,                 // number of OUTPUT (grandparent) hashes
     Blake2sHash *prev_layer,       // size == 4 * `size`
     Blake2sHash *result

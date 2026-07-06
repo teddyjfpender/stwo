@@ -460,6 +460,14 @@ impl PolyOps for CudaBackend {
         for e in evals {
             assert_eq!(e.len(), weights.len());
         }
+        // Kill switch for a clean on/off A/B of the batched kernel vs the
+        // per-column path (value-identical either way). Default = batched.
+        if std::env::var("STWO_CUDA_BATCHED_OODS").as_deref() == Ok("0") {
+            return evals
+                .iter()
+                .map(|e| Self::barycentric_eval_at_point(e, weights))
+                .collect();
+        }
         // The batched kernel puts columns on the grid's y-dimension, capped at
         // 65535 by CUDA. Cairo OODS groups are far below this, but chunk so an
         // oversized group can never make the launch fail — each chunk is an
