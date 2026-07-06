@@ -23,7 +23,7 @@
 
 #include "cuda_mem_pool.cuh"
 
-#define WFC_DESC_STRIDE 11u
+#define WFC_DESC_STRIDE 14u
 #define WFC_MAX_WORDS 5u
 #define WFC_NO_LUT 0xFFFFFFFFu
 
@@ -43,23 +43,53 @@ __global__ void witness_feed_counts_kernel(
         const uint32_t *e = descs + (size_t)d * WFC_DESC_STRIDE;
         uint32_t word_base = e[0];
         uint32_t n_words = e[1];
+        uint32_t rel_index = e[7];
+        uint32_t table_size = e[8];
+        uint32_t lut_index = e[9];
+        uint32_t kind = e[11];
+
+        if (kind == 1u) {
+            // MEM-ID DECODE (memory_id_to_big): tag = id >> 30 (0 = small,
+            // 1 = big), val = id & 0x3FFFFFFF; DEFAULT_ID (empty cell) skipped
+            // defensively — the host feed panics on it, a valid trace never
+            // produces one. e[8] = big table size, e[12] = small table size,
+            // e[10] = big counts slot, e[13] = small counts slot.
+            uint32_t v = sub_words[(size_t)word_base * column_length + row];
+            if (v == ((1u << 30) - 1u)) {
+                continue;
+            }
+            uint32_t tag = v >> 30;
+            uint32_t val = v & 0x3FFFFFFFu;
+            if (tag == 1u) {
+                if (val < table_size) {
+                    atomicAdd(&counts[e[10]][(size_t)rel_index * table_size + val], 1u);
+                }
+            } else if (tag == 0u) {
+                uint32_t small_size = e[12];
+                if (val < small_size) {
+                    atomicAdd(&counts[e[13]][(size_t)rel_index * small_size + val], 1u);
+                }
+            }
+            continue;
+        }
+
+        // FOLD (+ optional signed key offset e[12], e.g. addr - 1; + optional LUT).
         uint32_t key = 0;
         for (uint32_t i = 0; i < n_words; ++i) {
             key = (key << e[2 + i]) |
                   sub_words[(size_t)(word_base + i) * column_length + row];
         }
-        uint32_t rel_index = e[7];
-        uint32_t table_size = e[8];
-        uint32_t lut_index = e[9];
+        long long keyed = (long long)key + (long long)(int32_t)e[12];
         // Memory safety FIRST: the key must be in the LUT/table domain BEFORE
         // any dereference (an out-of-width tuple — impossible on a valid trace,
         // where the host feed would panic — must never become an OOB read).
         // LUT domains equal table_size for every registered family (the LUT
         // covers the full tuple space).
-        if (key >= table_size) {
+        if (keyed < 0 || (uint64_t)keyed >= table_size) {
             continue;
         }
-        uint32_t idx = (lut_index == WFC_NO_LUT) ? key : luts[lut_index][key];
+        uint32_t k = (uint32_t)keyed;
+        uint32_t idx = (lut_index == WFC_NO_LUT) ? k : luts[lut_index][k];
         if (idx < table_size) {
             atomicAdd(&counts[e[10]][(size_t)rel_index * table_size + idx], 1u);
         }

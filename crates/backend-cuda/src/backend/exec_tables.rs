@@ -840,7 +840,9 @@ pub fn run_witness_feed_counts(
             sub_dev.device_ptr,
             n_rows as u32,
             descs_dev.as_ptr(),
-            (descs.len() / 11) as u32,
+            // Stride 14 = witness_feed_counts.cu WFC_DESC_STRIDE (v2: kind + key
+            // offset + mem-id decode small-table params).
+            (descs.len() / 14) as u32,
             lut_table.as_ptr(),
             count_table.as_ptr().cast::<*mut u32>(),
         )
