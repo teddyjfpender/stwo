@@ -155,16 +155,25 @@ impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M3
         if IS_M31_OUTPUT {
             return None;
         }
-        // Group width bounds the concurrently-resident LDE. 16 keeps peak to ~16
-        // blown-up columns + the per-leaf state; the big (log24) columns dominate,
-        // and they sort last, so early small-column groups still stream cheaply.
-        const STREAM_GROUP_COLS: usize = 16;
+        // Group width trades streaming-commit launch overhead (fewer, larger
+        // batched groups) against the transient LDE peak (~G blown-up columns
+        // resident; the big log24 columns dominate and sort last, so peak ≈
+        // G·2^lift·4B over the coeff floor). Env-tunable (STWO_STREAM_GROUP_COLS,
+        // multiple of 16) to sweep the commit-speed/peak Pareto against the
+        // two-proof VRAM budget without a rebuild. Default 32 (~+8GB, keeps two
+        // proofs under 80GB while roughly halving the launch count vs 16).
+        let group_cols = std::env::var("STWO_STREAM_GROUP_COLS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&g| g >= 16)
+            .map(|g| g / 16 * 16)
+            .unwrap_or(32);
         Some(Self::stream_commit_leaves_from_coeffs(
             coeffs,
             log_blowup_factor,
             twiddles,
             lifting_log_size,
-            STREAM_GROUP_COLS,
+            group_cols,
         ))
     }
 
