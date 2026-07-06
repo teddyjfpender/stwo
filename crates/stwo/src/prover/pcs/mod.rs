@@ -875,10 +875,13 @@ fn decommit_compact_tree<B: BackendForChannel<MC>, MC: MerkleChannel>(
     // `evaluate_into(coeffs, domain, ..)`.
     let polys = B::evaluate_polynomials(coeffs, 0, twiddles, false, pool);
 
+    // Pair sequentially (rayon can't zip a parallel iterator with a plain Vec), then
+    // parallelize over the tuples.
+    let paired: Vec<(Poly<B>, CircleDomain)> = polys.into_iter().zip(domains).collect();
     #[cfg(not(feature = "parallel"))]
-    let iter = polys.into_iter().zip(domains);
+    let iter = paired.into_iter();
     #[cfg(feature = "parallel")]
-    let iter = polys.into_par_iter().zip(domains);
+    let iter = paired.into_par_iter();
 
     let (log_sizes, rows): (Vec<u32>, Vec<HashMap<usize, BaseField>>) = iter
         .map(|(poly, domain)| {
