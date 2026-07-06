@@ -387,6 +387,92 @@ impl CudaBackend {
         drop((table, logs));
         state
     }
+
+    /// The VRAM diet: build the lifted leaf layer by LDE'ing the base columns
+    /// one GROUP at a time from their coefficients (retained), feeding each
+    /// group into the running leaf-hash state, then DROPPING the group's
+    /// evaluations before the next. Peak = the coefficients + one group's LDE +
+    /// the h[8]-per-leaf state, instead of ALL columns' LDE resident at once.
+    ///
+    /// `coeffs` must be sorted by `log_size()` ascending (as `build_leaves`
+    /// sorts by eval length — the blowup is constant, so the orders coincide).
+    /// `group_cols` bounds how many columns are LDE'd concurrently (rounded to a
+    /// multiple of 16 so non-final groups are whole 64-byte blocks). Byte-identical
+    /// to `build_leaves(evaluate_polynomials(coeffs))` — same NTT, same sorted
+    /// lifted-index word stream, same block boundaries (gated by
+    /// `stream_commit_leaves_matches_bulk`).
+    pub fn stream_commit_leaves_from_coeffs(
+        coeffs: &[stwo::prover::poly::circle::CircleCoefficients<Self>],
+        log_blowup_factor: u32,
+        twiddles: &stwo::prover::poly::twiddles::TwiddleTree<Self>,
+        lifting_log_size: u32,
+        group_cols: usize,
+    ) -> Blake2sHashVec {
+        use stwo::core::poly::circle::CanonicCoset;
+        let size = 1usize << lifting_log_size;
+        let state = Blake2sHashVec::new_uninitialized(size);
+        unsafe {
+            bindings::stream_leaf_init(size as u32, state.device_ptr.cast_mut());
+        }
+        let n = coeffs.len();
+        if n == 0 {
+            return <CudaBackend as MerkleOpsLifted<
+                Blake2sMerkleHasherGeneric<false>,
+            >>::build_leaves(&[], lifting_log_size);
+        }
+        // LDE one column to its blown-up evaluation domain (same domain the bulk
+        // `evaluate_polynomials` uses — the NTT is deterministic, so the values
+        // match bit-for-bit).
+        let lde = |c: &stwo::prover::poly::circle::CircleCoefficients<Self>| -> BaseFieldVec {
+            let domain = CanonicCoset::new(c.log_size() + log_blowup_factor).circle_domain();
+            c.evaluate_with_twiddles(domain, twiddles).values
+        };
+
+        let rem = (n - 1) % 16 + 1;
+        let n_full = n - rem;
+        let step = group_cols.max(16) / 16 * 16;
+        let mut off = 0usize;
+        while off < n_full {
+            let end = (off + step).min(n_full);
+            let evals: Vec<BaseFieldVec> = coeffs[off..end].iter().map(lde).collect();
+            let ptrs: Vec<*const u32> = evals.iter().map(|e| e.device_ptr).collect();
+            let logs: Vec<u32> = evals.iter().map(|e| e.len().ilog2()).collect();
+            let table = UploadedDevicePointerVec::upload(&ptrs);
+            let uploaded_logs = UploadedUint32Vec::upload(&logs);
+            unsafe {
+                bindings::stream_leaf_update(
+                    size as u32,
+                    (end - off) as u32,
+                    table.as_ptr(),
+                    uploaded_logs.as_ptr(),
+                    lifting_log_size,
+                    off as u32,
+                    state.device_ptr.cast_mut(),
+                );
+            }
+            drop((table, uploaded_logs, evals)); // free the group's LDE now
+            off = end;
+        }
+        // Finalize the trailing block.
+        let evals: Vec<BaseFieldVec> = coeffs[n_full..n].iter().map(lde).collect();
+        let ptrs: Vec<*const u32> = evals.iter().map(|e| e.device_ptr).collect();
+        let logs: Vec<u32> = evals.iter().map(|e| e.len().ilog2()).collect();
+        let table = UploadedDevicePointerVec::upload(&ptrs);
+        let uploaded_logs = UploadedUint32Vec::upload(&logs);
+        unsafe {
+            bindings::stream_leaf_finalize(
+                size as u32,
+                rem as u32,
+                table.as_ptr(),
+                uploaded_logs.as_ptr(),
+                lifting_log_size,
+                n_full as u32,
+                state.device_ptr.cast_mut(),
+            );
+        }
+        drop((table, uploaded_logs, evals));
+        state
+    }
 }
 
 #[cfg(test)]
@@ -447,6 +533,69 @@ mod stream_leaf_tests {
                     "n_columns={n_columns} group={group}"
                 );
             }
+        }
+    }
+
+    // End-to-end diet gate: the coeff-driven streaming commit (LDE per group,
+    // free per group) must produce the SAME leaf layer as the bulk path
+    // (evaluate_polynomials -> build_leaves). Covers the NTT + lifted-index +
+    // block-boundary composition on real coefficients.
+    #[test]
+    fn stream_commit_leaves_matches_bulk() {
+        use stwo::core::poly::circle::CanonicCoset;
+        use stwo::prover::mempool::BaseColumnPool;
+        use stwo::prover::poly::circle::{CircleCoefficients, PolyOps};
+
+        if !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
+            return;
+        }
+        const BLOWUP: u32 = 1;
+        for n_columns in [16usize, 17, 32, 48] {
+            // Mixed-size coefficient columns, sorted ascending by log_size.
+            let mut logs: Vec<u32> = (0..n_columns).map(|i| 4 + (i % 4) as u32).collect();
+            logs.sort_unstable();
+            let coeffs: Vec<CircleCoefficients<CudaBackend>> = logs
+                .iter()
+                .enumerate()
+                .map(|(i, &log)| {
+                    let vals: Vec<M31> = (0..(1usize << log))
+                        .map(|j| M31::from((i * 5 + j + 1) as u32))
+                        .collect();
+                    CircleCoefficients::new(BaseFieldVec::from_vec(vals))
+                })
+                .collect();
+            let lifting = logs.last().unwrap() + BLOWUP;
+
+            // Reference: bulk LDE all -> build_leaves (sorted refs).
+            let twiddles = CudaBackend::precompute_twiddles(
+                CanonicCoset::new(lifting).circle_domain().half_coset,
+            );
+            let pool = BaseColumnPool::<CudaBackend>::new();
+            let polys = <CudaBackend as PolyOps>::evaluate_polynomials(
+                coeffs.clone(),
+                BLOWUP,
+                &twiddles,
+                true,
+                &pool,
+            );
+            let mut eval_cols: Vec<&BaseFieldVec> = polys.iter().map(|p| &p.evals.values).collect();
+            eval_cols.sort_by_key(|c| c.len());
+            let ref_logs: Vec<u32> = eval_cols.iter().map(|c| c.len().ilog2()).collect();
+            let reference =
+                <CudaBackend as MerkleOpsLifted<Blake2sMerkleHasherGeneric<false>>>::build_leaves(
+                    &eval_cols, lifting,
+                );
+
+            let _ = ref_logs;
+            let streamed = CudaBackend::stream_commit_leaves_from_coeffs(
+                &coeffs, BLOWUP, &twiddles, lifting, 16,
+            );
+
+            assert_eq!(
+                streamed.to_cpu(),
+                reference.to_cpu(),
+                "n_columns={n_columns}"
+            );
         }
     }
 }
