@@ -133,6 +133,87 @@ __device__ void blake2s_finalize(Blake2sState* S, Blake2sHash* out) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// WORD-BLOCK blake2s (the commit-path fast lane). The tree hashes M31 words
+// and 32-byte child digests — both are sequences of little-endian u32s, which
+// ARE blake2s message words: the byte-buffered state machine above (64-byte
+// local buffer, per-4-byte memcpy, byte->word re-decode every compress) is
+// pure overhead for them. These helpers keep h[8] and m[16] in REGISTERS
+// (callers must index m with compile-time constants — unrolled 16-word
+// groups), producing BIT-IDENTICAL digests: same word stream, same byte
+// counts, same lastblock flag.
+// ---------------------------------------------------------------------------
+
+__device__ __forceinline__ void blake2s_compress_words(
+    uint32_t h[8],
+    const uint32_t m[16],
+    uint32_t t,         // total bytes so far
+    uint32_t lastblock  // 0 for normal, 0xFFFFFFFF for last block
+) {
+    uint32_t v[16];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) v[i] = h[i];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) v[i+8] = blake2s_IV[i];
+
+    v[12] ^= t;
+    v[14] ^= lastblock;
+
+    #pragma unroll
+    for (int r = 0; r < 10; r++) {
+        G(r,0,v[0],v[4],v[8],v[12]);
+        G(r,1,v[1],v[5],v[9],v[13]);
+        G(r,2,v[2],v[6],v[10],v[14]);
+        G(r,3,v[3],v[7],v[11],v[15]);
+        G(r,4,v[0],v[5],v[10],v[15]);
+        G(r,5,v[1],v[6],v[11],v[12]);
+        G(r,6,v[2],v[7],v[8],v[13]);
+        G(r,7,v[3],v[4],v[9],v[14]);
+    }
+
+    #pragma unroll
+    for (int i = 0; i < 8; i++)
+        h[i] ^= v[i] ^ v[i+8];
+}
+
+__device__ __forceinline__ void blake2s_init_words(uint32_t h[8]) {
+    #pragma unroll
+    for (int i = 0; i < 8; i++) h[i] = blake2s_IV[i];
+    h[0] ^= 0x01010020; // digest len = 32, fanout/depth 1 — same as blake2s_init
+}
+
+// Hash a row's column words: unrolled 16-word groups (m stays in registers),
+// zero-padded tail block with the exact byte count + lastblock flag.
+__device__ __forceinline__ void blake2s_hash_column_words(
+    uint32_t h[8],
+    uint32_t t,                 // bytes already consumed (0, or 64 after children)
+    uint32_t **data,
+    uint32_t number_of_columns,
+    uint32_t index,
+    Blake2sHash *out
+) {
+    uint32_t m[16];
+    uint32_t col = 0;
+    while (col + 16 <= number_of_columns) {
+        #pragma unroll
+        for (int k = 0; k < 16; k++) m[k] = data[col + k][index];
+        t += 64;
+        blake2s_compress_words(h, m, t, 0);
+        col += 16;
+    }
+    uint32_t rem = number_of_columns - col;
+    #pragma unroll
+    for (int k = 0; k < 16; k++) {
+        m[k] = (k < rem) ? data[col + k][index] : 0;
+    }
+    t += 4 * rem;
+    blake2s_compress_words(h, m, t, 0xFFFFFFFF);
+    #pragma unroll
+    for (int i = 0; i < 8; i++) out->s[i] = h[i];
+}
+
+
+
 
 __global__ void commit_on_first_layer_in_gpu(
     uint32_t size,
@@ -142,19 +223,11 @@ __global__ void commit_on_first_layer_in_gpu(
 ) {
     uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
     if (index >= size) return;
-    Blake2sState state;
-    blake2s_init(&state);
-
-    for (int col = 0; col < number_of_columns; ++col) {
-        uint32_t val = data[col][index];
-        uint8_t bytes[4];
-        bytes[0] = (val >>  0) & 0xFF;
-        bytes[1] = (val >>  8) & 0xFF;
-        bytes[2] = (val >> 16) & 0xFF;
-        bytes[3] = (val >> 24) & 0xFF;
-        blake2s_update(&state, bytes, sizeof(bytes));
-    }
-    blake2s_finalize(&state, &result[index]);
+    // Word-block lane: bit-identical digests, no byte buffer (see
+    // blake2s_hash_column_words).
+    uint32_t h[8];
+    blake2s_init_words(h);
+    blake2s_hash_column_words(h, 0, data, number_of_columns, index, &result[index]);
 }
 
 __device__ __forceinline__ uint32_t lifted_column_index(
@@ -178,21 +251,36 @@ __global__ void commit_on_first_layer_lifted_in_gpu(
     uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
     if (index >= size) return;
 
-    Blake2sState state;
-    blake2s_init(&state);
-
-    for (uint32_t col = 0; col < number_of_columns; ++col) {
-        uint32_t column_log_size = column_log_sizes[col];
-        uint32_t source_index = lifted_column_index(index, lifting_log_size - column_log_size);
-        uint32_t val = data[col][source_index];
-        uint8_t bytes[4];
-        bytes[0] = (val >>  0) & 0xFF;
-        bytes[1] = (val >>  8) & 0xFF;
-        bytes[2] = (val >> 16) & 0xFF;
-        bytes[3] = (val >> 24) & 0xFF;
-        blake2s_update(&state, bytes, sizeof(bytes));
+    // Word-block lane with per-column lifted source indices.
+    uint32_t h[8];
+    blake2s_init_words(h);
+    uint32_t m[16];
+    uint32_t t = 0;
+    uint32_t col = 0;
+    while (col + 16 <= number_of_columns) {
+        #pragma unroll
+        for (int k = 0; k < 16; k++) {
+            uint32_t log_ratio = lifting_log_size - column_log_sizes[col + k];
+            m[k] = data[col + k][lifted_column_index(index, log_ratio)];
+        }
+        t += 64;
+        blake2s_compress_words(h, m, t, 0);
+        col += 16;
     }
-    blake2s_finalize(&state, &result[index]);
+    uint32_t rem = number_of_columns - col;
+    #pragma unroll
+    for (int k = 0; k < 16; k++) {
+        if (k < rem) {
+            uint32_t log_ratio = lifting_log_size - column_log_sizes[col + k];
+            m[k] = data[col + k][lifted_column_index(index, log_ratio)];
+        } else {
+            m[k] = 0;
+        }
+    }
+    t += 4 * rem;
+    blake2s_compress_words(h, m, t, 0xFFFFFFFF);
+    #pragma unroll
+    for (int i = 0; i < 8; i++) result[index].s[i] = h[i];
 }
 __global__ void commit_on_layer_using_previous_in_gpu(
     uint32_t size,
@@ -203,41 +291,25 @@ __global__ void commit_on_layer_using_previous_in_gpu(
 ) {
     uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
     if (index >= size) return;
-    Blake2sState state;
-    blake2s_init(&state);
-    // left hash
+    // Word-block lane: children = exactly one full block (t = 64), then the
+    // optional layer columns continue block-wise. Bit-identical digests.
+    uint32_t h[8];
+    blake2s_init_words(h);
+    uint32_t m[16];
     Blake2sHash left = prev_layer[2*index];
-    for (int i = 0; i < 8; ++i) {
-        uint32_t word = left.s[i];
-        uint8_t bytes[4];
-        bytes[0] = (word >>  0) & 0xFF;
-        bytes[1] = (word >>  8) & 0xFF;
-        bytes[2] = (word >> 16) & 0xFF;
-        bytes[3] = (word >> 24) & 0xFF;
-        blake2s_update(&state, bytes, sizeof(bytes));
-    }
-    // right hash
     Blake2sHash right = prev_layer[2*index+1];
-    for (int i = 0; i < 8; ++i) {
-        uint32_t word = right.s[i];
-        uint8_t bytes[4];
-        bytes[0] = (word >>  0) & 0xFF;
-        bytes[1] = (word >>  8) & 0xFF;
-        bytes[2] = (word >> 16) & 0xFF;
-        bytes[3] = (word >> 24) & 0xFF;
-        blake2s_update(&state, bytes, sizeof(bytes));
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) m[i] = left.s[i];
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) m[8 + i] = right.s[i];
+    if (number_of_columns == 0) {
+        blake2s_compress_words(h, m, 64, 0xFFFFFFFF);
+        #pragma unroll
+        for (int i = 0; i < 8; i++) result[index].s[i] = h[i];
+        return;
     }
-    // current hash
-    for (int col = 0; col < number_of_columns; ++col) {
-        uint32_t val = data[col][index];
-        uint8_t bytes[4];
-        bytes[0] = (val >>  0) & 0xFF;
-        bytes[1] = (val >>  8) & 0xFF;
-        bytes[2] = (val >> 16) & 0xFF;
-        bytes[3] = (val >> 24) & 0xFF;
-        blake2s_update(&state, bytes, sizeof(bytes));
-    }
-    blake2s_finalize(&state, &result[index]);
+    blake2s_compress_words(h, m, 64, 0);
+    blake2s_hash_column_words(h, 64, data, number_of_columns, index, &result[index]);
 }
 
 // ---------------------------------------------------------------------------
@@ -262,30 +334,18 @@ __device__ __forceinline__ Blake2sHash blake2s_hash_children_device(
     const Blake2sHash& left,
     const Blake2sHash& right
 ) {
-    Blake2sState state;
-    blake2s_init(&state);
+    // Word-block lane: one full block (t = 64) with the lastblock flag.
+    uint32_t h[8];
+    blake2s_init_words(h);
+    uint32_t m[16];
     #pragma unroll
-    for (int i = 0; i < 8; ++i) {
-        uint32_t word = left.s[i];
-        uint8_t bytes[4];
-        bytes[0] = (word >>  0) & 0xFF;
-        bytes[1] = (word >>  8) & 0xFF;
-        bytes[2] = (word >> 16) & 0xFF;
-        bytes[3] = (word >> 24) & 0xFF;
-        blake2s_update(&state, bytes, sizeof(bytes));
-    }
+    for (int i = 0; i < 8; ++i) m[i] = left.s[i];
     #pragma unroll
-    for (int i = 0; i < 8; ++i) {
-        uint32_t word = right.s[i];
-        uint8_t bytes[4];
-        bytes[0] = (word >>  0) & 0xFF;
-        bytes[1] = (word >>  8) & 0xFF;
-        bytes[2] = (word >> 16) & 0xFF;
-        bytes[3] = (word >> 24) & 0xFF;
-        blake2s_update(&state, bytes, sizeof(bytes));
-    }
+    for (int i = 0; i < 8; ++i) m[8 + i] = right.s[i];
+    blake2s_compress_words(h, m, 64, 0xFFFFFFFF);
     Blake2sHash out;
-    blake2s_finalize(&state, &out);
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) out.s[i] = h[i];
     return out;
 }
 
