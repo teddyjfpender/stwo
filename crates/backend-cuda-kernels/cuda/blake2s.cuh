@@ -6,6 +6,18 @@
 
 const unsigned int BLOCK_SIZE = 256;
 
+// Occupancy lever for the register-capped commit/leaf-hash kernels. The
+// STWO_COMMIT_PROBE measured them pinned at 255 registers => 1 block/SM => 12.5%
+// occupancy, already spilling to local memory (blake2s full-unroll register
+// explosion). The minBlocksPerMultiprocessor argument to __launch_bounds__ forces
+// the compiler to cap registers so >=N blocks co-reside on an SM, trading register
+// spilling for latency-hiding occupancy. Compile-time tunable to sweep the
+// trade-off; 1 reproduces the prior (uncapped, 255-reg) behavior. Byte-identical
+// either way — this is purely a scheduling/occupancy hint.
+#ifndef STWO_LEAF_MIN_BLOCKS
+#define STWO_LEAF_MIN_BLOCKS 2
+#endif
+
 extern "C"
 void commit_on_first_layer(uint32_t size, uint32_t number_of_columns, uint32_t **columns, Blake2sHash* result);
 

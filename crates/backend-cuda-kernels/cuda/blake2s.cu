@@ -245,7 +245,7 @@ __device__ __forceinline__ uint32_t lifted_column_index(
     return ((lifted_index >> (log_ratio + 1)) << 1) + (lifted_index & 1);
 }
 
-__global__ void __launch_bounds__(BLOCK_SIZE) commit_on_first_layer_lifted_in_gpu(
+__global__ void __launch_bounds__(BLOCK_SIZE, STWO_LEAF_MIN_BLOCKS) commit_on_first_layer_lifted_in_gpu(
     uint32_t size,
     uint32_t number_of_columns,
     uint32_t **data,
@@ -318,7 +318,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE) stream_leaf_init_in_gpu(
     for (int i = 0; i < 8; i++) state[index].s[i] = h[i];
 }
 
-__global__ void __launch_bounds__(BLOCK_SIZE) stream_leaf_update_in_gpu(
+__global__ void __launch_bounds__(BLOCK_SIZE, STWO_LEAF_MIN_BLOCKS) stream_leaf_update_in_gpu(
     uint32_t size,
     uint32_t group_n_cols,          // MULTIPLE OF 16 (whole blocks, last=0)
     uint32_t **group_data,
@@ -379,7 +379,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE) stream_leaf_finalize_in_gpu(
     for (int i = 0; i < 8; i++) result[index].s[i] = h[i];
 }
 
-__global__ void __launch_bounds__(BLOCK_SIZE) commit_on_layer_using_previous_in_gpu(
+__global__ void __launch_bounds__(BLOCK_SIZE, STWO_LEAF_MIN_BLOCKS) commit_on_layer_using_previous_in_gpu(
     uint32_t size,
     uint32_t number_of_columns,
     uint32_t **data,
