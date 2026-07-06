@@ -822,27 +822,42 @@ fn decommit_compact_tree<B: BackendForChannel<MC>, MC: MerkleChannel>(
     // The leaves whose hashes the decommit will recompute (unretained bottom tree layers).
     let leaf_indices = tree.commitment.unretained_leaf_indices(query_positions);
 
+    // Regenerate the released evaluations in ONE BATCHED pass (not per-column):
+    // reconstruct each column's full-degree coefficients, then hand the whole set to
+    // `evaluate_polynomials`, which groups by log size and runs one batched NTT per
+    // group. The prior per-column `evaluate_into` issued hundreds of separate
+    // single-column NTT launches — the dominant cost of the streamed-LDE decommit
+    // (measured ~20s of the ~21s Prove STARKs span on SN_PIE_2). Batching is
+    // byte-identical (same NTT, same values); it only changes launch structure.
+    // Column order is preserved by `evaluate_polynomials` (wraps results in input
+    // order), so the positional (column ↔ log_size ↔ gather) correspondence holds.
+    let domains: Vec<CircleDomain> = compact.columns.iter().map(|(_, d)| *d).collect();
+    let coeffs: ColumnVec<CircleCoefficients<B>> = compact
+        .columns
+        .into_iter()
+        .map(|(column, _)| match column {
+            CompactColumn::Original(coeffs) | CompactColumn::Full(coeffs) => coeffs,
+            CompactColumn::Half(left) => {
+                // Upper coefficient half was verified all-zero at compaction; restore it.
+                let zeros = CircleCoefficients::new(Col::<B, BaseField>::zeros(left.coeffs.len()));
+                B::join_at_mid(left, zeros)
+            }
+        })
+        .collect();
+    // Blowup 0: each column's coefficients already carry its full (LDE) log size, so
+    // it evaluates back onto its committed domain — identical to the prior
+    // `evaluate_into(coeffs, domain, ..)`.
+    let polys = B::evaluate_polynomials(coeffs, 0, twiddles, false, pool);
+
     #[cfg(not(feature = "parallel"))]
-    let iter = compact.columns.into_iter();
+    let iter = polys.into_iter().zip(domains);
     #[cfg(feature = "parallel")]
-    let iter = compact.columns.into_par_iter();
+    let iter = polys.into_par_iter().zip(domains);
 
     let (log_sizes, rows): (Vec<u32>, Vec<HashMap<usize, BaseField>>) = iter
-        .map(|(column, domain)| {
+        .map(|(poly, domain)| {
             let log_size = domain.log_size();
             let shift = lifting_log_size - log_size;
-            let buffer = pool.take_or_alloc(log_size);
-            let evals = match column {
-                CompactColumn::Original(coeffs) | CompactColumn::Full(coeffs) => {
-                    B::evaluate_into(&coeffs, domain, twiddles, buffer)
-                }
-                CompactColumn::Half(left) => {
-                    let zeros =
-                        CircleCoefficients::new(Col::<B, BaseField>::zeros(left.coeffs.len()));
-                    let joined = B::join_at_mid(left, zeros);
-                    B::evaluate_into(&joined, domain, twiddles, buffer)
-                }
-            };
             let mut gathered = HashMap::new();
             for pos in query_positions.iter().chain(leaf_indices.iter()) {
                 let row = (pos >> (shift + 1) << 1) + (pos & 1);
@@ -850,9 +865,8 @@ fn decommit_compact_tree<B: BackendForChannel<MC>, MC: MerkleChannel>(
                 // the exact committed bytes.
                 gathered
                     .entry(row)
-                    .or_insert_with(|| evals.values.at_unreduced(row));
+                    .or_insert_with(|| poly.evals.values.at_unreduced(row));
             }
-            pool.give_back(log_size, evals.values);
             (log_size, gathered)
         })
         .unzip();
