@@ -882,10 +882,16 @@ fn decommit_compact_tree<B: BackendForChannel<MC>, MC: MerkleChannel>(
             .all(|(c, d)| d.log_size() - c.log_size() == log_blowup),
         "decommit batch assumes a single extension factor per tree"
     );
+    let pvt_on = std::env::var("STWO_PVT").as_deref() == Ok("1");
+    let t0 = std::time::Instant::now();
     let polys = B::evaluate_polynomials(coeffs, log_blowup, twiddles, false, pool);
+    if pvt_on {
+        eprintln!("PVT   dct_reLDE {:.3}", t0.elapsed().as_secs_f64());
+    }
 
     // Pair sequentially (rayon can't zip a parallel iterator with a plain Vec), then
     // parallelize the row gather over the tuples.
+    let t1 = std::time::Instant::now();
     let paired: Vec<(Poly<B>, CircleDomain)> = polys.into_iter().zip(domains).collect();
     #[cfg(not(feature = "parallel"))]
     let iter = paired.into_iter();
@@ -896,18 +902,25 @@ fn decommit_compact_tree<B: BackendForChannel<MC>, MC: MerkleChannel>(
         .map(|(poly, domain)| {
             let log_size = domain.log_size();
             let shift = lifting_log_size - log_size;
-            let mut gathered = HashMap::new();
-            for pos in query_positions.iter().chain(leaf_indices.iter()) {
-                let row = (pos >> (shift + 1) << 1) + (pos & 1);
-                // Gather raw stored representations: leaf-hash recomputation must reproduce
-                // the exact committed bytes.
-                gathered
-                    .entry(row)
-                    .or_insert_with(|| poly.evals.values.at_unreduced(row));
-            }
+            // Batch the row gather into ONE device readback per column (was one
+            // `at_unreduced` device roundtrip PER row — queries×columns individual
+            // copies, the dominant streamed-LDE decommit cost). Dedup rows first;
+            // `gather_unreduced` reproduces the exact committed raw bytes.
+            let mut unique_rows: Vec<usize> = query_positions
+                .iter()
+                .chain(leaf_indices.iter())
+                .map(|pos| (pos >> (shift + 1) << 1) + (pos & 1))
+                .collect();
+            unique_rows.sort_unstable();
+            unique_rows.dedup();
+            let vals = poly.evals.values.gather_unreduced(&unique_rows);
+            let gathered: HashMap<usize, BaseField> = unique_rows.into_iter().zip(vals).collect();
             (log_size, gathered)
         })
         .unzip();
+    if pvt_on {
+        eprintln!("PVT   dct_gather {:.3}", t1.elapsed().as_secs_f64());
+    }
 
     tree.commitment
         .decommit_gathered(query_positions, &GatheredColumns { log_sizes, rows })
