@@ -331,6 +331,44 @@ where
         dec_pruned.decommitment.hash_witness, dec_b.decommitment.hash_witness,
         "pruned hash witness"
     );
+
+    // Column counts that are exact 16-word (64-byte) block multiples: the leaf hash
+    // stream must end in a full last-flagged block, never a zero-padded extra block.
+    // Hash implementations that buffer block-wise get this wrong only on these counts
+    // (regression: an eager word-block CUDA lane produced RootMismatch solely on trees
+    // whose column count was 0 mod 16 — SN_PIE_3's FRI first layer — while passing
+    // every mixed-count tree).
+    for n_columns in [16usize, 32] {
+        let columns_cpu: Vec<Vec<BaseField>> = (0..n_columns)
+            .map(|i| random_base_field_vec(&mut rng, 1 << (3 + (i % 5) as u32)))
+            .collect();
+        let columns_b: Vec<Col<B, BaseField>> = columns_cpu
+            .iter()
+            .map(|c| c.iter().copied().collect())
+            .collect();
+        let tree_b =
+            MerkleProverLifted::<B, MC::H>::commit(columns_b.iter().collect(), lifting_log_size, 0);
+        let tree_cpu = MerkleProverLifted::<CpuBackend, MC::H>::commit(
+            columns_cpu.iter().collect(),
+            lifting_log_size,
+            0,
+        );
+        assert_eq!(
+            tree_b.root(),
+            tree_cpu.root(),
+            "Merkle root, n_columns={n_columns}"
+        );
+        let (values_b, dec_b) = tree_b.decommit(&queries, columns_b.iter().collect_vec());
+        let (values_cpu, dec_cpu) = tree_cpu.decommit(&queries, columns_cpu.iter().collect_vec());
+        assert_eq!(
+            values_b, values_cpu,
+            "queried values, n_columns={n_columns}"
+        );
+        assert_eq!(
+            dec_b.decommitment.hash_witness, dec_cpu.decommitment.hash_witness,
+            "hash witness, n_columns={n_columns}"
+        );
+    }
 }
 
 /// Proof-of-work grinding must return the same nonce as the reference backend. (Any valid
