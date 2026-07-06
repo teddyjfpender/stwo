@@ -460,18 +460,27 @@ impl PolyOps for CudaBackend {
         for e in evals {
             assert_eq!(e.len(), weights.len());
         }
-        let ptrs: Vec<*const u32> = evals.iter().map(|e| e.values.device_ptr).collect();
-        let table = crate::backend::UploadedDevicePointerVec::upload(&ptrs);
-        let out = unsafe {
-            interface::bindings::barycentric_eval_base_field_many(
-                table.as_ptr(),
-                evals.len() as u32,
-                weights.device_ptr,
-                weights.len() as u32,
-            )
-        };
-        drop(table);
-        out.into_iter().map(SecureField::from).collect()
+        // The batched kernel puts columns on the grid's y-dimension, capped at
+        // 65535 by CUDA. Cairo OODS groups are far below this, but chunk so an
+        // oversized group can never make the launch fail — each chunk is an
+        // independent, exact set of columns, concatenated in order.
+        const MAX_COLS_PER_LAUNCH: usize = 32768;
+        let mut out = Vec::with_capacity(evals.len());
+        for chunk in evals.chunks(MAX_COLS_PER_LAUNCH) {
+            let ptrs: Vec<*const u32> = chunk.iter().map(|e| e.values.device_ptr).collect();
+            let table = crate::backend::UploadedDevicePointerVec::upload(&ptrs);
+            let chunk_out = unsafe {
+                interface::bindings::barycentric_eval_base_field_many(
+                    table.as_ptr(),
+                    chunk.len() as u32,
+                    weights.device_ptr,
+                    weights.len() as u32,
+                )
+            };
+            drop(table);
+            out.extend(chunk_out.into_iter().map(SecureField::from));
+        }
+        out
     }
 
     fn eval_at_point_by_folding(
