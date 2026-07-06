@@ -324,6 +324,33 @@ mod tests {
     }
 
     #[test]
+    fn test_commit_on_first_layer_exact_block_multiple_columns() {
+        // 16/32 columns = exact 64-byte block multiples: the word stream must
+        // end in a full last-flagged block, never a zero-padded extra block
+        // (regression: SN_PIE_3 FRI first layer, RootMismatch).
+        let log_size = 10;
+        let size = 1 << log_size;
+        for n_columns in [16, 32] {
+            let cpu_columns_vector: Vec<Vec<BaseField>> = columns_test_vector(n_columns, size);
+            let gpu_columns_vector: Vec<BaseFieldVec> = gpu_columns_from(&cpu_columns_vector);
+
+            let expected_result = <CpuBackend as MerkleOps<Blake2sMerkleHasher>>::commit_on_layer(
+                log_size,
+                None,
+                &cpu_columns_vector.iter().collect::<Vec<_>>(),
+            );
+            let result: Blake2sHashVec =
+                <CudaBackend as MerkleOps<Blake2sMerkleHasher>>::commit_on_layer(
+                    log_size,
+                    None,
+                    &gpu_columns_vector.iter().collect::<Vec<_>>(),
+                );
+
+            assert_eq!(result.to_cpu(), expected_result, "n_columns={n_columns}");
+        }
+    }
+
+    #[test]
     fn test_commit_on_layer_with_previous_layer_compared_with_cpu() {
         let current_layer_log_size = 10;
         let current_layer_size = 1 << current_layer_log_size;

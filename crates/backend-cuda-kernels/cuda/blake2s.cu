@@ -194,7 +194,11 @@ __device__ __forceinline__ void blake2s_hash_column_words(
 ) {
     uint32_t m[16];
     uint32_t col = 0;
-    while (col + 16 <= number_of_columns) {
+    // Lazy like blake2s_update (`inlen > fill`): a block is compressed with
+    // last=0 only when more words follow it, so the block holding the final
+    // word is the one flagged last — also when the stream is an exact
+    // multiple of 16 words (rem == 16 below, never a zero-padded extra block).
+    while (col + 16 < number_of_columns) {
         #pragma unroll
         for (int k = 0; k < 16; k++) m[k] = data[col + k][index];
         t += 64;
@@ -257,7 +261,8 @@ __global__ void commit_on_first_layer_lifted_in_gpu(
     uint32_t m[16];
     uint32_t t = 0;
     uint32_t col = 0;
-    while (col + 16 <= number_of_columns) {
+    // Lazy full-block loop — see blake2s_hash_column_words.
+    while (col + 16 < number_of_columns) {
         #pragma unroll
         for (int k = 0; k < 16; k++) {
             uint32_t log_ratio = lifting_log_size - column_log_sizes[col + k];
