@@ -575,6 +575,9 @@ pub unsafe extern "C" fn cuda_pool_highwater(used_high: *mut usize, reserved_hig
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn cuda_pool_highwater_reset() {}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn cuda_get_memory_info(free_mem: *mut usize, total_mem: *mut usize) {
     no_cuda_symbol("cuda_get_memory_info")
 }

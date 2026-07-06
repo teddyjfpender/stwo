@@ -39,3 +39,11 @@ pub fn gpu_pool_highwater() -> (usize, usize) {
     unsafe { columns::bindings::cuda_pool_highwater(&mut used, &mut reserved) };
     (used, reserved)
 }
+
+/// Reset the pool high-water marks to current usage — per-phase VRAM
+/// attribution (design §1.1 R5): read + reset at phase boundaries.
+pub fn gpu_pool_highwater_reset() {
+    if stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
+        unsafe { columns::bindings::cuda_pool_highwater_reset() };
+    }
+}

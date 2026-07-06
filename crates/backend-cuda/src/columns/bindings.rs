@@ -140,9 +140,9 @@ pub use sys_raw::{
     copy_uint32_t_vec_from_host_to_device_into_async, cuda_alloc_pinned_host_u32,
     cuda_alloc_zeroes_uint32_t, cuda_free_memory, cuda_free_pinned_host_u32, cuda_gather_uint32_t,
     cuda_get_memory_info, cuda_get_uint32_t, cuda_increase_at, cuda_malloc_uint32_t,
-    cuda_pool_highwater, cuda_release_uploaded_pointer_vec, cuda_set_uint32_t,
-    cuda_zero_device_region, lift_accumulate_secure_columns, logup_fraction_chain, ntt_b2n_column,
-    ntt_n2b_columns, stwo_legacy_stream_sync,
+    cuda_pool_highwater, cuda_pool_highwater_reset, cuda_release_uploaded_pointer_vec,
+    cuda_set_uint32_t, cuda_zero_device_region, lift_accumulate_secure_columns,
+    logup_fraction_chain, ntt_b2n_column, ntt_n2b_columns, stwo_legacy_stream_sync,
 };
 
 pub unsafe fn cuda_get_secure_field(device_ptr: *const c_void, index: usize) -> CudaSecureField {

@@ -185,6 +185,7 @@ extern "C" {
 
     pub fn cuda_get_memory_info(free_mem: *mut usize, total_mem: *mut usize);
     pub fn cuda_pool_highwater(used_high: *mut usize, reserved_high: *mut usize);
+    pub fn cuda_pool_highwater_reset();
 
     pub fn bit_reverse_base_field(array: *const u32, size: usize);
 

@@ -483,3 +483,13 @@ extern "C" void cuda_pool_highwater(size_t* used_high, size_t* reserved_high) {
         *reserved_high = (size_t)reserved;
     }
 }
+
+// Reset the pool high-water marks (per-phase VRAM attribution, R-metric R5):
+// the driver accepts writing 0 to the *High attributes, resetting them to the
+// CURRENT usage.
+extern "C" void cuda_pool_highwater_reset() {
+    cudaMemPool_t pool = stwo_default_mem_pool();
+    unsigned long long zero = 0;
+    cudaMemPoolSetAttribute(pool, cudaMemPoolAttrUsedMemHigh, &zero);
+    cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReservedMemHigh, &zero);
+}
