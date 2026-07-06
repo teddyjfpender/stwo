@@ -622,8 +622,18 @@ pub fn launch_recorded_witness_for_prove(
         enabler_col.device_ptr,
     ];
 
-    let result =
-        launch_witness_program_core(label, program, &input_ptrs, n, tables, want_host_lookup);
+    // Opcodes always keep the host sub buffer: verify_instruction (not a COUNT_RELATION)
+    // is host-fed from `sub_flat`, so it can never be skipped here.
+    let result = launch_witness_program_core(
+        label,
+        program,
+        &input_ptrs,
+        n,
+        tables,
+        want_host_lookup,
+        // want_host_sub
+        true,
+    );
     // Inputs may be dropped now (the core launch is synchronous through its D2H).
     drop((pc_col, ap_col, fp_col, enabler_col));
     result
@@ -645,6 +655,7 @@ pub fn launch_recorded_builtin_for_prove(
     input_cols: &[Vec<u32>],
     tables: &DeviceExecutionTables,
     want_host_lookup: bool,
+    want_host_sub: bool,
 ) -> Option<(
     Vec<BaseFieldVec>,
     BaseFieldVec,
@@ -675,8 +686,15 @@ pub fn launch_recorded_builtin_for_prove(
         .collect();
     let input_ptrs: Vec<*const u32> = uploaded.iter().map(|u| u.as_ptr()).collect();
 
-    let result =
-        launch_witness_program_core(label, program, &input_ptrs, n, tables, want_host_lookup);
+    let result = launch_witness_program_core(
+        label,
+        program,
+        &input_ptrs,
+        n,
+        tables,
+        want_host_lookup,
+        want_host_sub,
+    );
     drop(uploaded);
     result
 }
@@ -691,6 +709,7 @@ pub fn launch_recorded_builtin_from_device_cols(
     n: usize,
     tables: &DeviceExecutionTables,
     want_host_lookup: bool,
+    want_host_sub: bool,
 ) -> Option<(
     Vec<BaseFieldVec>,
     BaseFieldVec,
@@ -717,6 +736,7 @@ pub fn launch_recorded_builtin_from_device_cols(
         n,
         tables,
         want_host_lookup,
+        want_host_sub,
     )
 }
 
@@ -731,6 +751,7 @@ pub fn launch_recorded_builtin_mixed(
     n: usize,
     tables: &DeviceExecutionTables,
     want_host_lookup: bool,
+    want_host_sub: bool,
 ) -> Option<(
     Vec<BaseFieldVec>,
     BaseFieldVec,
@@ -763,6 +784,7 @@ pub fn launch_recorded_builtin_mixed(
         n,
         tables,
         want_host_lookup,
+        want_host_sub,
     );
     drop(uploaded);
     result
@@ -871,6 +893,7 @@ fn launch_witness_program_core(
     n: usize,
     tables: &DeviceExecutionTables,
     want_host_lookup: bool,
+    want_host_sub: bool,
 ) -> Option<(
     Vec<BaseFieldVec>,
     BaseFieldVec,
@@ -967,7 +990,16 @@ fn launch_witness_program_core(
     } else {
         Vec::new()
     };
-    let sub_host: Vec<u32> = sub_words.to_vec().into_iter().map(|f| f.0).collect();
+    // The largest witness D2H (~0.7 GiB for w18): skipped for the all-count builtins
+    // whose host `sub_flat` is provably unused (device count feed fully closed, no
+    // edge stash). Mirrors the `want_host_lookup` gate above; the DEVICE `sub_words`
+    // buffer is untouched and still feeds the counts in place. Fail-closed: the caller
+    // passes `true` whenever anything might read `sub_flat`.
+    let sub_host: Vec<u32> = if want_host_sub {
+        sub_words.to_vec().into_iter().map(|f| f.0).collect()
+    } else {
+        Vec::new()
+    };
     // The DEVICE sub buffer rides along for the device-DAG count feed
     // (witness_feed_counts.cu consumes it in place — no D2H on that path).
     // Tables may be dropped now (launch is synchronous through the D2H above); the
