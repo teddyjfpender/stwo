@@ -270,6 +270,7 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         WeightsCache::Unbounded(weights_dashmap)
     }
 
+    #[allow(unused_assignments)] // the final `pvt!` timer reset is intentionally unread
     pub fn prove_values(
         mut self,
         sampled_points: TreeVec<ColumnVec<Vec<CirclePoint<SecureField>>>>,
