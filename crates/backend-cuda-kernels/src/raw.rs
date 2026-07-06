@@ -322,6 +322,30 @@ extern "C" {
         result: *mut Blake2sHash,
     );
 
+    /// Streaming leaf commit (VRAM diet): the lifted first layer split so the
+    /// caller LDEs base columns one group at a time. init -> update per group
+    /// -> finalize; `state` holds h[8] per leaf. Byte-identical to
+    /// `commit_on_first_layer_lifted`.
+    pub fn stream_leaf_init(size: u32, state: *mut Blake2sHash);
+    pub fn stream_leaf_update(
+        size: u32,
+        group_n_cols: u32,
+        columns: *const *const u32,
+        column_log_sizes: *const u32,
+        lifting_log_size: u32,
+        cols_done: u32,
+        state: *mut Blake2sHash,
+    );
+    pub fn stream_leaf_finalize(
+        size: u32,
+        rem_cols: u32,
+        columns: *const *const u32,
+        column_log_sizes: *const u32,
+        lifting_log_size: u32,
+        cols_done: u32,
+        result: *mut Blake2sHash,
+    );
+
     pub fn copy_blake_2s_hash_vec_from_host_to_device(
         from: *const Blake2sHash,
         size: usize,

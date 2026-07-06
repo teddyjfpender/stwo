@@ -787,6 +787,37 @@ pub unsafe extern "C" fn commit_on_two_layers_with_previous(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn stream_leaf_init(_size: u32, _state: *mut Blake2sHash) {
+    no_cuda_symbol("stream_leaf_init")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stream_leaf_update(
+    _size: u32,
+    _group_n_cols: u32,
+    _columns: *const *const u32,
+    _column_log_sizes: *const u32,
+    _lifting_log_size: u32,
+    _cols_done: u32,
+    _state: *mut Blake2sHash,
+) {
+    no_cuda_symbol("stream_leaf_update")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stream_leaf_finalize(
+    _size: u32,
+    _rem_cols: u32,
+    _columns: *const *const u32,
+    _column_log_sizes: *const u32,
+    _lifting_log_size: u32,
+    _cols_done: u32,
+    _result: *mut Blake2sHash,
+) {
+    no_cuda_symbol("stream_leaf_finalize")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn copy_blake_2s_hash_vec_from_host_to_device(
     from: *const Blake2sHash,
     size: usize,

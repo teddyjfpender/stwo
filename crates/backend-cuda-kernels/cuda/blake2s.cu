@@ -287,6 +287,97 @@ __global__ void __launch_bounds__(BLOCK_SIZE) commit_on_first_layer_lifted_in_gp
     #pragma unroll
     for (int i = 0; i < 8; i++) result[index].s[i] = h[i];
 }
+
+// ---------------------------------------------------------------------------
+// STREAMING leaf commit (VRAM diet): the lifted first-layer hash split into
+// init / update-group / finalize, so the caller can LDE the base columns one
+// GROUP at a time — feed each group into every leaf's running blake2s state,
+// then free the group — instead of holding ALL LDE'd columns resident. Peak
+// drops from all-columns to one-group + the h[8]-per-leaf state.
+//
+// BYTE-IDENTICAL to commit_on_first_layer_lifted_in_gpu by construction: the
+// word stream per leaf is the same sorted-column / lifted-index sequence, and
+// the block boundaries match the lazy loop above. Non-final groups carry a
+// column count that is a MULTIPLE OF 16 (whole 64-byte blocks, last=0); the
+// cross-group state is exactly h[8] plus the byte count t = 4*(cols so far),
+// so no partial-word carry is needed at group boundaries. The finalize step
+// compresses the trailing [0,rem) block (rem in 1..=16) with the last flag —
+// identical to the reference kernel's tail. `state` holds h[8] per leaf and is
+// updated in place; finalize writes the digest back into the same buffer.
+// ---------------------------------------------------------------------------
+__global__ void __launch_bounds__(BLOCK_SIZE) stream_leaf_init_in_gpu(
+    uint32_t size,
+    Blake2sHash *state
+) {
+    uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= size) return;
+    uint32_t h[8];
+    blake2s_init_words(h);
+    #pragma unroll
+    for (int i = 0; i < 8; i++) state[index].s[i] = h[i];
+}
+
+__global__ void __launch_bounds__(BLOCK_SIZE) stream_leaf_update_in_gpu(
+    uint32_t size,
+    uint32_t group_n_cols,          // MULTIPLE OF 16 (whole blocks, last=0)
+    uint32_t **group_data,
+    const uint32_t *group_col_log_sizes,
+    uint32_t lifting_log_size,
+    uint32_t cols_done,             // columns compressed in prior groups
+    Blake2sHash *state
+) {
+    uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= size) return;
+    uint32_t h[8];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) h[i] = state[index].s[i];
+    uint32_t m[16];
+    uint32_t t = 4u * cols_done;    // bytes hashed so far (4 per M31 word)
+    uint32_t col = 0;
+    while (col + 16 <= group_n_cols) {
+        #pragma unroll
+        for (int k = 0; k < 16; k++) {
+            uint32_t log_ratio = lifting_log_size - group_col_log_sizes[col + k];
+            m[k] = group_data[col + k][lifted_column_index(index, log_ratio)];
+        }
+        t += 64;
+        blake2s_compress_words(h, m, t, 0);
+        col += 16;
+    }
+    #pragma unroll
+    for (int i = 0; i < 8; i++) state[index].s[i] = h[i];
+}
+
+__global__ void __launch_bounds__(BLOCK_SIZE) stream_leaf_finalize_in_gpu(
+    uint32_t size,
+    uint32_t rem_cols,              // final block width in 1..=16
+    uint32_t **final_data,
+    const uint32_t *final_col_log_sizes,
+    uint32_t lifting_log_size,
+    uint32_t cols_done,             // columns compressed before the final block
+    Blake2sHash *result             // in/out: carries h[8], receives the digest
+) {
+    uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= size) return;
+    uint32_t h[8];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) h[i] = result[index].s[i];
+    uint32_t m[16];
+    #pragma unroll
+    for (int k = 0; k < 16; k++) {
+        if (k < rem_cols) {
+            uint32_t log_ratio = lifting_log_size - final_col_log_sizes[k];
+            m[k] = final_data[k][lifted_column_index(index, log_ratio)];
+        } else {
+            m[k] = 0;
+        }
+    }
+    uint32_t t = 4u * cols_done + 4u * rem_cols;
+    blake2s_compress_words(h, m, t, 0xFFFFFFFF);
+    #pragma unroll
+    for (int i = 0; i < 8; i++) result[index].s[i] = h[i];
+}
+
 __global__ void __launch_bounds__(BLOCK_SIZE) commit_on_layer_using_previous_in_gpu(
     uint32_t size,
     uint32_t number_of_columns,
@@ -394,6 +485,46 @@ void commit_on_first_layer_lifted(
 ) {
     commit_on_first_layer_lifted_in_gpu<<<number_of_blocks_for(size), BLOCK_SIZE>>>(
         size, number_of_columns, device_columns, column_log_sizes, lifting_log_size, result);
+    ASSERT_CUDA_SUCCESS(cudaGetLastError());
+    stwo_maybe_debug_sync();
+    ASSERT_CUDA_SUCCESS(cudaGetLastError());
+}
+
+// Streaming leaf commit (VRAM diet) — init / update-group / finalize.
+void stream_leaf_init(uint32_t size, Blake2sHash *state) {
+    stream_leaf_init_in_gpu<<<number_of_blocks_for(size), BLOCK_SIZE>>>(size, state);
+    ASSERT_CUDA_SUCCESS(cudaGetLastError());
+    stwo_maybe_debug_sync();
+    ASSERT_CUDA_SUCCESS(cudaGetLastError());
+}
+
+void stream_leaf_update(
+    uint32_t size,
+    uint32_t group_n_cols,
+    uint32_t **device_columns,
+    const uint32_t *column_log_sizes,
+    uint32_t lifting_log_size,
+    uint32_t cols_done,
+    Blake2sHash *state
+) {
+    stream_leaf_update_in_gpu<<<number_of_blocks_for(size), BLOCK_SIZE>>>(
+        size, group_n_cols, device_columns, column_log_sizes, lifting_log_size, cols_done, state);
+    ASSERT_CUDA_SUCCESS(cudaGetLastError());
+    stwo_maybe_debug_sync();
+    ASSERT_CUDA_SUCCESS(cudaGetLastError());
+}
+
+void stream_leaf_finalize(
+    uint32_t size,
+    uint32_t rem_cols,
+    uint32_t **device_columns,
+    const uint32_t *column_log_sizes,
+    uint32_t lifting_log_size,
+    uint32_t cols_done,
+    Blake2sHash *result
+) {
+    stream_leaf_finalize_in_gpu<<<number_of_blocks_for(size), BLOCK_SIZE>>>(
+        size, rem_cols, device_columns, column_log_sizes, lifting_log_size, cols_done, result);
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
     stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
