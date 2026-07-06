@@ -447,6 +447,33 @@ impl PolyOps for CudaBackend {
         }
     }
 
+    fn barycentric_eval_columns_at_point(
+        evals: &[&CircleEvaluation<Self, BaseField, BitReversedOrder>],
+        weights: &Col<Self, SecureField>,
+    ) -> Vec<SecureField> {
+        // One launch pair + one D2H for the whole same-size group, vs a
+        // launch+sync round trip per column (the OODS phase issues thousands).
+        // Exact field sums — values identical to the per-column path.
+        if evals.is_empty() {
+            return Vec::new();
+        }
+        for e in evals {
+            assert_eq!(e.len(), weights.len());
+        }
+        let ptrs: Vec<*const u32> = evals.iter().map(|e| e.values.device_ptr).collect();
+        let table = crate::backend::UploadedDevicePointerVec::upload(&ptrs);
+        let out = unsafe {
+            interface::bindings::barycentric_eval_base_field_many(
+                table.as_ptr(),
+                evals.len() as u32,
+                weights.device_ptr,
+                weights.len() as u32,
+            )
+        };
+        drop(table);
+        out.into_iter().map(SecureField::from).collect()
+    }
+
     fn eval_at_point_by_folding(
         evals: &CircleEvaluation<Self, BaseField, BitReversedOrder>,
         point: CirclePoint<SecureField>,

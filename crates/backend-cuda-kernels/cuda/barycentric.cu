@@ -157,6 +157,68 @@ __global__ void reduce_qm31_partial_sums_kernel(
     }
 }
 
+__global__ void barycentric_eval_partial_many_kernel(
+    const m31 *const *columns,      // n_cols device pointers, same size
+    const qm31 *weights,
+    uint32_t size,
+    qm31 *partial_sums              // [n_cols][gridDim.x] row-major
+) {
+    extern __shared__ qm31 shared[];
+
+    const m31 *eval_values = columns[blockIdx.y];
+    qm31 thread_sum = {{0, 0}, {0, 0}};
+    uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t stride = blockDim.x * gridDim.x;
+
+    while (index < size) {
+        thread_sum = add(thread_sum, mul(eval_values[index], weights[index]));
+        index += stride;
+    }
+
+    shared[threadIdx.x] = thread_sum;
+    __syncthreads();
+
+    for (uint32_t offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+        if (threadIdx.x < offset) {
+            shared[threadIdx.x] = add(shared[threadIdx.x], shared[threadIdx.x + offset]);
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        partial_sums[blockIdx.y * gridDim.x + blockIdx.x] = shared[0];
+    }
+}
+
+// One block per column: reduce that column's row of partial sums to out[col].
+__global__ void reduce_qm31_rows_kernel(
+    const qm31 *partials,           // [n_cols][row_width]
+    uint32_t row_width,
+    qm31 *out                       // [n_cols]
+) {
+    extern __shared__ qm31 shared[];
+
+    const qm31 *row = partials + (size_t)blockIdx.x * row_width;
+    qm31 thread_sum = {{0, 0}, {0, 0}};
+    for (uint32_t i = threadIdx.x; i < row_width; i += blockDim.x) {
+        thread_sum = add(thread_sum, row[i]);
+    }
+
+    shared[threadIdx.x] = thread_sum;
+    __syncthreads();
+
+    for (uint32_t offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+        if (threadIdx.x < offset) {
+            shared[threadIdx.x] = add(shared[threadIdx.x], shared[threadIdx.x + offset]);
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        out[blockIdx.x] = shared[0];
+    }
+}
+
 } // namespace
 
 // Computes the per-point `point_vanishing(d_i, p)` values for the whole (bit-reversed)
@@ -265,4 +327,44 @@ qm31 barycentric_eval_base_field(
     cuda_proving_free(current);
 
     return result;
+}
+
+// Batched OODS evaluation: MANY same-size base-field columns against ONE weights
+// column, one launch pair + one D2H for the whole group (vs a launch+sync round
+// trip per column). Exact field sums — values identical to the per-column entry
+// regardless of reduction shape.
+extern "C"
+void barycentric_eval_base_field_many(
+    const m31 *const *columns_dev,  // DEVICE array of n_cols column pointers
+    uint32_t n_cols,
+    const qm31 *weights,
+    uint32_t size,
+    qm31 *out_host                  // HOST buffer, n_cols results
+) {
+    uint32_t blocks_per_col = (size + BARYCENTRIC_BLOCK_DIM - 1) / BARYCENTRIC_BLOCK_DIM;
+    if (blocks_per_col > 1024) blocks_per_col = 1024;
+
+    qm31 *partials = cuda_proving_malloc<qm31>((size_t)n_cols * blocks_per_col);
+    dim3 grid(blocks_per_col, n_cols);
+    barycentric_eval_partial_many_kernel<<<grid, BARYCENTRIC_BLOCK_DIM, sizeof(qm31) * BARYCENTRIC_BLOCK_DIM>>>(
+        columns_dev,
+        weights,
+        size,
+        partials
+    );
+    stwo_maybe_debug_sync();
+    ASSERT_CUDA_SUCCESS(cudaGetLastError());
+
+    qm31 *out_dev = cuda_proving_malloc<qm31>(n_cols);
+    reduce_qm31_rows_kernel<<<n_cols, BARYCENTRIC_BLOCK_DIM, sizeof(qm31) * BARYCENTRIC_BLOCK_DIM>>>(
+        partials,
+        blocks_per_col,
+        out_dev
+    );
+    stwo_maybe_debug_sync();
+    ASSERT_CUDA_SUCCESS(cudaGetLastError());
+
+    cuda_mem_copy_device_to_host(out_dev, out_host, n_cols);
+    cuda_proving_free(partials);
+    cuda_proving_free(out_dev);
 }

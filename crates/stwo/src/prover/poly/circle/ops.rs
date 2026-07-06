@@ -63,6 +63,24 @@ pub trait PolyOps: ColumnOps<BaseField> + ColumnOps<SecureField> + Sized {
         weights: &Col<Self, SecureField>,
     ) -> SecureField;
 
+    /// Barycentric-evaluates MANY same-size polynomials at the one point the `weights`
+    /// column encodes, returning one value per column in order. Value-identical to
+    /// per-column [`Self::barycentric_eval_at_point`] calls by construction (exact
+    /// field sums — no ordering sensitivity); the hook exists so device backends can
+    /// batch the whole group into one launch + one readback instead of a
+    /// launch+sync round-trip per column (the OODS phase issues thousands).
+    fn barycentric_eval_columns_at_point(
+        evals: &[&CircleEvaluation<Self, BaseField, BitReversedOrder>],
+        weights: &Col<Self, SecureField>,
+    ) -> Vec<SecureField> {
+        #[cfg(feature = "parallel")]
+        let iter = evals.par_iter();
+        #[cfg(not(feature = "parallel"))]
+        let iter = evals.iter();
+        iter.map(|e| Self::barycentric_eval_at_point(e, weights))
+            .collect()
+    }
+
     /// Evaluates a polynomial, represented by it's evaluations, at a point using folding.
     /// Used by the [`CircleEvaluation::eval_at_point_by_folding()`] function.
     fn eval_at_point_by_folding(

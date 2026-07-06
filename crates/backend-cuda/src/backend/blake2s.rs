@@ -17,6 +17,29 @@ impl ColumnOps<Blake2sHash> for CudaBackend {
     }
 }
 
+/// STWO_MERKLE_SPANS=1: true GPU time per Merkle op (sync–time–sync), for
+/// ranking leaf vs interior vs tail across the ~14 commits of a prove.
+/// Observational only — the syncs run solely under the flag.
+fn merkle_span_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("STWO_MERKLE_SPANS").as_deref() == Ok("1"))
+}
+
+fn merkle_span<T>(label: &str, n_cols: usize, log_size: u32, f: impl FnOnce() -> T) -> T {
+    if !merkle_span_enabled() || !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
+        return f();
+    }
+    unsafe { stwo_backend_cuda_kernels::raw::stwo_legacy_stream_sync() };
+    let t0 = std::time::Instant::now();
+    let out = f();
+    unsafe { stwo_backend_cuda_kernels::raw::stwo_legacy_stream_sync() };
+    eprintln!(
+        "merkle_span[{label}]: cols={n_cols} log={log_size} ms={:.2}",
+        t0.elapsed().as_secs_f64() * 1e3
+    );
+    out
+}
+
 impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M31_OUTPUT>>
     for CudaBackend
 {
@@ -64,14 +87,14 @@ impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M3
 
         let size = 1usize << lifting_log_size;
         let result = Blake2sHashVec::new_uninitialized(size);
-        unsafe {
+        merkle_span("leaves", columns.len(), lifting_log_size, || unsafe {
             Self::commit_on_first_layer_lifted_using_gpu(
                 columns,
                 &column_log_sizes,
                 lifting_log_size,
                 result.device_ptr,
             );
-        }
+        });
         result
     }
 
@@ -137,9 +160,9 @@ impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M3
         }
         let result = Blake2sHashVec::new_uninitialized(size);
 
-        unsafe {
+        merkle_span("interior", 0, size.ilog2(), || unsafe {
             Self::commit_on_layer_using_gpu(size, 0, &[], Some(prev_layer), result.device_ptr);
-        }
+        });
 
         result
     }
@@ -171,14 +194,14 @@ impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M3
             .collect();
         let ptrs: Vec<*const u32> = levels.iter().map(|l| l.device_ptr.cast::<u32>()).collect();
         let table = crate::backend::UploadedDevicePointerVec::upload(&ptrs);
-        let rc = unsafe {
+        let rc = merkle_span("tail", 0, n_levels, || unsafe {
             stwo_backend_cuda_kernels::raw::stwo_blake2s_tail(
                 first.device_ptr.cast(),
                 first.len() as u32,
                 table.as_ptr().cast(),
                 n_levels,
             )
-        };
+        });
         drop(table);
         assert_eq!(rc, 0, "blake2s tail launch failed");
         levels

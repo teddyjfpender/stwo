@@ -305,16 +305,85 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
                 .collect_vec()
         };
 
-        #[cfg(not(feature = "parallel"))]
-        let samples: TreeVec<Vec<Vec<PointSample>>> = self
-            .polynomials()
-            .zip_cols(&sampled_points)
-            .map_cols(eval_at_points);
-        #[cfg(feature = "parallel")]
-        let samples: TreeVec<Vec<Vec<PointSample>>> = self
-            .polynomials()
-            .zip_cols(&sampled_points)
-            .par_map_cols(eval_at_points);
+        let samples: TreeVec<Vec<Vec<PointSample>>> = if let Some(cache) = &weights_hash_map {
+            // Barycentric mode: group every (tree, column, point-slot) evaluation by
+            // (log_size, folded point) — each group shares one weights column — and
+            // evaluate each group's columns in ONE backend call
+            // ([`PolyOps::barycentric_eval_columns_at_point`]). Values are identical
+            // to the per-column path (exact field sums); device backends collapse a
+            // launch+sync round trip per column into one launch pair per group.
+            let polys = self.polynomials();
+            let mut groups: std::collections::HashMap<
+                (u32, CirclePoint<SecureField>),
+                Vec<(usize, usize, usize)>,
+            > = std::collections::HashMap::new();
+            for (t, (tree_polys, tree_points)) in
+                polys.0.iter().zip(sampled_points.0.iter()).enumerate()
+            {
+                for (c, (poly, points)) in tree_polys.iter().zip(tree_points.iter()).enumerate() {
+                    let log_size = poly.evals.domain.log_size();
+                    for (k, &point) in points.iter().enumerate() {
+                        let folded = point.repeated_double(lifting_log_size - log_size);
+                        groups
+                            .entry((log_size, folded))
+                            .or_default()
+                            .push((t, c, k));
+                    }
+                }
+            }
+            let mut out: TreeVec<Vec<Vec<PointSample>>> = TreeVec(
+                sampled_points
+                    .0
+                    .iter()
+                    .map(|tree| {
+                        tree.iter()
+                            .map(|pts| {
+                                pts.iter()
+                                    .map(|&point| PointSample {
+                                        point,
+                                        value: SecureField::default(),
+                                    })
+                                    .collect_vec()
+                            })
+                            .collect_vec()
+                    })
+                    .collect_vec(),
+            );
+            for ((log_size, folded), entries) in groups {
+                let evals_refs: Vec<&CircleEvaluation<B, BaseField, BitReversedOrder>> = entries
+                    .iter()
+                    .map(|&(t, c, _)| &polys.0[t][c].evals)
+                    .collect_vec();
+                let values = cache.with_weights(
+                    (log_size, folded),
+                    || {
+                        CircleEvaluation::<B, BaseField, BitReversedOrder>::barycentric_weights(
+                            CanonicCoset::new(log_size),
+                            folded,
+                        )
+                    },
+                    |weights| B::barycentric_eval_columns_at_point(&evals_refs, weights),
+                );
+                for (&(t, c, k), value) in entries.iter().zip(values) {
+                    out.0[t][c][k].value = value;
+                }
+            }
+            out
+        } else {
+            // Coefficients mode: the per-column path (Horner on stored coefficients).
+            #[cfg(not(feature = "parallel"))]
+            {
+                self.polynomials()
+                    .zip_cols(&sampled_points)
+                    .map_cols(eval_at_points)
+            }
+            #[cfg(feature = "parallel")]
+            {
+                self.polynomials()
+                    .zip_cols(&sampled_points)
+                    .par_map_cols(eval_at_points)
+            }
+        };
 
         span.exit();
         // The barycentric weights are only needed for the out-of-domain evaluations above.

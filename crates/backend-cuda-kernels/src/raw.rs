@@ -255,6 +255,14 @@ extern "C" {
         size: u32,
     ) -> CudaSecureField;
 
+    pub fn barycentric_eval_base_field_many(
+        columns_dev: *const *const u32,
+        n_cols: u32,
+        weights: *const u32,
+        size: u32,
+        out_host: *mut CudaSecureField,
+    );
+
     pub fn fold_line(
         gpu_domain: *const u32,
         twiddle_offset: usize,

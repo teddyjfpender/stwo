@@ -266,6 +266,17 @@ pub unsafe fn barycentric_eval_base_field(
     ))
 }
 
+pub unsafe fn barycentric_eval_base_field_many(
+    columns_dev: *const *const u32,
+    n_cols: u32,
+    weights: *const u32,
+    size: u32,
+) -> Vec<CudaSecureField> {
+    let mut raw = vec![sys_raw::CudaSecureField::default(); n_cols as usize];
+    sys_raw::barycentric_eval_base_field_many(columns_dev, n_cols, weights, size, raw.as_mut_ptr());
+    raw.into_iter().map(CudaSecureField::from_raw).collect()
+}
+
 pub unsafe fn fold_line(
     gpu_domain: *const u32,
     twiddle_offset: usize,
