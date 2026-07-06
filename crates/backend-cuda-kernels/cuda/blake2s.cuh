@@ -14,8 +14,14 @@ const unsigned int BLOCK_SIZE = 256;
 // spilling for latency-hiding occupancy. Compile-time tunable to sweep the
 // trade-off; 1 reproduces the prior (uncapped, 255-reg) behavior. Byte-identical
 // either way — this is purely a scheduling/occupancy hint.
+//
+// MEASURED 2026-07-06: minBlocks=2 doubles occupancy (12.5%→25%, regs 255→128, no
+// added spilling) but is FLAT on total prove within run-to-run noise (~0.8s on
+// SN_PIE_2): the leaf-hash is blake2s-COMPUTE-bound, so latency-hiding occupancy
+// doesn't help, and the commit-Merkle slice is small. Default kept at 1 (no forced
+// cap = original behavior); the knob + STWO_COMMIT_PROBE stay as diagnostics.
 #ifndef STWO_LEAF_MIN_BLOCKS
-#define STWO_LEAF_MIN_BLOCKS 2
+#define STWO_LEAF_MIN_BLOCKS 1
 #endif
 
 extern "C"
