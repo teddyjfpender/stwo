@@ -912,6 +912,18 @@ extern "C" {
     pub fn stwo_fanout_fork(stream: *mut core::ffi::c_void);
     pub fn stwo_fanout_join(stream: *mut core::ffi::c_void);
 
+    // Resource-owning execution context for one resident proof (design §19,
+    // cuda_exec_context.cu): an owned non-blocking stream + its own never-release
+    // memory pool. Opaque handle (StwoExecContext*). `create` returns null on
+    // failure; `alloc`/`free` are stream-ordered on the context's stream (so a
+    // buffer frees after its last same-stream use — no cross-stream reuse hazard).
+    pub fn stwo_exec_context_create() -> *mut core::ffi::c_void;
+    pub fn stwo_exec_context_destroy(handle: *mut core::ffi::c_void);
+    pub fn stwo_exec_context_sync(handle: *mut core::ffi::c_void);
+    pub fn stwo_exec_context_stream(handle: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+    pub fn stwo_exec_context_alloc_u32(handle: *mut core::ffi::c_void, count: usize) -> *mut u32;
+    pub fn stwo_exec_context_free_u32(handle: *mut core::ffi::c_void, ptr: *mut u32);
+
     // Truth oracle for the witness-JIT computed EC deduces (ISA-V3 kinds 2/3):
     // runs the exact `stwo_wit_deduce_*` device functions the JIT kernels embed
     // from a precompiled kernel (see `stwo_wit_deduce_oracle.cu`), so the pod

@@ -6,6 +6,7 @@ mod blake2s;
 pub mod blake_witness;
 mod column;
 mod constraint_eval;
+pub mod exec_context;
 pub mod exec_tables;
 mod field;
 mod fri;

@@ -1314,6 +1314,44 @@ pub unsafe extern "C" fn stwo_fanout_join(_stream: *mut core::ffi::c_void) {
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_exec_context_create() -> *mut core::ffi::c_void {
+    no_cuda_symbol("stwo_exec_context_create")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_exec_context_destroy(_handle: *mut core::ffi::c_void) {
+    no_cuda_symbol("stwo_exec_context_destroy")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_exec_context_sync(_handle: *mut core::ffi::c_void) {
+    no_cuda_symbol("stwo_exec_context_sync")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_exec_context_stream(
+    _handle: *mut core::ffi::c_void,
+) -> *mut core::ffi::c_void {
+    no_cuda_symbol("stwo_exec_context_stream")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_exec_context_alloc_u32(
+    _handle: *mut core::ffi::c_void,
+    _count: usize,
+) -> *mut u32 {
+    no_cuda_symbol("stwo_exec_context_alloc_u32")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_exec_context_free_u32(
+    _handle: *mut core::ffi::c_void,
+    _ptr: *mut u32,
+) {
+    no_cuda_symbol("stwo_exec_context_free_u32")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stwo_wit_deduce_oracle_run(
     _kind: u32,
     _h_in: *const u32,
