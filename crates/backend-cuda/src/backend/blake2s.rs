@@ -310,6 +310,140 @@ impl CudaBackend {
             );
         }
     }
+
+    /// Streaming leaf layer (VRAM diet): hashes the same lifted leaf digests as
+    /// [`Self::commit_on_first_layer_lifted_using_gpu`], but feeds the columns
+    /// through the running-state kernels in GROUPS of `group_cols` (rounded to a
+    /// multiple of 16) so the caller can materialize columns a group at a time.
+    ///
+    /// This entry point takes columns already resident (it isolates and gates the
+    /// streaming KERNEL logic against the all-at-once path). The memory win comes
+    /// from the caller LDE'ing each group on demand and dropping it after the
+    /// corresponding `stream_leaf_update` — see the commit driver.
+    ///
+    /// `columns` must be sorted by length ascending (as `build_leaves` sorts) and
+    /// `column_log_sizes[i]` = `columns[i].len().ilog2()`. Byte-identical to the
+    /// reference: non-final groups carry whole 64-byte blocks (multiple-of-16
+    /// column counts, `last=0`); the trailing `rem in 1..=16` block is finalized.
+    pub fn stream_leaf_layer(
+        columns: &[&BaseFieldVec],
+        column_log_sizes: &[u32],
+        lifting_log_size: u32,
+        group_cols: usize,
+    ) -> Blake2sHashVec {
+        let size = 1usize << lifting_log_size;
+        let state = Blake2sHashVec::new_uninitialized(size);
+        let n = columns.len();
+        unsafe {
+            bindings::stream_leaf_init(size as u32, state.device_ptr.cast_mut());
+        }
+        if n == 0 {
+            // Match the reference's empty-column behavior via the all-at-once path.
+            return <CudaBackend as MerkleOpsLifted<
+                Blake2sMerkleHasherGeneric<false>,
+            >>::build_leaves(columns, lifting_log_size);
+        }
+        // Final block = the trailing rem columns (rem in 1..=16); everything before
+        // it is whole 16-column blocks, streamed in groups.
+        let rem = (n - 1) % 16 + 1;
+        let n_full = n - rem;
+        let step = group_cols.max(16) / 16 * 16; // round down to a multiple of 16, >= 16
+        let mut off = 0usize;
+        while off < n_full {
+            let end = (off + step).min(n_full);
+            let g = end - off;
+            let ptrs: Vec<*const u32> = columns[off..end].iter().map(|c| c.device_ptr).collect();
+            let table = UploadedDevicePointerVec::upload(&ptrs);
+            let logs = UploadedUint32Vec::upload(&column_log_sizes[off..end]);
+            unsafe {
+                bindings::stream_leaf_update(
+                    size as u32,
+                    g as u32,
+                    table.as_ptr(),
+                    logs.as_ptr(),
+                    lifting_log_size,
+                    off as u32,
+                    state.device_ptr.cast_mut(),
+                );
+            }
+            drop((table, logs));
+            off = end;
+        }
+        // Finalize the trailing block in place (state -> digests).
+        let ptrs: Vec<*const u32> = columns[n_full..n].iter().map(|c| c.device_ptr).collect();
+        let table = UploadedDevicePointerVec::upload(&ptrs);
+        let logs = UploadedUint32Vec::upload(&column_log_sizes[n_full..n]);
+        unsafe {
+            bindings::stream_leaf_finalize(
+                size as u32,
+                rem as u32,
+                table.as_ptr(),
+                logs.as_ptr(),
+                lifting_log_size,
+                n_full as u32,
+                state.device_ptr.cast_mut(),
+            );
+        }
+        drop((table, logs));
+        state
+    }
+}
+
+#[cfg(test)]
+mod stream_leaf_tests {
+    use stwo::core::fields::m31::M31;
+    use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleHasherGeneric;
+    use stwo::prover::backend::Column;
+    use stwo::prover::vcs_lifted::ops::MerkleOpsLifted;
+
+    use crate::backend::CudaBackend;
+    use crate::columns::base_field_vec::BaseFieldVec;
+
+    // The streaming leaf layer must be BYTE-IDENTICAL to the all-at-once
+    // `build_leaves`, especially where the column count is a multiple of 16 (the
+    // final word block is full — the exact shape that broke the eager word-block
+    // loop in M4). Mixed sizes exercise the lifted index; several group sizes
+    // exercise the group-boundary/finalize split.
+    fn cols(n: usize) -> Vec<Vec<M31>> {
+        // Sorted ascending by size (as build_leaves requires): sizes cycle 2^3..2^7.
+        let mut v: Vec<Vec<M31>> = (0..n)
+            .map(|i| {
+                let log = 3 + (i % 5) as u32;
+                (0..(1usize << log))
+                    .map(|j| M31::from((i * 7 + j * 13 + 1) as u32))
+                    .collect()
+            })
+            .collect();
+        v.sort_by_key(|c| c.len());
+        v
+    }
+
+    #[test]
+    fn stream_leaf_layer_matches_build_leaves() {
+        for n_columns in [1usize, 15, 16, 17, 31, 32, 33, 64, 100] {
+            for group in [16usize, 32, 48] {
+                let cpu_cols = cols(n_columns);
+                let gpu_cols: Vec<BaseFieldVec> = cpu_cols
+                    .iter()
+                    .map(|c| BaseFieldVec::from_vec(c.clone()))
+                    .collect();
+                let refs: Vec<&BaseFieldVec> = gpu_cols.iter().collect();
+                let log_sizes: Vec<u32> = gpu_cols.iter().map(|c| c.len().ilog2()).collect();
+                let lifting = *log_sizes.last().unwrap();
+
+                let reference = <CudaBackend as MerkleOpsLifted<
+                    Blake2sMerkleHasherGeneric<false>,
+                >>::build_leaves(&refs, lifting);
+                let streamed = CudaBackend::stream_leaf_layer(&refs, &log_sizes, lifting, group);
+
+                assert_eq!(
+                    streamed.to_cpu(),
+                    reference.to_cpu(),
+                    "n_columns={n_columns} group={group}"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(any())] // legacy (pre-lifted-merkle) test, superseded by the testkit

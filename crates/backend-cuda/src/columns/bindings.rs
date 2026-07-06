@@ -345,6 +345,53 @@ pub unsafe fn commit_on_first_layer_lifted(
     );
 }
 
+/// Streaming leaf commit (VRAM diet): the lifted first layer split so the caller
+/// LDEs base columns one group at a time. init -> update per group -> finalize;
+/// `state` holds h[8] per leaf. Byte-identical to `commit_on_first_layer_lifted`.
+pub unsafe fn stream_leaf_init(size: u32, state: *mut Blake2sHash) {
+    sys_raw::stream_leaf_init(size, raw_blake2s_mut_ptr(state));
+}
+
+pub unsafe fn stream_leaf_update(
+    size: u32,
+    group_n_cols: u32,
+    columns: *const *const u32,
+    column_log_sizes: *const u32,
+    lifting_log_size: u32,
+    cols_done: u32,
+    state: *mut Blake2sHash,
+) {
+    sys_raw::stream_leaf_update(
+        size,
+        group_n_cols,
+        columns,
+        column_log_sizes,
+        lifting_log_size,
+        cols_done,
+        raw_blake2s_mut_ptr(state),
+    );
+}
+
+pub unsafe fn stream_leaf_finalize(
+    size: u32,
+    rem_cols: u32,
+    columns: *const *const u32,
+    column_log_sizes: *const u32,
+    lifting_log_size: u32,
+    cols_done: u32,
+    result: *mut Blake2sHash,
+) {
+    sys_raw::stream_leaf_finalize(
+        size,
+        rem_cols,
+        columns,
+        column_log_sizes,
+        lifting_log_size,
+        cols_done,
+        raw_blake2s_mut_ptr(result),
+    );
+}
+
 /// Workstream D layer-pair fusion: hash two internal (column-free) tree levels per
 /// launch. `size` = grandparent hash count; `previous_layer` holds `4 * size`.
 /// Byte-identical to two `commit_on_layer_with_previous` calls with zero columns.
