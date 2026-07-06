@@ -1,5 +1,6 @@
 #include "blake2s.cuh"
 #include <cstdio>
+#include <cstdlib>
 #include "utils.cuh"
 
 __device__ __constant__ uint32_t blake2s_IV[8] = {
@@ -491,7 +492,58 @@ void commit_on_first_layer_lifted(
 }
 
 // Streaming leaf commit (VRAM diet) — init / update-group / finalize.
+// Decisive bandwidth-vs-occupancy probe for the fused-commit keystone (design §19,
+// component #2). Prints, once per process when STWO_COMMIT_PROBE is set, each commit
+// kernel's static register/shared footprint and the resulting theoretical occupancy
+// (achieved active-warps / SM max). Low occupancy => the leaf-hash kernel is
+// register/occupancy-bound (the ledger's evidence-based finding, now measured), so
+// the lever is register-pressure reduction / cooperative hashing, NOT eliminating the
+// LDE HBM round-trip (which is only ~5ms of bandwidth). Zero cost when the env is unset.
+static void stwo_maybe_probe_commit_occupancy() {
+    static bool done = false;
+    if (done) {
+        return;
+    }
+    done = true;
+    if (getenv("STWO_COMMIT_PROBE") == nullptr) {
+        return;
+    }
+    struct KernelInfo {
+        const char *name;
+        const void *fn;
+        int block;
+    };
+    const KernelInfo kernels[] = {
+        {"stream_leaf_update", reinterpret_cast<const void *>(stream_leaf_update_in_gpu), BLOCK_SIZE},
+        {"stream_leaf_finalize", reinterpret_cast<const void *>(stream_leaf_finalize_in_gpu),
+         BLOCK_SIZE},
+        {"commit_on_first_layer_lifted",
+         reinterpret_cast<const void *>(commit_on_first_layer_lifted_in_gpu), BLOCK_SIZE},
+        {"commit_on_layer_using_previous",
+         reinterpret_cast<const void *>(commit_on_layer_using_previous_in_gpu), BLOCK_SIZE},
+    };
+    int dev = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, dev);
+    for (const KernelInfo &k : kernels) {
+        cudaFuncAttributes attr;
+        if (cudaFuncGetAttributes(&attr, k.fn) != cudaSuccess) {
+            continue;
+        }
+        int max_blocks = 0;
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks, k.fn, k.block, 0);
+        double occ = static_cast<double>(max_blocks * k.block) / prop.maxThreadsPerMultiProcessor;
+        fprintf(stderr,
+                "COMMIT_PROBE %s: regs=%d smem_bytes=%zu localmem_bytes=%zu "
+                "block=%d maxBlocksPerSM=%d occupancy=%.3f\n",
+                k.name, attr.numRegs, attr.sharedSizeBytes, attr.localSizeBytes, k.block,
+                max_blocks, occ);
+    }
+}
+
 void stream_leaf_init(uint32_t size, Blake2sHash *state) {
+    stwo_maybe_probe_commit_occupancy();
     stream_leaf_init_in_gpu<<<number_of_blocks_for(size), BLOCK_SIZE>>>(size, state);
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
     stwo_maybe_debug_sync();
