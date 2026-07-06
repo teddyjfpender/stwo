@@ -420,6 +420,11 @@ mod stream_leaf_tests {
 
     #[test]
     fn stream_leaf_layer_matches_build_leaves() {
+        // CUDA-only: the stub backend aborts on any device call. Skip locally
+        // (matches the conformance-test gate); runs on the pod.
+        if !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
+            return;
+        }
         for n_columns in [1usize, 15, 16, 17, 31, 32, 33, 64, 100] {
             for group in [16usize, 32, 48] {
                 let cpu_cols = cols(n_columns);
