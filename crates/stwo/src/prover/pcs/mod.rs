@@ -612,6 +612,45 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
         lifting_log_size: Option<u32>,
         base_column_pool: &BaseColumnPool<B>,
     ) -> Self {
+        // VRAM diet (STWO_CUDA_STREAM_LEAF_COMMIT): build the leaf layer by LDE'ing
+        // the base columns one group at a time (never all evaluations resident),
+        // then retain coefficients + release evaluations — the stream_lde state,
+        // so later phases regenerate from coefficients. Requires
+        // `store_polynomials_coefficients`; falls through to the bulk path if the
+        // backend returns `None`. Byte-identical (the backend's streaming tests +
+        // whole-proof gate cover it).
+        if store_polynomials_coefficients
+            && !polynomials.is_empty()
+            && std::env::var("STWO_CUDA_STREAM_LEAF_COMMIT").as_deref() == Ok("1")
+        {
+            let max_log = polynomials.iter().map(|p| p.log_size()).max().unwrap();
+            let lifting = lifting_log_size.unwrap_or(max_log + log_blowup_factor);
+            // Leaf-hash order = columns sorted ascending by size (blowup constant, so
+            // sorting coefficients by log_size reproduces the bulk `build_leaves` sort).
+            // Sort REFERENCES — no coefficient clone (that would defeat the diet).
+            let mut sorted: Vec<&CircleCoefficients<B>> = polynomials.iter().collect();
+            sorted.sort_by_key(|c| c.log_size());
+            if let Some(leaves) =
+                B::stream_commit_leaves(&sorted, log_blowup_factor, twiddles, lifting)
+            {
+                let tree = MerkleProverLifted::commit_pruned_from_leaves(leaves, lifting);
+                // Retain coefficients, release evaluations (domain kept, values empty).
+                let polynomials = polynomials
+                    .into_iter()
+                    .map(|coeffs| {
+                        let domain = CanonicCoset::new(coeffs.log_size() + log_blowup_factor)
+                            .circle_domain();
+                        let evals = CircleEvaluation::new(domain, Col::<B, BaseField>::zeros(0));
+                        Poly::new(Some(coeffs), evals)
+                    })
+                    .collect();
+                return CommitmentTreeProver {
+                    polynomials,
+                    commitment: tree,
+                };
+            }
+        }
+
         let span = span!(Level::INFO, "Extension").entered();
         let polynomials = B::evaluate_polynomials(
             polynomials,

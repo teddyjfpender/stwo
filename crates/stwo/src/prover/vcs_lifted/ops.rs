@@ -14,6 +14,30 @@ pub trait MerkleOpsLifted<H: MerkleHasherLifted>:
     fn build_leaves(columns: &[&Col<Self, BaseField>], lifting_log_size: u32)
         -> Col<Self, H::Hash>;
 
+    /// VRAM-diet leaf commit: build the lifted leaf layer by LDE'ing `coeffs` one
+    /// column-group at a time (bounding peak memory to one group's evaluations +
+    /// the per-leaf hash state, instead of ALL columns' evaluations at once).
+    ///
+    /// Returns `None` if the backend does not implement streaming — the caller
+    /// then uses the bulk [`Self::build_leaves`] path. When `Some`, the leaf layer
+    /// MUST equal what `build_leaves` produces for the same columns sorted
+    /// ascending by size (the blowup is constant, so sorting `coeffs` by
+    /// `log_size()` reproduces the bulk sort order). Byte-identical to
+    /// `build_leaves(evaluate_polynomials(coeffs))`.
+    ///
+    /// The default is `None` (bulk path); device backends override.
+    fn stream_commit_leaves(
+        _coeffs: &[&crate::prover::poly::circle::CircleCoefficients<Self>],
+        _log_blowup_factor: u32,
+        _twiddles: &crate::prover::poly::twiddles::TwiddleTree<Self>,
+        _lifting_log_size: u32,
+    ) -> Option<Col<Self, H::Hash>>
+    where
+        Self: crate::prover::poly::circle::PolyOps,
+    {
+        None
+    }
+
     /// Given a layer of hashes as input, computes a new layer by hashing pairs
     /// of adjacent elements of the input, as in a standard Merkle tree.
     fn build_next_layer(prev_layer: &Col<Self, H::Hash>) -> Col<Self, H::Hash>;

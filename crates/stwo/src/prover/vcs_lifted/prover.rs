@@ -112,6 +112,19 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
             B::build_leaves(&sorted_columns, lifting_log_size)
         };
 
+        Self::tree_from_leaves(leaves, lifting_log_size, n_unretained_layers)
+    }
+
+    /// Builds the interior tree above a pre-computed leaf layer (parent-of-leaves
+    /// up to the root), pruning the bottom `n_unretained_layers`. Extracted from
+    /// [`Self::commit_inner`] so the streamed-leaf commit path (which produces the
+    /// leaf layer one column-group at a time to bound VRAM) can share the exact
+    /// same interior construction — byte-identical tree either way.
+    fn tree_from_leaves(
+        leaves: Col<B, H::Hash>,
+        lifting_log_size: u32,
+        n_unretained_layers: u32,
+    ) -> Self {
         // Build the layers from the leaves up, dropping unretained bottom layers eagerly to
         // also reduce the transient memory of the commitment itself.
         let min_retained_log_size = lifting_log_size.saturating_sub(n_unretained_layers);
@@ -150,6 +163,17 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
             layers: layers_top_down,
             leaf_log_size: lifting_log_size,
         }
+    }
+
+    /// Streamed-leaf pruned commit (VRAM diet): identical to [`Self::commit_pruned`]
+    /// but the caller supplies the already-computed lifted leaf layer (built one
+    /// column-group at a time from coefficients, so all columns' LDE is never
+    /// resident at once). The interior + pruning are byte-identical to
+    /// `commit_pruned`; the leaf layer must equal what `build_leaves` would produce
+    /// for the same (sorted) columns (gated by the backend's streaming tests +
+    /// whole-proof byte-identity).
+    pub fn commit_pruned_from_leaves(leaves: Col<B, H::Hash>, lifting_log_size: u32) -> Self {
+        Self::tree_from_leaves(leaves, lifting_log_size, N_UNRETAINED_BOTTOM_LAYERS)
     }
 
     /// Decommits to columns on the given queries.

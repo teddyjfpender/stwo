@@ -144,6 +144,30 @@ impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M3
         }
     }
 
+    fn stream_commit_leaves(
+        coeffs: &[&stwo::prover::poly::circle::CircleCoefficients<Self>],
+        log_blowup_factor: u32,
+        twiddles: &stwo::prover::poly::twiddles::TwiddleTree<Self>,
+        lifting_log_size: u32,
+    ) -> Option<Blake2sHashVec> {
+        // The M31-output hasher runs host-side (see build_leaves); streaming is the
+        // device word-block lane only.
+        if IS_M31_OUTPUT {
+            return None;
+        }
+        // Group width bounds the concurrently-resident LDE. 16 keeps peak to ~16
+        // blown-up columns + the per-leaf state; the big (log24) columns dominate,
+        // and they sort last, so early small-column groups still stream cheaply.
+        const STREAM_GROUP_COLS: usize = 16;
+        Some(Self::stream_commit_leaves_from_coeffs(
+            coeffs,
+            log_blowup_factor,
+            twiddles,
+            lifting_log_size,
+            STREAM_GROUP_COLS,
+        ))
+    }
+
     fn build_next_layer(prev_layer: &Blake2sHashVec) -> Blake2sHashVec {
         let size = prev_layer.len() / 2;
         if IS_M31_OUTPUT {
@@ -402,7 +426,7 @@ impl CudaBackend {
     /// lifted-index word stream, same block boundaries (gated by
     /// `stream_commit_leaves_matches_bulk`).
     pub fn stream_commit_leaves_from_coeffs(
-        coeffs: &[stwo::prover::poly::circle::CircleCoefficients<Self>],
+        coeffs: &[&stwo::prover::poly::circle::CircleCoefficients<Self>],
         log_blowup_factor: u32,
         twiddles: &stwo::prover::poly::twiddles::TwiddleTree<Self>,
         lifting_log_size: u32,
@@ -434,7 +458,7 @@ impl CudaBackend {
         let mut off = 0usize;
         while off < n_full {
             let end = (off + step).min(n_full);
-            let evals: Vec<BaseFieldVec> = coeffs[off..end].iter().map(lde).collect();
+            let evals: Vec<BaseFieldVec> = coeffs[off..end].iter().map(|c| lde(c)).collect();
             let ptrs: Vec<*const u32> = evals.iter().map(|e| e.device_ptr).collect();
             let logs: Vec<u32> = evals.iter().map(|e| e.len().ilog2()).collect();
             let table = UploadedDevicePointerVec::upload(&ptrs);
@@ -454,7 +478,7 @@ impl CudaBackend {
             off = end;
         }
         // Finalize the trailing block.
-        let evals: Vec<BaseFieldVec> = coeffs[n_full..n].iter().map(lde).collect();
+        let evals: Vec<BaseFieldVec> = coeffs[n_full..n].iter().map(|c| lde(c)).collect();
         let ptrs: Vec<*const u32> = evals.iter().map(|e| e.device_ptr).collect();
         let logs: Vec<u32> = evals.iter().map(|e| e.len().ilog2()).collect();
         let table = UploadedDevicePointerVec::upload(&ptrs);
@@ -587,8 +611,13 @@ mod stream_leaf_tests {
                 );
 
             let _ = ref_logs;
+            let coeff_refs: Vec<&CircleCoefficients<CudaBackend>> = coeffs.iter().collect();
             let streamed = CudaBackend::stream_commit_leaves_from_coeffs(
-                &coeffs, BLOWUP, &twiddles, lifting, 16,
+                &coeff_refs,
+                BLOWUP,
+                &twiddles,
+                lifting,
+                16,
             );
 
             assert_eq!(
