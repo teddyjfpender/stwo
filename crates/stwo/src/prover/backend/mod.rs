@@ -3,11 +3,16 @@ use std::fmt::Debug;
 pub use cpu::CpuBackend;
 
 use crate::core::channel::MerkleChannel;
+use crate::core::circle::CirclePoint;
 use crate::core::fields::m31::BaseField;
 use crate::core::fields::qm31::SecureField;
+use crate::core::pcs::quotients::ExtendedCommitmentSchemeProof;
+use crate::core::pcs::TreeVec;
 use crate::core::proof_of_work::GrindOps;
+use crate::core::ColumnVec;
 use crate::prover::fri::FriOps;
 use crate::prover::lookups::gkr_prover::GkrOps;
+use crate::prover::pcs::CommitmentSchemeProver;
 use crate::prover::poly::circle::PolyOps;
 use crate::prover::vcs_lifted::ops::MerkleOpsLifted;
 use crate::prover::{AccumulationOps, QuotientOps};
@@ -32,6 +37,18 @@ pub trait Backend:
 pub trait BackendForChannel<MC: MerkleChannel>:
     Backend + MerkleOpsLifted<MC::H> + GrindOps<MC::C>
 {
+    /// Backend dispatch seam for the PCS/FRI proof driver.
+    ///
+    /// The default preserves the reference protocol verbatim. Backends may override
+    /// this to own device-resident orchestration while preserving the same transcript,
+    /// proof, and auxiliary-data contract.
+    fn prove_values_driver<'a>(
+        commitment_scheme: CommitmentSchemeProver<'a, Self, MC>,
+        sampled_points: TreeVec<ColumnVec<Vec<CirclePoint<SecureField>>>>,
+        channel: &mut MC::C,
+    ) -> ExtendedCommitmentSchemeProof<MC::H> {
+        commitment_scheme.prove_values_reference(sampled_points, channel)
+    }
 }
 
 /// Conversion of columns produced by the [`simd::SimdBackend`] into this backend's column

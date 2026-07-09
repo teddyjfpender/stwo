@@ -375,6 +375,29 @@ mod tests {
     fn test_pcs_prove_and_verify_cpu() {
         assert!(prove_and_verify_pcs::<CpuBackend, true>().is_ok());
     }
+
+    #[test]
+    fn test_pcs_prove_values_uses_backend_override() {
+        assert!(
+            !crate::prover::backend::cpu::take_prove_values_driver_called(),
+            "test thread started with a stale dispatch marker"
+        );
+        assert!(
+            crate::prover::backend::cpu::take_prove_values_driver_stages().is_empty(),
+            "test thread started with stale proof-stage telemetry"
+        );
+        assert!(prove_and_verify_pcs::<CpuBackend, true>().is_ok());
+        assert!(
+            crate::prover::backend::cpu::take_prove_values_driver_called(),
+            "CommitmentSchemeProver::prove_values bypassed BackendForChannel dispatch"
+        );
+        assert_eq!(
+            crate::prover::backend::cpu::take_prove_values_driver_stages(),
+            crate::prover::pcs::proof_driver::PcsProofStage::ALL,
+            "backend driver changed the transcript-stage order"
+        );
+    }
+
     #[test]
     fn test_pcs_prove_and_verify_simd() {
         assert!(prove_and_verify_pcs::<SimdBackend, true>().is_ok());

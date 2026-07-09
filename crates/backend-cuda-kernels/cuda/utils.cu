@@ -168,7 +168,7 @@ qm31 cuda_get_secure_field(qm31 *device_ptr, size_t index) {
 
 Blake2sHash* cuda_alloc_zeroes_blake_2s_hash(int size) {
     Blake2sHash* device_ptr = cuda_malloc_blake_2s_hash(size);
-    cudaMemset(device_ptr, 0x00, sizeof(uint32_t) * size);
+    cudaMemset(device_ptr, 0x00, sizeof(Blake2sHash) * size);
     return device_ptr;
 }
 

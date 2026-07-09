@@ -38,4 +38,34 @@ void evaluate(int eval_domain_size, m31 *values, m31 *twiddles_tree, int twiddle
 extern "C"
 void evaluate_columns(const int *eval_domain_sizes, m31 **values, m31 *twiddles_tree, int twiddles_size, int number_of_columns, const int *column_sizes);
 
+// Allocation-free explicit-stream N2B transform. `device_values` is a device
+// pointer table; all buffers and the stream are caller-owned.
+extern "C"
+int stwo_ntt_n2b_columns_on(
+    uint32_t **device_values,
+    unsigned log_n,
+    unsigned num_poly,
+    uint32_t *g_twiddles,
+    unsigned twiddles_size,
+    unsigned eval_domain_size,
+    void *stream
+);
+
+// Allocation-free explicit-stream LDE. Both pointer tables live on the device.
+// `coefficient_sizes[i]` is the exact source length and may be smaller than
+// `eval_domain_size` when blowup > 1. Each destination has
+// `2 * eval_domain_size` words and is staged as coefficients followed by zeroes.
+extern "C"
+int stwo_lde_n2b_columns_on(
+    const uint32_t *const *coefficient_values,
+    const uint32_t *coefficient_sizes,
+    uint32_t **device_values,
+    unsigned log_n,
+    unsigned num_poly,
+    uint32_t *g_twiddles,
+    unsigned twiddles_size,
+    unsigned eval_domain_size,
+    void *stream
+);
+
 #endif // POLY_RFFT_H

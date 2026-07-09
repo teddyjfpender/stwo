@@ -54,6 +54,25 @@ pub trait MerkleOpsLifted<H: MerkleHasherLifted>:
             .collect()
     }
 
+    /// Gathers all committed-column rows needed by one tree decommitment.
+    ///
+    /// `rows[i]` contains the row indices to read from `columns[i]`; the output
+    /// preserves both dimensions and ordering exactly. The default batches each
+    /// column through [`Column::gather_unreduced`]. Device backends override this
+    /// with one descriptor launch and one D2H transfer for the entire tree, which
+    /// removes a host round trip per column without changing the Merkle leaf bytes.
+    fn batch_gather_column_rows(
+        columns: &[&Col<Self, BaseField>],
+        rows: &[Vec<usize>],
+    ) -> Vec<Vec<BaseField>> {
+        assert_eq!(columns.len(), rows.len());
+        columns
+            .iter()
+            .zip(rows)
+            .map(|(column, indices)| column.gather_unreduced(indices))
+            .collect()
+    }
+
     /// Builds the top `n_levels` layers above `first` (parent of `first`
     /// first, root last). Semantics are EXACTLY `n_levels` chained
     /// [`Self::build_next_layer`] calls — the default does just that; device

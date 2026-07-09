@@ -279,9 +279,11 @@ __global__ void n2b_nofinal_block_batch(m31** input, m31** output,
   }
 }
 
-EXTERN void ntt_n2b_nofinal_6_stage_batch(m31** input, m31** output,
-                                unsigned log_n, unsigned num_poly, unsigned start_stage,
-                                m31 *g_twiddles, unsigned twiddles_size, unsigned eval_domain_size) {
+static cudaError_t ntt_n2b_nofinal_6_stage_batch_on(
+    m31** input, m31** output, unsigned log_n, unsigned num_poly,
+    unsigned start_stage, m31 *g_twiddles, unsigned twiddles_size,
+    unsigned eval_domain_size, cudaStream_t stream
+) {
     g_twiddles = &g_twiddles[twiddles_size - eval_domain_size];
     constexpr unsigned log_val_per_thread = 3;
     dim3 block_dim{32, 1 << log_val_per_thread, 1};
@@ -293,22 +295,31 @@ EXTERN void ntt_n2b_nofinal_6_stage_batch(m31** input, m31** output,
     grid_dim.x = min_stride / 32;
     grid_dim.y = (1 << log_n) / (min_stride << num_stage);
 
-    n2b_nofinal_block_batch<log_val_per_thread><<<grid_dim, block_dim, 0>>>(
+    n2b_nofinal_block_batch<log_val_per_thread><<<grid_dim, block_dim, 0, stream>>>(
         input, output, log_n, num_poly, start_stage, end_stage, g_twiddles);
-    ASSERT_CUDA_SUCCESS(cudaGetLastError());
-    stwo_maybe_debug_sync();
-    ASSERT_CUDA_SUCCESS(cudaGetLastError());
-
+    return cudaGetLastError();
 }
 
-EXTERN void ntt_n2b_nofinal_8_stage_batch(m31** input, m31** output,
+EXTERN void ntt_n2b_nofinal_6_stage_batch(m31** input, m31** output,
                                 unsigned log_n, unsigned num_poly, unsigned start_stage,
                                 m31 *g_twiddles, unsigned twiddles_size, unsigned eval_domain_size) {
+    ASSERT_CUDA_SUCCESS(ntt_n2b_nofinal_6_stage_batch_on(
+        input, output, log_n, num_poly, start_stage, g_twiddles, twiddles_size,
+        eval_domain_size, 0));
+    stwo_maybe_debug_sync();
+    ASSERT_CUDA_SUCCESS(cudaGetLastError());
+}
+
+static cudaError_t ntt_n2b_nofinal_8_stage_batch_on(
+    m31** input, m31** output, unsigned log_n, unsigned num_poly,
+    unsigned start_stage, m31 *g_twiddles, unsigned twiddles_size,
+    unsigned eval_domain_size, cudaStream_t stream
+) {
     g_twiddles = &g_twiddles[twiddles_size - eval_domain_size];
     constexpr unsigned log_val_per_thread = 4;
-    ASSERT_TRUE(
-        log_n - start_stage + 1 >= 2 * log_val_per_thread + 5,
-        "left stage < (2 * log_val_per_thread + 5) in ntt_nofinal_8_stage");
+    if (log_n - start_stage + 1 < 2 * log_val_per_thread + 5) {
+        return cudaErrorInvalidValue;
+    }
     dim3 block_dim{32, 1 << log_val_per_thread, 1};
     dim3 grid_dim{};
     constexpr unsigned num_stage = 2 * log_val_per_thread;
@@ -318,13 +329,21 @@ EXTERN void ntt_n2b_nofinal_8_stage_batch(m31** input, m31** output,
     grid_dim.x = min_stride / 32;
     grid_dim.y = (1 << log_n) / (min_stride << num_stage);
 
-    ASSERT_TRUE(grid_dim.y * grid_dim.x * block_dim.x * block_dim.y
-                        << log_val_per_thread ==
-                    1 << log_n,
-                "thread count mismatch in ntt_nofinal_8_stage");
-    n2b_nofinal_block_batch<log_val_per_thread><<<grid_dim, block_dim, 0>>>(
+    if ((grid_dim.y * grid_dim.x * block_dim.x * block_dim.y
+         << log_val_per_thread) != (1u << log_n)) {
+        return cudaErrorInvalidConfiguration;
+    }
+    n2b_nofinal_block_batch<log_val_per_thread><<<grid_dim, block_dim, 0, stream>>>(
         input, output, log_n, num_poly, start_stage, end_stage, g_twiddles);
-    ASSERT_CUDA_SUCCESS(cudaGetLastError());
+    return cudaGetLastError();
+}
+
+EXTERN void ntt_n2b_nofinal_8_stage_batch(m31** input, m31** output,
+                                unsigned log_n, unsigned num_poly, unsigned start_stage,
+                                m31 *g_twiddles, unsigned twiddles_size, unsigned eval_domain_size) {
+    ASSERT_CUDA_SUCCESS(ntt_n2b_nofinal_8_stage_batch_on(
+        input, output, log_n, num_poly, start_stage, g_twiddles, twiddles_size,
+        eval_domain_size, 0));
     stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 }
@@ -415,14 +434,16 @@ __global__ void n2b_final_warp_batch(m31** input, m31** output,
     }
 }
 
-EXTERN void ntt_n2b_final_7_stage_batch(m31** input, m31** output,
-                              unsigned log_n, unsigned num_poly,
-                              unsigned start_stage,
-                              m31 *g_twiddles, unsigned twiddles_size, unsigned eval_domain_size) {
+static cudaError_t ntt_n2b_final_7_stage_batch_on(
+    m31** input, m31** output, unsigned log_n, unsigned num_poly,
+    unsigned start_stage, m31 *g_twiddles, unsigned twiddles_size,
+    unsigned eval_domain_size, cudaStream_t stream
+) {
     g_twiddles = &g_twiddles[twiddles_size - eval_domain_size];
     constexpr unsigned log_val_per_thread = 2;
-    ASSERT_TRUE(log_n + 1 - (log_val_per_thread + LOG_WARP) == start_stage,
-                "start_stage mismatch in ntt_final_7_stage");
+    if (log_n + 1 - (log_val_per_thread + LOG_WARP) != start_stage) {
+        return cudaErrorInvalidValue;
+    }
     dim3 block_dim = dim3{32, 1, 1};
     dim3 grid_dim = dim3{1, 1, 1};
     const unsigned num_warp = 1 << (log_n - LOG_WARP - log_val_per_thread);
@@ -430,31 +451,51 @@ EXTERN void ntt_n2b_final_7_stage_batch(m31** input, m31** output,
     grid_dim.y = num_poly;
     grid_dim.x = num_warp / block_dim.y;
 
-    n2b_final_warp_batch<log_val_per_thread><<<grid_dim, block_dim, 0>>>(
+    n2b_final_warp_batch<log_val_per_thread><<<grid_dim, block_dim, 0, stream>>>(
         input, output, log_n, num_poly, start_stage, g_twiddles);
-    ASSERT_CUDA_SUCCESS(cudaGetLastError());
+    return cudaGetLastError();
+}
+
+EXTERN void ntt_n2b_final_7_stage_batch(m31** input, m31** output,
+                              unsigned log_n, unsigned num_poly,
+                              unsigned start_stage,
+                              m31 *g_twiddles, unsigned twiddles_size, unsigned eval_domain_size) {
+    ASSERT_CUDA_SUCCESS(ntt_n2b_final_7_stage_batch_on(
+        input, output, log_n, num_poly, start_stage, g_twiddles, twiddles_size,
+        eval_domain_size, 0));
     stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
+}
+
+static cudaError_t ntt_n2b_final_8_stage_batch_on(
+    m31** input, m31** output, unsigned log_n, unsigned num_poly,
+    unsigned start_stage, m31 *g_twiddles, unsigned twiddles_size,
+    unsigned eval_domain_size, cudaStream_t stream
+) {
+    g_twiddles = &g_twiddles[twiddles_size - eval_domain_size];
+    constexpr unsigned log_val_per_thread = 3;
+    if (log_n + 1 - (log_val_per_thread + LOG_WARP) != start_stage) {
+        return cudaErrorInvalidValue;
+    }
+    dim3 block_dim = dim3{32, 1, 1};
+    dim3 grid_dim = dim3{1, 1, 1};
+    const unsigned num_warp = 1 << (log_n - LOG_WARP - log_val_per_thread);
+    block_dim.y = min(num_warp, 4);
+    grid_dim.y = num_poly;
+    grid_dim.x = num_warp / block_dim.y;
+
+    n2b_final_warp_batch<log_val_per_thread><<<grid_dim, block_dim, 0, stream>>>(
+        input, output, log_n, num_poly, start_stage, g_twiddles);
+    return cudaGetLastError();
 }
 
 EXTERN void ntt_n2b_final_8_stage_batch(m31** input, m31** output,
                               unsigned log_n, unsigned num_poly,
                               unsigned start_stage,
                               m31 *g_twiddles, unsigned twiddles_size, unsigned eval_domain_size) {
-    g_twiddles = &g_twiddles[twiddles_size - eval_domain_size];
-    constexpr unsigned log_val_per_thread = 3;
-    ASSERT_TRUE(log_n + 1 - (log_val_per_thread + LOG_WARP) == start_stage,
-                "start_stage mismatch in ntt_final_8_stage");
-    dim3 block_dim = dim3{32, 1, 1};
-    dim3 grid_dim = dim3{1, 1, 1};
-    const unsigned num_warp = 1 << (log_n - LOG_WARP - log_val_per_thread);
-    block_dim.y = min(num_warp, 4);
-    grid_dim.y = num_poly;
-    grid_dim.x = num_warp / block_dim.y;
-
-    n2b_final_warp_batch<log_val_per_thread><<<grid_dim, block_dim, 0>>>(
-        input, output, log_n, num_poly, start_stage, g_twiddles);
-    ASSERT_CUDA_SUCCESS(cudaGetLastError());
+    ASSERT_CUDA_SUCCESS(ntt_n2b_final_8_stage_batch_on(
+        input, output, log_n, num_poly, start_stage, g_twiddles, twiddles_size,
+        eval_domain_size, 0));
     stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 }
@@ -590,43 +631,65 @@ __global__ void n2b_final_block_warp_batch(
         dst[i << LOG_WARP] = src[i];
 }
 
-EXTERN void ntt_n2b_final_10_stage_batch(m31** input, m31** output,
-                               unsigned log_n, unsigned num_poly, unsigned start_stage,
-                               m31 *g_twiddles, unsigned twiddles_size, unsigned eval_domain_size) {
+static cudaError_t ntt_n2b_final_10_stage_batch_on(
+    m31** input, m31** output, unsigned log_n, unsigned num_poly,
+    unsigned start_stage, m31 *g_twiddles, unsigned twiddles_size,
+    unsigned eval_domain_size, cudaStream_t stream
+) {
     g_twiddles = &g_twiddles[twiddles_size - eval_domain_size];
     constexpr unsigned log_warp_per_block = 2;
     constexpr unsigned LOG_VALS_PER_THREAD = 3;
-    ASSERT_TRUE(log_n + 1 - start_stage ==
-                    LOG_VALS_PER_THREAD + LOG_WARP + log_warp_per_block,
-                "start_stage mismatch in ntt_final_10_stage");
+    if (log_n + 1 - start_stage !=
+        LOG_VALS_PER_THREAD + LOG_WARP + log_warp_per_block) {
+        return cudaErrorInvalidValue;
+    }
     dim3 block_dim = {32, 1 << log_warp_per_block, 1};
     dim3 grid_dim = {};
     grid_dim.z = num_poly;
     grid_dim.x = 1 << (log_n - LOG_WARP - LOG_VALS_PER_THREAD - log_warp_per_block);
 
-    n2b_final_block_warp_batch<log_warp_per_block><<<grid_dim, block_dim>>>(
+    n2b_final_block_warp_batch<log_warp_per_block><<<grid_dim, block_dim, 0, stream>>>(
         input, output, log_n, num_poly, start_stage, g_twiddles);
-    ASSERT_CUDA_SUCCESS(cudaGetLastError());
+    return cudaGetLastError();
+}
+
+EXTERN void ntt_n2b_final_10_stage_batch(m31** input, m31** output,
+                               unsigned log_n, unsigned num_poly, unsigned start_stage,
+                               m31 *g_twiddles, unsigned twiddles_size, unsigned eval_domain_size) {
+    ASSERT_CUDA_SUCCESS(ntt_n2b_final_10_stage_batch_on(
+        input, output, log_n, num_poly, start_stage, g_twiddles, twiddles_size,
+        eval_domain_size, 0));
     stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
+}
+
+static cudaError_t ntt_n2b_final_11_stage_batch_on(
+    m31** input, m31** output, unsigned log_n, unsigned num_poly,
+    unsigned start_stage, m31 *g_twiddles, unsigned twiddles_size,
+    unsigned eval_domain_size, cudaStream_t stream
+) {
+    g_twiddles = &g_twiddles[twiddles_size - eval_domain_size];
+    constexpr unsigned log_warp_per_block = 3;
+    constexpr unsigned LOG_VALS_PER_THREAD = 3;
+    if (log_n + 1 - start_stage !=
+        LOG_VALS_PER_THREAD + LOG_WARP + log_warp_per_block) {
+        return cudaErrorInvalidValue;
+    }
+    dim3 block_dim = {32, 1 << log_warp_per_block, 1};
+    dim3 grid_dim = {};
+    grid_dim.z = num_poly;
+    grid_dim.x = 1 << (log_n - LOG_WARP - LOG_VALS_PER_THREAD - log_warp_per_block);
+    n2b_final_block_warp_batch<log_warp_per_block><<<grid_dim, block_dim, 0, stream>>>(
+        input, output,  log_n, num_poly, start_stage, g_twiddles);
+    return cudaGetLastError();
 }
 
 EXTERN void ntt_n2b_final_11_stage_batch(m31** input, m31** output,
                                unsigned log_n, unsigned num_poly, unsigned start_stage,
                                m31 *g_twiddles, unsigned twiddles_size, unsigned eval_domain_size) {
-    g_twiddles = &g_twiddles[twiddles_size - eval_domain_size];
-    constexpr unsigned log_warp_per_block = 3;
-    constexpr unsigned LOG_VALS_PER_THREAD = 3;
-    ASSERT_TRUE(log_n + 1 - start_stage ==
-                    LOG_VALS_PER_THREAD + LOG_WARP + log_warp_per_block,
-                "start_stage mismatch in ntt_final_11_stage");
-    dim3 block_dim = {32, 1 << log_warp_per_block, 1};
-    dim3 grid_dim = {};
-    grid_dim.z = num_poly;
-    grid_dim.x = 1 << (log_n - LOG_WARP - LOG_VALS_PER_THREAD - log_warp_per_block);
-    n2b_final_block_warp_batch<log_warp_per_block><<<grid_dim, block_dim>>>(
-        input, output,  log_n, num_poly, start_stage, g_twiddles);
-    ASSERT_CUDA_SUCCESS(cudaGetLastError());
+    ASSERT_CUDA_SUCCESS(ntt_n2b_final_11_stage_batch_on(
+        input, output, log_n, num_poly, start_stage, g_twiddles, twiddles_size,
+        eval_domain_size, 0));
     stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 }
@@ -666,12 +729,14 @@ __global__ void ntt_n2b_stage_batch(m31** input, m31** output,
     output_start[right_index] = right_r;
 }
 
-EXTERN void ntt_n2b_native_batch(m31** value,
-                           unsigned log_n, unsigned num_poly,
-                           unsigned start_stage, unsigned end_stage,
-                           m31 *g_twiddles,
-                           unsigned twiddles_size, unsigned eval_domain_size) {
-    m31 **device_values = cuda_proving_clone_to_device<m31*>(value, num_poly);
+static cudaError_t ntt_n2b_native_device_batch_on(
+    m31** device_values, unsigned log_n, unsigned num_poly,
+    unsigned start_stage, unsigned end_stage, m31 *g_twiddles,
+    unsigned twiddles_size, unsigned eval_domain_size, cudaStream_t stream
+) {
+    if (start_stage < 1 || end_stage > log_n) {
+        return cudaErrorInvalidValue;
+    }
     g_twiddles = &g_twiddles[twiddles_size - eval_domain_size];
     dim3 block_dim{};
     block_dim.x = log_n <= 9 ? 1 << (log_n - 1) : 256;
@@ -682,172 +747,146 @@ EXTERN void ntt_n2b_native_batch(m31** value,
     unsigned layer_domain_size = 1;
     unsigned layer_domain_offset = ((1 << log_n) >> 1) - 2;
 
-    ASSERT_TRUE(start_stage >= 1, "start_stage < 1 in ntt_n2b_native");
-    ASSERT_TRUE(end_stage <= log_n, "end_stage <= log_n in ntt_n2b_native");
     for (unsigned stage = 1; stage < log_n; stage++) {
 
         if (stage >= start_stage) {
-            ntt_n2b_stage_batch<<<grid_dim, block_dim, 0>>>(device_values, device_values, log_n, stage, &g_twiddles[layer_domain_offset]);
-            ASSERT_CUDA_SUCCESS(cudaGetLastError());
+            ntt_n2b_stage_batch<<<grid_dim, block_dim, 0, stream>>>(
+                device_values, device_values, log_n, stage,
+                &g_twiddles[layer_domain_offset]);
+            cudaError_t err = cudaGetLastError();
+            if (err != cudaSuccess) {
+                return err;
+            }
         }
 
         layer_domain_size <<= 1;
         layer_domain_offset -= layer_domain_size;
     }
     if (end_stage == log_n) {
-        ntt_n2b_stage_batch<<<grid_dim, block_dim, 0>>>(device_values, device_values, log_n, log_n, g_twiddles);
-        ASSERT_CUDA_SUCCESS(cudaGetLastError());
-        stwo_maybe_debug_sync();
-        ASSERT_CUDA_SUCCESS(cudaGetLastError());
+        ntt_n2b_stage_batch<<<grid_dim, block_dim, 0, stream>>>(
+            device_values, device_values, log_n, log_n, g_twiddles);
+        return cudaGetLastError();
     }
+    return cudaSuccess;
+}
+
+EXTERN void ntt_n2b_native_batch(m31** value,
+                           unsigned log_n, unsigned num_poly,
+                           unsigned start_stage, unsigned end_stage,
+                           m31 *g_twiddles,
+                           unsigned twiddles_size, unsigned eval_domain_size) {
+    m31 **device_values = cuda_proving_clone_to_device<m31*>(value, num_poly);
+    ASSERT_CUDA_SUCCESS(ntt_n2b_native_device_batch_on(
+        device_values, log_n, num_poly, start_stage, end_stage, g_twiddles,
+        twiddles_size, eval_domain_size, 0));
+    stwo_maybe_debug_sync();
+    ASSERT_CUDA_SUCCESS(cudaGetLastError());
     cuda_proving_free(device_values);
 }
 
-static void ntt_n2b_columns_dispatch(
+static cudaError_t ntt_n2b_columns_dispatch_on(
     m31** device_values,
     unsigned log_n,
     unsigned num_poly,
     uint32_t* g_twiddles,
     unsigned twiddles_size,
-    unsigned eval_domain_size
+    unsigned eval_domain_size,
+    cudaStream_t stream,
+    bool legacy_debug_sync
 ) {
+    auto finish_stage = [legacy_debug_sync](cudaError_t err) -> cudaError_t {
+        if (err != cudaSuccess) {
+            return err;
+        }
+        if (legacy_debug_sync) {
+            stwo_maybe_debug_sync();
+            return cudaGetLastError();
+        }
+        return cudaSuccess;
+    };
+    auto nofinal = [&](unsigned n_stages, unsigned start_stage) -> cudaError_t {
+        cudaError_t err;
+        switch (n_stages) {
+            case 6:
+                err = ntt_n2b_nofinal_6_stage_batch_on(
+                    device_values, device_values, log_n, num_poly, start_stage,
+                    g_twiddles, twiddles_size, eval_domain_size, stream);
+                break;
+            case 8:
+                err = ntt_n2b_nofinal_8_stage_batch_on(
+                    device_values, device_values, log_n, num_poly, start_stage,
+                    g_twiddles, twiddles_size, eval_domain_size, stream);
+                break;
+            default:
+                return cudaErrorInvalidConfiguration;
+        }
+        return finish_stage(err);
+    };
+    auto final = [&](unsigned n_stages, unsigned start_stage) -> cudaError_t {
+        cudaError_t err;
+        switch (n_stages) {
+            case 7:
+                err = ntt_n2b_final_7_stage_batch_on(
+                    device_values, device_values, log_n, num_poly, start_stage,
+                    g_twiddles, twiddles_size, eval_domain_size, stream);
+                break;
+            case 8:
+                err = ntt_n2b_final_8_stage_batch_on(
+                    device_values, device_values, log_n, num_poly, start_stage,
+                    g_twiddles, twiddles_size, eval_domain_size, stream);
+                break;
+            case 10:
+                err = ntt_n2b_final_10_stage_batch_on(
+                    device_values, device_values, log_n, num_poly, start_stage,
+                    g_twiddles, twiddles_size, eval_domain_size, stream);
+                break;
+            case 11:
+                err = ntt_n2b_final_11_stage_batch_on(
+                    device_values, device_values, log_n, num_poly, start_stage,
+                    g_twiddles, twiddles_size, eval_domain_size, stream);
+                break;
+            default:
+                return cudaErrorInvalidConfiguration;
+        }
+        return finish_stage(err);
+    };
+
     if (log_n < 13) {
-        ntt_n2b_native_batch(device_values, log_n, num_poly, 1, log_n, g_twiddles, twiddles_size, eval_domain_size);
+        return finish_stage(ntt_n2b_native_device_batch_on(
+            device_values, log_n, num_poly, 1, log_n, g_twiddles,
+            twiddles_size, eval_domain_size, stream));
     } else if (log_n >= 13 && log_n <= 19) {
         const auto& config = LAUNCH_N2B_CONFIG_13_19[log_n - 13];
-        auto kernel0 = [config]() -> void(*)(uint32_t**, uint32_t**, uint32_t, uint32_t, uint32_t, uint32_t*, uint32_t, uint32_t) {
-            switch (config[0]) {
-                case 6: return ntt_n2b_nofinal_6_stage_batch;
-                case 8: return ntt_n2b_nofinal_8_stage_batch;
-                default: {
-                    fprintf(stderr, "n2b kernel0 config error\n");
-                    exit(EXIT_FAILURE);
-                }
-            }
-        }();
-
-        auto kernel1 = [config]() -> void(*)(uint32_t**, uint32_t**, uint32_t, uint32_t, uint32_t, uint32_t*, uint32_t, uint32_t) {
-            switch (config[1]) {
-                case 7: return ntt_n2b_final_7_stage_batch;
-                case 8: return ntt_n2b_final_8_stage_batch;
-                case 10: return ntt_n2b_final_10_stage_batch;
-                case 11: return ntt_n2b_final_11_stage_batch;
-                default: {
-                    fprintf(stderr, "n2b kernel1 config error\n");
-                    exit(EXIT_FAILURE);
-                }
-            }
-        }();
-
         const uint32_t start_stage1 = 1 + config[0];
-
-        kernel0(device_values, device_values, log_n, num_poly, 1, g_twiddles, twiddles_size, eval_domain_size);
-        kernel1(device_values, device_values, log_n, num_poly, start_stage1, g_twiddles, twiddles_size, eval_domain_size);
-
+        cudaError_t err = nofinal(config[0], 1);
+        return err == cudaSuccess ? final(config[1], start_stage1) : err;
     } else if (log_n >= 20 && log_n <= 27) {
         const auto& config = LAUNCH_N2B_CONFIG_20_27[log_n - 20];
-        auto kernel0 = [config]() -> void(*)(uint32_t**, uint32_t**, uint32_t, uint32_t, uint32_t, uint32_t*, uint32_t, uint32_t) {
-            switch (config[0]) {
-                case 6: return ntt_n2b_nofinal_6_stage_batch;
-                case 8: return ntt_n2b_nofinal_8_stage_batch;
-                default: {
-                    fprintf(stderr, "n2b kernel0 config error\n");
-                    exit(EXIT_FAILURE);
-                }
-            }
-        }();
-
-        auto kernel1 = [config]() -> void(*)(uint32_t**, uint32_t**, uint32_t, uint32_t, uint32_t, uint32_t*, uint32_t, uint32_t) {
-            switch (config[1]) {
-                case 6: return ntt_n2b_nofinal_6_stage_batch;
-                case 8: return ntt_n2b_nofinal_8_stage_batch;
-                default: {
-                    fprintf(stderr, "n2b kernel1 config error\n");
-                    exit(EXIT_FAILURE);
-                }
-            }
-        }();
-
-        auto kernel2 = [config]() -> void(*)(uint32_t**, uint32_t**, uint32_t, uint32_t, uint32_t, uint32_t*, uint32_t, uint32_t) {
-            switch (config[2]) {
-                case 7: return ntt_n2b_final_7_stage_batch;
-                case 8: return ntt_n2b_final_8_stage_batch;
-                case 10: return ntt_n2b_final_10_stage_batch;
-                case 11: return ntt_n2b_final_11_stage_batch;
-                default: {
-                    fprintf(stderr, "n2b kernel2 config error\n");
-                    exit(EXIT_FAILURE);
-                }
-            }
-        }();
         const uint32_t start_stage1 = 1 + config[0];
         const uint32_t start_stage2 = start_stage1 + config[1];
-
-        kernel0(device_values, device_values, log_n, num_poly, 1, g_twiddles, twiddles_size, eval_domain_size);
-        kernel1(device_values, device_values, log_n, num_poly, start_stage1, g_twiddles, twiddles_size, eval_domain_size);
-        kernel2(device_values, device_values, log_n, num_poly, start_stage2, g_twiddles, twiddles_size, eval_domain_size);
-
+        cudaError_t err = nofinal(config[0], 1);
+        if (err == cudaSuccess) err = nofinal(config[1], start_stage1);
+        return err == cudaSuccess ? final(config[2], start_stage2) : err;
     } else if (log_n >= 28 && log_n <= 30) {
         const auto& config = LAUNCH_N2B_CONFIG_28_30[log_n - 28];
-
-        auto kernel0 = [config]() -> void(*)(uint32_t**, uint32_t**, uint32_t, uint32_t, uint32_t, uint32_t*, uint32_t, uint32_t) {
-            switch (config[0]) {
-                case 6: return ntt_n2b_nofinal_6_stage_batch;
-                case 8: return ntt_n2b_nofinal_8_stage_batch;
-                default: {
-                    fprintf(stderr, "n2b kernel0 config error\n");
-                    exit(EXIT_FAILURE);
-                }
-            }
-        }();
-
-        auto kernel1 = [config]() -> void(*)(uint32_t**, uint32_t**, uint32_t, uint32_t, uint32_t, uint32_t*, uint32_t, uint32_t) {
-            switch (config[1]) {
-                case 6: return ntt_n2b_nofinal_6_stage_batch;
-                case 8: return ntt_n2b_nofinal_8_stage_batch;
-                default: {
-                    fprintf(stderr, "n2b kernel1 config error\n");
-                    exit(EXIT_FAILURE);
-                }
-            }
-        }();
-
-        auto kernel2 = [config]() -> void(*)(uint32_t**, uint32_t**, uint32_t, uint32_t, uint32_t, uint32_t*, uint32_t, uint32_t) {
-            switch (config[2]) {
-                case 6: return ntt_n2b_nofinal_6_stage_batch;
-                case 8: return ntt_n2b_nofinal_8_stage_batch;
-                default: {
-                    fprintf(stderr, "n2b kernel2 config error\n");
-                    exit(EXIT_FAILURE);
-                }
-            }
-        }();
-
-        auto kernel3 = [config]() -> void(*)(uint32_t**, uint32_t**, uint32_t, uint32_t, uint32_t, uint32_t*, uint32_t, uint32_t) {
-            switch (config[3]) {
-                case 7: return ntt_n2b_final_7_stage_batch;
-                case 8: return ntt_n2b_final_8_stage_batch;
-                case 10: return ntt_n2b_final_10_stage_batch;
-                case 11: return ntt_n2b_final_11_stage_batch;
-                default: {
-                    fprintf(stderr, "n2b kernel3 config error\n");
-                    exit(EXIT_FAILURE);
-                }
-            }
-        }();
-
         const uint32_t start_stage1 = 1 + config[0];
         const uint32_t start_stage2 = start_stage1 + config[1];
         const uint32_t start_stage3 = start_stage2 + config[2];
-
-        kernel0(device_values, device_values, log_n, num_poly, 1, g_twiddles, twiddles_size, eval_domain_size);
-        kernel1(device_values, device_values, log_n, num_poly, start_stage1, g_twiddles, twiddles_size, eval_domain_size);
-        kernel2(device_values, device_values, log_n, num_poly, start_stage2, g_twiddles, twiddles_size, eval_domain_size);
-        kernel3(device_values, device_values, log_n, num_poly, start_stage3, g_twiddles, twiddles_size, eval_domain_size);
-    } else {
-        fprintf(stderr, "n2b config too big\n");
-        exit(EXIT_FAILURE);
+        cudaError_t err = nofinal(config[0], 1);
+        if (err == cudaSuccess) err = nofinal(config[1], start_stage1);
+        if (err == cudaSuccess) err = nofinal(config[2], start_stage2);
+        return err == cudaSuccess ? final(config[3], start_stage3) : err;
     }
+    return cudaErrorInvalidValue;
+}
+
+static void ntt_n2b_columns_dispatch(
+    m31** device_values, unsigned log_n, unsigned num_poly,
+    uint32_t* g_twiddles, unsigned twiddles_size, unsigned eval_domain_size
+) {
+    ASSERT_CUDA_SUCCESS(ntt_n2b_columns_dispatch_on(
+        device_values, log_n, num_poly, g_twiddles, twiddles_size,
+        eval_domain_size, 0, true));
 }
 
 // Tile the column (batch) axis into chunks of at most MAX_NTT_BATCH_COLUMNS so the
@@ -878,4 +917,100 @@ EXTERN void ntt_n2b_columns(
                                  twiddles_size, eval_domain_size);
         cuda_proving_free(device_values);
     }
+}
+
+// Allocation-free, explicit-stream N2B transform for graph capture. `device_values`
+// is already a DEVICE-resident array of device-column pointers owned by the caller.
+// No upload, allocation, free, default-stream launch, or host synchronization occurs.
+extern "C" int stwo_ntt_n2b_columns_on(
+    uint32_t **device_values,
+    unsigned log_n,
+    unsigned num_poly,
+    uint32_t *g_twiddles,
+    unsigned twiddles_size,
+    unsigned eval_domain_size,
+    void *stream
+) {
+    if (device_values == nullptr || g_twiddles == nullptr || stream == nullptr ||
+        log_n == 0 || log_n > 30 || num_poly == 0 || eval_domain_size == 0 ||
+        eval_domain_size > twiddles_size) {
+        return cudaErrorInvalidValue;
+    }
+
+    cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    for (unsigned base = 0; base < num_poly; base += MAX_NTT_BATCH_COLUMNS) {
+        const unsigned chunk = min(num_poly - base, MAX_NTT_BATCH_COLUMNS);
+        cudaError_t err = ntt_n2b_columns_dispatch_on(
+            reinterpret_cast<m31 **>(device_values + base), log_n, chunk,
+            g_twiddles, twiddles_size, eval_domain_size, cuda_stream, false);
+        if (err != cudaSuccess) {
+            return err;
+        }
+    }
+    return cudaSuccess;
+}
+
+__global__ void stage_lde_columns(
+    const uint32_t *const *coefficient_values,
+    const uint32_t *coefficient_sizes,
+    uint32_t **device_values,
+    unsigned eval_domain_size
+) {
+    const unsigned column = blockIdx.y;
+    const unsigned index = blockIdx.x * blockDim.x + threadIdx.x;
+    // The safe Rust preparation layer validates this bound before uploading the
+    // descriptor. Clamp defensively here so a raw FFI caller still cannot make
+    // the staging kernel read beyond the NTT half-domain.
+    const unsigned coefficient_count = min(coefficient_sizes[column], eval_domain_size);
+    if (index < coefficient_count) {
+        device_values[column][index] = coefficient_values[column][index];
+    } else if (index < 2 * eval_domain_size) {
+        device_values[column][index] = 0;
+    }
+}
+
+// Allocation-free, explicit-stream LDE for graph capture. Both pointer tables
+// and every pointed-to buffer are caller-owned device memory. Staging and N2B
+// run on the supplied stream, with no host upload, allocation, free, or sync.
+extern "C" int stwo_lde_n2b_columns_on(
+    const uint32_t *const *coefficient_values,
+    const uint32_t *coefficient_sizes,
+    uint32_t **device_values,
+    unsigned log_n,
+    unsigned num_poly,
+    uint32_t *g_twiddles,
+    unsigned twiddles_size,
+    unsigned eval_domain_size,
+    void *stream
+) {
+    if (coefficient_values == nullptr || coefficient_sizes == nullptr ||
+        device_values == nullptr ||
+        g_twiddles == nullptr || stream == nullptr || log_n == 0 ||
+        log_n > 30 || num_poly == 0 ||
+        eval_domain_size != (1u << (log_n - 1)) ||
+        eval_domain_size > twiddles_size) {
+        return cudaErrorInvalidValue;
+    }
+
+    cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    constexpr unsigned block_size = 256;
+    const unsigned output_size = 2 * eval_domain_size;
+    const unsigned grid_x = (output_size + block_size - 1) / block_size;
+    for (unsigned base = 0; base < num_poly; base += MAX_NTT_BATCH_COLUMNS) {
+        const unsigned chunk = min(num_poly - base, MAX_NTT_BATCH_COLUMNS);
+        stage_lde_columns<<<dim3(grid_x, chunk), block_size, 0, cuda_stream>>>(
+            coefficient_values + base, coefficient_sizes + base,
+            device_values + base, eval_domain_size);
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            return err;
+        }
+        err = ntt_n2b_columns_dispatch_on(
+            reinterpret_cast<m31 **>(device_values + base), log_n, chunk,
+            g_twiddles, twiddles_size, eval_domain_size, cuda_stream, false);
+        if (err != cudaSuccess) {
+            return err;
+        }
+    }
+    return cudaSuccess;
 }

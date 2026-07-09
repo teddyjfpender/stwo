@@ -13,6 +13,38 @@
 //! ptxas, which the AOT path never runs. `force_relax` falsified -O0 at 2.6×
 //! worse — AOT gives fused AND -O3, which no runtime option could.
 
+/// Stable identity of the AOT semantic-key/architecture set embedded in this
+/// binary. Zero means no AOT pack is present and is never a valid graph key.
+pub fn loaded_manifest_hash() -> u64 {
+    stwo_backend_cuda_kernels::aot_pack::aot_pack_manifest_hash()
+}
+
+/// Cheap device-architecture admission check. Individual semantic lookups still
+/// fail closed in strict GPU-native mode, so a partial pack cannot masquerade as
+/// complete merely because it contains one kernel for the device.
+pub fn supports_arch(sm_major: u32, sm_minor: u32) -> bool {
+    stwo_backend_cuda_kernels::aot_pack::aot_pack_supports_arch(sm_major, sm_minor)
+}
+
+pub use stwo_backend_cuda_kernels::raw::CudaJitAotStats as RuntimeStats;
+
+/// Permanently select the fail-closed AOT-only lane for subsequent generated
+/// kernel lookups in this process. Call during prover construction, before any
+/// witness or composition work can populate the module cache.
+pub fn require_loaded_kernels() {
+    unsafe { stwo_backend_cuda_kernels::raw::stwo_cuda_jit_set_require_aot(true) }
+}
+
+pub fn runtime_stats() -> RuntimeStats {
+    let mut stats = RuntimeStats::default();
+    unsafe { stwo_backend_cuda_kernels::raw::stwo_cuda_jit_get_aot_stats(&mut stats) };
+    stats
+}
+
+pub fn reset_runtime_stats() {
+    unsafe { stwo_backend_cuda_kernels::raw::stwo_cuda_jit_reset_aot_stats() }
+}
+
 use stwo::core::fields::qm31::SecureField;
 use stwo_constraint_framework::FrameworkEval;
 

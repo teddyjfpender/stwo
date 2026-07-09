@@ -4,9 +4,12 @@ use tracing::{info, instrument, span, Level};
 use crate::core::channel::{Channel, MerkleChannel};
 use crate::core::circle::CirclePoint;
 use crate::core::fields::qm31::{SecureField, SECURE_EXTENSION_DEGREE};
+use crate::core::pcs::quotients::ExtendedCommitmentSchemeProof;
 use crate::core::pcs::utils::{try_get_lifting_log_size, InvalidLiftingLogSizeError};
+use crate::core::pcs::TreeVec;
 use crate::core::proof::{ExtendedStarkProof, StarkProof};
 use crate::core::verifier::PREPROCESSED_TRACE_IDX;
+use crate::core::ColumnVec;
 use crate::prover::backend::BackendForChannel;
 
 mod air;
@@ -34,13 +37,55 @@ pub fn prove<B: BackendForChannel<MC>, MC: MerkleChannel>(
     Ok(prove_ex(components, channel, commitment_scheme, false)?.proof)
 }
 
-#[instrument(skip_all)]
 pub fn prove_ex<B: BackendForChannel<MC>, MC: MerkleChannel>(
     components: &[&dyn ComponentProver<B>],
     channel: &mut MC::C,
-    mut commitment_scheme: CommitmentSchemeProver<'_, B, MC>,
+    commitment_scheme: CommitmentSchemeProver<'_, B, MC>,
     include_all_preprocessed_columns: bool,
 ) -> Result<ExtendedStarkProof<MC::H>, ProvingError> {
+    let result = prove_ex_with_pcs_driver(
+        components,
+        channel,
+        commitment_scheme,
+        include_all_preprocessed_columns,
+        |commitment_scheme, sample_points, channel| {
+            Ok::<_, std::convert::Infallible>((
+                commitment_scheme.prove_values(sample_points, channel),
+                (),
+            ))
+        },
+    );
+    match result {
+        Ok((proof, ())) => Ok(proof),
+        Err(ProveExWithPcsDriverError::Proving(error)) => Err(error),
+        Err(ProveExWithPcsDriverError::PcsDriver(never)) => match never {},
+    }
+}
+
+/// Runs STARK composition and delegates the final PCS/FRI protocol to an
+/// explicit caller-owned driver.
+///
+/// The closure receives the fully prepared commitment scheme, the exact OODS
+/// sample-point tree, and the live Fiat-Shamir channel. It must preserve that
+/// channel's operation order and return the standard proof plus arbitrary typed
+/// driver telemetry. [`prove_ex`] remains the reference-compatible wrapper.
+#[instrument(skip_all, name = "prove_ex")]
+pub fn prove_ex_with_pcs_driver<'a, B, MC, T, E, D>(
+    components: &[&dyn ComponentProver<B>],
+    channel: &mut MC::C,
+    mut commitment_scheme: CommitmentSchemeProver<'a, B, MC>,
+    include_all_preprocessed_columns: bool,
+    pcs_driver: D,
+) -> Result<(ExtendedStarkProof<MC::H>, T), ProveExWithPcsDriverError<E>>
+where
+    B: BackendForChannel<MC>,
+    MC: MerkleChannel,
+    D: FnOnce(
+        CommitmentSchemeProver<'a, B, MC>,
+        TreeVec<ColumnVec<Vec<CirclePoint<SecureField>>>>,
+        &mut MC::C,
+    ) -> Result<(ExtendedCommitmentSchemeProof<MC::H>, T), E>,
+{
     let n_preprocessed_columns = commitment_scheme.trees[PREPROCESSED_TRACE_IDX]
         .polynomials
         .len();
@@ -92,7 +137,8 @@ pub fn prove_ex<B: BackendForChannel<MC>, MC: MerkleChannel>(
     // If `self.config.lifting_log_size` is None, the lifting size is the length of the split
     // composition polynomials' domain.
     let lifting_log_size =
-        try_get_lifting_log_size(&commitment_scheme.config, split_composition_log_size)?;
+        try_get_lifting_log_size(&commitment_scheme.config, split_composition_log_size)
+            .map_err(ProvingError::from)?;
     if include_all_preprocessed_columns {
         // If all the preprocessed columns are included, the lifting log size must be greater than
         // or equal to the preprocessed log size.
@@ -100,10 +146,11 @@ pub fn prove_ex<B: BackendForChannel<MC>, MC: MerkleChannel>(
             .commitment
             .log_size();
         if lifting_log_size < preprocessed_log_size {
-            Err(InvalidLiftingLogSizeError {
+            return Err(ProvingError::from(InvalidLiftingLogSizeError {
                 lifting_log_size,
                 min_log_size: preprocessed_log_size,
-            })?;
+            })
+            .into());
         }
     }
     let max_log_degree_bound =
@@ -120,7 +167,9 @@ pub fn prove_ex<B: BackendForChannel<MC>, MC: MerkleChannel>(
     sample_points.push(vec![vec![oods_point]; 2 * SECURE_EXTENSION_DEGREE]);
 
     // Prove the trace and composition OODS values, and retrieve them.
-    let commitment_scheme_proof = commitment_scheme.prove_values(sample_points, channel);
+    let (commitment_scheme_proof, driver_telemetry) =
+        pcs_driver(commitment_scheme, sample_points, channel)
+            .map_err(ProveExWithPcsDriverError::PcsDriver)?;
     let proof = StarkProof(commitment_scheme_proof.proof);
     info!(proof_size_estimate = proof.size_estimate());
 
@@ -138,13 +187,24 @@ pub fn prove_ex<B: BackendForChannel<MC>, MC: MerkleChannel>(
                 max_log_degree_bound,
             )
     {
-        return Err(ProvingError::ConstraintsNotSatisfied);
+        return Err(ProvingError::ConstraintsNotSatisfied.into());
     }
 
-    Ok(ExtendedStarkProof {
-        proof,
-        aux: commitment_scheme_proof.aux,
-    })
+    Ok((
+        ExtendedStarkProof {
+            proof,
+            aux: commitment_scheme_proof.aux,
+        },
+        driver_telemetry,
+    ))
+}
+
+#[derive(Debug, Error)]
+pub enum ProveExWithPcsDriverError<E> {
+    #[error(transparent)]
+    Proving(#[from] ProvingError),
+    #[error("PCS proof driver failed: {0}")]
+    PcsDriver(E),
 }
 
 #[derive(Clone, Copy, Debug, Error)]

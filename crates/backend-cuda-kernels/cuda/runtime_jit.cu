@@ -64,12 +64,47 @@ extern "C" bool stwo_aot_lookup(uint64_t cache_key, unsigned sm_major, unsigned 
 
 namespace {
 
+enum class KernelOrigin : uint8_t { Aot = 0, Runtime = 1 };
+
+struct CachedFunction {
+    CUfunction function;
+    KernelOrigin origin;
+};
+
+struct StwoCudaJitAotStats {
+    uint64_t aot_loads;
+    uint64_t aot_cache_hits;
+    uint64_t aot_misses;
+    uint64_t runtime_loads;
+    uint64_t runtime_cache_hits;
+    uint64_t strict_rejections;
+};
+
+struct AotCounters {
+    std::atomic<uint64_t> aot_loads{0};
+    std::atomic<uint64_t> aot_cache_hits{0};
+    std::atomic<uint64_t> aot_misses{0};
+    std::atomic<uint64_t> runtime_loads{0};
+    std::atomic<uint64_t> runtime_cache_hits{0};
+    std::atomic<uint64_t> strict_rejections{0};
+};
+
+AotCounters &aot_counters() {
+    static AotCounters counters;
+    return counters;
+}
+
+std::atomic<bool> &require_aot() {
+    static std::atomic<bool> required{false};
+    return required;
+}
+
 struct JitCache {
     // Guards `functions` and `key_mutexes` only — held briefly for map lookups/inserts,
     // NEVER across a compile, so distinct-key compiles run concurrently.
     std::mutex mutex;
     // semantic_hash -> compiled function (module kept alive for process lifetime).
-    std::unordered_map<uint64_t, CUfunction> functions;
+    std::unordered_map<uint64_t, CachedFunction> functions;
     // semantic_hash -> per-key compile lock: concurrent requests for the SAME key
     // serialize (compile once, dedup) while different keys proceed in parallel.
     std::unordered_map<uint64_t, std::shared_ptr<std::mutex>> key_mutexes;
@@ -465,7 +500,7 @@ static bool try_cubin_path(const char *source, const char *kernel_name,
 // Optimization level changes SASS scheduling only, never the integer/modular values
 // the kernel computes.
 bool compile_kernel(const char *source, const char *kernel_name, uint64_t semantic_hash,
-                    bool relax_opt, CUfunction *out) {
+                    bool relax_opt, CachedFunction *out) {
     auto t_start = std::chrono::steady_clock::now();
     bool from_disk = false;
     int device = 0;
@@ -476,45 +511,61 @@ bool compile_kernel(const char *source, const char *kernel_name, uint64_t semant
     // Tier 0: the embedded AOT pack — offline -O3 SASS compiled at BUILD time
     // (design §4). No NVRTC, no ptxas, no disk. A miss (drifted recording, new
     // arch) falls through to the runtime lanes below — that miss IS the drift
-    // check. relax_opt kernels are governor overflow shapes the AOT pack never
-    // contains (it compiles uncapped at -O3), so skip the lookup for them.
-    if (!relax_opt) {
-        const unsigned char *blob = nullptr;
-        size_t blob_len = 0;
-        if (stwo_aot_lookup(semantic_hash, (unsigned)props.major, (unsigned)props.minor,
-                            &blob, &blob_len)) {
-            CUmodule module = nullptr;
-            CUresult r = cuModuleLoadData(&module, blob);
-            if (r == CUDA_SUCCESS) {
-                CUfunction function = nullptr;
-                if (cuModuleGetFunction(&function, module, kernel_name) == CUDA_SUCCESS &&
-                    fill_witness_pedersen_globals(module, kernel_name)) {
-                    // Fail-closed like the other load paths: an EC kernel whose
-                    // pedersen globals cannot fill must not launch.
-                    if (jit_log_enabled()) {
-                        fprintf(stderr,
-                                "stwo JIT: AOT pack hit kernel=%s key=%016llx (embedded "
-                                "sm_%d%d cubin)\n",
-                                kernel_name, (unsigned long long)semantic_hash, props.major,
-                                props.minor);
-                    }
-                    *out = function;
-                    return true;
+    // check. The emitted AOT pack carries the same cache key for oversized
+    // kernels too, so `relax_opt` never bypasses tier 0.
+    const unsigned char *blob = nullptr;
+    size_t blob_len = 0;
+    bool found_aot = stwo_aot_lookup(semantic_hash, (unsigned)props.major,
+                                     (unsigned)props.minor, &blob, &blob_len);
+    if (found_aot) {
+        CUmodule module = nullptr;
+        CUresult r = cuModuleLoadData(&module, blob);
+        if (r == CUDA_SUCCESS) {
+            CUfunction function = nullptr;
+            if (cuModuleGetFunction(&function, module, kernel_name) == CUDA_SUCCESS &&
+                fill_witness_pedersen_globals(module, kernel_name)) {
+                if (jit_log_enabled()) {
+                    fprintf(stderr,
+                            "stwo JIT: AOT pack hit kernel=%s key=%016llx (embedded "
+                            "sm_%d%d cubin)\n",
+                            kernel_name, (unsigned long long)semantic_hash, props.major,
+                            props.minor);
                 }
-                cuModuleUnload(module);
+                aot_counters().aot_loads.fetch_add(1, std::memory_order_relaxed);
+                *out = CachedFunction{function, KernelOrigin::Aot};
+                return true;
             }
-            if (jit_log_enabled()) {
-                fprintf(stderr,
-                        "stwo JIT: AOT pack entry for key=%016llx failed to load (%d) — "
-                        "falling back to runtime compile\n",
-                        (unsigned long long)semantic_hash, (int)r);
-            }
+            cuModuleUnload(module);
         }
+        if (jit_log_enabled()) {
+            fprintf(stderr,
+                    "stwo JIT: AOT pack entry for key=%016llx failed to load (%d)\n",
+                    (unsigned long long)semantic_hash, (int)r);
+        }
+    }
+    aot_counters().aot_misses.fetch_add(1, std::memory_order_relaxed);
+    if (require_aot().load(std::memory_order_acquire)) {
+        aot_counters().strict_rejections.fetch_add(1, std::memory_order_relaxed);
+        fprintf(stderr,
+                "stwo JIT: strict AOT rejection kernel=%s key=%016llx sm_%d%d "
+                "found_entry=%d\n",
+                kernel_name, (unsigned long long)semantic_hash, props.major, props.minor,
+                found_aot ? 1 : 0);
+        return false;
     }
 
     // Cubin fast path (skips ptxas at load). On any failure, fall through to PTX.
     if (jit_cubin_cache_enabled() &&
-        try_cubin_path(source, kernel_name, semantic_hash, relax_opt, props, t_start, out)) {
+        [&]() {
+            CUfunction function = nullptr;
+            if (!try_cubin_path(source, kernel_name, semantic_hash, relax_opt, props,
+                                t_start, &function)) {
+                return false;
+            }
+            *out = CachedFunction{function, KernelOrigin::Runtime};
+            return true;
+        }()) {
+        aot_counters().runtime_loads.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
 
@@ -629,7 +680,8 @@ bool compile_kernel(const char *source, const char *kernel_name, uint64_t semant
                 kernel_name, err_str ? err_str : "?", ptx.size(), relax_opt ? 1 : 0);
         return false;
     }
-    if (cuModuleGetFunction(out, module, kernel_name) != CUDA_SUCCESS) {
+    CUfunction function = nullptr;
+    if (cuModuleGetFunction(&function, module, kernel_name) != CUDA_SUCCESS) {
         fprintf(stderr, "stwo JIT: kernel %s not found in module\n", kernel_name);
         return false;
     }
@@ -647,6 +699,8 @@ bool compile_kernel(const char *source, const char *kernel_name, uint64_t semant
                 kernel_name, (long long)total_ms, (long long)load_ms,
                 from_disk ? "disk PTX cache" : "NVRTC compile");
     }
+    aot_counters().runtime_loads.fetch_add(1, std::memory_order_relaxed);
+    *out = CachedFunction{function, KernelOrigin::Runtime};
     return true;
 }
 
@@ -668,7 +722,15 @@ bool get_or_compile(const char *source, const char *kernel_name, uint64_t cache_
         std::lock_guard<std::mutex> guard(cache.mutex);
         auto it = cache.functions.find(cache_key);
         if (it != cache.functions.end()) {
-            *out = it->second;
+            if (require_aot().load(std::memory_order_acquire) &&
+                it->second.origin != KernelOrigin::Aot) {
+                aot_counters().strict_rejections.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+            (it->second.origin == KernelOrigin::Aot ? aot_counters().aot_cache_hits
+                                                    : aot_counters().runtime_cache_hits)
+                .fetch_add(1, std::memory_order_relaxed);
+            *out = it->second.function;
             return true;
         }
     }
@@ -680,7 +742,15 @@ bool get_or_compile(const char *source, const char *kernel_name, uint64_t cache_
         std::lock_guard<std::mutex> guard(cache.mutex);
         auto fit = cache.functions.find(cache_key);
         if (fit != cache.functions.end()) {
-            *out = fit->second;
+            if (require_aot().load(std::memory_order_acquire) &&
+                fit->second.origin != KernelOrigin::Aot) {
+                aot_counters().strict_rejections.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+            (fit->second.origin == KernelOrigin::Aot ? aot_counters().aot_cache_hits
+                                                     : aot_counters().runtime_cache_hits)
+                .fetch_add(1, std::memory_order_relaxed);
+            *out = fit->second.function;
             return true;
         }
         std::shared_ptr<std::mutex> &slot = cache.key_mutexes[cache_key];
@@ -695,24 +765,61 @@ bool get_or_compile(const char *source, const char *kernel_name, uint64_t cache_
         std::lock_guard<std::mutex> guard(cache.mutex);
         auto it = cache.functions.find(cache_key);
         if (it != cache.functions.end()) {
-            *out = it->second;
+            if (require_aot().load(std::memory_order_acquire) &&
+                it->second.origin != KernelOrigin::Aot) {
+                aot_counters().strict_rejections.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+            (it->second.origin == KernelOrigin::Aot ? aot_counters().aot_cache_hits
+                                                    : aot_counters().runtime_cache_hits)
+                .fetch_add(1, std::memory_order_relaxed);
+            *out = it->second.function;
             return true;
         }
     }
 
-    CUfunction function = nullptr;
-    if (!compile_kernel(source, kernel_name, cache_key, relax_opt, &function)) {
+    CachedFunction compiled{nullptr, KernelOrigin::Runtime};
+    if (!compile_kernel(source, kernel_name, cache_key, relax_opt, &compiled)) {
         return false;
     }
     {
         std::lock_guard<std::mutex> guard(cache.mutex);
-        cache.functions.emplace(cache_key, function);
+        cache.functions.emplace(cache_key, compiled);
     }
-    *out = function;
+    *out = compiled.function;
     return true;
 }
 
 }  // namespace
+
+extern "C" void stwo_cuda_jit_set_require_aot(bool required) {
+    // Strictness is monotonic. Relaxing it while other proof threads execute
+    // would make fallback policy schedule-dependent.
+    if (required) require_aot().store(true, std::memory_order_release);
+}
+
+extern "C" void stwo_cuda_jit_get_aot_stats(StwoCudaJitAotStats *out) {
+    if (out == nullptr) return;
+    AotCounters &c = aot_counters();
+    *out = StwoCudaJitAotStats{
+        c.aot_loads.load(std::memory_order_relaxed),
+        c.aot_cache_hits.load(std::memory_order_relaxed),
+        c.aot_misses.load(std::memory_order_relaxed),
+        c.runtime_loads.load(std::memory_order_relaxed),
+        c.runtime_cache_hits.load(std::memory_order_relaxed),
+        c.strict_rejections.load(std::memory_order_relaxed),
+    };
+}
+
+extern "C" void stwo_cuda_jit_reset_aot_stats() {
+    AotCounters &c = aot_counters();
+    c.aot_loads.store(0, std::memory_order_relaxed);
+    c.aot_cache_hits.store(0, std::memory_order_relaxed);
+    c.aot_misses.store(0, std::memory_order_relaxed);
+    c.runtime_loads.store(0, std::memory_order_relaxed);
+    c.runtime_cache_hits.store(0, std::memory_order_relaxed);
+    c.strict_rejections.store(0, std::memory_order_relaxed);
+}
 
 // Compile a kernel into the in-memory function cache (and the disk PTX cache) without
 // launching it. The Rust orchestrator precompiles EVERY kernel of a split component

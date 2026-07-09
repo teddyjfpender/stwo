@@ -38,3 +38,59 @@ pub unsafe extern "C" fn stwo_aot_lookup(
 pub fn aot_pack_entries() -> usize {
     AOT_INDEX.len()
 }
+
+/// Stable identity of the AOT modules embedded in this binary.
+///
+/// The graph cache needs the semantic cache keys and target architectures, not
+/// process-local module pointers.  An empty/stub pack deliberately returns zero
+/// so the GPU-native runtime can fail closed instead of constructing a graph key
+/// that would later fall through to NVRTC.
+pub fn aot_pack_manifest_hash() -> u64 {
+    if AOT_INDEX.is_empty() {
+        return 0;
+    }
+    let mut hash = 0xcbf29ce484222325u64;
+    let mut feed = |bytes: &[u8]| {
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    };
+    feed(b"stwo-cuda-aot-pack-v1\0");
+    feed(&(AOT_INDEX.len() as u64).to_le_bytes());
+    for &(cache_key, sm, _offset, len) in AOT_INDEX {
+        feed(&cache_key.to_le_bytes());
+        feed(&sm.to_le_bytes());
+        feed(&(len as u64).to_le_bytes());
+    }
+    hash
+}
+
+/// True when this binary contains at least one kernel for `sm_major.sm_minor`.
+/// Full per-proof coverage is still established by fail-closed lookup at every
+/// semantic key; this is the cheap admission check before arena allocation.
+pub fn aot_pack_supports_arch(sm_major: u32, sm_minor: u32) -> bool {
+    let sm = sm_major * 10 + sm_minor;
+    AOT_INDEX.iter().any(|entry| entry.1 == sm)
+}
+
+#[cfg(test)]
+mod manifest_tests {
+    use super::*;
+
+    #[test]
+    fn empty_pack_is_explicitly_unbound() {
+        if AOT_INDEX.is_empty() {
+            assert_eq!(aot_pack_manifest_hash(), 0);
+        } else {
+            assert_ne!(aot_pack_manifest_hash(), 0);
+        }
+    }
+
+    #[test]
+    fn architecture_admission_matches_embedded_index() {
+        for &(_, sm, ..) in AOT_INDEX {
+            assert!(aot_pack_supports_arch(sm / 10, sm % 10));
+        }
+    }
+}

@@ -1,17 +1,13 @@
 use hashbrown::HashMap;
-use itertools::Itertools;
 #[cfg(feature = "parallel")]
 use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use tracing::{info, span, Level};
 
-use crate::core::channel::{Channel, MerkleChannel};
+use crate::core::channel::MerkleChannel;
 use crate::core::circle::CirclePoint;
 use crate::core::fields::m31::BaseField;
 use crate::core::fields::qm31::SecureField;
-use crate::core::pcs::quotients::{
-    CommitmentSchemeProof, CommitmentSchemeProofAux, ExtendedCommitmentSchemeProof, PointSample,
-};
-use crate::core::pcs::utils::prepare_preprocessed_query_positions;
+use crate::core::pcs::quotients::ExtendedCommitmentSchemeProof;
 use crate::core::pcs::{PcsConfig, TreeSubspan, TreeVec};
 use crate::core::poly::circle::{CanonicCoset, CircleDomain};
 use crate::core::utils::MaybeOwned;
@@ -20,14 +16,13 @@ use crate::core::vcs_lifted::verifier::ExtendedMerkleDecommitmentLifted;
 use crate::core::ColumnVec;
 use crate::prover::air::component_prover::{oods_cache_cap, Poly, Trace, WeightsCache};
 use crate::prover::backend::{Backend, BackendForChannel, Col, Column};
-use crate::prover::fri::{FriDecommitResult, FriProver};
 use crate::prover::mempool::BaseColumnPool;
-use crate::prover::pcs::quotient_ops::compute_fri_quotients;
 use crate::prover::poly::circle::{CircleCoefficients, CircleEvaluation};
 use crate::prover::poly::twiddles::TwiddleTree;
 use crate::prover::poly::BitReversedOrder;
-use crate::prover::vcs_lifted::prover::{GatheredColumns, MerkleProverLifted};
+use crate::prover::vcs_lifted::prover::MerkleProverLifted;
 
+pub mod proof_driver;
 pub mod quotient_ops;
 
 /// The prover side of a FRI polynomial commitment scheme. See [super].
@@ -270,331 +265,22 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         WeightsCache::Unbounded(weights_dashmap)
     }
 
-    #[allow(unused_assignments)] // the final `pvt!` timer reset is intentionally unread
     pub fn prove_values(
-        mut self,
+        self,
         sampled_points: TreeVec<ColumnVec<Vec<CirclePoint<SecureField>>>>,
         channel: &mut MC::C,
     ) -> ExtendedCommitmentSchemeProof<MC::H> {
-        // Subscriber-independent bisection timers (STWO_PVT=1): the bench trace
-        // subscriber only records spans with recognized `class` values, so new
-        // spans are dropped. These eprintln deltas pin the streamed-LDE cost.
-        let pvt_on = std::env::var("STWO_PVT").as_deref() == Ok("1");
-        #[allow(unused_assignments)]
-        let mut pvt_t = std::time::Instant::now();
-        macro_rules! pvt {
-            ($l:expr) => {
-                if pvt_on {
-                    eprintln!("PVT {} {:.3}", $l, pvt_t.elapsed().as_secs_f64());
-                    pvt_t = std::time::Instant::now();
-                }
-            };
-        }
-        // Evaluate polynomials on open points.
-        let span = span!(
-            Level::INFO,
-            "Evaluate columns out of domain",
-            class = "EvaluateOutOfDomain"
-        )
-        .entered();
+        <B as BackendForChannel<MC>>::prove_values_driver(self, sampled_points, channel)
+    }
 
-        let lifting_log_size = self.trees.last().unwrap().commitment.log_size();
-        let weights_hash_map = if self.store_polynomials_coefficients {
-            None
-        } else {
-            Some(self.build_weights_hash_map(&sampled_points, lifting_log_size))
-        };
-
-        // Lambda that evaluates a polynomial on a collection of circle points and returns a vector
-        // of point samples.
-        let eval_at_points = |(poly, points): (&Poly<B>, &Vec<CirclePoint<SecureField>>)| {
-            points
-                .iter()
-                .map(|&point| PointSample {
-                    point,
-                    value: poly.eval_at_point(
-                        point.repeated_double(lifting_log_size - poly.evals.domain.log_size()),
-                        weights_hash_map.as_ref(),
-                    ),
-                })
-                .collect_vec()
-        };
-
-        let samples: TreeVec<Vec<Vec<PointSample>>> = if let Some(cache) = &weights_hash_map {
-            // Barycentric mode: group every (tree, column, point-slot) evaluation by
-            // (log_size, folded point) — each group shares one weights column — and
-            // evaluate each group's columns in ONE backend call
-            // ([`PolyOps::barycentric_eval_columns_at_point`]). Values are identical
-            // to the per-column path (exact field sums); device backends collapse a
-            // launch+sync round trip per column into one launch pair per group.
-            let polys = self.polynomials();
-            let mut groups: std::collections::HashMap<
-                (u32, CirclePoint<SecureField>),
-                Vec<(usize, usize, usize)>,
-            > = std::collections::HashMap::new();
-            for (t, (tree_polys, tree_points)) in
-                polys.0.iter().zip(sampled_points.0.iter()).enumerate()
-            {
-                for (c, (poly, points)) in tree_polys.iter().zip(tree_points.iter()).enumerate() {
-                    let log_size = poly.evals.domain.log_size();
-                    for (k, &point) in points.iter().enumerate() {
-                        let folded = point.repeated_double(lifting_log_size - log_size);
-                        groups
-                            .entry((log_size, folded))
-                            .or_default()
-                            .push((t, c, k));
-                    }
-                }
-            }
-            let mut out: TreeVec<Vec<Vec<PointSample>>> = TreeVec(
-                sampled_points
-                    .0
-                    .iter()
-                    .map(|tree| {
-                        tree.iter()
-                            .map(|pts| {
-                                pts.iter()
-                                    .map(|&point| PointSample {
-                                        point,
-                                        value: SecureField::default(),
-                                    })
-                                    .collect_vec()
-                            })
-                            .collect_vec()
-                    })
-                    .collect_vec(),
-            );
-            for ((log_size, folded), entries) in groups {
-                let evals_refs: Vec<&CircleEvaluation<B, BaseField, BitReversedOrder>> = entries
-                    .iter()
-                    .map(|&(t, c, _)| &polys.0[t][c].evals)
-                    .collect_vec();
-                let values = cache.with_weights(
-                    (log_size, folded),
-                    || {
-                        CircleEvaluation::<B, BaseField, BitReversedOrder>::barycentric_weights(
-                            CanonicCoset::new(log_size),
-                            folded,
-                        )
-                    },
-                    |weights| B::barycentric_eval_columns_at_point(&evals_refs, weights),
-                );
-                for (&(t, c, k), value) in entries.iter().zip(values) {
-                    out.0[t][c][k].value = value;
-                }
-            }
-            out
-        } else {
-            // Coefficients mode: the per-column path (Horner on stored coefficients).
-            #[cfg(not(feature = "parallel"))]
-            {
-                self.polynomials()
-                    .zip_cols(&sampled_points)
-                    .map_cols(eval_at_points)
-            }
-            #[cfg(feature = "parallel")]
-            {
-                self.polynomials()
-                    .zip_cols(&sampled_points)
-                    .par_map_cols(eval_at_points)
-            }
-        };
-
-        span.exit();
-        // The barycentric weights are only needed for the out-of-domain evaluations above.
-        // Each entry is a full eval-domain-sized secure-field column, so dropping the map now
-        // (instead of at the end of the function) significantly reduces peak memory during FRI.
-        drop(weights_hash_map);
-        let sampled_values = samples
-            .as_cols_ref()
-            .map_cols(|x| x.iter().map(|o| o.value).collect());
-        channel.mix_felts(&sampled_values.clone().flatten_cols());
-        pvt!("oods");
-
-        // Compute oods quotients for boundary constraints on the sampled points.
-        // Streamed-LDE mode: the committed evaluations were released at commit time;
-        // feed the quotient computation coefficient sources instead — each log-size
-        // group is regenerated transiently inside (bit-exact, grouping-invariant
-        // exact-field accumulation; see `QuotientColumnSource`).
-        let quotients = if self.stream_lde {
-            let sources: TreeVec<Vec<quotient_ops::QuotientColumnSource<'_, B>>> = TreeVec(
-                self.trees
-                    .as_ref()
-                    .0
-                    .iter()
-                    .map(|tree| {
-                        tree.polynomials
-                            .iter()
-                            .map(|poly| match &poly.coeffs {
-                                Some(coeffs) => quotient_ops::QuotientColumnSource::Coeffs(
-                                    coeffs,
-                                    poly.evals.domain,
-                                ),
-                                // Borrowed/cached trees keep their evaluations resident.
-                                None => quotient_ops::QuotientColumnSource::Eval(&poly.evals),
-                            })
-                            .collect()
-                    })
-                    .collect(),
-            );
-            quotient_ops::compute_fri_quotients_streamed(
-                sources,
-                &samples,
-                channel.draw_secure_felt(),
-                lifting_log_size,
-                self.twiddles,
-                self.config.fri_config.log_blowup_factor,
-            )
-        } else {
-            let columns = self.evaluations();
-            print_column_size_histogram::<B, MC>(&columns);
-            compute_fri_quotients(
-                &columns,
-                &samples,
-                channel.draw_secure_felt(),
-                lifting_log_size,
-                self.twiddles,
-                self.config.fri_config.log_blowup_factor,
-            )
-        };
-
-        // In low-memory mode, the full column evaluations have now served their last bulk
-        // consumer (the FRI quotients above): compact each owned tree's columns. They are
-        // regenerated transiently — and bit-exactly — at decommit time.
-        // Streamed-LDE mode routes decommit through the same compact machinery: the
-        // evaluations were released at commit, so the normal gather path would read
-        // empty buffers; with coefficients present, compaction is a free
-        // `Original(coeffs)` wrapper and `decommit_compact_tree` regenerates
-        // bit-exactly per queried column (the give_back of the already-empty eval
-        // buffers inside `compact_tree_columns` is a harmless no-op).
-        let mut compact_trees: Vec<Option<CompactTreeColumns<B>>> = if self.low_memory
-            || self.stream_lde
-        {
-            let _span = span!(Level::INFO, "Eval compaction", class = "EvalCompaction").entered();
-            self.trees
-                .0
-                .iter_mut()
-                .map(|tree| match tree {
-                    MaybeOwned::Owned(tree) if !tree.polynomials.is_empty() => {
-                        Some(compact_tree_columns(
-                            std::mem::take(&mut tree.polynomials),
-                            self.twiddles,
-                            &self.base_column_pool,
-                        ))
-                    }
-                    // Borrowed (a cached &'static tree, e.g. the persistent preprocessed
-                    // artifact under stream_lde): its evals are released (size-0), so the
-                    // `_ => None` fallthrough would force `tree.decommit` to gather from an
-                    // empty buffer (OOB read). Route it through the SAME coeff-regen decommit
-                    // as owned diet trees by cloning a compact descriptor from its resident
-                    // coefficients — read-only (no `mem::take`, no `give_back`), so the shared
-                    // cached tree is never mutated. Requires coefficients (diet always stores
-                    // them); a coeff-less borrowed tree falls through to the resident-eval path.
-                    MaybeOwned::Borrowed(tree)
-                        if !tree.polynomials.is_empty()
-                            && tree.polynomials.iter().all(|p| p.coeffs.is_some()) =>
-                    {
-                        Some(compact_tree_columns_cloned(&tree.polynomials))
-                    }
-                    _ => None,
-                })
-                .collect()
-        } else {
-            self.trees.iter().map(|_| None).collect()
-        };
-
-        pvt!("quotients+compaction");
-        // Run FRI commitment phase on the oods quotients.
-        let span_fc = span!(Level::INFO, "FRI commit", class = "FriCommit").entered();
-        let fri_prover =
-            FriProver::<B, MC>::commit(channel, self.config.fri_config, &quotients, self.twiddles);
-        span_fc.exit();
-        pvt!("fri_commit");
-
-        // Proof of work.
-        let span1 = span!(Level::INFO, "Grind", class = "Queries POW").entered();
-        let proof_of_work = B::grind(channel, self.config.pow_bits);
-        span1.exit();
-        channel.mix_u64(proof_of_work);
-
-        // FRI decommitment phase.
-        let span_fd = span!(Level::INFO, "FRI decommit", class = "FriDecommit").entered();
-        let FriDecommitResult {
-            fri_proof,
-            query_positions,
-            unsorted_query_locations,
-        } = fri_prover.decommit(channel);
-        span_fd.exit();
-        pvt!("fri_decommit");
-        // Build the query position tree.
-        let preprocessed_query_positions = prepare_preprocessed_query_positions(
-            &query_positions,
-            lifting_log_size,
-            self.trees[0].commitment.log_size(),
-        );
-        let query_positions_tree = TreeVec::new(
-            self.trees
-                .iter()
-                .enumerate()
-                .map(|(i, _)| {
-                    if i == 0 {
-                        preprocessed_query_positions.as_slice()
-                    } else {
-                        query_positions.as_slice()
-                    }
-                })
-                .collect::<Vec<_>>(),
-        );
-        let commitments = self.roots();
-        let span_td = span!(Level::INFO, "Trees decommit", class = "TreesDecommit").entered();
-        let (queried_values, decommitments, aux): (Vec<_>, Vec<_>, Vec<_>) = self
-            .trees
-            .as_ref()
-            .zip_eq(query_positions_tree)
-            .0
-            .into_iter()
-            .zip(compact_trees.drain(..))
-            .map(|((tree, query_positions), compact)| match compact {
-                Some(compact) => decommit_compact_tree(
-                    tree,
-                    compact,
-                    query_positions,
-                    self.twiddles,
-                    &self.base_column_pool,
-                ),
-                None => tree.decommit(query_positions),
-            })
-            .map(|(v, x)| (v, x.decommitment, x.aux))
-            .multiunzip();
-        span_td.exit();
-        pvt!("trees_decommit");
-
-        // Return evaluation buffers to the memory pool for reuse (owned trees only).
-        for tree in &mut self.trees.0 {
-            if let MaybeOwned::Owned(tree) = tree {
-                for poly in tree.polynomials.drain(..) {
-                    let log_size = poly.evals.domain.log_size();
-                    self.base_column_pool.give_back(log_size, poly.evals.values);
-                }
-            }
-        }
-
-        ExtendedCommitmentSchemeProof {
-            proof: CommitmentSchemeProof {
-                commitments,
-                sampled_values,
-                decommitments: TreeVec(decommitments),
-                queried_values: TreeVec(queried_values),
-                proof_of_work,
-                fri_proof: fri_proof.proof,
-                config: self.config,
-            },
-            aux: CommitmentSchemeProofAux {
-                unsorted_query_locations,
-                trace_decommitment: TreeVec(aux),
-                fri: fri_proof.aux,
-            },
-        }
+    /// Reference PCS/FRI proof driver used by the default backend dispatch.
+    pub fn prove_values_reference(
+        self,
+        sampled_points: TreeVec<ColumnVec<Vec<CirclePoint<SecureField>>>>,
+        channel: &mut MC::C,
+    ) -> ExtendedCommitmentSchemeProof<MC::H> {
+        let mut observer = proof_driver::NoopPcsProofStageObserver;
+        self.prove_values_with_stage_observer(sampled_points, channel, &mut observer)
     }
 }
 
@@ -732,11 +418,10 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
     /// positions on each column of that size.
     ///
     /// The rows the decommit reads (the queried rows plus the rows of unretained leaves
-    /// whose hashes must be recomputed) are gathered up front with one batched
-    /// [`Column::gather_unreduced`] per column, and the decommit runs over the sparse
-    /// view — the same path the low-memory mode uses. Reading element-by-element during
-    /// the walk costs queries x columns individual `at` calls, each of which is a full
-    /// device readback on GPU backends; the values and output are identical either way.
+    /// whose hashes must be recomputed) are gathered up front through
+    /// [`MerkleOpsLifted::batch_gather_column_rows`](crate::prover::vcs_lifted::ops::MerkleOpsLifted::batch_gather_column_rows),
+    /// and the decommit runs over the sparse view — the same path the low-memory mode uses.
+    /// Device backends can gather the entire tree with one launch and one readback.
     fn decommit(
         &self,
         queries: &[usize],
@@ -744,40 +429,13 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
         ColumnVec<Vec<BaseField>>,
         ExtendedMerkleDecommitmentLifted<MC::H>,
     ) {
-        let lifting_log_size = self.commitment.log_size();
-        let leaf_indices = self.commitment.unretained_leaf_indices(queries);
-
-        #[cfg(not(feature = "parallel"))]
-        let iter = self.polynomials.iter();
-        #[cfg(feature = "parallel")]
-        let iter = self.polynomials.par_iter();
-
-        let (log_sizes, rows): (Vec<u32>, Vec<HashMap<usize, BaseField>>) = iter
-            .map(|poly| {
-                let log_size = poly.evals.domain.log_size();
-                let shift = lifting_log_size - log_size;
-                // Deduplicated, in deterministic order (BTreeSet), mirroring the row
-                // mapping in `decommit_inner`/`decommit_compact_tree`.
-                let needed_rows: Vec<usize> = queries
-                    .iter()
-                    .chain(leaf_indices.iter())
-                    .map(|pos| (pos >> (shift + 1) << 1) + (pos & 1))
-                    .collect::<std::collections::BTreeSet<_>>()
-                    .into_iter()
-                    .collect();
-                let values = poly.evals.values.gather_unreduced(&needed_rows);
-                (
-                    log_size,
-                    needed_rows
-                        .into_iter()
-                        .zip(values)
-                        .collect::<HashMap<_, _>>(),
-                )
-            })
-            .unzip();
-
-        self.commitment
-            .decommit_gathered(queries, &GatheredColumns { log_sizes, rows })
+        self.commitment.decommit(
+            queries,
+            self.polynomials
+                .iter()
+                .map(|poly| &poly.evals.values)
+                .collect(),
+        )
     }
 }
 
@@ -889,16 +547,12 @@ fn decommit_compact_tree<B: BackendForChannel<MC>, MC: MerkleChannel>(
     ColumnVec<Vec<BaseField>>,
     ExtendedMerkleDecommitmentLifted<MC::H>,
 ) {
-    let lifting_log_size = tree.commitment.log_size();
-    // The leaves whose hashes the decommit will recompute (unretained bottom tree layers).
-    let leaf_indices = tree.commitment.unretained_leaf_indices(query_positions);
-
     // RegenCache P1: the PVT bisection pinned the streamed-LDE 3.6x almost entirely
     // HERE — the released evals regenerated ONE COLUMN AT A TIME (hundreds of
     // single-column NTT launches, ~17s of the ~21s Prove STARKs span on SN_PIE_2).
     // Regenerate in one BATCHED pass via `evaluate_polynomials` (one NTT per log-size
-    // group), then gather the query/leaf rows. Byte-identical (same NTT, same
-    // at_unreduced raw gather; `evaluate_polynomials` returns columns in input order).
+    // group), then gather the query/leaf rows through the backend's whole-tree
+    // batch path. Byte-identical (`evaluate_polynomials` returns columns in input order).
     //
     // Blowup: each compact column carries either its NATIVE coefficients
     // (`Original`, stream_lde) or its full LDE-size coefficients (`Half`/`Full`,
@@ -934,41 +588,15 @@ fn decommit_compact_tree<B: BackendForChannel<MC>, MC: MerkleChannel>(
         eprintln!("PVT   dct_reLDE {:.3}", t0.elapsed().as_secs_f64());
     }
 
-    // Pair sequentially (rayon can't zip a parallel iterator with a plain Vec), then
-    // parallelize the row gather over the tuples.
     let t1 = std::time::Instant::now();
-    let paired: Vec<(Poly<B>, CircleDomain)> = polys.into_iter().zip(domains).collect();
-    #[cfg(not(feature = "parallel"))]
-    let iter = paired.into_iter();
-    #[cfg(feature = "parallel")]
-    let iter = paired.into_par_iter();
-
-    let (log_sizes, rows): (Vec<u32>, Vec<HashMap<usize, BaseField>>) = iter
-        .map(|(poly, domain)| {
-            let log_size = domain.log_size();
-            let shift = lifting_log_size - log_size;
-            // Batch the row gather into ONE device readback per column (was one
-            // `at_unreduced` device roundtrip PER row — queries×columns individual
-            // copies, the dominant streamed-LDE decommit cost). Dedup rows first;
-            // `gather_unreduced` reproduces the exact committed raw bytes.
-            let mut unique_rows: Vec<usize> = query_positions
-                .iter()
-                .chain(leaf_indices.iter())
-                .map(|pos| (pos >> (shift + 1) << 1) + (pos & 1))
-                .collect();
-            unique_rows.sort_unstable();
-            unique_rows.dedup();
-            let vals = poly.evals.values.gather_unreduced(&unique_rows);
-            let gathered: HashMap<usize, BaseField> = unique_rows.into_iter().zip(vals).collect();
-            (log_size, gathered)
-        })
-        .unzip();
+    let result = tree.commitment.decommit(
+        query_positions,
+        polys.iter().map(|poly| &poly.evals.values).collect(),
+    );
     if pvt_on {
         eprintln!("PVT   dct_gather {:.3}", t1.elapsed().as_secs_f64());
     }
-
-    tree.commitment
-        .decommit_gathered(query_positions, &GatheredColumns { log_sizes, rows })
+    result
 }
 
 fn print_column_size_histogram<B: BackendForChannel<MC>, MC: MerkleChannel>(

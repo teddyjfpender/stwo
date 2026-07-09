@@ -175,7 +175,12 @@ void batch_inverse_base_field(m31 *from, m31 *dst, int size) {
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 }
 
-void batch_inverse_secure_field(qm31 *from, qm31 *dst, int size) {
+cudaError_t batch_inverse_secure_field_on(
+    cudaStream_t stream, qm31 *from, qm31 *dst, int size
+) {
+    if (size <= 0) {
+        return cudaErrorInvalidValue;
+    }
     int log_size = log_2(size);
 
     // For small sizes (log_size < 6) or non-power-of-2 sizes, use simple element-by-element inverse
@@ -185,11 +190,9 @@ void batch_inverse_secure_field(qm31 *from, qm31 *dst, int size) {
     if(log_size < 6 || !is_power_of_2) {
         int block_size = size < 256 ? size : 256;
         int num_blocks = (size + block_size - 1) / block_size;
-        batch_inverse_secure_field_simple_kernel<<<num_blocks, block_size>>>(from, dst, size);
-        ASSERT_CUDA_SUCCESS(cudaGetLastError());
-        stwo_maybe_debug_sync();
-        ASSERT_CUDA_SUCCESS(cudaGetLastError());
-        return;
+        batch_inverse_secure_field_simple_kernel<<<num_blocks, block_size, 0, stream>>>(
+            from, dst, size);
+        return cudaGetLastError();
     }
 
     int block_size = 512;
@@ -197,8 +200,13 @@ void batch_inverse_secure_field(qm31 *from, qm31 *dst, int size) {
     int num_blocks = (half_size + block_size - 1) / block_size;
     int shared_memory_bytes = 1024 * 4 * 4 + (1024 - 32) * 4 * 4;
 
-    batch_inverse_secure_field_kernel<<<num_blocks, block_size, shared_memory_bytes>>>(from, dst, size, log_size);
-    ASSERT_CUDA_SUCCESS(cudaGetLastError());
+    batch_inverse_secure_field_kernel<<<num_blocks, block_size, shared_memory_bytes, stream>>>(
+        from, dst, size, log_size);
+    return cudaGetLastError();
+}
+
+void batch_inverse_secure_field(qm31 *from, qm31 *dst, int size) {
+    ASSERT_CUDA_SUCCESS(batch_inverse_secure_field_on((cudaStream_t)0, from, dst, size));
     stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 }

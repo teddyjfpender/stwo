@@ -44,6 +44,20 @@ pub struct LayerIndexPair {
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 pub struct Blake2sHash(pub [u8; 32]);
 
+/// Process-local provenance counters for generated CUDA kernels. Strict
+/// GPU-native admission requires `aot_misses == runtime_loads ==
+/// strict_rejections == 0`; cache hits retain their original provenance.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub struct CudaJitAotStats {
+    pub aot_loads: u64,
+    pub aot_cache_hits: u64,
+    pub aot_misses: u64,
+    pub runtime_loads: u64,
+    pub runtime_cache_hits: u64,
+    pub strict_rejections: u64,
+}
+
 #[cfg_attr(stwo_cuda_link, link(name = "stwo_cuda_kernels", kind = "static"))]
 extern "C" {
     /// Returns a CUDA error code (0 = success). Sets the default mem pool's release
@@ -112,6 +126,14 @@ extern "C" {
         relax_opts: *const bool,
         count: u32,
     ) -> bool;
+    /// Process-wide fail-closed policy for generated kernels. Set before any
+    /// proof work; when true, an absent/unloadable embedded AOT entry is an
+    /// error and NVRTC/disk-PTX paths are not entered.
+    pub fn stwo_cuda_jit_set_require_aot(required: bool);
+    pub fn stwo_cuda_jit_get_aot_stats(out: *mut CudaJitAotStats);
+    /// Reset counters only. Cached functions and their AOT/runtime provenance
+    /// remain intact, so subsequent cache-hit accounting stays truthful.
+    pub fn stwo_cuda_jit_reset_aot_stats();
     /// Per-component constraint-quotient kernel dispatch (NitrooZK lineage). The first
     /// 4 bytes behind `eval` are an FNV1a hash of the component name selecting the
     /// kernel; the rest is the raw `FrameworkEval` struct the kernel's generated code
@@ -164,6 +186,30 @@ extern "C" {
         n_indices: u32,
         host_out: *mut u32,
     );
+
+    /// Allocation-free, explicit-stream multi-column gather. All descriptor
+    /// arrays and the output are device-resident; returns a CUDA status.
+    pub fn stwo_batch_gather_column_rows_launch(
+        columns_device: *const *const u32,
+        row_offsets_device: *const u32,
+        row_indices_device: *const u32,
+        n_columns: u32,
+        total_rows: u32,
+        output_device: *mut u32,
+        stream: *mut c_void,
+    ) -> i32;
+
+    /// Host compatibility wrapper: uploads explicit descriptor arrays, performs
+    /// one gather launch, and copies the flattened output D2H once.
+    pub fn stwo_batch_gather_column_rows_host(
+        columns_host: *const *const u32,
+        column_lengths_host: *const u32,
+        row_offsets_host: *const u32,
+        row_indices_host: *const u32,
+        n_columns: u32,
+        total_rows: u32,
+        output_host: *mut u32,
+    ) -> i32;
 
     pub fn cuda_malloc_uint32_t(size: u32) -> *const u32;
 
@@ -281,6 +327,27 @@ extern "C" {
         folded_values: *const *const u32,
     );
 
+    /// Allocation-free explicit-stream FRI folds. Pointer tables are device
+    /// buffers and remain caller-owned for the full capture/replay lifetime.
+    pub fn stwo_fold_line_on(
+        gpu_domain: *const u32,
+        twiddle_offset: u32,
+        n: u32,
+        eval_values: *const *mut u32,
+        alpha: CudaSecureField,
+        folded_values: *const *mut u32,
+        stream: *mut c_void,
+    ) -> i32;
+    pub fn stwo_fold_circle_into_line_on(
+        gpu_domain: *const u32,
+        twiddle_offset: u32,
+        n: u32,
+        eval_values: *const *mut u32,
+        alpha: CudaSecureField,
+        folded_values: *const *mut u32,
+        stream: *mut c_void,
+    ) -> i32;
+
     pub fn accumulate(size: u32, left_columns: *const *const u32, right_columns: *const *const u32);
 
     pub fn lift_accumulate_secure_columns(
@@ -345,6 +412,49 @@ extern "C" {
         cols_done: u32,
         result: *mut Blake2sHash,
     );
+
+    /// Allocation-free explicit-stream commit-island kernels. Pointer tables,
+    /// state, scratch, and outputs are caller-owned device buffers.
+    pub fn stwo_blake2s_leaf_init_on(
+        size: u32,
+        state: *mut Blake2sHash,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+    pub fn stwo_blake2s_leaf_update_on(
+        size: u32,
+        group_n_cols: u32,
+        columns: *const *mut u32,
+        column_log_sizes: *const u32,
+        lifting_log_size: u32,
+        cols_done: u32,
+        state: *mut Blake2sHash,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+    pub fn stwo_blake2s_leaf_finalize_on(
+        size: u32,
+        rem_cols: u32,
+        columns: *const *mut u32,
+        column_log_sizes: *const u32,
+        lifting_log_size: u32,
+        cols_done: u32,
+        result: *mut Blake2sHash,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+    pub fn stwo_blake2s_layer_on(
+        previous_layer: *const Blake2sHash,
+        output_size: u32,
+        result: *mut Blake2sHash,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+    /// Hash four QM31 coordinate columns in the exact unpacked/packed FRI leaf
+    /// byte order without materializing packed columns.
+    pub fn stwo_blake2s_fri_leaf_on(
+        evaluation_size: u32,
+        coordinate_columns: *const *mut u32,
+        log_rows_per_leaf: u32,
+        result: *mut Blake2sHash,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
 
     pub fn copy_blake_2s_hash_vec_from_host_to_device(
         from: *const Blake2sHash,
@@ -566,6 +676,32 @@ extern "C" {
         eval_domain_size: u32,
     );
 
+    /// Allocation-free N2B transform. `device_values` is already a
+    /// device-resident pointer table and every launch uses `stream`.
+    pub fn stwo_ntt_n2b_columns_on(
+        device_values: *const *mut u32,
+        log_n: u32,
+        num_poly: u32,
+        g_twiddles: *mut u32,
+        twiddles_size: u32,
+        eval_domain_size: u32,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
+    /// Allocation-free LDE. Pointer and exact coefficient-size tables are
+    /// device-resident; staging and N2B use `stream`.
+    pub fn stwo_lde_n2b_columns_on(
+        coefficient_values: *const *const u32,
+        coefficient_sizes: *const u32,
+        device_values: *const *mut u32,
+        log_n: u32,
+        num_poly: u32,
+        g_twiddles: *mut u32,
+        twiddles_size: u32,
+        eval_domain_size: u32,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
     pub fn inclusive_prefix_sum(device_bit_rev_circle_domain_evals: *const u32, len: u32);
 
     pub fn inclusive_prefix_sum_x4(
@@ -603,6 +739,57 @@ extern "C" {
         num_cols_device_table: *const *mut u32,
         den_dense_device_table: *const *mut u32,
     ) -> bool;
+
+    /// Exact CUB storage query used during prepared relation setup.
+    pub fn stwo_relation_scan_temp_bytes(len: u32) -> usize;
+
+    /// Allocation-free, stream-explicit generated relation pair engine.
+    pub fn stwo_relation_pairs_on(
+        sources: *const *const u32,
+        n_sources: u32,
+        n_rows: u32,
+        n_real: u32,
+        source_offset_rows: u32,
+        descriptors: *const u32,
+        n_columns: u32,
+        alpha_powers: *const u32,
+        n_alpha_powers: u32,
+        z: *const u32,
+        outputs: *mut u32,
+        denominators: *mut u32,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
+    pub fn stwo_relation_fraction_chain_on(
+        outputs: *mut u32,
+        denominators: *const u32,
+        inverse_scratch: *mut u32,
+        n_rows: u32,
+        n_columns: u32,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
+    pub fn stwo_relation_reduce_shift_on(
+        outputs: *mut u32,
+        n_rows: u32,
+        n_columns: u32,
+        reduction_a: *mut u32,
+        reduction_b: *mut u32,
+        reduction_capacity: u32,
+        claimed_sum: *mut u32,
+        inverse_rows: u32,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
+    pub fn stwo_relation_prefix_scan_on(
+        outputs: *mut u32,
+        n_rows: u32,
+        n_columns: u32,
+        eval_scratch: *mut u32,
+        scan_temp: *mut core::ffi::c_void,
+        scan_temp_bytes: usize,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
 
     pub fn logup_fraction_chain_dense(
         num0: *const u32,
@@ -914,15 +1101,59 @@ extern "C" {
 
     // Resource-owning execution context for one resident proof (design §19,
     // cuda_exec_context.cu): an owned non-blocking stream + its own never-release
-    // memory pool. Opaque handle (StwoExecContext*). `create` returns null on
-    // failure; `alloc`/`free` are stream-ordered on the context's stream (so a
-    // buffer frees after its last same-stream use — no cross-stream reuse hazard).
-    pub fn stwo_exec_context_create() -> *mut core::ffi::c_void;
-    pub fn stwo_exec_context_destroy(handle: *mut core::ffi::c_void);
-    pub fn stwo_exec_context_sync(handle: *mut core::ffi::c_void);
-    pub fn stwo_exec_context_stream(handle: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
-    pub fn stwo_exec_context_alloc_u32(handle: *mut core::ffi::c_void, count: usize) -> *mut u32;
-    pub fn stwo_exec_context_free_u32(handle: *mut core::ffi::c_void, ptr: *mut u32);
+    // memory pool. Every function returns a CUDA status (0 = success); context
+    // creation fails closed when an isolated pool cannot be created.
+    pub fn stwo_exec_context_create(out_handle: *mut *mut core::ffi::c_void) -> i32;
+    pub fn stwo_exec_context_destroy(handle: *mut core::ffi::c_void) -> i32;
+    pub fn stwo_exec_context_sync(handle: *mut core::ffi::c_void) -> i32;
+    pub fn stwo_exec_context_stream(
+        handle: *mut core::ffi::c_void,
+        out_stream: *mut *mut core::ffi::c_void,
+    ) -> i32;
+    pub fn stwo_exec_context_alloc_u32(
+        handle: *mut core::ffi::c_void,
+        count: usize,
+        out_ptr: *mut *mut u32,
+    ) -> i32;
+    pub fn stwo_exec_context_free_u32(handle: *mut core::ffi::c_void, ptr: *mut u32) -> i32;
+    pub fn stwo_exec_context_memset_async(
+        handle: *mut core::ffi::c_void,
+        dst: *mut core::ffi::c_void,
+        value: i32,
+        bytes: usize,
+    ) -> i32;
+    pub fn stwo_exec_context_memcpy_d2d_async(
+        handle: *mut core::ffi::c_void,
+        dst: *mut core::ffi::c_void,
+        src: *const core::ffi::c_void,
+        bytes: usize,
+    ) -> i32;
+    pub fn stwo_exec_context_memcpy_h2d_async(
+        handle: *mut core::ffi::c_void,
+        dst: *mut core::ffi::c_void,
+        src: *const core::ffi::c_void,
+        bytes: usize,
+    ) -> i32;
+    pub fn stwo_exec_context_memcpy_d2h_async(
+        handle: *mut core::ffi::c_void,
+        dst: *mut core::ffi::c_void,
+        src: *const core::ffi::c_void,
+        bytes: usize,
+    ) -> i32;
+
+    // Opaque single-stream CUDA graph exec lifecycle. Capture is bounded to the
+    // context stream; host transcript work remains outside the captured segment.
+    pub fn stwo_graph_capture_begin(handle: *mut core::ffi::c_void) -> i32;
+    pub fn stwo_graph_capture_end(
+        handle: *mut core::ffi::c_void,
+        out_exec: *mut *mut core::ffi::c_void,
+    ) -> i32;
+    pub fn stwo_graph_capture_abort(handle: *mut core::ffi::c_void) -> i32;
+    pub fn stwo_graph_launch(
+        exec_handle: *mut core::ffi::c_void,
+        context_handle: *mut core::ffi::c_void,
+    ) -> i32;
+    pub fn stwo_graph_destroy(exec_handle: *mut core::ffi::c_void) -> i32;
 
     // Truth oracle for the witness-JIT computed EC deduces (ISA-V3 kinds 2/3):
     // runs the exact `stwo_wit_deduce_*` device functions the JIT kernels embed
@@ -956,6 +1187,13 @@ extern "C" {
         first_size: u32,
         out_levels_dev: *const *mut Blake2sHash,
         n_levels: u32,
+    ) -> i32;
+    pub fn stwo_blake2s_tail_on(
+        first_dev: *const Blake2sHash,
+        first_size: u32,
+        out_levels_dev: *const *mut Blake2sHash,
+        n_levels: u32,
+        stream: *mut core::ffi::c_void,
     ) -> i32;
 
     // Device edge (B3): blake_round's sub buffer -> blake_g's row-major input

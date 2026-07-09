@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use stwo::core::channel::Blake2sChannelGeneric;
 use stwo::core::proof_of_work::GrindOps;
-use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
+use stwo::core::vcs_lifted::blake2_merkle::{Blake2sM31MerkleChannel, Blake2sMerkleChannel};
 use stwo::prover::backend::simd::SimdBackend;
 use stwo::prover::backend::{Backend, BackendForChannel};
 
@@ -46,10 +46,60 @@ impl GrindOps<Blake2sChannelGeneric<true>> for CudaBackend {
     }
 }
 
-impl BackendForChannel<Blake2sMerkleChannel> for CudaBackend {}
-impl BackendForChannel<stwo::core::vcs_lifted::blake2_merkle::Blake2sM31MerkleChannel>
-    for CudaBackend
-{
+impl BackendForChannel<Blake2sMerkleChannel> for CudaBackend {
+    fn prove_values_driver<'a>(
+        commitment_scheme: stwo::prover::pcs::CommitmentSchemeProver<
+            'a,
+            Self,
+            Blake2sMerkleChannel,
+        >,
+        sampled_points: stwo::core::pcs::TreeVec<
+            stwo::core::ColumnVec<
+                Vec<stwo::core::circle::CirclePoint<stwo::core::fields::qm31::SecureField>>,
+            >,
+        >,
+        channel: &mut stwo::core::channel::Blake2sChannel,
+    ) -> stwo::core::pcs::quotients::ExtendedCommitmentSchemeProof<
+        <Blake2sMerkleChannel as stwo::core::channel::MerkleChannel>::H,
+    > {
+        let mut config = super::pcs_driver::CudaPcsDriverConfig::detached_eager();
+        super::pcs_driver::prove_values_with_config(
+            commitment_scheme,
+            sampled_points,
+            channel,
+            &mut config,
+        )
+        .expect("detached CUDA PCS driver has no fallible graph hook")
+        .proof
+    }
+}
+
+impl BackendForChannel<Blake2sM31MerkleChannel> for CudaBackend {
+    fn prove_values_driver<'a>(
+        commitment_scheme: stwo::prover::pcs::CommitmentSchemeProver<
+            'a,
+            Self,
+            Blake2sM31MerkleChannel,
+        >,
+        sampled_points: stwo::core::pcs::TreeVec<
+            stwo::core::ColumnVec<
+                Vec<stwo::core::circle::CirclePoint<stwo::core::fields::qm31::SecureField>>,
+            >,
+        >,
+        channel: &mut stwo::core::channel::Blake2sM31Channel,
+    ) -> stwo::core::pcs::quotients::ExtendedCommitmentSchemeProof<
+        <Blake2sM31MerkleChannel as stwo::core::channel::MerkleChannel>::H,
+    > {
+        let mut config = super::pcs_driver::CudaPcsDriverConfig::detached_eager();
+        super::pcs_driver::prove_values_with_config(
+            commitment_scheme,
+            sampled_points,
+            channel,
+            &mut config,
+        )
+        .expect("detached CUDA PCS driver has no fallible graph hook")
+        .proof
+    }
 }
 
 impl stwo_constraint_framework::FrameworkBackend for CudaBackend {

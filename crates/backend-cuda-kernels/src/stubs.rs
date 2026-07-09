@@ -171,6 +171,70 @@ pub unsafe extern "C" fn stwo_logup_pairs_from_flats(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_relation_scan_temp_bytes(_len: u32) -> usize {
+    no_cuda_symbol("stwo_relation_scan_temp_bytes")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_relation_pairs_on(
+    _sources: *const *const u32,
+    _n_sources: u32,
+    _n_rows: u32,
+    _n_real: u32,
+    _source_offset_rows: u32,
+    _descriptors: *const u32,
+    _n_columns: u32,
+    _alpha_powers: *const u32,
+    _n_alpha_powers: u32,
+    _z: *const u32,
+    _outputs: *mut u32,
+    _denominators: *mut u32,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_relation_pairs_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_relation_fraction_chain_on(
+    _outputs: *mut u32,
+    _denominators: *const u32,
+    _inverse_scratch: *mut u32,
+    _n_rows: u32,
+    _n_columns: u32,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_relation_fraction_chain_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_relation_reduce_shift_on(
+    _outputs: *mut u32,
+    _n_rows: u32,
+    _n_columns: u32,
+    _reduction_a: *mut u32,
+    _reduction_b: *mut u32,
+    _reduction_capacity: u32,
+    _claimed_sum: *mut u32,
+    _inverse_rows: u32,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_relation_reduce_shift_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_relation_prefix_scan_on(
+    _outputs: *mut u32,
+    _n_rows: u32,
+    _n_columns: u32,
+    _eval_scratch: *mut u32,
+    _scan_temp: *mut core::ffi::c_void,
+    _scan_temp_bytes: usize,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_relation_prefix_scan_on")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn logup_fraction_chain_dense(
     num0: *const u32,
     num1: *const u32,
@@ -522,6 +586,50 @@ pub unsafe extern "C" fn cuda_gather_uint32_t(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_batch_gather_column_rows_launch(
+    columns_device: *const *const u32,
+    row_offsets_device: *const u32,
+    row_indices_device: *const u32,
+    n_columns: u32,
+    total_rows: u32,
+    output_device: *mut u32,
+    stream: *mut c_void,
+) -> i32 {
+    let _ = (
+        columns_device,
+        row_offsets_device,
+        row_indices_device,
+        n_columns,
+        total_rows,
+        output_device,
+        stream,
+    );
+    no_cuda_symbol("stwo_batch_gather_column_rows_launch")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_batch_gather_column_rows_host(
+    columns_host: *const *const u32,
+    column_lengths_host: *const u32,
+    row_offsets_host: *const u32,
+    row_indices_host: *const u32,
+    n_columns: u32,
+    total_rows: u32,
+    output_host: *mut u32,
+) -> i32 {
+    let _ = (
+        columns_host,
+        column_lengths_host,
+        row_offsets_host,
+        row_indices_host,
+        n_columns,
+        total_rows,
+        output_host,
+    );
+    no_cuda_symbol("stwo_batch_gather_column_rows_host")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn cuda_malloc_uint32_t(size: u32) -> *const u32 {
     no_cuda_symbol("cuda_malloc_uint32_t")
 }
@@ -726,6 +834,32 @@ pub unsafe extern "C" fn fold_circle_into_line(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_fold_line_on(
+    gpu_domain: *const u32,
+    twiddle_offset: u32,
+    n: u32,
+    eval_values: *const *mut u32,
+    alpha: CudaSecureField,
+    folded_values: *const *mut u32,
+    stream: *mut c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_fold_line_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_fold_circle_into_line_on(
+    gpu_domain: *const u32,
+    twiddle_offset: u32,
+    n: u32,
+    eval_values: *const *mut u32,
+    alpha: CudaSecureField,
+    folded_values: *const *mut u32,
+    stream: *mut c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_fold_circle_into_line_on")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn accumulate(
     size: u32,
     left_columns: *const *const u32,
@@ -815,6 +949,64 @@ pub unsafe extern "C" fn stream_leaf_finalize(
     _result: *mut Blake2sHash,
 ) {
     no_cuda_symbol("stream_leaf_finalize")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_blake2s_leaf_init_on(
+    _size: u32,
+    _state: *mut Blake2sHash,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_blake2s_leaf_init_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_blake2s_leaf_update_on(
+    _size: u32,
+    _group_n_cols: u32,
+    _columns: *const *mut u32,
+    _column_log_sizes: *const u32,
+    _lifting_log_size: u32,
+    _cols_done: u32,
+    _state: *mut Blake2sHash,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_blake2s_leaf_update_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_blake2s_leaf_finalize_on(
+    _size: u32,
+    _rem_cols: u32,
+    _columns: *const *mut u32,
+    _column_log_sizes: *const u32,
+    _lifting_log_size: u32,
+    _cols_done: u32,
+    _result: *mut Blake2sHash,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_blake2s_leaf_finalize_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_blake2s_layer_on(
+    _previous_layer: *const Blake2sHash,
+    _output_size: u32,
+    _result: *mut Blake2sHash,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_blake2s_layer_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_blake2s_fri_leaf_on(
+    _evaluation_size: u32,
+    _coordinate_columns: *const *mut u32,
+    _log_rows_per_leaf: u32,
+    _result: *mut Blake2sHash,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_blake2s_fri_leaf_on")
 }
 
 #[unsafe(no_mangle)]
@@ -1115,6 +1307,34 @@ pub unsafe extern "C" fn ntt_n2b_columns(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_ntt_n2b_columns_on(
+    _device_values: *const *mut u32,
+    _log_n: u32,
+    _num_poly: u32,
+    _g_twiddles: *mut u32,
+    _twiddles_size: u32,
+    _eval_domain_size: u32,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_ntt_n2b_columns_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_lde_n2b_columns_on(
+    _coefficient_values: *const *const u32,
+    _coefficient_sizes: *const u32,
+    _device_values: *const *mut u32,
+    _log_n: u32,
+    _num_poly: u32,
+    _g_twiddles: *mut u32,
+    _twiddles_size: u32,
+    _eval_domain_size: u32,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_lde_n2b_columns_on")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn cuda_malloc_poseidon252_hash(size: usize) -> *mut [u8; 32] {
     no_cuda_symbol("cuda_malloc_poseidon252_hash")
 }
@@ -1256,6 +1476,19 @@ pub unsafe extern "C" fn stwo_cuda_jit_precompile_batch(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_cuda_jit_set_require_aot(_required: bool) {}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_cuda_jit_get_aot_stats(out: *mut crate::raw::CudaJitAotStats) {
+    if let Some(out) = unsafe { out.as_mut() } {
+        *out = crate::raw::CudaJitAotStats::default();
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_cuda_jit_reset_aot_stats() {}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn gen_seq_column_on_gpu(_output: *mut u32, _log_size: u32) {
     no_cuda_symbol("gen_seq_column_on_gpu")
 }
@@ -1314,24 +1547,25 @@ pub unsafe extern "C" fn stwo_fanout_join(_stream: *mut core::ffi::c_void) {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn stwo_exec_context_create() -> *mut core::ffi::c_void {
+pub unsafe extern "C" fn stwo_exec_context_create(_out_handle: *mut *mut core::ffi::c_void) -> i32 {
     no_cuda_symbol("stwo_exec_context_create")
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn stwo_exec_context_destroy(_handle: *mut core::ffi::c_void) {
+pub unsafe extern "C" fn stwo_exec_context_destroy(_handle: *mut core::ffi::c_void) -> i32 {
     no_cuda_symbol("stwo_exec_context_destroy")
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn stwo_exec_context_sync(_handle: *mut core::ffi::c_void) {
+pub unsafe extern "C" fn stwo_exec_context_sync(_handle: *mut core::ffi::c_void) -> i32 {
     no_cuda_symbol("stwo_exec_context_sync")
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stwo_exec_context_stream(
     _handle: *mut core::ffi::c_void,
-) -> *mut core::ffi::c_void {
+    _out_stream: *mut *mut core::ffi::c_void,
+) -> i32 {
     no_cuda_symbol("stwo_exec_context_stream")
 }
 
@@ -1339,7 +1573,8 @@ pub unsafe extern "C" fn stwo_exec_context_stream(
 pub unsafe extern "C" fn stwo_exec_context_alloc_u32(
     _handle: *mut core::ffi::c_void,
     _count: usize,
-) -> *mut u32 {
+    _out_ptr: *mut *mut u32,
+) -> i32 {
     no_cuda_symbol("stwo_exec_context_alloc_u32")
 }
 
@@ -1347,8 +1582,79 @@ pub unsafe extern "C" fn stwo_exec_context_alloc_u32(
 pub unsafe extern "C" fn stwo_exec_context_free_u32(
     _handle: *mut core::ffi::c_void,
     _ptr: *mut u32,
-) {
+) -> i32 {
     no_cuda_symbol("stwo_exec_context_free_u32")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_exec_context_memset_async(
+    _handle: *mut core::ffi::c_void,
+    _dst: *mut core::ffi::c_void,
+    _value: i32,
+    _bytes: usize,
+) -> i32 {
+    no_cuda_symbol("stwo_exec_context_memset_async")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_exec_context_memcpy_d2d_async(
+    _handle: *mut core::ffi::c_void,
+    _dst: *mut core::ffi::c_void,
+    _src: *const core::ffi::c_void,
+    _bytes: usize,
+) -> i32 {
+    no_cuda_symbol("stwo_exec_context_memcpy_d2d_async")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_exec_context_memcpy_h2d_async(
+    _handle: *mut core::ffi::c_void,
+    _dst: *mut core::ffi::c_void,
+    _src: *const core::ffi::c_void,
+    _bytes: usize,
+) -> i32 {
+    no_cuda_symbol("stwo_exec_context_memcpy_h2d_async")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_exec_context_memcpy_d2h_async(
+    _handle: *mut core::ffi::c_void,
+    _dst: *mut core::ffi::c_void,
+    _src: *const core::ffi::c_void,
+    _bytes: usize,
+) -> i32 {
+    no_cuda_symbol("stwo_exec_context_memcpy_d2h_async")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_graph_capture_begin(_handle: *mut core::ffi::c_void) -> i32 {
+    no_cuda_symbol("stwo_graph_capture_begin")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_graph_capture_end(
+    _handle: *mut core::ffi::c_void,
+    _out_exec: *mut *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_graph_capture_end")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_graph_capture_abort(_handle: *mut core::ffi::c_void) -> i32 {
+    no_cuda_symbol("stwo_graph_capture_abort")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_graph_launch(
+    _exec_handle: *mut core::ffi::c_void,
+    _context_handle: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_graph_launch")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_graph_destroy(_exec_handle: *mut core::ffi::c_void) -> i32 {
+    no_cuda_symbol("stwo_graph_destroy")
 }
 
 #[unsafe(no_mangle)]
@@ -1374,6 +1680,17 @@ pub unsafe extern "C" fn stwo_blake2s_tail(
     _n_levels: u32,
 ) -> i32 {
     no_cuda_symbol("stwo_blake2s_tail")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_blake2s_tail_on(
+    _first_dev: *const Blake2sHash,
+    _first_size: u32,
+    _out_levels_dev: *const *mut Blake2sHash,
+    _n_levels: u32,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_blake2s_tail_on")
 }
 
 #[unsafe(no_mangle)]

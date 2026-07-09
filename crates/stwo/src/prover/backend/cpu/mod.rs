@@ -27,7 +27,30 @@ use crate::prover::poly::circle::{CircleCoefficients, CircleEvaluation};
 pub struct CpuBackend;
 
 impl Backend for CpuBackend {}
+#[cfg(not(test))]
 impl BackendForChannel<Blake2sMerkleChannel> for CpuBackend {}
+#[cfg(test)]
+impl BackendForChannel<Blake2sMerkleChannel> for CpuBackend {
+    fn prove_values_driver<'a>(
+        commitment_scheme: crate::prover::pcs::CommitmentSchemeProver<
+            'a,
+            Self,
+            Blake2sMerkleChannel,
+        >,
+        sampled_points: crate::core::pcs::TreeVec<
+            crate::core::ColumnVec<
+                Vec<crate::core::circle::CirclePoint<crate::core::fields::qm31::SecureField>>,
+            >,
+        >,
+        channel: &mut crate::core::channel::Blake2sChannel,
+    ) -> crate::core::pcs::quotients::ExtendedCommitmentSchemeProof<
+        <Blake2sMerkleChannel as crate::core::channel::MerkleChannel>::H,
+    > {
+        PROVE_VALUES_DRIVER_CALLED.with(|called| called.set(true));
+        let mut observer = CpuTestStageObserver;
+        commitment_scheme.prove_values_with_stage_observer(sampled_points, channel, &mut observer)
+    }
+}
 impl BackendForChannel<Blake2sM31MerkleChannel> for CpuBackend {}
 impl BackendForChannel<Keccak256MerkleChannel> for CpuBackend {}
 #[cfg(not(target_arch = "wasm32"))]
@@ -70,6 +93,33 @@ impl<T: Debug + Clone + Default + Send + Sync> Column<T> for Vec<T> {
     fn shrink_to_fit(&mut self) {
         Vec::shrink_to_fit(self);
     }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static PROVE_VALUES_DRIVER_CALLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static PROVE_VALUES_DRIVER_STAGES: std::cell::RefCell<Vec<crate::prover::pcs::proof_driver::PcsProofStage>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+struct CpuTestStageObserver;
+
+#[cfg(test)]
+impl crate::prover::pcs::proof_driver::PcsProofStageObserver for CpuTestStageObserver {
+    fn stage_finished(&mut self, stage: crate::prover::pcs::proof_driver::PcsProofStage) {
+        PROVE_VALUES_DRIVER_STAGES.with(|stages| stages.borrow_mut().push(stage));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn take_prove_values_driver_called() -> bool {
+    PROVE_VALUES_DRIVER_CALLED.with(|called| called.replace(false))
+}
+
+#[cfg(test)]
+pub(crate) fn take_prove_values_driver_stages(
+) -> Vec<crate::prover::pcs::proof_driver::PcsProofStage> {
+    PROVE_VALUES_DRIVER_STAGES.with(|stages| std::mem::take(&mut *stages.borrow_mut()))
 }
 
 pub type CpuCirclePoly = CircleCoefficients<CpuBackend>;

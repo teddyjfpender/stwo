@@ -12,7 +12,7 @@ use crate::core::vcs_lifted::verifier::{
     ExtendedMerkleDecommitmentLifted, MerkleDecommitmentLifted, MerkleDecommitmentLiftedAux,
 };
 use crate::core::ColumnVec;
-use crate::prover::backend::{Col, Column, ColumnOps};
+use crate::prover::backend::{Col, Column};
 
 /// The number of bottom tree layers (leaves upwards) that [`MerkleProverLifted::commit_pruned`]
 /// does not retain. The unretained nodes are recomputed from the committed columns at decommit
@@ -198,7 +198,23 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
         ColumnVec<Vec<BaseField>>,
         ExtendedMerkleDecommitmentLifted<H>,
     ) {
-        self.decommit_inner(query_positions, &DenseColumns::<B>(&columns))
+        // Materialize the sparse read set once, before the host Merkle walk. On
+        // device backends this is one batched gather for the whole tree instead of
+        // `queries x columns` scalar PCIe reads. Include every leaf needed to
+        // reconstruct pruned bottom layers, so the sparse view is a complete drop-in
+        // replacement for dense column access.
+        let row_indices = self.decommit_column_rows(query_positions, &columns);
+        let values = B::batch_gather_column_rows(&columns, &row_indices);
+        let rows = row_indices
+            .into_iter()
+            .zip(values)
+            .map(|(indices, values)| indices.into_iter().zip(values).collect())
+            .collect();
+        let gathered = GatheredColumns {
+            log_sizes: columns.iter().map(|column| column.len().ilog2()).collect(),
+            rows,
+        };
+        self.decommit_inner(query_positions, &gathered)
     }
 
     /// Same as [`Self::decommit`], but reads column values from a sparse, row-gathered view
@@ -255,25 +271,20 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
         };
         let mut node_memo = HashMap::<(usize, usize), H::Hash>::new();
 
-        // Batched retained-layer reads (Stage A': STWO_CUDA_ASYNC_SPINE): collect
-        // every (level, idx) the walk below will read from a RETAINED layer (the
-        // mirror is `retained_node_reads`, same idiom as `unretained_leaf_indices`),
-        // fetch them in ONE backend call, and let `node_hash` consult the prefetch.
-        // Values are exactly `layers[level].at(idx)`; a miss falls back to the
-        // per-element read, so the worst case is today's behavior.
-        let prefetch: HashMap<(usize, usize), H::Hash> =
-            if std::env::var("STWO_CUDA_ASYNC_SPINE").as_deref() == Ok("1") {
-                let pairs = self.retained_node_reads(query_positions);
-                let layer_refs: Vec<&Col<B, H::Hash>> = self.layers.iter().collect();
-                let values = B::batch_layer_reads(&layer_refs, &pairs);
-                pairs
-                    .iter()
-                    .map(|&(l, i)| (l as usize, i as usize))
-                    .zip(values)
-                    .collect()
-            } else {
-                HashMap::new()
-            };
+        // Collect every retained-layer node the walk below will read (the mirror
+        // is `retained_node_reads`, same idiom as `unretained_leaf_indices`) and
+        // fetch it through the backend batch contract. This is no longer migration
+        // flag scaffolding: the default implementation is exactly the old scalar
+        // reads, while a resident backend turns the whole set into one gather and
+        // one D2H transfer. Values remain exactly `layers[level].at(idx)`.
+        let pairs = self.retained_node_reads(query_positions);
+        let layer_refs: Vec<&Col<B, H::Hash>> = self.layers.iter().collect();
+        let values = B::batch_layer_reads(&layer_refs, &pairs);
+        let prefetch: HashMap<(usize, usize), H::Hash> = pairs
+            .iter()
+            .map(|&(l, i)| (l as usize, i as usize))
+            .zip(values)
+            .collect();
 
         let mut prev_layer_queries = query_positions.to_vec();
         prev_layer_queries.dedup();
@@ -453,6 +464,34 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
         needed.into_iter().collect()
     }
 
+    /// Exact per-column sparse read set required by [`Self::decommit`]. Query
+    /// positions and unretained leaf positions live in the lifted leaf domain;
+    /// map both through the same two-coset lifting rule used by `decommit_inner`
+    /// and `leaf_hash`, then sort and deduplicate for deterministic descriptors.
+    fn decommit_column_rows(
+        &self,
+        query_positions: &[usize],
+        columns: &[&Col<B, BaseField>],
+    ) -> Vec<Vec<usize>> {
+        let leaf_rows = self.unretained_leaf_indices(query_positions);
+        columns
+            .iter()
+            .map(|column| {
+                let log_size = column.len().ilog2();
+                let shift = self.leaf_log_size - log_size;
+                let map_row = |position: &usize| (position >> (shift + 1) << 1) + (position & 1);
+                let mut rows: Vec<_> = query_positions
+                    .iter()
+                    .chain(&leaf_rows)
+                    .map(map_row)
+                    .collect();
+                rows.sort_unstable();
+                rows.dedup();
+                rows
+            })
+            .collect()
+    }
+
     pub fn root(&self) -> H::Hash {
         self.layers.first().unwrap().at(0)
     }
@@ -469,24 +508,6 @@ trait ColumnAccess {
     /// recomputing leaf hashes, which must reproduce the exact bytes that
     /// [`MerkleOpsLifted::build_leaves`] committed.
     fn raw_value(&self, col: usize, row: usize) -> BaseField;
-}
-
-/// Dense access: the full committed columns.
-struct DenseColumns<'a, B: ColumnOps<BaseField>>(&'a [&'a Col<B, BaseField>]);
-
-impl<B: ColumnOps<BaseField>> ColumnAccess for DenseColumns<'_, B> {
-    fn n_columns(&self) -> usize {
-        self.0.len()
-    }
-    fn column_log_size(&self, col: usize) -> u32 {
-        self.0[col].len().ilog2()
-    }
-    fn value(&self, col: usize, row: usize) -> BaseField {
-        self.0[col].at(row)
-    }
-    fn raw_value(&self, col: usize, row: usize) -> BaseField {
-        self.0[col].at_unreduced(row)
-    }
 }
 
 /// A sparse, row-gathered view of a tree's committed columns, sufficient for decommitting a

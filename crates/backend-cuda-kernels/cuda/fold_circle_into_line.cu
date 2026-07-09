@@ -68,3 +68,32 @@ void fold_circle_into_line(m31 *gpu_domain, uint32_t twiddle_offset, uint32_t n,
     cuda_proving_free(eval_values_device);
     cuda_proving_free(folded_values_device);
 }
+
+extern "C" int stwo_fold_circle_into_line_on(
+    const uint32_t *gpu_domain,
+    uint32_t twiddle_offset,
+    uint32_t n,
+    uint32_t **eval_values,
+    qm31 alpha,
+    uint32_t **folded_values,
+    void *stream
+) {
+    if (gpu_domain == nullptr || n < 2 || (n & (n - 1)) != 0 ||
+        eval_values == nullptr || folded_values == nullptr || stream == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr int block_dim = 256;
+    const int num_blocks = (n / 2 + block_dim - 1) / block_dim;
+    const qm31 alpha_sq = mul(alpha, alpha);
+    fold_circle_into_line_kernel<<<num_blocks, block_dim, 0,
+                                   reinterpret_cast<cudaStream_t>(stream)>>>(
+        const_cast<m31 *>(reinterpret_cast<const m31 *>(gpu_domain)),
+        twiddle_offset,
+        n,
+        alpha,
+        alpha_sq,
+        reinterpret_cast<m31 **>(eval_values),
+        reinterpret_cast<m31 **>(folded_values)
+    );
+    return cudaGetLastError();
+}

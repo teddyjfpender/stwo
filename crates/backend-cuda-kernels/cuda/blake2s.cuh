@@ -52,6 +52,29 @@ void stream_leaf_update(uint32_t size, uint32_t group_n_cols, uint32_t **columns
 extern "C"
 void stream_leaf_finalize(uint32_t size, uint32_t rem_cols, uint32_t **columns, const uint32_t *column_log_sizes, uint32_t lifting_log_size, uint32_t cols_done, Blake2sHash *result);
 
+// Allocation-free explicit-stream variants used by transcript-bounded graph
+// segments. All pointer tables, state, and outputs are caller-owned device memory.
+extern "C"
+int stwo_blake2s_leaf_init_on(uint32_t size, Blake2sHash *state, void *stream);
+extern "C"
+int stwo_blake2s_leaf_update_on(uint32_t size, uint32_t group_n_cols, uint32_t **columns, const uint32_t *column_log_sizes, uint32_t lifting_log_size, uint32_t cols_done, Blake2sHash *state, void *stream);
+extern "C"
+int stwo_blake2s_leaf_finalize_on(uint32_t size, uint32_t rem_cols, uint32_t **columns, const uint32_t *column_log_sizes, uint32_t lifting_log_size, uint32_t cols_done, Blake2sHash *result, void *stream);
+extern "C"
+int stwo_blake2s_layer_on(const Blake2sHash *previous_layer, uint32_t output_size, Blake2sHash *result, void *stream);
+extern "C"
+int stwo_blake2s_tail_on(const Blake2sHash *first, uint32_t first_size, Blake2sHash *const *out_levels, uint32_t n_levels, void *stream);
+
+// FRI leaf hashing directly from four coordinate columns. `log_rows_per_leaf`
+// is exactly 0 (four-word leaf) or 2 (the verifier's 4-row packed leaf). This
+// avoids materializing the 16 packed columns while preserving their byte order.
+extern "C"
+int stwo_blake2s_fri_leaf_on(uint32_t evaluation_size,
+                             uint32_t **coordinate_columns,
+                             uint32_t log_rows_per_leaf,
+                             Blake2sHash *result,
+                             void *stream);
+
 // Workstream D layer-pair fusion: hash two internal (column-free) tree levels per
 // launch. `size` = number of grandparent hashes; `previous_layer` holds 4*size.
 extern "C"

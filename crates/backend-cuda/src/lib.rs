@@ -7,6 +7,44 @@
 mod backend;
 
 pub use backend::aot;
+pub use backend::commit_graph::{
+    CommitGraphError, CommitGraphPlan, CommitLaunchKind, CommitLdeBatch, CommitLeafGroup,
+    CommitTailPlan,
+};
+pub use backend::decommit_gather::{
+    column_row_gather_requirements, gather_column_rows_host, ColumnRowGatherError,
+    ColumnRowGatherRequirements, ColumnRowGatherSlots, PreparedColumnRowGather,
+};
+pub use backend::exec_context::{
+    ArenaError, ArenaLayout, ArenaSlice, ArenaSlotId, ArenaSlotSpec, CudaExecContext,
+    CudaGraphCapture, CudaGraphExec, CudaRuntimeError, DeviceArena,
+};
+pub use backend::pcs_driver::{
+    prove_values_with_config as prove_cuda_pcs_values, CudaPcsDriverConfig, CudaPcsDriverError,
+    CudaPcsDriverOutput, CudaPcsDriverTelemetry, CudaPcsGraphHookError, CudaPcsGraphHooks,
+    CudaPcsRuntimeMode,
+};
+pub use backend::prepared_commit::{
+    commit_workspace_requirements, CommitArenaSlotRequirement, CommitBatchRequirements,
+    CommitBatchSlots, CommitCoefficientColumn, CommitCoefficientGroup, CommitGroupRequirements,
+    CommitGroupSlots, CommitLayerRequirements, CommitWorkspaceConfig, CommitWorkspaceRequirements,
+    CommitWorkspaceSlots, PreparedCommitError, PreparedCommitGraph, COMMIT_HASH_ALIGNMENT_WORDS,
+    COMMIT_POINTER_ALIGNMENT_WORDS,
+};
+pub use backend::prepared_fri::{
+    fri_workspace_requirements, FriArenaSlotRequirement, FriMerkleLayerRequirements,
+    FriMerkleTreeRequirements, FriMerkleTreeSlots, FriRoundRequirements, FriWorkspaceConfig,
+    FriWorkspaceRequirements, FriWorkspaceSlots, PreparedFriError, PreparedFriEvaluation,
+    PreparedFriGraph, FRI_HASH_ALIGNMENT_WORDS, FRI_POINTER_ALIGNMENT_WORDS,
+};
+pub use backend::relation_graph::{
+    relation_graph_requirements, PreparedRelationGraph, PreparedRelationOutput,
+    RelationArenaSlotRequirement, RelationBatchProgram, RelationChallenges,
+    RelationColumnDescriptor, RelationGraphError, RelationGraphRequirements, RelationGraphSlots,
+    RelationInstanceRequirement, RelationInstanceSlots, RelationInstanceSources,
+    RelationKernelProgram, RelationMultiplicityKind, RelationRowExtent, RelationSourceLayout,
+    RelationTupleKind, RelationUseDescriptor, RELATION_POINTER_ALIGNMENT_WORDS,
+};
 mod columns;
 
 pub use backend::{

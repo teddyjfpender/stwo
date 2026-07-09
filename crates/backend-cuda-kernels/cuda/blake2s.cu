@@ -379,6 +379,43 @@ __global__ void __launch_bounds__(BLOCK_SIZE) stream_leaf_finalize_in_gpu(
     for (int i = 0; i < 8; i++) result[index].s[i] = h[i];
 }
 
+// FRI's packed-leaf transform is purely a byte-layout transform:
+// packed[coord + 4*offset][row] = coords[coord][4*row + offset]. Hash that
+// exact 16-word stream directly so no second full-size evaluation is needed.
+__global__ void __launch_bounds__(BLOCK_SIZE) fri_leaf_in_gpu(
+    uint32_t evaluation_size,
+    m31 **coordinates,
+    uint32_t log_rows_per_leaf,
+    Blake2sHash *result
+) {
+    const uint32_t leaf_index = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t leaf_count = evaluation_size >> log_rows_per_leaf;
+    if (leaf_index >= leaf_count) return;
+
+    uint32_t h[8];
+    blake2s_init_words(h);
+    uint32_t m[16] = {0};
+    if (log_rows_per_leaf == 0) {
+        #pragma unroll
+        for (int coord = 0; coord < 4; ++coord) {
+            m[coord] = coordinates[coord][leaf_index];
+        }
+        blake2s_compress_words(h, m, 16, 0xFFFFFFFF);
+    } else {
+        #pragma unroll
+        for (int offset = 0; offset < 4; ++offset) {
+            #pragma unroll
+            for (int coord = 0; coord < 4; ++coord) {
+                m[coord + 4 * offset] =
+                    coordinates[coord][4 * leaf_index + offset];
+            }
+        }
+        blake2s_compress_words(h, m, 64, 0xFFFFFFFF);
+    }
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) result[leaf_index].s[i] = h[i];
+}
+
 __global__ void __launch_bounds__(BLOCK_SIZE, STWO_LEAF_MIN_BLOCKS) commit_on_layer_using_previous_in_gpu(
     uint32_t size,
     uint32_t number_of_columns,
@@ -582,6 +619,109 @@ void stream_leaf_finalize(
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 }
 
+// Graph-capturable streaming-leaf entry points. Pointer/log tables and output
+// state are caller-owned DEVICE buffers; every launch uses the supplied stream.
+// These functions intentionally skip the optional occupancy probe and all debug
+// synchronization so capture contains only the actual kernels.
+extern "C" int stwo_blake2s_leaf_init_on(
+    uint32_t size, Blake2sHash *state, void *stream
+) {
+    if (size == 0 || state == nullptr || stream == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    stream_leaf_init_in_gpu<<<number_of_blocks_for(size), BLOCK_SIZE, 0,
+                              reinterpret_cast<cudaStream_t>(stream)>>>(size, state);
+    return cudaGetLastError();
+}
+
+extern "C" int stwo_blake2s_leaf_update_on(
+    uint32_t size,
+    uint32_t group_n_cols,
+    uint32_t **device_columns,
+    const uint32_t *column_log_sizes,
+    uint32_t lifting_log_size,
+    uint32_t cols_done,
+    Blake2sHash *state,
+    void *stream
+) {
+    if (size == 0 || group_n_cols == 0 || (group_n_cols % 16) != 0 ||
+        device_columns == nullptr || column_log_sizes == nullptr ||
+        lifting_log_size >= 31 || size != (1u << lifting_log_size) ||
+        (cols_done % 16) != 0 || state == nullptr || stream == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    stream_leaf_update_in_gpu<<<number_of_blocks_for(size), BLOCK_SIZE, 0,
+                                reinterpret_cast<cudaStream_t>(stream)>>>(
+        size, group_n_cols, device_columns, column_log_sizes, lifting_log_size,
+        cols_done, state);
+    return cudaGetLastError();
+}
+
+extern "C" int stwo_blake2s_leaf_finalize_on(
+    uint32_t size,
+    uint32_t rem_cols,
+    uint32_t **device_columns,
+    const uint32_t *column_log_sizes,
+    uint32_t lifting_log_size,
+    uint32_t cols_done,
+    Blake2sHash *result,
+    void *stream
+) {
+    if (size == 0 || rem_cols == 0 || rem_cols > 16 || device_columns == nullptr ||
+        column_log_sizes == nullptr || lifting_log_size >= 31 ||
+        size != (1u << lifting_log_size) || (cols_done % 16) != 0 ||
+        result == nullptr || stream == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    stream_leaf_finalize_in_gpu<<<number_of_blocks_for(size), BLOCK_SIZE, 0,
+                                  reinterpret_cast<cudaStream_t>(stream)>>>(
+        size, rem_cols, device_columns, column_log_sizes, lifting_log_size,
+        cols_done, result);
+    return cudaGetLastError();
+}
+
+// One column-free interior Merkle level: result[i] = H(prev[2i], prev[2i+1]).
+extern "C" int stwo_blake2s_layer_on(
+    const Blake2sHash *previous_layer,
+    uint32_t output_size,
+    Blake2sHash *result,
+    void *stream
+) {
+    if (previous_layer == nullptr || output_size == 0 ||
+        (output_size & (output_size - 1)) != 0 || result == nullptr || stream == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    commit_on_layer_using_previous_in_gpu<<<number_of_blocks_for(output_size), BLOCK_SIZE, 0,
+                                            reinterpret_cast<cudaStream_t>(stream)>>>(
+        output_size, 0, nullptr, const_cast<Blake2sHash *>(previous_layer), result);
+    return cudaGetLastError();
+}
+
+extern "C" int stwo_blake2s_fri_leaf_on(
+    uint32_t evaluation_size,
+    uint32_t **coordinate_columns,
+    uint32_t log_rows_per_leaf,
+    Blake2sHash *result,
+    void *stream
+) {
+    if (evaluation_size == 0 ||
+        (evaluation_size & (evaluation_size - 1)) != 0 ||
+        coordinate_columns == nullptr ||
+        (log_rows_per_leaf != 0 && log_rows_per_leaf != 2) ||
+        evaluation_size < (1u << log_rows_per_leaf) ||
+        result == nullptr || stream == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    const uint32_t leaf_count = evaluation_size >> log_rows_per_leaf;
+    fri_leaf_in_gpu<<<number_of_blocks_for(leaf_count), BLOCK_SIZE, 0,
+                      reinterpret_cast<cudaStream_t>(stream)>>>(
+        evaluation_size,
+        reinterpret_cast<m31 **>(coordinate_columns),
+        log_rows_per_leaf,
+        result);
+    return cudaGetLastError();
+}
+
 void commit_on_layer_with_previous(
     uint32_t size,
     uint32_t number_of_columns,
@@ -656,7 +796,7 @@ extern "C" int stwo_blake2s_tail(
     if (n_levels == 0) {
         return 0;
     }
-    if (first_size == 0 || (first_size & (first_size - 1)) != 0 ||
+    if (n_levels >= 32 || first_size == 0 || (first_size & (first_size - 1)) != 0 ||
         (first_size >> n_levels) == 0) {
         fprintf(stderr, "stwo_blake2s_tail: bad sizes (first=%u levels=%u)\n",
                 first_size, n_levels);
@@ -668,4 +808,30 @@ extern "C" int stwo_blake2s_tail(
         return 1;
     }
     return 0;
+}
+
+// Explicit-stream tail variant for graph capture. All level buffers and the
+// device pointer table are caller-owned and address-stable for the graph epoch.
+extern "C" int stwo_blake2s_tail_on(
+    const Blake2sHash *first_dev,
+    uint32_t first_size,
+    Blake2sHash *const *out_levels_dev,
+    uint32_t n_levels,
+    void *stream
+) {
+    if (stream == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    if (n_levels == 0) {
+        return cudaSuccess;
+    }
+    if (first_dev == nullptr || out_levels_dev == nullptr || n_levels >= 32 ||
+        first_size == 0 || (first_size & (first_size - 1)) != 0 ||
+        (first_size >> n_levels) == 0) {
+        return cudaErrorInvalidValue;
+    }
+    blake2s_tail_kernel<<<1, STWO_TAIL_BLOCK, 0,
+                          reinterpret_cast<cudaStream_t>(stream)>>>(
+        first_dev, first_size, out_levels_dev, n_levels);
+    return cudaGetLastError();
 }

@@ -43,6 +43,14 @@ fn merkle_span<T>(label: &str, n_cols: usize, log_size: u32, f: impl FnOnce() ->
 impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M31_OUTPUT>>
     for CudaBackend
 {
+    fn batch_gather_column_rows(
+        columns: &[&BaseFieldVec],
+        rows: &[Vec<usize>],
+    ) -> Vec<Vec<stwo::core::fields::m31::BaseField>> {
+        crate::backend::decommit_gather::gather_column_rows_host(columns, rows)
+            .unwrap_or_else(|error| panic!("CUDA multi-column decommit gather failed: {error}"))
+    }
+
     fn build_leaves(columns: &[&BaseFieldVec], lifting_log_size: u32) -> Blake2sHashVec {
         // First commit hook hit per tree — report the resolved commit-fusion
         // configuration once so a pod operator / the bisecting integration agent
