@@ -36,6 +36,13 @@ StwoExecContext *context_from(void *handle) {
 cudaError_t first_error(cudaError_t current, cudaError_t candidate) {
     return current == cudaSuccess ? candidate : current;
 }
+
+__global__ void fill_u32_kernel(uint32_t *dst, uint32_t value, size_t count) {
+    size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index < count) {
+        dst[index] = value;
+    }
+}
 }  // namespace
 
 // Create a context: a non-blocking stream + its own never-release memory pool on
@@ -179,6 +186,25 @@ extern "C" int stwo_exec_context_memset_async(
         return cudaSuccess;
     }
     return cudaMemsetAsync(dst, value, bytes, context_from(handle)->stream);
+}
+
+extern "C" int stwo_exec_context_fill_u32_async(
+    void *handle, uint32_t *dst, uint32_t value, size_t count
+) {
+    if (handle == nullptr || (dst == nullptr && count != 0)) {
+        return cudaErrorInvalidValue;
+    }
+    if (count == 0) {
+        return cudaSuccess;
+    }
+    constexpr uint32_t block = 256;
+    size_t blocks = (count + block - 1u) / block;
+    if (blocks > static_cast<size_t>(UINT32_MAX)) {
+        return cudaErrorInvalidValue;
+    }
+    fill_u32_kernel<<<static_cast<uint32_t>(blocks), block, 0,
+                      context_from(handle)->stream>>>(dst, value, count);
+    return cudaGetLastError();
 }
 
 extern "C" int stwo_exec_context_memcpy_d2d_async(

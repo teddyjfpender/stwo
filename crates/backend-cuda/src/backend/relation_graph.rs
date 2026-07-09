@@ -1,6 +1,6 @@
 //! Prepared, arena-backed CommonLookupElements execution.
 //!
-//! Static relation descriptors and source-pointer tables are uploaded once in
+//! Static relation descriptors plus source/output pointer tables are uploaded once in
 //! [`PreparedRelationGraph::prepare`]. [`PreparedRelationGraph::launch`] is the
 //! single eager/capture sequence: combine/pair, fraction chain, device reduction
 //! and shift, then four caller-scratch prefix scans. It allocates, transfers, and
@@ -260,6 +260,10 @@ pub struct RelationInstanceRequirement {
     pub instance_index: usize,
     pub row_capacity: u32,
     pub source_pointer_words: usize,
+    pub output_pointer_words: usize,
+    pub output_coordinate_count: usize,
+    pub output_coordinate_words: usize,
+    /// Aggregate words across every output coordinate.
     pub output_words: usize,
     pub denominator_words: usize,
     pub claimed_sum_words: usize,
@@ -285,12 +289,13 @@ pub struct RelationArenaSlotRequirement {
     pub alignment_words: usize,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RelationInstanceSlots {
     pub source_pointers: ArenaSlotId,
-    /// Pair numerators are written here and fraction-chained in place into the
-    /// final interaction coordinates.
-    pub outputs: ArenaSlotId,
+    pub output_pointers: ArenaSlotId,
+    /// Exactly `4 * logup_columns` commit-source slots in interaction-column,
+    /// secure-coordinate order. Numerators are fraction-chained in place.
+    pub output_coordinates: Vec<ArenaSlotId>,
     pub denominators: ArenaSlotId,
     pub claimed_sum: ArenaSlotId,
 }
@@ -335,13 +340,29 @@ impl RelationGraphRequirements {
             slot_requirement(slots.scan_temp_scratch, self.scan_temp_words, 1),
         ];
         for (requirement, instance_slots) in self.instances.iter().zip(&slots.instances) {
+            if instance_slots.output_coordinates.len() != requirement.output_coordinate_count {
+                return Err(RelationGraphError::SlotShapeMismatch {
+                    expected: requirement.output_coordinate_count,
+                    actual: instance_slots.output_coordinates.len(),
+                });
+            }
+            output.push(slot_requirement(
+                instance_slots.source_pointers,
+                requirement.source_pointer_words,
+                RELATION_POINTER_ALIGNMENT_WORDS,
+            ));
+            output.push(slot_requirement(
+                instance_slots.output_pointers,
+                requirement.output_pointer_words,
+                RELATION_POINTER_ALIGNMENT_WORDS,
+            ));
+            output.extend(
+                instance_slots
+                    .output_coordinates
+                    .iter()
+                    .map(|&id| slot_requirement(id, requirement.output_coordinate_words, 1)),
+            );
             output.extend([
-                slot_requirement(
-                    instance_slots.source_pointers,
-                    requirement.source_pointer_words,
-                    RELATION_POINTER_ALIGNMENT_WORDS,
-                ),
-                slot_requirement(instance_slots.outputs, requirement.output_words, 1),
                 slot_requirement(
                     instance_slots.denominators,
                     requirement.denominator_words,
@@ -412,6 +433,14 @@ pub fn relation_graph_requirements(
                     .pointer_count()?
                     .checked_mul(POINTER_WORDS)
                     .ok_or(RelationGraphError::SizeOverflow)?,
+                output_pointer_words: columns
+                    .checked_mul(SECURE_FIELD_WORDS)
+                    .and_then(|count| count.checked_mul(POINTER_WORDS))
+                    .ok_or(RelationGraphError::SizeOverflow)?,
+                output_coordinate_count: columns
+                    .checked_mul(SECURE_FIELD_WORDS)
+                    .ok_or(RelationGraphError::SizeOverflow)?,
+                output_coordinate_words: rows,
                 output_words: coordinate_words,
                 denominator_words: coordinate_words,
                 claimed_sum_words: SECURE_FIELD_WORDS,
@@ -671,13 +700,14 @@ pub struct RelationInstanceSources {
     pub columns: Vec<ArenaSlice>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct PreparedRelationOutput {
     pub batch_index: usize,
     pub instance_index: usize,
     pub rows: u32,
     pub columns: u32,
-    pub coordinates: ArenaSlice,
+    /// Exact commit-source slices in interaction-column, secure-coordinate order.
+    pub coordinates: Vec<ArenaSlice>,
     pub claimed_sum: ArenaSlice,
 }
 
@@ -685,6 +715,7 @@ struct PreparedInstance {
     output: PreparedRelationOutput,
     descriptor_ptr: *const u32,
     source_pointers: ArenaSlice,
+    output_pointers: ArenaSlice,
     denominators: ArenaSlice,
     n_real_rows: u32,
     source_offset_rows: u32,
@@ -838,7 +869,17 @@ impl<'a> PreparedRelationGraph<'a> {
                 requirement.source_pointer_words,
                 RELATION_POINTER_ALIGNMENT_WORDS,
             )?;
-            let outputs = bind_slot(arena, instance_slots.outputs, requirement.output_words, 1)?;
+            let output_pointers = bind_slot(
+                arena,
+                instance_slots.output_pointers,
+                requirement.output_pointer_words,
+                RELATION_POINTER_ALIGNMENT_WORDS,
+            )?;
+            let output_coordinates = instance_slots
+                .output_coordinates
+                .iter()
+                .map(|&id| bind_slot(arena, id, requirement.output_coordinate_words, 1))
+                .collect::<Result<Vec<_>, _>>()?;
             let denominators = bind_slot(
                 arena,
                 instance_slots.denominators,
@@ -859,6 +900,13 @@ impl<'a> PreparedRelationGraph<'a> {
                     .map(|column| column.as_u32_ptr() as usize)
                     .collect(),
             ));
+            uploads.push(PendingUpload::pointers(
+                output_pointers,
+                output_coordinates
+                    .iter()
+                    .map(|column| column.as_u32_ptr() as usize)
+                    .collect(),
+            ));
             let descriptor_word_offset = descriptor_column_offset[requirement.batch_index]
                 .checked_mul(DESCRIPTOR_WORDS)
                 .ok_or(RelationGraphError::SizeOverflow)?;
@@ -875,11 +923,12 @@ impl<'a> PreparedRelationGraph<'a> {
                     rows: padded_rows,
                     columns: u32::try_from(batch.columns.len())
                         .map_err(|_| RelationGraphError::SizeOverflow)?,
-                    coordinates: outputs,
+                    coordinates: output_coordinates,
                     claimed_sum,
                 },
                 descriptor_ptr,
                 source_pointers,
+                output_pointers,
                 denominators,
                 n_real_rows,
                 source_offset_rows,
@@ -922,14 +971,14 @@ impl<'a> PreparedRelationGraph<'a> {
                     u32::try_from(self.alphas.len_words() / SECURE_FIELD_WORDS)
                         .map_err(|_| RelationGraphError::SizeOverflow)?,
                     self.z.as_u32_ptr().cast_const(),
-                    instance.output.coordinates.as_u32_ptr(),
+                    instance.output_pointers.as_u32_ptr().cast(),
                     instance.denominators.as_u32_ptr(),
                     stream,
                 )
             })?;
             check_cuda("relation_fraction_chain_on", unsafe {
                 stwo_backend_cuda_kernels::raw::stwo_relation_fraction_chain_on(
-                    instance.output.coordinates.as_u32_ptr(),
+                    instance.output_pointers.as_u32_ptr().cast(),
                     instance.denominators.as_u32_ptr().cast_const(),
                     self.inverse_scratch.as_u32_ptr(),
                     rows,
@@ -937,12 +986,19 @@ impl<'a> PreparedRelationGraph<'a> {
                     stream,
                 )
             })?;
+            let last_start = usize::try_from(columns - 1)
+                .map_err(|_| RelationGraphError::SizeOverflow)?
+                .checked_mul(SECURE_FIELD_WORDS)
+                .ok_or(RelationGraphError::SizeOverflow)?;
+            let last = &instance.output.coordinates[last_start..last_start + SECURE_FIELD_WORDS];
             let inverse_rows = M31::from_u32_unchecked(rows).inverse().0;
             check_cuda("relation_reduce_shift_on", unsafe {
                 stwo_backend_cuda_kernels::raw::stwo_relation_reduce_shift_on(
-                    instance.output.coordinates.as_u32_ptr(),
+                    last[0].as_u32_ptr(),
+                    last[1].as_u32_ptr(),
+                    last[2].as_u32_ptr(),
+                    last[3].as_u32_ptr(),
                     rows,
-                    columns,
                     self.reduction_a.as_u32_ptr(),
                     self.reduction_b.as_u32_ptr(),
                     u32::try_from(self.reduction_a.len_words() / SECURE_FIELD_WORDS)
@@ -952,23 +1008,57 @@ impl<'a> PreparedRelationGraph<'a> {
                     stream,
                 )
             })?;
-            check_cuda("relation_prefix_scan_on", unsafe {
-                stwo_backend_cuda_kernels::raw::stwo_relation_prefix_scan_on(
-                    instance.output.coordinates.as_u32_ptr(),
-                    rows,
-                    columns,
-                    self.scan_eval_scratch.as_u32_ptr(),
-                    self.scan_temp_scratch.as_void_ptr(),
-                    self.scan_temp_bytes,
-                    stream,
-                )
-            })?;
+            for coordinate in last {
+                check_cuda("relation_prefix_scan_on", unsafe {
+                    stwo_backend_cuda_kernels::raw::stwo_relation_prefix_scan_on(
+                        coordinate.as_u32_ptr(),
+                        rows,
+                        self.scan_eval_scratch.as_u32_ptr(),
+                        self.scan_temp_scratch.as_void_ptr(),
+                        self.scan_temp_bytes,
+                        stream,
+                    )
+                })?;
+            }
         }
         Ok(())
     }
 
-    pub fn outputs(&self) -> impl ExactSizeIterator<Item = PreparedRelationOutput> + '_ {
-        self.instances.iter().map(|instance| instance.output)
+    pub fn outputs(&self) -> impl ExactSizeIterator<Item = &PreparedRelationOutput> + '_ {
+        self.instances.iter().map(|instance| &instance.output)
+    }
+
+    /// Expand the device transcript's exact `LookupElements::draw` output
+    /// (`[z, alpha]`, two consecutive QM31 values) directly into the persistent
+    /// z/alpha-power slots used by [`Self::launch`]. This is allocation-free,
+    /// transfer-free and capture-safe on the arena's explicit stream.
+    pub fn expand_challenges_from_transcript(
+        &self,
+        drawn_z_alpha: ArenaSlice,
+    ) -> Result<(), RelationGraphError> {
+        if drawn_z_alpha.context_token() != self.arena.context().identity_token() {
+            return Err(RelationGraphError::ContextMismatch(drawn_z_alpha.id()));
+        }
+        let required_words = 2 * SECURE_FIELD_WORDS;
+        if drawn_z_alpha.len_words() < required_words {
+            return Err(RelationGraphError::SlotTooSmall {
+                slot: drawn_z_alpha.id(),
+                required_words,
+                actual_words: drawn_z_alpha.len_words(),
+            });
+        }
+        let n_alpha_powers = u32::try_from(self.alphas.len_words() / SECURE_FIELD_WORDS)
+            .map_err(|_| RelationGraphError::SizeOverflow)?;
+        check_cuda("relation_expand_challenges_on", unsafe {
+            stwo_backend_cuda_kernels::raw::stwo_relation_expand_challenges_on(
+                drawn_z_alpha.as_u32_ptr().cast_const(),
+                self.alphas.as_u32_ptr(),
+                n_alpha_powers,
+                self.z.as_u32_ptr(),
+                self.arena.context().stream_raw().as_ptr(),
+            )
+        })?;
+        Ok(())
     }
 
     /// Update only transcript-derived challenge words between proof replays. This
@@ -1219,7 +1309,8 @@ mod tests {
             instances: (0..2)
                 .map(|_| RelationInstanceSlots {
                     source_pointers: id(),
-                    outputs: id(),
+                    output_pointers: id(),
+                    output_coordinates: (0..4).map(|_| id()).collect(),
                     denominators: id(),
                     claimed_sum: id(),
                 })
@@ -1242,6 +1333,12 @@ mod tests {
             requirements.instances[0].output_words,
             8 * SECURE_FIELD_WORDS
         );
+        assert_eq!(requirements.instances[0].output_coordinate_count, 4);
+        assert_eq!(requirements.instances[0].output_coordinate_words, 8);
+        assert_eq!(
+            requirements.instances[0].output_pointer_words,
+            4 * POINTER_WORDS
+        );
         assert_eq!(
             requirements.instances[1].source_pointer_words,
             5 * POINTER_WORDS
@@ -1249,7 +1346,7 @@ mod tests {
 
         let slots = sample_slots();
         let slot_requirements = requirements.arena_slot_requirements(&slots).unwrap();
-        assert_eq!(slot_requirements.len(), 8 + 2 * 4);
+        assert_eq!(slot_requirements.len(), 8 + 2 * 8);
         assert_eq!(
             slot_requirements[8].alignment_words,
             RELATION_POINTER_ALIGNMENT_WORDS
@@ -1310,7 +1407,7 @@ mod tests {
     fn duplicate_caller_slots_are_rejected() {
         let requirements = sample_program().requirements().unwrap();
         let mut slots = sample_slots();
-        slots.instances[1].outputs = slots.instances[0].outputs;
+        slots.instances[1].output_coordinates[0] = slots.instances[0].output_coordinates[0];
         assert!(matches!(
             requirements.arena_slot_requirements(&slots),
             Err(RelationGraphError::DuplicateSlot(_))

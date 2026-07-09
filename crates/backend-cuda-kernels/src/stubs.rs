@@ -176,6 +176,17 @@ pub unsafe extern "C" fn stwo_relation_scan_temp_bytes(_len: u32) -> usize {
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_relation_expand_challenges_on(
+    _drawn_z_alpha: *const u32,
+    _alpha_powers: *mut u32,
+    _n_alpha_powers: u32,
+    _z: *mut u32,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_relation_expand_challenges_on")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stwo_relation_pairs_on(
     _sources: *const *const u32,
     _n_sources: u32,
@@ -187,7 +198,7 @@ pub unsafe extern "C" fn stwo_relation_pairs_on(
     _alpha_powers: *const u32,
     _n_alpha_powers: u32,
     _z: *const u32,
-    _outputs: *mut u32,
+    _outputs: *const *mut u32,
     _denominators: *mut u32,
     _stream: *mut core::ffi::c_void,
 ) -> i32 {
@@ -196,7 +207,7 @@ pub unsafe extern "C" fn stwo_relation_pairs_on(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stwo_relation_fraction_chain_on(
-    _outputs: *mut u32,
+    _outputs: *const *mut u32,
     _denominators: *const u32,
     _inverse_scratch: *mut u32,
     _n_rows: u32,
@@ -208,9 +219,11 @@ pub unsafe extern "C" fn stwo_relation_fraction_chain_on(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stwo_relation_reduce_shift_on(
-    _outputs: *mut u32,
+    _output_0: *mut u32,
+    _output_1: *mut u32,
+    _output_2: *mut u32,
+    _output_3: *mut u32,
     _n_rows: u32,
-    _n_columns: u32,
     _reduction_a: *mut u32,
     _reduction_b: *mut u32,
     _reduction_capacity: u32,
@@ -223,9 +236,8 @@ pub unsafe extern "C" fn stwo_relation_reduce_shift_on(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stwo_relation_prefix_scan_on(
-    _outputs: *mut u32,
+    _output: *mut u32,
     _n_rows: u32,
-    _n_columns: u32,
     _eval_scratch: *mut u32,
     _scan_temp: *mut core::ffi::c_void,
     _scan_temp_bytes: usize,
@@ -839,7 +851,8 @@ pub unsafe extern "C" fn stwo_fold_line_on(
     twiddle_offset: u32,
     n: u32,
     eval_values: *const *mut u32,
-    alpha: CudaSecureField,
+    alpha: *const CudaSecureField,
+    alpha_squarings: u32,
     folded_values: *const *mut u32,
     stream: *mut c_void,
 ) -> i32 {
@@ -852,7 +865,8 @@ pub unsafe extern "C" fn stwo_fold_circle_into_line_on(
     twiddle_offset: u32,
     n: u32,
     eval_values: *const *mut u32,
-    alpha: CudaSecureField,
+    alpha: *const CudaSecureField,
+    alpha_squarings: u32,
     folded_values: *const *mut u32,
     stream: *mut c_void,
 ) -> i32 {
@@ -1148,6 +1162,31 @@ pub unsafe extern "C" fn combine_quotients_from_numerators(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_combine_quotients_from_numerators_on(
+    _half_coset_initial_index: u32,
+    _half_coset_step_size: u32,
+    _domain_size: u32,
+    _domain_log_size: u32,
+    _sample_points: *const u32,
+    _sample_size: u32,
+    _first_linear_term_accs: *const CudaSecureField,
+    _partial_numerator_log_sizes: *const u32,
+    _partial_numerators_0: *const *const u32,
+    _partial_numerators_1: *const *const u32,
+    _partial_numerators_2: *const *const u32,
+    _partial_numerators_3: *const *const u32,
+    _result_column_0: *mut u32,
+    _result_column_1: *mut u32,
+    _result_column_2: *mut u32,
+    _result_column_3: *mut u32,
+    _denominator_inverses: *mut u32,
+    _denominator_count: u64,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_combine_quotients_from_numerators_on")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn gen_eq_evals(
     v: CudaSecureField,
     y: *const CudaSecureField,
@@ -1292,6 +1331,19 @@ pub unsafe extern "C" fn ntt_b2n_column(
     eval_domain_size: u32,
 ) {
     no_cuda_symbol("ntt_b2n_column")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_ntt_b2n_columns_on(
+    _device_values: *const *mut u32,
+    _log_n: u32,
+    _num_poly: u32,
+    _g_twiddles: *mut u32,
+    _twiddles_size: u32,
+    _eval_domain_size: u32,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_ntt_b2n_columns_on")
 }
 
 #[unsafe(no_mangle)]
@@ -1597,6 +1649,16 @@ pub unsafe extern "C" fn stwo_exec_context_memset_async(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_exec_context_fill_u32_async(
+    _handle: *mut core::ffi::c_void,
+    _dst: *mut u32,
+    _value: u32,
+    _count: usize,
+) -> i32 {
+    no_cuda_symbol("stwo_exec_context_fill_u32_async")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stwo_exec_context_memcpy_d2d_async(
     _handle: *mut core::ffi::c_void,
     _dst: *mut core::ffi::c_void,
@@ -1655,6 +1717,94 @@ pub unsafe extern "C" fn stwo_graph_launch(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stwo_graph_destroy(_exec_handle: *mut core::ffi::c_void) -> i32 {
     no_cuda_symbol("stwo_graph_destroy")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_blake2s_transcript_init_on(
+    _state: *mut u32,
+    _seed: *const u32,
+    _seed_snapshot: *mut u32,
+    _initial_chain: u64,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_blake2s_transcript_init_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_blake2s_transcript_mix_words_on(
+    _state: *mut u32,
+    _expected_step: u32,
+    _expected_chain: u64,
+    _next_chain: u64,
+    _source: *const u32,
+    _n_words: u32,
+    _validate_m31: u32,
+    _input_snapshot: *mut u32,
+    _boundary_snapshot: *mut u32,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_blake2s_transcript_mix_words_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_blake2s_transcript_absorb_pow_on(
+    _state: *mut u32,
+    _expected_step: u32,
+    _expected_chain: u64,
+    _next_chain: u64,
+    _nonce_words: *const u32,
+    _pow_bits: u32,
+    _input_snapshot: *mut u32,
+    _boundary_snapshot: *mut u32,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_blake2s_transcript_absorb_pow_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_blake2s_transcript_draw_u32s_on(
+    _state: *mut u32,
+    _expected_step: u32,
+    _expected_chain: u64,
+    _next_chain: u64,
+    _output: *mut u32,
+    _output_snapshot: *mut u32,
+    _boundary_snapshot: *mut u32,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_blake2s_transcript_draw_u32s_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_blake2s_transcript_draw_secure_on(
+    _state: *mut u32,
+    _expected_step: u32,
+    _expected_chain: u64,
+    _next_chain: u64,
+    _n_felts: u32,
+    _max_rejection_rounds: u32,
+    _output: *mut u32,
+    _output_snapshot: *mut u32,
+    _boundary_snapshot: *mut u32,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_blake2s_transcript_draw_secure_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_blake2s_transcript_draw_queries_on(
+    _state: *mut u32,
+    _expected_step: u32,
+    _expected_chain: u64,
+    _next_chain: u64,
+    _log_domain_size: u32,
+    _n_queries: u32,
+    _output: *mut u32,
+    _output_snapshot: *mut u32,
+    _boundary_snapshot: *mut u32,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_blake2s_transcript_draw_queries_on")
 }
 
 #[unsafe(no_mangle)]

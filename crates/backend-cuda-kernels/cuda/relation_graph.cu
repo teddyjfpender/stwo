@@ -18,6 +18,26 @@ constexpr uint32_t LARGE_MEMORY_VALUE_ID_BASE = 0x40000000u;
 constexpr uint32_t XOR12_LIMB_BITS = 10;
 constexpr uint32_t XOR12_EXPAND_BITS = 2;
 
+// Expand the channel's exact LookupElements draw order `[z, alpha]` into the
+// persistent relation slots consumed by every generated relation instance.
+// One thread is intentional: at most 128 QM31 powers are produced and this
+// launch sits on a serial Fiat-Shamir boundary.
+__global__ void relation_expand_challenges_kernel(const qm31 *drawn,
+                                                   qm31 *alpha_powers,
+                                                   uint32_t n_alpha_powers,
+                                                   qm31 *z) {
+  if (blockIdx.x != 0u || threadIdx.x != 0u) {
+    return;
+  }
+  z[0] = drawn[0];
+  qm31 alpha = drawn[1];
+  qm31 power = {{1, 0}, {0, 0}};
+  for (uint32_t i = 0; i < n_alpha_powers; ++i) {
+    alpha_powers[i] = power;
+    power = mul(power, alpha);
+  }
+}
+
 __device__ __forceinline__ m31 tuple_word(const uint32_t *const *sources,
                                           uint32_t n_rows, uint32_t row,
                                           uint32_t source_offset_rows,
@@ -103,7 +123,7 @@ __global__ void relation_pairs_kernel(const uint32_t *const *sources,
                                       uint32_t source_offset_rows,
                                       const uint32_t *descriptors,
                                       const qm31 *alphas, const qm31 *z_ptr,
-                                      m31 *outputs, qm31 *denominators) {
+                                      m31 *const *outputs, qm31 *denominators) {
   uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
   uint32_t column = blockIdx.y;
   if (row >= n_rows) {
@@ -128,44 +148,45 @@ __global__ void relation_pairs_kernel(const uint32_t *const *sources,
     numerator = qm31{{mult_a, 0}, {0, 0}};
     denominator = denominator_a;
   }
-  uint32_t output_base = column * 4u * n_rows + row;
-  outputs[output_base] = numerator.a.a;
-  outputs[output_base + n_rows] = numerator.a.b;
-  outputs[output_base + 2u * n_rows] = numerator.b.a;
-  outputs[output_base + 3u * n_rows] = numerator.b.b;
+  uint32_t output_base = column * 4u;
+  outputs[output_base][row] = numerator.a.a;
+  outputs[output_base + 1u][row] = numerator.a.b;
+  outputs[output_base + 2u][row] = numerator.b.a;
+  outputs[output_base + 3u][row] = numerator.b.b;
   denominators[column * n_rows + row] = denominator;
 }
 
-__global__ void fraction_chain_kernel(m31 *outputs, const qm31 *inverse,
+__global__ void fraction_chain_kernel(m31 *const *outputs, const qm31 *inverse,
                                       uint32_t n_rows, uint32_t column) {
   uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
   if (row >= n_rows) {
     return;
   }
-  uint32_t base = column * 4u * n_rows + row;
-  qm31 numerator = {{outputs[base], outputs[base + n_rows]},
-                    {outputs[base + 2u * n_rows], outputs[base + 3u * n_rows]}};
+  uint32_t base = column * 4u;
+  qm31 numerator = {{outputs[base][row], outputs[base + 1u][row]},
+                    {outputs[base + 2u][row], outputs[base + 3u][row]}};
   qm31 value = mul(numerator, inverse[row]);
   if (column != 0u) {
-    uint32_t previous = base - 4u * n_rows;
-    value = add(value, qm31{{outputs[previous], outputs[previous + n_rows]},
-                            {outputs[previous + 2u * n_rows],
-                             outputs[previous + 3u * n_rows]}});
+    uint32_t previous = base - 4u;
+    value =
+        add(value,
+            qm31{{outputs[previous][row], outputs[previous + 1u][row]},
+                 {outputs[previous + 2u][row], outputs[previous + 3u][row]}});
   }
-  outputs[base] = value.a.a;
-  outputs[base + n_rows] = value.a.b;
-  outputs[base + 2u * n_rows] = value.b.a;
-  outputs[base + 3u * n_rows] = value.b.b;
+  outputs[base][row] = value.a.a;
+  outputs[base + 1u][row] = value.a.b;
+  outputs[base + 2u][row] = value.b.a;
+  outputs[base + 3u][row] = value.b.b;
 }
 
-__global__ void reduce_coordinates_kernel(const m31 *last, uint32_t n_rows,
-                                          qm31 *partials) {
+__global__ void reduce_coordinates_kernel(const m31 *c0, const m31 *c1,
+                                          const m31 *c2, const m31 *c3,
+                                          uint32_t n_rows, qm31 *partials) {
   extern __shared__ qm31 shared[];
   uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
-  shared[threadIdx.x] =
-      row < n_rows ? qm31{{last[row], last[row + n_rows]},
-                          {last[row + 2u * n_rows], last[row + 3u * n_rows]}}
-                   : qm31{{0, 0}, {0, 0}};
+  shared[threadIdx.x] = row < n_rows
+                            ? qm31{{c0[row], c1[row]}, {c2[row], c3[row]}}
+                            : qm31{{0, 0}, {0, 0}};
   __syncthreads();
   for (uint32_t stride = blockDim.x / 2u; stride != 0u; stride >>= 1u) {
     if (threadIdx.x < stride) {
@@ -197,9 +218,9 @@ __global__ void reduce_qm31_kernel(const qm31 *input, uint32_t size,
   }
 }
 
-__global__ void shift_last_column_kernel(m31 *last, uint32_t n_rows,
-                                         const qm31 *sum, qm31 *claimed_sum,
-                                         m31 inverse_rows) {
+__global__ void shift_last_column_kernel(m31 *c0, m31 *c1, m31 *c2, m31 *c3,
+                                         uint32_t n_rows, const qm31 *sum,
+                                         qm31 *claimed_sum, m31 inverse_rows) {
   uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
   if (row == 0u) {
     claimed_sum[0] = sum[0];
@@ -208,19 +229,34 @@ __global__ void shift_last_column_kernel(m31 *last, uint32_t n_rows,
     return;
   }
   qm31 shift = mul(inverse_rows, sum[0]);
-  last[row] = sub(last[row], shift.a.a);
-  last[row + n_rows] = sub(last[row + n_rows], shift.a.b);
-  last[row + 2u * n_rows] = sub(last[row + 2u * n_rows], shift.b.a);
-  last[row + 3u * n_rows] = sub(last[row + 3u * n_rows], shift.b.b);
+  c0[row] = sub(c0[row], shift.a.a);
+  c1[row] = sub(c1[row], shift.a.b);
+  c2[row] = sub(c2[row], shift.b.a);
+  c3[row] = sub(c3[row], shift.b.b);
 }
 
 } // namespace
+
+extern "C" int stwo_relation_expand_challenges_on(
+    const uint32_t *drawn_z_alpha, uint32_t *alpha_powers,
+    uint32_t n_alpha_powers, uint32_t *z, void *stream_raw) {
+  if (drawn_z_alpha == nullptr || alpha_powers == nullptr || z == nullptr ||
+      n_alpha_powers == 0u) {
+    return (int)cudaErrorInvalidValue;
+  }
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_raw);
+  relation_expand_challenges_kernel<<<1, 1, 0, stream>>>(
+      reinterpret_cast<const qm31 *>(drawn_z_alpha),
+      reinterpret_cast<qm31 *>(alpha_powers), n_alpha_powers,
+      reinterpret_cast<qm31 *>(z));
+  return (int)cudaGetLastError();
+}
 
 extern "C" int stwo_relation_pairs_on(
     const uint32_t *const *sources, uint32_t n_sources, uint32_t n_rows,
     uint32_t n_real, uint32_t source_offset_rows, const uint32_t *descriptors,
     uint32_t n_columns, const uint32_t *alpha_powers, uint32_t n_alpha_powers,
-    const uint32_t *z, uint32_t *outputs, uint32_t *denominators,
+    const uint32_t *z, uint32_t *const *outputs, uint32_t *denominators,
     void *stream_raw) {
   if (n_sources == 0u || n_rows == 0u || n_real > n_rows || n_columns == 0u ||
       n_alpha_powers == 0u) {
@@ -231,15 +267,18 @@ extern "C" int stwo_relation_pairs_on(
   relation_pairs_kernel<<<grid, BLOCK, 0, stream>>>(
       sources, n_rows, n_real, source_offset_rows, descriptors,
       reinterpret_cast<const qm31 *>(alpha_powers),
-      reinterpret_cast<const qm31 *>(z), outputs,
+      reinterpret_cast<const qm31 *>(z),
+      reinterpret_cast<m31 *const *>(outputs),
       reinterpret_cast<qm31 *>(denominators));
   return (int)cudaGetLastError();
 }
 
-extern "C" int
-stwo_relation_fraction_chain_on(uint32_t *outputs, const uint32_t *denominators,
-                                uint32_t *inverse_scratch, uint32_t n_rows,
-                                uint32_t n_columns, void *stream_raw) {
+extern "C" int stwo_relation_fraction_chain_on(uint32_t *const *outputs,
+                                               const uint32_t *denominators,
+                                               uint32_t *inverse_scratch,
+                                               uint32_t n_rows,
+                                               uint32_t n_columns,
+                                               void *stream_raw) {
   if (n_rows == 0u || n_columns == 0u) {
     return (int)cudaErrorInvalidValue;
   }
@@ -254,8 +293,8 @@ stwo_relation_fraction_chain_on(uint32_t *outputs, const uint32_t *denominators,
     if (error != cudaSuccess) {
       return (int)error;
     }
-    fraction_chain_kernel<<<blocks, BLOCK, 0, stream>>>(outputs, inverse,
-                                                        n_rows, column);
+    fraction_chain_kernel<<<blocks, BLOCK, 0, stream>>>(
+        reinterpret_cast<m31 *const *>(outputs), inverse, n_rows, column);
     error = cudaGetLastError();
     if (error != cudaSuccess) {
       return (int)error;
@@ -265,22 +304,22 @@ stwo_relation_fraction_chain_on(uint32_t *outputs, const uint32_t *denominators,
 }
 
 extern "C" int stwo_relation_reduce_shift_on(
-    uint32_t *outputs, uint32_t n_rows, uint32_t n_columns,
-    uint32_t *reduction_a, uint32_t *reduction_b, uint32_t reduction_capacity,
-    uint32_t *claimed_sum, uint32_t inverse_rows, void *stream_raw) {
-  if (n_rows == 0u || n_columns == 0u || reduction_capacity == 0u) {
+    uint32_t *output_0, uint32_t *output_1, uint32_t *output_2,
+    uint32_t *output_3, uint32_t n_rows, uint32_t *reduction_a,
+    uint32_t *reduction_b, uint32_t reduction_capacity, uint32_t *claimed_sum,
+    uint32_t inverse_rows, void *stream_raw) {
+  if (n_rows == 0u || reduction_capacity == 0u) {
     return (int)cudaErrorInvalidValue;
   }
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_raw);
   qm31 *a = reinterpret_cast<qm31 *>(reduction_a);
   qm31 *b = reinterpret_cast<qm31 *>(reduction_b);
-  m31 *last = outputs + (n_columns - 1u) * 4u * n_rows;
   uint32_t size = (n_rows + BLOCK - 1u) / BLOCK;
   if (size > reduction_capacity) {
     return (int)cudaErrorInvalidValue;
   }
   reduce_coordinates_kernel<<<size, BLOCK, BLOCK * sizeof(qm31), stream>>>(
-      last, n_rows, a);
+      output_0, output_1, output_2, output_3, n_rows, a);
   cudaError_t error = cudaGetLastError();
   if (error != cudaSuccess) {
     return (int)error;
@@ -302,29 +341,20 @@ extern "C" int stwo_relation_reduce_shift_on(
   }
   uint32_t blocks = (n_rows + BLOCK - 1u) / BLOCK;
   shift_last_column_kernel<<<blocks, BLOCK, 0, stream>>>(
-      last, n_rows, current, reinterpret_cast<qm31 *>(claimed_sum),
-      inverse_rows);
+      output_0, output_1, output_2, output_3, n_rows, current,
+      reinterpret_cast<qm31 *>(claimed_sum), inverse_rows);
   return (int)cudaGetLastError();
 }
 
-extern "C" int stwo_relation_prefix_scan_on(uint32_t *outputs, uint32_t n_rows,
-                                            uint32_t n_columns,
+extern "C" int stwo_relation_prefix_scan_on(uint32_t *output, uint32_t n_rows,
                                             uint32_t *eval_scratch,
                                             void *scan_temp,
                                             size_t scan_temp_bytes,
                                             void *stream_raw) {
-  if (n_rows == 0u || n_columns == 0u) {
+  if (n_rows == 0u) {
     return (int)cudaErrorInvalidValue;
   }
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_raw);
-  m31 *last = outputs + (n_columns - 1u) * 4u * n_rows;
-  for (uint32_t coordinate = 0; coordinate < 4u; ++coordinate) {
-    cudaError_t error = inclusive_prefix_sum_prepared_on(
-        stream, last + coordinate * n_rows, eval_scratch, scan_temp,
-        scan_temp_bytes, n_rows);
-    if (error != cudaSuccess) {
-      return (int)error;
-    }
-  }
-  return (int)cudaSuccess;
+  return (int)inclusive_prefix_sum_prepared_on(
+      stream, output, eval_scratch, scan_temp, scan_temp_bytes, n_rows);
 }

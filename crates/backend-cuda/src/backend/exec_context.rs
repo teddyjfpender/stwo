@@ -188,6 +188,29 @@ impl CudaExecContext {
         check_cuda("exec_context_memset_async", code)
     }
 
+    /// Enqueue an arbitrary u32 fill on this context's stream.
+    ///
+    /// # Safety
+    ///
+    /// `dst..dst+count` must be a live device range that remains valid until
+    /// this stream has passed the operation.
+    pub unsafe fn fill_u32_async(
+        &self,
+        dst: *mut u32,
+        value: u32,
+        count: usize,
+    ) -> Result<(), CudaRuntimeError> {
+        let code = unsafe {
+            stwo_backend_cuda_kernels::raw::stwo_exec_context_fill_u32_async(
+                self.handle.as_ptr(),
+                dst,
+                value,
+                count,
+            )
+        };
+        check_cuda("exec_context_fill_u32_async", code)
+    }
+
     /// Enqueue a device-to-device copy on this context's stream.
     ///
     /// # Safety

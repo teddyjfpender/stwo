@@ -31,4 +31,11 @@ mod tests {
     fn build_mode_is_consistent() {
         assert_eq!(BUILD_MODE == "cuda", CUDA_KERNELS_BUILT);
     }
+
+    #[test]
+    fn prepared_quotient_symbols_are_linked_in_cuda_and_stub_builds() {
+        assert_ne!(raw::stwo_combine_quotients_from_numerators_on as usize, 0);
+        assert_ne!(raw::stwo_ntt_b2n_columns_on as usize, 0);
+        assert_ne!(raw::stwo_lde_n2b_columns_on as usize, 0);
+    }
 }

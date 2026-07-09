@@ -183,11 +183,10 @@ cudaError_t batch_inverse_secure_field_on(
     }
     int log_size = log_2(size);
 
-    // For small sizes (log_size < 6) or non-power-of-2 sizes, use simple element-by-element inverse
-    // The Montgomery's trick tree-based algorithm requires power-of-2 sizes to work correctly
-    // Check if size is a power of 2: (size & (size-1)) == 0
+    // The tree kernel is fixed at 1024 leaves per block. Smaller and non-power-of-two
+    // inputs use the direct kernel rather than reading a partial tree out of bounds.
     bool is_power_of_2 = (size > 0) && ((size & (size - 1)) == 0);
-    if(log_size < 6 || !is_power_of_2) {
+    if(size < 1024 || !is_power_of_2) {
         int block_size = size < 256 ? size : 256;
         int num_blocks = (size + block_size - 1) / block_size;
         batch_inverse_secure_field_simple_kernel<<<num_blocks, block_size, 0, stream>>>(

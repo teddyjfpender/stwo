@@ -33,6 +33,7 @@ fn workspace_slots(requirements: &FriWorkspaceRequirements) -> FriWorkspaceSlots
         input_coordinate_ptrs: id(),
         ping_coordinate_ptrs: id(),
         pong_coordinate_ptrs: id(),
+        folding_challenges: requirements.rounds.iter().map(|_| id()).collect(),
         trees: requirements
             .trees
             .iter()
@@ -241,7 +242,10 @@ fn eager_and_capture_match() {
     drop(tree_graph);
 
     let alpha = SecureField::from_u32_unchecked(1, 3, 5, 7);
-    prepared.launch_round(0, alpha).unwrap();
+    prepared
+        .upload_round_challenge_at_transcript_boundary(0, alpha)
+        .unwrap();
+    prepared.launch_round(0).unwrap();
     let eager_final = read_evaluation(&arena, prepared.final_evaluation());
     assert_eq!(
         eager_final,
@@ -254,7 +258,7 @@ fn eager_and_capture_match() {
         )
     );
     let capture = arena.context().capture().unwrap();
-    prepared.launch_round(0, alpha).unwrap();
+    prepared.launch_round(0).unwrap();
     let fold_graph = capture.finish().unwrap();
     fold_graph.launch(arena.context()).unwrap();
     let captured_final = read_evaluation(&arena, prepared.final_evaluation());

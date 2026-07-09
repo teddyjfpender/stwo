@@ -134,6 +134,27 @@ __device__ void blake2s_finalize(Blake2sState* S, Blake2sHash* out) {
     }
 }
 
+// Kept in this translation unit deliberately: transcript hashing must share
+// the exact compression implementation used by the ordinary Blake2s Merkle
+// channel.  Relocatable device code resolves this symbol for
+// device_transcript.cu at device-link time.
+__device__ void stwo_blake2s_hash2_device(
+    const uint8_t *first,
+    size_t first_len,
+    const uint8_t *second,
+    size_t second_len,
+    Blake2sHash *out) {
+    Blake2sState state;
+    blake2s_init(&state);
+    if (first_len != 0) {
+        blake2s_update(&state, first, first_len);
+    }
+    if (second_len != 0) {
+        blake2s_update(&state, second, second_len);
+    }
+    blake2s_finalize(&state, out);
+}
+
 // ---------------------------------------------------------------------------
 // WORD-BLOCK blake2s (the commit-path fast lane). The tree hashes M31 words
 // and 32-byte child digests — both are sequences of little-endian u32s, which

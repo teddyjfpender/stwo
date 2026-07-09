@@ -6,6 +6,19 @@
 
 const unsigned int BLOCK_SIZE = 256;
 
+// Shared device primitive for the transcript engine.  It is defined by
+// blake2s.cu so the channel and Merkle paths use one compression
+// implementation.  Inputs are byte strings exactly as consumed by the Rust
+// `Blake2sHasher`; no domain tag is inserted here.
+#ifdef __CUDACC__
+__device__ void stwo_blake2s_hash2_device(
+    const uint8_t *first,
+    size_t first_len,
+    const uint8_t *second,
+    size_t second_len,
+    Blake2sHash *out);
+#endif
+
 // Occupancy lever for the register-capped commit/leaf-hash kernels. The
 // STWO_COMMIT_PROBE measured them pinned at 255 registers => 1 block/SM => 12.5%
 // occupancy, already spilling to local memory (blake2s full-unroll register

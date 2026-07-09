@@ -18,7 +18,8 @@ int stwo_fold_circle_into_line_on(const uint32_t *gpu_domain,
                                  uint32_t twiddle_offset,
                                  uint32_t n,
                                  uint32_t **eval_values,
-                                 qm31 alpha,
+                                 const qm31 *alpha,
+                                 uint32_t alpha_squarings,
                                  uint32_t **folded_values,
                                  void *stream);
 

@@ -110,7 +110,7 @@ DEVICE_FORCEINLINE void denominator_inverse(
 }
 
 DEVICE_FORCEINLINE void denominator_inverse_from_sample_points(
-        secure_field_point *sample_points,
+        const secure_field_point *sample_points,
         uint32_t sample_size,
         const point domain_point,
         cm31 *flat_denominators) {
@@ -148,9 +148,8 @@ __global__ void accumulate_quotients_in_gpu(
         cm31 *denominator_inverses
 ) {
     int row = threadIdx.x + blockDim.x * blockIdx.x;
-    denominator_inverses = &denominator_inverses[row * sample_size];
-
     if (row < domain_size) {
+        denominator_inverses = &denominator_inverses[row * sample_size];
         uint32_t domain_index = bit_reverse(row, domain_log_size);
         point domain_point = domain_at_index(half_coset_initial_index, half_coset_step_size, domain_index, domain_size);
 
@@ -236,14 +235,14 @@ __global__ void combine_quotients_from_numerators_in_gpu(
         uint32_t half_coset_step_size,
         uint32_t domain_size,
         uint32_t domain_log_size,
-        secure_field_point *sample_points,
+        const secure_field_point *sample_points,
         uint32_t sample_size,
-        qm31 *first_linear_term_accs,
-        uint32_t *partial_numerator_log_sizes,
-        m31 **partial_numerators_0,
-        m31 **partial_numerators_1,
-        m31 **partial_numerators_2,
-        m31 **partial_numerators_3,
+        const qm31 *first_linear_term_accs,
+        const uint32_t *partial_numerator_log_sizes,
+        const m31 *const *partial_numerators_0,
+        const m31 *const *partial_numerators_1,
+        const m31 *const *partial_numerators_2,
+        const m31 *const *partial_numerators_3,
         uint32_t *result_column_0,
         uint32_t *result_column_1,
         uint32_t *result_column_2,
@@ -251,9 +250,8 @@ __global__ void combine_quotients_from_numerators_in_gpu(
         cm31 *denominator_inverses
 ) {
     int row = threadIdx.x + blockDim.x * blockIdx.x;
-    denominator_inverses = &denominator_inverses[row * sample_size];
-
     if (row < domain_size) {
+        denominator_inverses = &denominator_inverses[row * sample_size];
         uint32_t domain_index = bit_reverse(row, domain_log_size);
         point domain_point = domain_at_index(
                 half_coset_initial_index,
@@ -497,4 +495,64 @@ void combine_quotients_from_numerators(
     cuda_proving_free(first_linear_term_accs_device);
     cuda_proving_free(partial_numerator_log_sizes_device);
     cuda_proving_free(denominator_inverses);
+}
+
+extern "C" int stwo_combine_quotients_from_numerators_on(
+        uint32_t half_coset_initial_index,
+        uint32_t half_coset_step_size,
+        uint32_t domain_size,
+        uint32_t domain_log_size,
+        const secure_field_point *sample_points,
+        uint32_t sample_size,
+        const qm31 *first_linear_term_accs,
+        const uint32_t *partial_numerator_log_sizes,
+        const m31 *const *partial_numerators_0,
+        const m31 *const *partial_numerators_1,
+        const m31 *const *partial_numerators_2,
+        const m31 *const *partial_numerators_3,
+        uint32_t *result_column_0,
+        uint32_t *result_column_1,
+        uint32_t *result_column_2,
+        uint32_t *result_column_3,
+        cm31 *denominator_inverses,
+        uint64_t denominator_count,
+        void *stream
+) {
+    const uint64_t required_denominators =
+        static_cast<uint64_t>(domain_size) * static_cast<uint64_t>(sample_size);
+    if (half_coset_step_size == 0 || domain_size == 0 || sample_size == 0 ||
+        domain_log_size == 0 || domain_log_size > 30 ||
+        domain_size != (1u << domain_log_size) || sample_points == nullptr ||
+        first_linear_term_accs == nullptr || partial_numerator_log_sizes == nullptr ||
+        partial_numerators_0 == nullptr || partial_numerators_1 == nullptr ||
+        partial_numerators_2 == nullptr || partial_numerators_3 == nullptr ||
+        result_column_0 == nullptr || result_column_1 == nullptr ||
+        result_column_2 == nullptr || result_column_3 == nullptr ||
+        denominator_inverses == nullptr || denominator_count < required_denominators ||
+        stream == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+
+    constexpr int block_dim = 512;
+    const int num_blocks = (domain_size + block_dim - 1) / block_dim;
+    combine_quotients_from_numerators_in_gpu<<<
+        num_blocks, block_dim, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
+            half_coset_initial_index,
+            half_coset_step_size,
+            domain_size,
+            domain_log_size,
+            sample_points,
+            sample_size,
+            first_linear_term_accs,
+            partial_numerator_log_sizes,
+            partial_numerators_0,
+            partial_numerators_1,
+            partial_numerators_2,
+            partial_numerators_3,
+            result_column_0,
+            result_column_1,
+            result_column_2,
+            result_column_3,
+            denominator_inverses);
+    return cudaGetLastError();
 }

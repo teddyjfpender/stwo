@@ -42,4 +42,17 @@ void interpolate(int eval_domain_size, m31 *values, m31 *inverse_twiddles_tree, 
 extern "C"
 void interpolate_columns(int eval_domain_size, m31 **values, m31 *inverse_twiddles_tree, int inverse_twiddles_size, int values_size, int number_of_rows);
 
+// Allocation-free inverse transform. `device_values` is a device-resident
+// pointer table and all stages launch on `stream`.
+extern "C"
+int stwo_ntt_b2n_columns_on(
+        uint32_t **device_values,
+        uint32_t log_n,
+        uint32_t num_poly,
+        uint32_t *g_twiddles,
+        uint32_t twiddles_size,
+        uint32_t eval_domain_size,
+        void *stream
+);
+
 #endif // POLY_IFFT_H

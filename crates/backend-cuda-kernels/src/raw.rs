@@ -334,7 +334,8 @@ extern "C" {
         twiddle_offset: u32,
         n: u32,
         eval_values: *const *mut u32,
-        alpha: CudaSecureField,
+        alpha: *const CudaSecureField,
+        alpha_squarings: u32,
         folded_values: *const *mut u32,
         stream: *mut c_void,
     ) -> i32;
@@ -343,7 +344,8 @@ extern "C" {
         twiddle_offset: u32,
         n: u32,
         eval_values: *const *mut u32,
-        alpha: CudaSecureField,
+        alpha: *const CudaSecureField,
+        alpha_squarings: u32,
         folded_values: *const *mut u32,
         stream: *mut c_void,
     ) -> i32;
@@ -558,6 +560,29 @@ extern "C" {
         result_column_3: *const u32,
     );
 
+    /// Allocation-free quotient combination on an explicit proof stream.
+    pub fn stwo_combine_quotients_from_numerators_on(
+        half_coset_initial_index: u32,
+        half_coset_step_size: u32,
+        domain_size: u32,
+        domain_log_size: u32,
+        sample_points: *const u32,
+        sample_size: u32,
+        first_linear_term_accs: *const CudaSecureField,
+        partial_numerator_log_sizes: *const u32,
+        partial_numerators_0: *const *const u32,
+        partial_numerators_1: *const *const u32,
+        partial_numerators_2: *const *const u32,
+        partial_numerators_3: *const *const u32,
+        result_column_0: *mut u32,
+        result_column_1: *mut u32,
+        result_column_2: *mut u32,
+        result_column_3: *mut u32,
+        denominator_inverses: *mut u32,
+        denominator_count: u64,
+        stream: *mut c_void,
+    ) -> i32;
+
     pub fn gen_eq_evals(
         v: CudaSecureField,
         y: *const CudaSecureField,
@@ -667,6 +692,17 @@ extern "C" {
         eval_domain_size: u32,
     );
 
+    /// Allocation-free B2N transform using a device pointer table and explicit stream.
+    pub fn stwo_ntt_b2n_columns_on(
+        device_values: *const *mut u32,
+        log_n: u32,
+        num_poly: u32,
+        g_twiddles: *mut u32,
+        twiddles_size: u32,
+        eval_domain_size: u32,
+        stream: *mut c_void,
+    ) -> i32;
+
     pub fn ntt_n2b_columns(
         values_columns: *mut *mut u32,
         log_n: u32,
@@ -743,6 +779,16 @@ extern "C" {
     /// Exact CUB storage query used during prepared relation setup.
     pub fn stwo_relation_scan_temp_bytes(len: u32) -> usize;
 
+    /// Expand the transcript draw `[z, alpha]` into z plus alpha powers on the
+    /// explicit proof stream.
+    pub fn stwo_relation_expand_challenges_on(
+        drawn_z_alpha: *const u32,
+        alpha_powers: *mut u32,
+        n_alpha_powers: u32,
+        z: *mut u32,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
     /// Allocation-free, stream-explicit generated relation pair engine.
     pub fn stwo_relation_pairs_on(
         sources: *const *const u32,
@@ -755,13 +801,13 @@ extern "C" {
         alpha_powers: *const u32,
         n_alpha_powers: u32,
         z: *const u32,
-        outputs: *mut u32,
+        outputs: *const *mut u32,
         denominators: *mut u32,
         stream: *mut core::ffi::c_void,
     ) -> i32;
 
     pub fn stwo_relation_fraction_chain_on(
-        outputs: *mut u32,
+        outputs: *const *mut u32,
         denominators: *const u32,
         inverse_scratch: *mut u32,
         n_rows: u32,
@@ -770,9 +816,11 @@ extern "C" {
     ) -> i32;
 
     pub fn stwo_relation_reduce_shift_on(
-        outputs: *mut u32,
+        output_0: *mut u32,
+        output_1: *mut u32,
+        output_2: *mut u32,
+        output_3: *mut u32,
         n_rows: u32,
-        n_columns: u32,
         reduction_a: *mut u32,
         reduction_b: *mut u32,
         reduction_capacity: u32,
@@ -782,9 +830,8 @@ extern "C" {
     ) -> i32;
 
     pub fn stwo_relation_prefix_scan_on(
-        outputs: *mut u32,
+        output: *mut u32,
         n_rows: u32,
-        n_columns: u32,
         eval_scratch: *mut u32,
         scan_temp: *mut core::ffi::c_void,
         scan_temp_bytes: usize,
@@ -1122,6 +1169,12 @@ extern "C" {
         value: i32,
         bytes: usize,
     ) -> i32;
+    pub fn stwo_exec_context_fill_u32_async(
+        handle: *mut core::ffi::c_void,
+        dst: *mut u32,
+        value: u32,
+        count: usize,
+    ) -> i32;
     pub fn stwo_exec_context_memcpy_d2d_async(
         handle: *mut core::ffi::c_void,
         dst: *mut core::ffi::c_void,
@@ -1154,6 +1207,74 @@ extern "C" {
         context_handle: *mut core::ffi::c_void,
     ) -> i32;
     pub fn stwo_graph_destroy(exec_handle: *mut core::ffi::c_void) -> i32;
+
+    // Ordinary-Blake2s Fiat-Shamir transcript kernels. The 16-word state,
+    // mirror snapshots, all sources, and all outputs are caller-owned device
+    // arena ranges. Every operation is enqueued on the explicit proof stream.
+    pub fn stwo_blake2s_transcript_init_on(
+        state: *mut u32,
+        seed: *const u32,
+        seed_snapshot: *mut u32,
+        initial_chain: u64,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+    pub fn stwo_blake2s_transcript_mix_words_on(
+        state: *mut u32,
+        expected_step: u32,
+        expected_chain: u64,
+        next_chain: u64,
+        source: *const u32,
+        n_words: u32,
+        validate_m31: u32,
+        input_snapshot: *mut u32,
+        boundary_snapshot: *mut u32,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+    pub fn stwo_blake2s_transcript_absorb_pow_on(
+        state: *mut u32,
+        expected_step: u32,
+        expected_chain: u64,
+        next_chain: u64,
+        nonce_words: *const u32,
+        pow_bits: u32,
+        input_snapshot: *mut u32,
+        boundary_snapshot: *mut u32,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+    pub fn stwo_blake2s_transcript_draw_u32s_on(
+        state: *mut u32,
+        expected_step: u32,
+        expected_chain: u64,
+        next_chain: u64,
+        output: *mut u32,
+        output_snapshot: *mut u32,
+        boundary_snapshot: *mut u32,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+    pub fn stwo_blake2s_transcript_draw_secure_on(
+        state: *mut u32,
+        expected_step: u32,
+        expected_chain: u64,
+        next_chain: u64,
+        n_felts: u32,
+        max_rejection_rounds: u32,
+        output: *mut u32,
+        output_snapshot: *mut u32,
+        boundary_snapshot: *mut u32,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+    pub fn stwo_blake2s_transcript_draw_queries_on(
+        state: *mut u32,
+        expected_step: u32,
+        expected_chain: u64,
+        next_chain: u64,
+        log_domain_size: u32,
+        n_queries: u32,
+        output: *mut u32,
+        output_snapshot: *mut u32,
+        boundary_snapshot: *mut u32,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
 
     // Truth oracle for the witness-JIT computed EC deduces (ISA-V3 kinds 2/3):
     // runs the exact `stwo_wit_deduce_*` device functions the JIT kernels embed

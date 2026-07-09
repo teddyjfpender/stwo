@@ -15,6 +15,16 @@ pub use backend::decommit_gather::{
     column_row_gather_requirements, gather_column_rows_host, ColumnRowGatherError,
     ColumnRowGatherRequirements, ColumnRowGatherSlots, PreparedColumnRowGather,
 };
+pub use backend::device_transcript::{
+    replay_blake2s_reference, Blake2sTranscriptRequirements, Blake2sTranscriptSchedule,
+    Blake2sTranscriptWorkspaceSlots, DeviceTranscriptError, PreparedBlake2sTranscript,
+    TranscriptArenaSlotRequirement, TranscriptBoundaryId, TranscriptBoundaryState,
+    TranscriptInputBinding, TranscriptInputId, TranscriptIoRequirement, TranscriptMirrorReport,
+    TranscriptOperation, TranscriptOutputBinding, TranscriptOutputId, TranscriptReferenceTrace,
+    TranscriptSegmentCursor, TranscriptSegmentStart, TranscriptStart,
+    BLAKE2S_TRANSCRIPT_ALIGNMENT_WORDS, BLAKE2S_TRANSCRIPT_PROTOCOL_TAG,
+    BLAKE2S_TRANSCRIPT_STATE_WORDS,
+};
 pub use backend::exec_context::{
     ArenaError, ArenaLayout, ArenaSlice, ArenaSlotId, ArenaSlotSpec, CudaExecContext,
     CudaGraphCapture, CudaGraphExec, CudaRuntimeError, DeviceArena,
@@ -35,7 +45,13 @@ pub use backend::prepared_fri::{
     fri_workspace_requirements, FriArenaSlotRequirement, FriMerkleLayerRequirements,
     FriMerkleTreeRequirements, FriMerkleTreeSlots, FriRoundRequirements, FriWorkspaceConfig,
     FriWorkspaceRequirements, FriWorkspaceSlots, PreparedFriError, PreparedFriEvaluation,
-    PreparedFriGraph, FRI_HASH_ALIGNMENT_WORDS, FRI_POINTER_ALIGNMENT_WORDS,
+    PreparedFriGraph, FRI_CHALLENGE_WORDS, FRI_HASH_ALIGNMENT_WORDS, FRI_POINTER_ALIGNMENT_WORDS,
+};
+pub use backend::prepared_quotient::{
+    quotient_workspace_requirements, PreparedQuotientError, PreparedQuotientGraph,
+    QuotientArenaSlotRequirement, QuotientNumeratorSource, QuotientSampleConstants,
+    QuotientWorkspaceConfig, QuotientWorkspaceRequirements, QuotientWorkspaceSlots,
+    QUOTIENT_POINTER_ALIGNMENT_WORDS,
 };
 pub use backend::relation_graph::{
     relation_graph_requirements, PreparedRelationGraph, PreparedRelationOutput,
@@ -83,5 +99,21 @@ pub fn gpu_pool_highwater() -> (usize, usize) {
 pub fn gpu_pool_highwater_reset() {
     if stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
         unsafe { columns::bindings::cuda_pool_highwater_reset() };
+    }
+}
+
+/// Fence work issued by the migration-era CUDA backend default stream before
+/// handing its buffers to an isolated [`CudaExecContext`].
+///
+/// The resident prover does not launch proof work on the legacy stream.  This
+/// boundary exists solely while witness producers still return owning
+/// `BaseFieldVec`s allocated by the old backend; once those producers target
+/// arena slices directly this function and the associated D2D staging copy are
+/// removed.  Stub builds have no device work to fence.
+pub fn synchronize_legacy_stream_for_arena_handoff() {
+    if stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
+        // The native wrapper checks the CUDA status and aborts rather than
+        // allowing a failed producer to race an arena consumer.
+        unsafe { columns::bindings::stwo_legacy_stream_sync() };
     }
 }

@@ -848,6 +848,82 @@ __global__ void ntt_b2n_stage_batch(m31** input, m31** output,
 }
 
 
+static cudaError_t ntt_b2n_native_device_batch_on(
+        m31 **device_values,
+        unsigned log_n,
+        unsigned num_poly,
+        m31 *g_twiddles,
+        unsigned twiddles_size,
+        unsigned eval_domain_size,
+        cudaStream_t stream) {
+    if (device_values == nullptr || g_twiddles == nullptr || stream == nullptr ||
+        log_n == 0 || log_n > 30 || num_poly == 0 ||
+        eval_domain_size != (1u << (log_n - 1)) ||
+        eval_domain_size > twiddles_size) {
+        return cudaErrorInvalidValue;
+    }
+
+    g_twiddles = &g_twiddles[twiddles_size - eval_domain_size];
+    dim3 block_dim{};
+    block_dim.x = log_n <= 8 ? 1u << (log_n - 1) : 128;
+    dim3 grid_dim{};
+    grid_dim.y = num_poly;
+    grid_dim.x = log_n <= 8 ? 1 : 1u << (log_n - 8);
+
+    const m31 rescale_factor = inv(pow(m31{2}, log_n));
+    unsigned layer_domain_size = (1u << log_n) >> 1;
+    unsigned layer_domain_offset = 0;
+    ntt_b2n_stage_batch<<<grid_dim, block_dim, 0, stream>>>(
+        device_values, device_values, log_n, 1, g_twiddles, rescale_factor);
+    cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess) {
+        return error;
+    }
+
+    for (unsigned stage = 2; stage <= log_n; stage++) {
+        ntt_b2n_stage_batch<<<grid_dim, block_dim, 0, stream>>>(
+            device_values, device_values, log_n, stage,
+            &g_twiddles[layer_domain_offset], rescale_factor);
+        error = cudaGetLastError();
+        if (error != cudaSuccess) {
+            return error;
+        }
+        layer_domain_size >>= 1;
+        layer_domain_offset += layer_domain_size;
+    }
+    return cudaSuccess;
+}
+
+
+extern "C" int stwo_ntt_b2n_columns_on(
+        uint32_t **device_values,
+        uint32_t log_n,
+        uint32_t num_poly,
+        uint32_t *g_twiddles,
+        uint32_t twiddles_size,
+        uint32_t eval_domain_size,
+        void *stream) {
+    if (device_values == nullptr || g_twiddles == nullptr || stream == nullptr ||
+        log_n == 0 || log_n > 30 || num_poly == 0 ||
+        eval_domain_size != (1u << (log_n - 1)) ||
+        eval_domain_size > twiddles_size) {
+        return cudaErrorInvalidValue;
+    }
+
+    const cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    for (unsigned base = 0; base < num_poly; base += MAX_NTT_BATCH_COLUMNS) {
+        const unsigned chunk = min(num_poly - base, MAX_NTT_BATCH_COLUMNS);
+        const cudaError_t error = ntt_b2n_native_device_batch_on(
+            reinterpret_cast<m31 **>(device_values + base), log_n, chunk,
+            g_twiddles, twiddles_size, eval_domain_size, cuda_stream);
+        if (error != cudaSuccess) {
+            return error;
+        }
+    }
+    return cudaSuccess;
+}
+
+
 EXTERN void ntt_b2n_native_batch(m31** input, m31** output,
                            unsigned log_n, unsigned num_poly,
                            unsigned start_stage,

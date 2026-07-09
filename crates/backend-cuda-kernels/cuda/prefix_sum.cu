@@ -49,9 +49,8 @@ __global__ void bit_reverse_copy_m31_on(const m31 *in, m31 *out, int size, int b
     }
 }
 
-// Stream-parameterized scan body: every launch, CUB call, and copy runs on
-// `stream`. Caller owns the P3 bridge discipline (see cuda_mem_pool.cuh) and
-// must pre-allocate/free the scratch on the legacy stream around the bridges.
+// Stream-parameterized scan body. Caller owns both scratch buffers; the final
+// bit-reverse writes directly to the destination, so no copy is enqueued.
 static cudaError_t inclusive_prefix_sum_on(
     cudaStream_t stream,
     m31 *device_bit_rev_circle_domain_evals,
