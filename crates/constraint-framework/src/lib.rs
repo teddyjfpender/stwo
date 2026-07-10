@@ -292,6 +292,12 @@ macro_rules! relation {
             pub fn draw(channel: &mut impl stwo::core::channel::Channel) -> Self {
                 Self($crate::logup::LookupElements::draw(channel))
             }
+            pub fn from_z_alpha(
+                z: stwo::core::fields::qm31::SecureField,
+                alpha: stwo::core::fields::qm31::SecureField,
+            ) -> Self {
+                Self($crate::logup::LookupElements::from_z_alpha(z, alpha))
+            }
         }
 
         impl<F: Clone, EF: $crate::RelationEFTraitBound<F>> $crate::Relation<F, EF> for $name {

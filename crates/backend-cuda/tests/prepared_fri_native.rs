@@ -33,6 +33,8 @@ fn workspace_slots(requirements: &FriWorkspaceRequirements) -> FriWorkspaceSlots
         input_coordinate_ptrs: id(),
         ping_coordinate_ptrs: id(),
         pong_coordinate_ptrs: id(),
+        retained_tree_evaluations: requirements.trees.iter().skip(1).map(|_| id()).collect(),
+        retained_tree_coordinate_ptrs: requirements.trees.iter().skip(1).map(|_| id()).collect(),
         folding_challenges: requirements.rounds.iter().map(|_| id()).collect(),
         trees: requirements
             .trees
@@ -160,9 +162,9 @@ fn reference_fold_round(
 #[test]
 fn eager_and_capture_match() {
     let config = FriWorkspaceConfig {
-        fri: FriConfig::new(1, 1, 16, 4),
-        circle_log_size: 6,
-        twiddle_log_size: 5,
+        fri: FriConfig::new(1, 1, 16, 3),
+        circle_log_size: 9,
+        twiddle_log_size: 8,
     };
     let requirements = fri_workspace_requirements(config).unwrap();
     let slots = workspace_slots(&requirements);
@@ -245,10 +247,16 @@ fn eager_and_capture_match() {
     prepared
         .upload_round_challenge_at_transcript_boundary(0, alpha)
         .unwrap();
+    arena.context().reset_telemetry();
     prepared.launch_round(0).unwrap();
-    let eager_final = read_evaluation(&arena, prepared.final_evaluation());
+    arena.context().sync().unwrap();
     assert_eq!(
-        eager_final,
+        arena.context().telemetry().d2d_bytes,
+        (requirements.trees[1].evaluation_words * core::mem::size_of::<u32>()) as u64
+    );
+    let eager_inner = read_evaluation(&arena, prepared.tree_evaluation(1).unwrap());
+    assert_eq!(
+        eager_inner,
         reference_fold_round(
             &host_input,
             config.circle_log_size,
@@ -257,10 +265,43 @@ fn eager_and_capture_match() {
             alpha,
         )
     );
+    let eager_inner_root = prepared.read_tree_root(1).unwrap();
+    assert_eq!(
+        eager_inner_root,
+        reference_first_tree_root(&eager_inner, requirements.trees[1].evaluation_log_size)
+    );
+
+    arena.context().reset_telemetry();
     let capture = arena.context().capture().unwrap();
     prepared.launch_round(0).unwrap();
+    assert_eq!(
+        arena.context().telemetry().d2d_bytes,
+        (requirements.trees[1].evaluation_words * core::mem::size_of::<u32>()) as u64
+    );
     let fold_graph = capture.finish().unwrap();
+    arena.context().reset_telemetry();
     fold_graph.launch(arena.context()).unwrap();
-    let captured_final = read_evaluation(&arena, prepared.final_evaluation());
-    assert_eq!(eager_final, captured_final);
+    let captured_inner = read_evaluation(&arena, prepared.tree_evaluation(1).unwrap());
+    assert_eq!(eager_inner, captured_inner);
+    assert_eq!(eager_inner_root, prepared.read_tree_root(1).unwrap());
+    let replay = arena.context().telemetry();
+    assert_eq!(replay.graph_launches, 1);
+    assert_eq!(
+        replay.kernel_launches,
+        u64::from(requirements.rounds[0].fold_step)
+            + requirements.trees[1].layers_bottom_up.len() as u64,
+        "retaining an inner codeword must add memcpy nodes, not kernel nodes"
+    );
+
+    for round_index in 1..prepared.round_count() {
+        prepared
+            .upload_round_challenge_at_transcript_boundary(round_index, alpha)
+            .unwrap();
+        prepared.launch_round(round_index).unwrap();
+    }
+    assert_eq!(
+        eager_inner,
+        read_evaluation(&arena, prepared.tree_evaluation(1).unwrap()),
+        "later ping/pong folds overwrote a committed FRI tree snapshot"
+    );
 }

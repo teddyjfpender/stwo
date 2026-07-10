@@ -556,3 +556,265 @@ extern "C" int stwo_combine_quotients_from_numerators_on(
             denominator_inverses);
     return cudaGetLastError();
 }
+
+namespace {
+
+constexpr uint32_t PREPARED_TERM_WORDS = 5;
+constexpr uint32_t PREPARED_BATCH_TERM_WORDS = 3;
+
+__device__ secure_field_point add_secure_point_offset(
+        secure_field_point value,
+        point offset
+) {
+    return secure_field_point{
+        sub(mul_by_scalar(value.x, offset.x), mul_by_scalar(value.y, offset.y)),
+        add(mul_by_scalar(value.x, offset.y), mul_by_scalar(value.y, offset.x)),
+    };
+}
+
+__global__ void prepare_quotient_numerator_terms(
+        const uint32_t *term_descriptors,
+        uint32_t term_count,
+        const secure_field_point *sample_points,
+        const qm31 *sample_values,
+        const qm31 *random_coefficient,
+        secure_field_point *term_points,
+        qm31 *line_coefficients
+) {
+    const uint32_t term = blockIdx.x * blockDim.x + threadIdx.x;
+    if (term >= term_count) {
+        return;
+    }
+    const uint32_t *descriptor =
+        term_descriptors + static_cast<size_t>(term) * PREPARED_TERM_WORDS;
+    const uint32_t sample_index = descriptor[0];
+    const uint32_t exponent = descriptor[1];
+    const bool periodic = descriptor[2] != 0;
+    const point period = point{descriptor[3], descriptor[4]};
+
+    secure_field_point sample_point = sample_points[sample_index];
+    if (periodic) {
+        sample_point = add_secure_point_offset(sample_point, period);
+    }
+    term_points[term] = sample_point;
+
+    qm31 a;
+    qm31 b;
+    qm31 c;
+    const qm31 alpha = pow(*random_coefficient, exponent);
+    complex_conjugate_line_coeffs(
+        sample_point, sample_values[sample_index], alpha, &a, &b, &c);
+    line_coefficients[static_cast<size_t>(term) * 3] = a;
+    line_coefficients[static_cast<size_t>(term) * 3 + 1] = b;
+    line_coefficients[static_cast<size_t>(term) * 3 + 2] = c;
+}
+
+__global__ void finalize_quotient_numerator_groups(
+        const uint32_t *group_offsets,
+        const uint32_t *group_term_indices,
+        uint32_t group_count,
+        const secure_field_point *term_points,
+        const qm31 *line_coefficients,
+        secure_field_point *sample_points,
+        qm31 *first_linear_terms
+) {
+    const uint32_t group = blockIdx.x * blockDim.x + threadIdx.x;
+    if (group >= group_count) {
+        return;
+    }
+    const uint32_t begin = group_offsets[group];
+    const uint32_t end = group_offsets[group + 1];
+    const uint32_t representative = group_term_indices[begin];
+    sample_points[group] = term_points[representative];
+
+    qm31 first = qm31{cm31{0, 0}, cm31{0, 0}};
+    for (uint32_t index = begin; index < end; ++index) {
+        const uint32_t term = group_term_indices[index];
+        first = add(first, line_coefficients[static_cast<size_t>(term) * 3]);
+    }
+    first_linear_terms[group] = first;
+}
+
+__global__ void zero_quotient_numerator_outputs(
+        const uint32_t *group_log_sizes,
+        uint32_t group_count,
+        uint32_t max_output_size,
+        uint32_t *const *outputs_0,
+        uint32_t *const *outputs_1,
+        uint32_t *const *outputs_2,
+        uint32_t *const *outputs_3
+) {
+    const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t group = blockIdx.y;
+    if (group >= group_count || row >= max_output_size ||
+        row >= (1u << group_log_sizes[group])) {
+        return;
+    }
+    outputs_0[group][row] = 0;
+    outputs_1[group][row] = 0;
+    outputs_2[group][row] = 0;
+    outputs_3[group][row] = 0;
+}
+
+__global__ void accumulate_quotient_numerator_batch(
+        const uint32_t *group_offsets,
+        const uint32_t *term_descriptors,
+        uint32_t group_count,
+        uint32_t max_output_size,
+        const uint32_t *const *source_evaluations,
+        const qm31 *line_coefficients,
+        const uint32_t *group_log_sizes,
+        uint32_t *const *outputs_0,
+        uint32_t *const *outputs_1,
+        uint32_t *const *outputs_2,
+        uint32_t *const *outputs_3
+) {
+    const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t group = blockIdx.y;
+    if (group >= group_count || row >= max_output_size) {
+        return;
+    }
+    const uint32_t group_log_size = group_log_sizes[group];
+    if (row >= (1u << group_log_size)) {
+        return;
+    }
+
+    qm31 numerator = qm31{cm31{0, 0}, cm31{0, 0}};
+    for (uint32_t index = group_offsets[group];
+         index < group_offsets[group + 1]; ++index) {
+        const uint32_t *descriptor =
+            term_descriptors + static_cast<size_t>(index) * PREPARED_BATCH_TERM_WORDS;
+        const uint32_t source = descriptor[0];
+        const uint32_t term = descriptor[1];
+        const uint32_t source_log_size = descriptor[2];
+        const uint32_t log_ratio = group_log_size - source_log_size;
+        const uint32_t source_row =
+            (row >> (log_ratio + 1) << 1) + (row & 1);
+        const qm31 b = line_coefficients[static_cast<size_t>(term) * 3 + 1];
+        const qm31 c = line_coefficients[static_cast<size_t>(term) * 3 + 2];
+        numerator = add(
+            numerator,
+            sub(mul_by_scalar(c, source_evaluations[source][source_row]), b));
+    }
+
+    qm31 current = qm31{
+        cm31{outputs_0[group][row], outputs_1[group][row]},
+        cm31{outputs_2[group][row], outputs_3[group][row]},
+    };
+    current = add(current, numerator);
+    outputs_0[group][row] = current.a.a;
+    outputs_1[group][row] = current.a.b;
+    outputs_2[group][row] = current.b.a;
+    outputs_3[group][row] = current.b.b;
+}
+
+} // namespace
+
+extern "C" int stwo_prepare_quotient_numerator_terms_on(
+        const uint32_t *term_descriptors,
+        uint32_t term_count,
+        const secure_field_point *sample_points,
+        const qm31 *sample_values,
+        const qm31 *random_coefficient,
+        secure_field_point *term_points,
+        qm31 *line_coefficients,
+        void *stream
+) {
+    if (term_descriptors == nullptr || term_count == 0 ||
+        sample_points == nullptr || sample_values == nullptr ||
+        random_coefficient == nullptr || term_points == nullptr ||
+        line_coefficients == nullptr || stream == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr uint32_t block_size = 256;
+    const uint32_t blocks = (term_count + block_size - 1) / block_size;
+    prepare_quotient_numerator_terms<<<
+        blocks, block_size, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
+            term_descriptors, term_count, sample_points, sample_values,
+            random_coefficient, term_points, line_coefficients);
+    return cudaGetLastError();
+}
+
+extern "C" int stwo_finalize_quotient_numerator_groups_on(
+        const uint32_t *group_offsets,
+        const uint32_t *group_term_indices,
+        uint32_t group_count,
+        const secure_field_point *term_points,
+        const qm31 *line_coefficients,
+        secure_field_point *sample_points,
+        qm31 *first_linear_terms,
+        void *stream
+) {
+    if (group_offsets == nullptr || group_term_indices == nullptr ||
+        group_count == 0 || term_points == nullptr ||
+        line_coefficients == nullptr || sample_points == nullptr ||
+        first_linear_terms == nullptr || stream == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr uint32_t block_size = 256;
+    const uint32_t blocks = (group_count + block_size - 1) / block_size;
+    finalize_quotient_numerator_groups<<<
+        blocks, block_size, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
+            group_offsets, group_term_indices, group_count, term_points,
+            line_coefficients, sample_points, first_linear_terms);
+    return cudaGetLastError();
+}
+
+extern "C" int stwo_zero_quotient_numerator_outputs_on(
+        const uint32_t *group_log_sizes,
+        uint32_t group_count,
+        uint32_t max_output_size,
+        uint32_t *const *outputs_0,
+        uint32_t *const *outputs_1,
+        uint32_t *const *outputs_2,
+        uint32_t *const *outputs_3,
+        void *stream
+) {
+    if (group_log_sizes == nullptr || group_count == 0 ||
+        group_count > 65535 || max_output_size == 0 ||
+        outputs_0 == nullptr || outputs_1 == nullptr ||
+        outputs_2 == nullptr || outputs_3 == nullptr || stream == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr uint32_t block_size = 256;
+    const uint32_t blocks = (max_output_size + block_size - 1) / block_size;
+    zero_quotient_numerator_outputs<<<
+        dim3(blocks, group_count), block_size, 0,
+        reinterpret_cast<cudaStream_t>(stream)>>>(
+            group_log_sizes, group_count, max_output_size, outputs_0,
+            outputs_1, outputs_2, outputs_3);
+    return cudaGetLastError();
+}
+
+extern "C" int stwo_accumulate_quotient_numerator_batch_on(
+        const uint32_t *group_offsets,
+        const uint32_t *term_descriptors,
+        uint32_t group_count,
+        uint32_t max_output_size,
+        const uint32_t *const *source_evaluations,
+        const qm31 *line_coefficients,
+        const uint32_t *group_log_sizes,
+        uint32_t *const *outputs_0,
+        uint32_t *const *outputs_1,
+        uint32_t *const *outputs_2,
+        uint32_t *const *outputs_3,
+        void *stream
+) {
+    if (group_offsets == nullptr || term_descriptors == nullptr ||
+        group_count == 0 || group_count > 65535 || max_output_size == 0 ||
+        source_evaluations == nullptr || line_coefficients == nullptr ||
+        group_log_sizes == nullptr || outputs_0 == nullptr ||
+        outputs_1 == nullptr || outputs_2 == nullptr ||
+        outputs_3 == nullptr || stream == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr uint32_t block_size = 256;
+    const uint32_t blocks = (max_output_size + block_size - 1) / block_size;
+    accumulate_quotient_numerator_batch<<<
+        dim3(blocks, group_count), block_size, 0,
+        reinterpret_cast<cudaStream_t>(stream)>>>(
+            group_offsets, term_descriptors, group_count, max_output_size,
+            source_evaluations, line_coefficients, group_log_sizes, outputs_0,
+            outputs_1, outputs_2, outputs_3);
+    return cudaGetLastError();
+}

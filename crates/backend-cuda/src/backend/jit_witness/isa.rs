@@ -143,6 +143,12 @@ pub enum DeduceKind {
     /// Division by zero panics on the host; the writers only divide by EC slope
     /// denominators, never zero on valid traces.
     FeltDiv = 7,
+    /// Cairo Poseidon fast-deduction primitives. Width27 felts use ten canonical
+    /// M31 words throughout; chain outputs preserve `(chain, round, state)` shape.
+    PoseidonRoundKeys = 8,
+    Cube252 = 9,
+    PoseidonFullRoundChain = 10,
+    Poseidon3PartialRoundsChain = 11,
 }
 
 impl DeduceKind {
@@ -156,6 +162,10 @@ impl DeduceKind {
             5 => Self::FeltSub,
             6 => Self::FeltMul,
             7 => Self::FeltDiv,
+            8 => Self::PoseidonRoundKeys,
+            9 => Self::Cube252,
+            10 => Self::PoseidonFullRoundChain,
+            11 => Self::Poseidon3PartialRoundsChain,
             _ => return None,
         })
     }
@@ -167,6 +177,10 @@ impl DeduceKind {
             Self::PartialEcMulW18 => (72, 72),
             Self::PedersenPointsTableW18 => (1, 56),
             Self::FeltAdd | Self::FeltSub | Self::FeltMul | Self::FeltDiv => (56, 28),
+            Self::PoseidonRoundKeys => (1, 30),
+            Self::Cube252 => (10, 10),
+            Self::PoseidonFullRoundChain => (32, 32),
+            Self::Poseidon3PartialRoundsChain => (42, 42),
         }
     }
 }

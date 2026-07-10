@@ -17,7 +17,7 @@ use super::isa::{DeduceKind, WitnessOp, WitnessProgram};
 /// Bumped whenever the emitted source for a fixed program changes, mixed into the
 /// cache key so new source can never collide with PTX an older build persisted for the
 /// same bytecode (same rule as the constraint lane's `CODEGEN_VERSION`).
-pub const WITNESS_CODEGEN_VERSION: u64 = 9;
+pub const WITNESS_CODEGEN_VERSION: u64 = 10;
 
 /// Cache key: program semantic hash mixed (FNV-1a) with [`WITNESS_CODEGEN_VERSION`].
 pub fn witness_jit_cache_key(semantic_hash: u64) -> u64 {
@@ -67,9 +67,21 @@ pub fn compile_witness_to_cuda_source(program: &WitnessProgram) -> Option<String
                 | DeduceKind::FeltSub
                 | DeduceKind::FeltMul
                 | DeduceKind::FeltDiv
+                | DeduceKind::PoseidonRoundKeys
+                | DeduceKind::Cube252
+                | DeduceKind::PoseidonFullRoundChain
+                | DeduceKind::Poseidon3PartialRoundsChain
         )
     };
     if kinds_used.iter().any(uses_fp256) {
+        if kinds_used.iter().any(|kind| {
+            matches!(
+                kind,
+                DeduceKind::PartialEcMulW18 | DeduceKind::PedersenPointsTableW18
+            )
+        }) {
+            src.push_str("#define STWO_WIT_NEEDS_PEDERSEN 1\n");
+        }
         emit_fp256_deduce_support(&mut src);
     }
     if kinds_used.contains(&DeduceKind::BlakeG) {
@@ -256,6 +268,26 @@ fn emit_body(program: &WitnessProgram, src: &mut String) -> Option<()> {
                             "    stwo_wit_deduce_felt_div(dargs{seq}, douts{seq});\n"
                         ));
                     }
+                    DeduceKind::PoseidonRoundKeys => {
+                        src.push_str(&format!(
+                            "    stwo_wit_deduce_poseidon_round_keys(dargs{seq}, douts{seq});\n"
+                        ));
+                    }
+                    DeduceKind::Cube252 => {
+                        src.push_str(&format!(
+                            "    stwo_wit_deduce_cube_252(dargs{seq}, douts{seq});\n"
+                        ));
+                    }
+                    DeduceKind::PoseidonFullRoundChain => {
+                        src.push_str(&format!(
+                            "    stwo_wit_deduce_poseidon_full_round_chain(dargs{seq}, douts{seq});\n"
+                        ));
+                    }
+                    DeduceKind::Poseidon3PartialRoundsChain => {
+                        src.push_str(&format!(
+                            "    stwo_wit_deduce_poseidon_3_partial_rounds_chain(dargs{seq}, douts{seq});\n"
+                        ));
+                    }
                 }
                 let base = inst.dst as usize;
                 for i in 0..n_outs {
@@ -369,7 +401,7 @@ typedef unsigned int m31;
 extern \"C\" __device__ int printf(const char*, ...);
 
 ";
-    const CHAIN: [&str; 8] = [
+    const CHAIN: [&str; 9] = [
         include_str!("../../../../backend-cuda-kernels/cuda/fp256_storage.cuh"),
         include_str!("../../../../backend-cuda-kernels/cuda/ptx.cuh"),
         include_str!("../../../../backend-cuda-kernels/cuda/fp256_host_math.cuh"),
@@ -377,6 +409,7 @@ extern \"C\" __device__ int printf(const char*, ...);
         include_str!("../../../../backend-cuda-kernels/cuda/fp256_config.cuh"),
         include_str!("../../../../backend-cuda-kernels/cuda/fp256_dispatch_st.cuh"),
         include_str!("../../../../backend-cuda-kernels/cuda/ec_ops.cuh"),
+        include_str!("../../../../backend-cuda-kernels/cuda/poseidon_witness_round_keys.cuh"),
         include_str!("../../../../backend-cuda-kernels/cuda/stwo_wit_deduce.cuh"),
     ];
     src.push_str(PRELUDE);
@@ -517,6 +550,35 @@ mod tests {
     }
 
     #[test]
+    fn poseidon_deduce_codegen_uses_compact_width27_abis() {
+        let mut recorder = WitnessRecorder::new("poseidon_deduce_probe");
+        let inputs = (0..42).map(|i| recorder.input(i)).collect::<Vec<_>>();
+        let keys = recorder.deduce(DeduceKind::PoseidonRoundKeys, &inputs[..1]);
+        let cube = recorder.deduce(DeduceKind::Cube252, &inputs[..10]);
+        let full = recorder.deduce(DeduceKind::PoseidonFullRoundChain, &inputs[..32]);
+        let partial = recorder.deduce(DeduceKind::Poseidon3PartialRoundsChain, &inputs[..42]);
+        recorder.col_write(0, keys[0]);
+        recorder.col_write(1, cube[0]);
+        recorder.col_write(2, full[0]);
+        recorder.col_write(3, partial[0]);
+        let source = compile_witness_to_cuda_source(&recorder.finish()).expect("codegen");
+        for symbol in [
+            "stwo_wit_deduce_poseidon_round_keys",
+            "stwo_wit_deduce_cube_252",
+            "stwo_wit_deduce_poseidon_full_round_chain",
+            "stwo_wit_deduce_poseidon_3_partial_rounds_chain",
+        ] {
+            assert!(source.contains(symbol), "missing {symbol}");
+        }
+        assert!(!source.contains("#define STWO_WIT_NEEDS_PEDERSEN 1"));
+        assert!(source.contains("dargs0[1]"));
+        assert!(source.contains("douts0[30]"));
+        assert!(source.contains("dargs1[10]"));
+        assert!(source.contains("dargs2[32]"));
+        assert!(source.contains("dargs3[42]"));
+    }
+
+    #[test]
     fn ec_deduce_codegen_embeds_fp256_support() {
         use super::super::isa::DeduceKind;
 
@@ -542,6 +604,7 @@ mod tests {
         assert!(src.contains("ff_dispatch_st"));
         assert!(src.contains("ec_add_affine"));
         assert!(src.contains("g_stwo_wit_pedersen_cols"));
+        assert!(src.contains("#define STWO_WIT_NEEDS_PEDERSEN 1"));
         // …and self-contained: NVRTC resolves no includes.
         assert!(!src.contains("#include"), "unstripped #include in embed");
         assert!(src.contains("douts0[72]"));
@@ -576,6 +639,7 @@ mod tests {
         assert!(src.contains("stwo_wit_deduce_felt_add(dargs3, douts3);"));
         assert!(src.contains("ff_dispatch_st"), "fp256 chain embedded");
         assert!(src.contains("douts0[28]"));
+        assert!(!src.contains("#define STWO_WIT_NEEDS_PEDERSEN 1"));
         assert!(!src.contains("#include"));
     }
 

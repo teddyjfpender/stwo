@@ -19,6 +19,7 @@ use crate::backend::memory_witness::DeviceRawLogupColumn;
 use crate::backend::UploadedDevicePointerVec;
 use crate::columns::bindings::{self, CudaSecureField};
 use crate::columns::{BaseFieldVec, SecureFieldVec};
+use crate::{CudaLaunchContext, CudaRuntimeError};
 
 /// Number of committed base-trace columns (cairo-air blake_g N_TRACE_COLUMNS).
 pub const BG_N_TRACE: usize = 53;
@@ -54,6 +55,142 @@ pub fn write_trace(
     }
     cols
 }
+
+/// Writes the canonical trace/lookup/sub outputs directly into borrowed arena
+/// buffers on the proof-owned stream. No output allocation or D2D clone occurs.
+pub fn write_trace_into_on(
+    inputs: &BaseFieldVec,
+    n_rows: usize,
+    column_length: usize,
+    trace: &[BaseFieldVec],
+    lookup: &BaseFieldVec,
+    sub: &BaseFieldVec,
+    context: CudaLaunchContext,
+) -> Result<(), CudaRuntimeError> {
+    if inputs.size < column_length.saturating_mul(6) {
+        return Err(CudaRuntimeError::Cuda {
+            operation: "blake_g_write_trace_into_on_input_geometry",
+            code: -1,
+        });
+    }
+    write_trace_into_on_inner(
+        inputs.device_ptr,
+        core::ptr::null(),
+        0,
+        0,
+        0,
+        n_rows,
+        column_length,
+        trace,
+        lookup,
+        sub,
+        context,
+    )
+}
+
+/// Device-edge form of [`write_trace_into_on`]: reads the canonical six-word
+/// inputs straight from blake_round's word-major subcomponent buffer.
+#[allow(clippy::too_many_arguments)]
+pub fn write_trace_from_sub_into_on(
+    producer_sub: &BaseFieldVec,
+    producer_rows: usize,
+    producer_word_base: usize,
+    producer_instances: usize,
+    n_rows: usize,
+    column_length: usize,
+    trace: &[BaseFieldVec],
+    lookup: &BaseFieldVec,
+    sub: &BaseFieldVec,
+    context: CudaLaunchContext,
+) -> Result<(), CudaRuntimeError> {
+    let required_words = producer_instances
+        .checked_mul(6)
+        .and_then(|words| producer_word_base.checked_add(words))
+        .and_then(|words| words.checked_mul(producer_rows));
+    if required_words.is_none_or(|required| required > producer_sub.size)
+        || producer_rows
+            .checked_mul(producer_instances)
+            .is_none_or(|rows| rows != n_rows)
+    {
+        return Err(CudaRuntimeError::Cuda {
+            operation: "blake_g_write_trace_from_sub_into_on_input_geometry",
+            code: -1,
+        });
+    }
+    write_trace_into_on_inner(
+        core::ptr::null(),
+        producer_sub.device_ptr,
+        producer_rows,
+        producer_word_base,
+        producer_instances,
+        n_rows,
+        column_length,
+        trace,
+        lookup,
+        sub,
+        context,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_trace_into_on_inner(
+    inputs: *const u32,
+    producer_sub: *const u32,
+    producer_rows: usize,
+    producer_word_base: usize,
+    producer_instances: usize,
+    n_rows: usize,
+    column_length: usize,
+    trace: &[BaseFieldVec],
+    lookup: &BaseFieldVec,
+    sub: &BaseFieldVec,
+    context: CudaLaunchContext,
+) -> Result<(), CudaRuntimeError> {
+    if !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
+        return Err(CudaRuntimeError::Unavailable);
+    }
+    if trace.len() != BG_N_TRACE
+        || trace.iter().any(|column| column.size != column_length)
+        || lookup.size < BG_N_LOOKUP_WORDS * column_length
+        || sub.size < BG_N_SUB_WORDS * column_length
+        || n_rows > column_length
+    {
+        return Err(CudaRuntimeError::Cuda {
+            operation: "blake_g_write_trace_into_on_geometry",
+            code: -1,
+        });
+    }
+    let trace_ptrs: Vec<*mut u32> = trace
+        .iter()
+        .map(|column| column.device_ptr.cast_mut())
+        .collect();
+    let code = unsafe {
+        stwo_backend_cuda_kernels::raw::blake_g_write_trace_into_on(
+            inputs,
+            producer_sub,
+            u32::try_from(producer_rows).map_err(|_| CudaRuntimeError::SizeOverflow)?,
+            u32::try_from(producer_word_base).map_err(|_| CudaRuntimeError::SizeOverflow)?,
+            u32::try_from(producer_instances).map_err(|_| CudaRuntimeError::SizeOverflow)?,
+            u32::try_from(n_rows).map_err(|_| CudaRuntimeError::SizeOverflow)?,
+            u32::try_from(column_length).map_err(|_| CudaRuntimeError::SizeOverflow)?,
+            trace_ptrs.as_ptr(),
+            lookup.device_ptr.cast_mut(),
+            sub.device_ptr.cast_mut(),
+            context.stream_raw().as_ptr(),
+        )
+    };
+    if code == 0 {
+        Ok(())
+    } else {
+        Err(CudaRuntimeError::Cuda {
+            operation: "blake_g_write_trace_into_on",
+            code,
+        })
+    }
+}
+
+const BG_N_LOOKUP_WORDS: usize = 87;
+const BG_N_SUB_WORDS: usize = 48;
 
 /// Uploads a dense `(a << shift) | b -> row` LUT (row indices are `< P`, so the
 /// M31 representation is exact) for the device xor multiplicity feed.

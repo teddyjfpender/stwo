@@ -2,9 +2,9 @@
 //!
 //! Static relation descriptors plus source/output pointer tables are uploaded once in
 //! [`PreparedRelationGraph::prepare`]. [`PreparedRelationGraph::launch`] is the
-//! single eager/capture sequence: combine/pair, fraction chain, device reduction
-//! and shift, then four caller-scratch prefix scans. It allocates, transfers, and
-//! synchronizes nothing.
+//! single eager/capture sequence: proof-wide ragged pair generation, inverse and
+//! fraction chaining, then segmented reduction, shift and prefix scans. It
+//! allocates, transfers, and synchronizes nothing.
 
 use core::ffi::c_void;
 use std::collections::BTreeSet;
@@ -22,12 +22,82 @@ const DESCRIPTOR_WORDS: usize = 16;
 const USE_WORDS: usize = 7;
 const REDUCTION_BLOCK: usize = 256;
 const SECURE_FIELD_WORDS: usize = 4;
-const SCAN_TEMP_OVERHEAD_WORDS: usize = 1024;
+const INSTANCE_POINTER_TABLES: usize = 5;
+const INSTANCE_GEOMETRY_WORDS: usize = 11;
+const FRACTION_INVERSE_BLOCK_VALUES: usize = 1024;
 const M31_MODULUS: u64 = 0x7fff_ffff;
 const LARGE_MEMORY_VALUE_ID_BASE: u32 = 0x4000_0000;
 const XOR12_ROWS: u32 = 1 << 20;
 pub const RELATION_POINTER_ALIGNMENT_WORDS: usize =
     core::mem::align_of::<*const u32>() / WORD_BYTES;
+
+/// Width of the fused-lane eligibility bitmask passed by value into
+/// `stwo_relation_fused_on` (must match `RELATION_FUSED_MASK_WORDS` in
+/// `relation_fused.cuh`). 8 words = 256 instance bits.
+pub const RELATION_FUSED_MASK_WORDS: usize = 8;
+/// Proofs with more relation instances than mask bits fail closed to the
+/// 3-stage lane as a whole.
+pub const RELATION_FUSED_MAX_INSTANCES: usize = RELATION_FUSED_MASK_WORDS * 32;
+/// Fused-lane eligibility bound on tuple width. The fused kernel streams
+/// tuple words through one QM31 accumulator, so registers do not scale with
+/// width; the cap bounds the recompute cost per denominator (every
+/// denominator is evaluated twice) and keeps the fused lane inside the
+/// register/latency envelope that hardware parity validates. Wider combines
+/// route to the existing 3-stage path — decided statically here, never at
+/// runtime.
+pub const RELATION_FUSED_MAX_TUPLE_WORDS: u32 = 32;
+/// Defensive fused-lane bound on chain length. Running state stays three
+/// QM31 registers regardless of column count; this only guards pathological
+/// programs whose per-thread column walk would dominate a single launch.
+pub const RELATION_FUSED_MAX_COLUMNS: usize = 1024;
+
+/// Selects which kernel pipeline [`PreparedRelationGraph::launch_with_mode`]
+/// submits. Both modes produce byte-identical committed columns and claimed
+/// sums; `Fused` is opt-in via `STWO_CUDA_RELATION_FUSED=1`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RelationLaunchMode {
+    /// pairs -> ragged batch inverse -> global fraction chain (default).
+    ThreeStage,
+    /// One fused kernel that never materializes the denominator slab;
+    /// fused-ineligible instances still run per-instance 3-stage kernels.
+    Fused,
+}
+
+/// Static fused-lane eligibility of every instance of `batch`. Fail-closed:
+/// anything outside the audited envelope keeps the proven 3-stage path.
+pub fn relation_batch_fused_eligible(batch: &RelationBatchProgram) -> bool {
+    batch.columns.len() <= RELATION_FUSED_MAX_COLUMNS
+        && batch.columns.iter().all(|column| {
+            column
+                .uses
+                .iter()
+                .all(|relation_use| relation_use.tuple_words <= RELATION_FUSED_MAX_TUPLE_WORDS)
+        })
+}
+
+/// Pack per-instance eligibility flags into the device kernel's by-value
+/// mask. `None` means the proof cannot use the fused lane at all (more
+/// instances than mask bits) and must fail closed to the 3-stage path.
+fn fused_eligibility_mask(eligible: &[bool]) -> Option<[u32; RELATION_FUSED_MASK_WORDS]> {
+    if eligible.len() > RELATION_FUSED_MAX_INSTANCES {
+        return None;
+    }
+    let mut mask = [0u32; RELATION_FUSED_MASK_WORDS];
+    for (instance, &flag) in eligible.iter().enumerate() {
+        if flag {
+            mask[instance / 32] |= 1u32 << (instance % 32);
+        }
+    }
+    Some(mask)
+}
+
+/// `STWO_CUDA_RELATION_FUSED=1` opts the default [`PreparedRelationGraph::launch`]
+/// into the fused lane. Read once per process so eager runs, capture and
+/// replay all observe one mode.
+fn fused_launch_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("STWO_CUDA_RELATION_FUSED").as_deref() == Ok("1"))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
@@ -208,8 +278,14 @@ impl RelationKernelProgram {
                     }
                 }
             }
+            let columns =
+                u32::try_from(batch.columns.len()).map_err(|_| RelationGraphError::SizeOverflow)?;
             for extent in &batch.instances {
                 validate_extent(batch.source_layout, *extent)?;
+                let rows = extent.capacity_rows();
+                if u64::from(rows) * u64::from(columns) > i32::MAX as u64 {
+                    return Err(RelationGraphError::FractionChainTooLarge { rows, columns });
+                }
             }
             if matches!(batch.source_layout, RelationSourceLayout::MemoryBig { .. }) {
                 let mut expected_offset = 0u32;
@@ -277,8 +353,13 @@ pub struct RelationGraphRequirements {
     pub inverse_words: usize,
     pub reduction_words: usize,
     pub scan_eval_words: usize,
-    /// Conservative CUB capacity; prepare queries the native exact byte count.
+    /// One-word compatibility sentinel; the proof-wide scan no longer uses CUB.
     pub scan_temp_words: usize,
+    pub fraction_pointer_words: usize,
+    pub fraction_geometry_words: usize,
+    pub pair_blocks: u32,
+    pub fraction_inverse_blocks: u32,
+    pub fraction_chain_blocks: u32,
     pub instances: Vec<RelationInstanceRequirement>,
 }
 
@@ -310,6 +391,10 @@ pub struct RelationGraphSlots {
     pub reduction_b: ArenaSlotId,
     pub scan_eval_scratch: ArenaSlotId,
     pub scan_temp_scratch: ArenaSlotId,
+    /// Proof-wide dispatch pointer tables in source, descriptor, output,
+    /// denominator and claimed-sum order, followed by immutable ragged geometry.
+    pub fraction_pointers: ArenaSlotId,
+    pub fraction_geometry: ArenaSlotId,
     /// Active instances in deterministic `(batch, instance)` order.
     pub instances: Vec<RelationInstanceSlots>,
 }
@@ -338,6 +423,12 @@ impl RelationGraphRequirements {
             slot_requirement(slots.reduction_b, self.reduction_words, SECURE_FIELD_WORDS),
             slot_requirement(slots.scan_eval_scratch, self.scan_eval_words, 1),
             slot_requirement(slots.scan_temp_scratch, self.scan_temp_words, 1),
+            slot_requirement(
+                slots.fraction_pointers,
+                self.fraction_pointer_words,
+                RELATION_POINTER_ALIGNMENT_WORDS,
+            ),
+            slot_requirement(slots.fraction_geometry, self.fraction_geometry_words, 1),
         ];
         for (requirement, instance_slots) in self.instances.iter().zip(&slots.instances) {
             if instance_slots.output_coordinates.len() != requirement.output_coordinate_count {
@@ -412,14 +503,37 @@ pub fn relation_graph_requirements(
         .map_err(|_| RelationGraphError::SizeOverflow)?
         .checked_mul(SECURE_FIELD_WORDS)
         .ok_or(RelationGraphError::SizeOverflow)?;
-    let mut max_rows = 1usize;
+    let mut pair_blocks = 0usize;
+    let mut fraction_inverse_blocks = 0usize;
+    let mut fraction_chain_blocks = 0usize;
     let mut instances = Vec::new();
     for (batch_index, batch) in program.batches.iter().enumerate() {
         for (instance_index, extent) in batch.instances.iter().enumerate() {
             let rows = usize::try_from(extent.capacity_rows())
                 .map_err(|_| RelationGraphError::SizeOverflow)?;
-            max_rows = max_rows.max(rows);
             let columns = batch.columns.len();
+            let values = rows
+                .checked_mul(columns)
+                .ok_or(RelationGraphError::SizeOverflow)?;
+            let inverse_blocks = if rows >= FRACTION_INVERSE_BLOCK_VALUES {
+                debug_assert_eq!(rows % FRACTION_INVERSE_BLOCK_VALUES, 0);
+                values / FRACTION_INVERSE_BLOCK_VALUES
+            } else {
+                values.div_ceil(FRACTION_INVERSE_BLOCK_VALUES)
+            };
+            fraction_inverse_blocks = fraction_inverse_blocks
+                .checked_add(inverse_blocks)
+                .ok_or(RelationGraphError::SizeOverflow)?;
+            let row_blocks = rows.div_ceil(REDUCTION_BLOCK);
+            let instance_pair_blocks = row_blocks
+                .checked_mul(columns)
+                .ok_or(RelationGraphError::SizeOverflow)?;
+            pair_blocks = pair_blocks
+                .checked_add(instance_pair_blocks)
+                .ok_or(RelationGraphError::SizeOverflow)?;
+            fraction_chain_blocks = fraction_chain_blocks
+                .checked_add(row_blocks)
+                .ok_or(RelationGraphError::SizeOverflow)?;
             let coordinate_words = columns
                 .checked_mul(SECURE_FIELD_WORDS)
                 .and_then(|value| value.checked_mul(rows))
@@ -447,25 +561,43 @@ pub fn relation_graph_requirements(
             });
         }
     }
-    let inverse_words = max_rows
-        .checked_mul(SECURE_FIELD_WORDS)
-        .ok_or(RelationGraphError::SizeOverflow)?;
-    let reduction_words = max_rows
-        .div_ceil(REDUCTION_BLOCK)
+    let reduction_words = fraction_chain_blocks
         .max(1)
         .checked_mul(SECURE_FIELD_WORDS)
+        .ok_or(RelationGraphError::SizeOverflow)?;
+    let pair_blocks = u32::try_from(pair_blocks).map_err(|_| RelationGraphError::SizeOverflow)?;
+    let fraction_chain_blocks =
+        u32::try_from(fraction_chain_blocks).map_err(|_| RelationGraphError::SizeOverflow)?;
+    fraction_chain_blocks
+        .checked_mul(SECURE_FIELD_WORDS as u32)
+        .ok_or(RelationGraphError::SizeOverflow)?;
+    u32::try_from(instances.len())
+        .map_err(|_| RelationGraphError::SizeOverflow)?
+        .checked_mul(SECURE_FIELD_WORDS as u32)
         .ok_or(RelationGraphError::SizeOverflow)?;
     Ok(RelationGraphRequirements {
         descriptor_words,
         alpha_words,
         z_words: SECURE_FIELD_WORDS,
-        inverse_words,
+        // The ragged inverse operates in-place in each denominator slab.
+        inverse_words: 1,
         reduction_words,
-        scan_eval_words: max_rows,
-        scan_temp_words: max_rows
-            .checked_mul(2)
-            .and_then(|words| words.checked_add(SCAN_TEMP_OVERHEAD_WORDS))
+        // Custom segmented scans reuse reduction_b for their tile totals.
+        scan_eval_words: 1,
+        scan_temp_words: 1,
+        fraction_pointer_words: instances
+            .len()
+            .checked_mul(INSTANCE_POINTER_TABLES)
+            .and_then(|pointers| pointers.checked_mul(POINTER_WORDS))
             .ok_or(RelationGraphError::SizeOverflow)?,
+        fraction_geometry_words: instances
+            .len()
+            .checked_mul(INSTANCE_GEOMETRY_WORDS)
+            .ok_or(RelationGraphError::SizeOverflow)?,
+        pair_blocks,
+        fraction_inverse_blocks: u32::try_from(fraction_inverse_blocks)
+            .map_err(|_| RelationGraphError::SizeOverflow)?,
+        fraction_chain_blocks,
         instances,
     })
 }
@@ -666,6 +798,10 @@ pub enum RelationGraphError {
         required_bytes: usize,
         actual_bytes: usize,
     },
+    FractionChainTooLarge {
+        rows: u32,
+        columns: u32,
+    },
 }
 
 impl core::fmt::Display for RelationGraphError {
@@ -719,6 +855,10 @@ struct PreparedInstance {
     denominators: ArenaSlice,
     n_real_rows: u32,
     source_offset_rows: u32,
+    /// Pointer count in `source_pointers`, for the per-instance fallback lane.
+    n_source_pointers: u32,
+    /// Static fused-lane eligibility (see [`relation_batch_fused_eligible`]).
+    fused_eligible: bool,
 }
 
 /// Descriptor-complete executable relation graph. The arena borrow makes every
@@ -730,9 +870,11 @@ pub struct PreparedRelationGraph<'a> {
     inverse_scratch: ArenaSlice,
     reduction_a: ArenaSlice,
     reduction_b: ArenaSlice,
-    scan_eval_scratch: ArenaSlice,
-    scan_temp_scratch: ArenaSlice,
-    scan_temp_bytes: usize,
+    fraction_pointers: ArenaSlice,
+    fraction_geometry: ArenaSlice,
+    pair_blocks: u32,
+    fraction_inverse_blocks: u32,
+    fraction_chain_blocks: u32,
     instances: Vec<PreparedInstance>,
 }
 
@@ -777,6 +919,9 @@ impl<'a> PreparedRelationGraph<'a> {
         let descriptors = bind_slot(arena, slots.descriptors, requirements.descriptor_words, 1)?;
         let alphas = bind_slot(arena, slots.alphas, requirements.alpha_words, 1)?;
         let z = bind_slot(arena, slots.z, requirements.z_words, 1)?;
+        // Kept bound (not just validated): the fused lane's per-instance
+        // fallback drives `stwo_relation_fraction_chain_on`, whose ABI still
+        // carries this legacy one-word scratch slot.
         let inverse_scratch = bind_slot(
             arena,
             slots.inverse_scratch,
@@ -795,31 +940,30 @@ impl<'a> PreparedRelationGraph<'a> {
             requirements.reduction_words,
             SECURE_FIELD_WORDS,
         )?;
-        let scan_eval_scratch = bind_slot(
+        let _scan_eval_scratch = bind_slot(
             arena,
             slots.scan_eval_scratch,
             requirements.scan_eval_words,
             1,
         )?;
-        let scan_temp_scratch = bind_slot(
+        let _scan_temp_scratch = bind_slot(
             arena,
             slots.scan_temp_scratch,
             requirements.scan_temp_words,
             1,
         )?;
-        let exact_scan_temp_bytes = unsafe {
-            stwo_backend_cuda_kernels::raw::stwo_relation_scan_temp_bytes(
-                u32::try_from(requirements.scan_eval_words)
-                    .map_err(|_| RelationGraphError::SizeOverflow)?,
-            )
-        };
-        if exact_scan_temp_bytes > scan_temp_scratch.len_bytes() {
-            return Err(RelationGraphError::ScanScratchTooSmall {
-                required_bytes: exact_scan_temp_bytes,
-                actual_bytes: scan_temp_scratch.len_bytes(),
-            });
-        }
-
+        let fraction_pointers = bind_slot(
+            arena,
+            slots.fraction_pointers,
+            requirements.fraction_pointer_words,
+            RELATION_POINTER_ALIGNMENT_WORDS,
+        )?;
+        let fraction_geometry = bind_slot(
+            arena,
+            slots.fraction_geometry,
+            requirements.fraction_geometry_words,
+            1,
+        )?;
         let descriptor_words = program.descriptor_words()?;
         let alpha_words =
             secure_words(&challenges.alpha_powers[..program.max_alpha_powers as usize]);
@@ -932,7 +1076,93 @@ impl<'a> PreparedRelationGraph<'a> {
                 denominators,
                 n_real_rows,
                 source_offset_rows,
+                n_source_pointers: u32::try_from(expected_sources)
+                    .map_err(|_| RelationGraphError::SizeOverflow)?,
+                fused_eligible: relation_batch_fused_eligible(batch),
             });
+        }
+
+        if !prepared.is_empty() {
+            let mut pointers = prepared
+                .iter()
+                .map(|instance| instance.source_pointers.as_u32_ptr() as usize)
+                .collect::<Vec<_>>();
+            pointers.extend(
+                prepared
+                    .iter()
+                    .map(|instance| instance.descriptor_ptr as usize),
+            );
+            pointers.extend(
+                prepared
+                    .iter()
+                    .map(|instance| instance.output_pointers.as_u32_ptr() as usize),
+            );
+            pointers.extend(
+                prepared
+                    .iter()
+                    .map(|instance| instance.denominators.as_u32_ptr() as usize),
+            );
+            pointers.extend(
+                prepared
+                    .iter()
+                    .map(|instance| instance.output.claimed_sum.as_u32_ptr() as usize),
+            );
+            let mut geometry = Vec::with_capacity(
+                prepared
+                    .len()
+                    .checked_mul(INSTANCE_GEOMETRY_WORDS)
+                    .ok_or(RelationGraphError::SizeOverflow)?,
+            );
+            let mut pair_first = 0u32;
+            let mut inverse_first = 0u32;
+            let mut row_first = 0u32;
+            for instance in &prepared {
+                let rows = instance.output.rows;
+                let columns = instance.output.columns;
+                let values = rows
+                    .checked_mul(columns)
+                    .ok_or(RelationGraphError::SizeOverflow)?;
+                let inverse_blocks = if rows as usize >= FRACTION_INVERSE_BLOCK_VALUES {
+                    values / FRACTION_INVERSE_BLOCK_VALUES as u32
+                } else {
+                    values.div_ceil(FRACTION_INVERSE_BLOCK_VALUES as u32)
+                };
+                let row_blocks = rows.div_ceil(REDUCTION_BLOCK as u32);
+                let pair_count = row_blocks
+                    .checked_mul(columns)
+                    .ok_or(RelationGraphError::SizeOverflow)?;
+                let inverse_rows = M31::from_u32_unchecked(rows).inverse().0;
+                geometry.extend([
+                    pair_first,
+                    pair_count,
+                    inverse_first,
+                    inverse_blocks,
+                    row_first,
+                    row_blocks,
+                    rows,
+                    columns,
+                    instance.n_real_rows,
+                    instance.source_offset_rows,
+                    inverse_rows,
+                ]);
+                pair_first = pair_first
+                    .checked_add(pair_count)
+                    .ok_or(RelationGraphError::SizeOverflow)?;
+                inverse_first = inverse_first
+                    .checked_add(inverse_blocks)
+                    .ok_or(RelationGraphError::SizeOverflow)?;
+                row_first = row_first
+                    .checked_add(row_blocks)
+                    .ok_or(RelationGraphError::SizeOverflow)?;
+            }
+            if pair_first != requirements.pair_blocks
+                || inverse_first != requirements.fraction_inverse_blocks
+                || row_first != requirements.fraction_chain_blocks
+            {
+                return Err(RelationGraphError::SizeOverflow);
+            }
+            uploads.push(PendingUpload::pointers(fraction_pointers, pointers));
+            uploads.push(PendingUpload::u32(fraction_geometry, geometry));
         }
 
         upload_and_sync(arena, &uploads)?;
@@ -943,89 +1173,207 @@ impl<'a> PreparedRelationGraph<'a> {
             inverse_scratch,
             reduction_a,
             reduction_b,
-            scan_eval_scratch,
-            scan_temp_scratch,
-            scan_temp_bytes: exact_scan_temp_bytes,
+            fraction_pointers,
+            fraction_geometry,
+            pair_blocks: requirements.pair_blocks,
+            fraction_inverse_blocks: requirements.fraction_inverse_blocks,
+            fraction_chain_blocks: requirements.fraction_chain_blocks,
             instances: prepared,
         })
     }
 
     /// Allocation/copy/sync/default-stream-free sequence shared by eager mode and
-    /// graph capture.
+    /// graph capture. The pipeline defaults to the proven 3-stage lane;
+    /// `STWO_CUDA_RELATION_FUSED=1` (read once per process) opts into the
+    /// fused lane. Both lanes produce byte-identical outputs.
     pub fn launch(&self) -> Result<(), RelationGraphError> {
+        let mode = if fused_launch_enabled() {
+            RelationLaunchMode::Fused
+        } else {
+            RelationLaunchMode::ThreeStage
+        };
+        self.launch_with_mode(mode)
+    }
+
+    /// The fused lane: one kernel replaces pairs + ragged inverse + global
+    /// fraction chain and never touches the denominator slabs or
+    /// `inverse_scratch` for eligible instances (both stay allocated — the
+    /// arena ABI is unchanged; reclaiming them is a follow-up once the fused
+    /// lane is the default). Fused-ineligible instances run the existing
+    /// per-instance pairs + inverse + chain kernels.
+    pub fn launch_fused(&self) -> Result<(), RelationGraphError> {
+        self.launch_with_mode(RelationLaunchMode::Fused)
+    }
+
+    /// Explicit-mode launch used by both lanes' parity tests.
+    pub fn launch_with_mode(&self, mode: RelationLaunchMode) -> Result<(), RelationGraphError> {
+        if self.instances.is_empty() {
+            return Ok(());
+        }
+        let eligibility = self
+            .instances
+            .iter()
+            .map(|instance| instance.fused_eligible)
+            .collect::<Vec<_>>();
+        // Fail closed: proofs beyond the mask capacity, or with no eligible
+        // instance, run the whole 3-stage lane even when fused was requested.
+        let fused_mask = match mode {
+            RelationLaunchMode::Fused => {
+                fused_eligibility_mask(&eligibility).filter(|_| eligibility.contains(&true))
+            }
+            RelationLaunchMode::ThreeStage => None,
+        };
+        match fused_mask {
+            Some(mask) => self.launch_fused_body(&mask),
+            None => self.launch_three_stage_body(),
+        }?;
+        self.launch_tail()
+    }
+
+    fn pointer_table(&self, index: usize) -> Result<*mut u32, RelationGraphError> {
+        let offset = self
+            .instances
+            .len()
+            .checked_mul(POINTER_WORDS)
+            .and_then(|table_words| table_words.checked_mul(index))
+            .ok_or(RelationGraphError::SizeOverflow)?;
+        Ok(unsafe { self.fraction_pointers.as_u32_ptr().add(offset) })
+    }
+
+    fn n_instances(&self) -> Result<u32, RelationGraphError> {
+        u32::try_from(self.instances.len()).map_err(|_| RelationGraphError::SizeOverflow)
+    }
+
+    fn n_alpha_powers(&self) -> Result<u32, RelationGraphError> {
+        u32::try_from(self.alphas.len_words() / SECURE_FIELD_WORDS)
+            .map_err(|_| RelationGraphError::SizeOverflow)
+    }
+
+    fn launch_three_stage_body(&self) -> Result<(), RelationGraphError> {
         let stream = self.arena.context().stream_raw().as_ptr();
-        for instance in &self.instances {
-            let rows = instance.output.rows;
-            let columns = instance.output.columns;
+        let geometry = self.fraction_geometry.as_u32_ptr().cast_const();
+        check_cuda("relation_pairs_global_on", unsafe {
+            stwo_backend_cuda_kernels::raw::stwo_relation_pairs_global_on(
+                self.pointer_table(0)?.cast(),
+                self.pointer_table(1)?.cast(),
+                self.pointer_table(2)?.cast(),
+                self.pointer_table(3)?.cast(),
+                geometry,
+                self.n_instances()?,
+                self.pair_blocks,
+                self.alphas.as_u32_ptr().cast_const(),
+                self.n_alpha_powers()?,
+                self.z.as_u32_ptr().cast_const(),
+                stream,
+            )
+        })?;
+        check_cuda("relation_fraction_chain_global_on", unsafe {
+            stwo_backend_cuda_kernels::raw::stwo_relation_fraction_chain_global_on(
+                self.pointer_table(2)?.cast(),
+                self.pointer_table(3)?.cast(),
+                geometry,
+                self.n_instances()?,
+                self.fraction_inverse_blocks,
+                self.fraction_chain_blocks,
+                stream,
+            )
+        })?;
+        Ok(())
+    }
+
+    fn launch_fused_body(
+        &self,
+        mask: &[u32; RELATION_FUSED_MASK_WORDS],
+    ) -> Result<(), RelationGraphError> {
+        let stream = self.arena.context().stream_raw().as_ptr();
+        let geometry = self.fraction_geometry.as_u32_ptr().cast_const();
+        check_cuda("relation_fused_on", unsafe {
+            stwo_backend_cuda_kernels::raw::stwo_relation_fused_on(
+                self.pointer_table(0)?.cast(),
+                self.pointer_table(1)?.cast(),
+                self.pointer_table(2)?.cast(),
+                geometry,
+                self.n_instances()?,
+                self.fraction_chain_blocks,
+                self.alphas.as_u32_ptr().cast_const(),
+                self.n_alpha_powers()?,
+                self.z.as_u32_ptr().cast_const(),
+                mask.as_ptr(),
+                stream,
+            )
+        })?;
+        // Statically ineligible instances keep the exact per-instance 3-stage
+        // sequence (pairs, then in-place slab inverse + fraction chain).
+        for instance in self.instances.iter().filter(|i| !i.fused_eligible) {
             check_cuda("relation_pairs_on", unsafe {
                 stwo_backend_cuda_kernels::raw::stwo_relation_pairs_on(
-                    instance.source_pointers.as_u32_ptr().cast(),
-                    u32::try_from(instance.source_pointers.len_words() / POINTER_WORDS)
-                        .map_err(|_| RelationGraphError::SizeOverflow)?,
-                    rows,
+                    instance.source_pointers.as_u32_ptr().cast_const().cast(),
+                    instance.n_source_pointers,
+                    instance.output.rows,
                     instance.n_real_rows,
                     instance.source_offset_rows,
                     instance.descriptor_ptr,
-                    columns,
+                    instance.output.columns,
                     self.alphas.as_u32_ptr().cast_const(),
-                    u32::try_from(self.alphas.len_words() / SECURE_FIELD_WORDS)
-                        .map_err(|_| RelationGraphError::SizeOverflow)?,
+                    self.n_alpha_powers()?,
                     self.z.as_u32_ptr().cast_const(),
-                    instance.output_pointers.as_u32_ptr().cast(),
+                    instance.output_pointers.as_u32_ptr().cast_const().cast(),
                     instance.denominators.as_u32_ptr(),
                     stream,
                 )
             })?;
             check_cuda("relation_fraction_chain_on", unsafe {
                 stwo_backend_cuda_kernels::raw::stwo_relation_fraction_chain_on(
-                    instance.output_pointers.as_u32_ptr().cast(),
-                    instance.denominators.as_u32_ptr().cast_const(),
+                    instance.output_pointers.as_u32_ptr().cast_const().cast(),
+                    instance.denominators.as_u32_ptr(),
                     self.inverse_scratch.as_u32_ptr(),
-                    rows,
-                    columns,
+                    instance.output.rows,
+                    instance.output.columns,
                     stream,
                 )
             })?;
-            let last_start = usize::try_from(columns - 1)
-                .map_err(|_| RelationGraphError::SizeOverflow)?
-                .checked_mul(SECURE_FIELD_WORDS)
-                .ok_or(RelationGraphError::SizeOverflow)?;
-            let last = &instance.output.coordinates[last_start..last_start + SECURE_FIELD_WORDS];
-            let inverse_rows = M31::from_u32_unchecked(rows).inverse().0;
-            check_cuda("relation_reduce_shift_on", unsafe {
-                stwo_backend_cuda_kernels::raw::stwo_relation_reduce_shift_on(
-                    last[0].as_u32_ptr(),
-                    last[1].as_u32_ptr(),
-                    last[2].as_u32_ptr(),
-                    last[3].as_u32_ptr(),
-                    rows,
-                    self.reduction_a.as_u32_ptr(),
-                    self.reduction_b.as_u32_ptr(),
-                    u32::try_from(self.reduction_a.len_words() / SECURE_FIELD_WORDS)
-                        .map_err(|_| RelationGraphError::SizeOverflow)?,
-                    instance.output.claimed_sum.as_u32_ptr(),
-                    inverse_rows,
-                    stream,
-                )
-            })?;
-            for coordinate in last {
-                check_cuda("relation_prefix_scan_on", unsafe {
-                    stwo_backend_cuda_kernels::raw::stwo_relation_prefix_scan_on(
-                        coordinate.as_u32_ptr(),
-                        rows,
-                        self.scan_eval_scratch.as_u32_ptr(),
-                        self.scan_temp_scratch.as_void_ptr(),
-                        self.scan_temp_bytes,
-                        stream,
-                    )
-                })?;
-            }
         }
+        Ok(())
+    }
+
+    /// Segmented reduction, claimed sums, shift and prefix scans — identical
+    /// in both lanes.
+    fn launch_tail(&self) -> Result<(), RelationGraphError> {
+        let stream = self.arena.context().stream_raw().as_ptr();
+        let geometry = self.fraction_geometry.as_u32_ptr().cast_const();
+        check_cuda("relation_tail_global_on", unsafe {
+            stwo_backend_cuda_kernels::raw::stwo_relation_tail_global_on(
+                self.pointer_table(2)?.cast(),
+                self.pointer_table(4)?.cast(),
+                geometry,
+                self.n_instances()?,
+                self.fraction_chain_blocks,
+                self.reduction_a.as_u32_ptr(),
+                u32::try_from(self.reduction_a.len_words() / SECURE_FIELD_WORDS)
+                    .map_err(|_| RelationGraphError::SizeOverflow)?,
+                self.reduction_b.as_u32_ptr(),
+                u32::try_from(self.reduction_b.len_words())
+                    .map_err(|_| RelationGraphError::SizeOverflow)?,
+                stream,
+            )
+        })?;
         Ok(())
     }
 
     pub fn outputs(&self) -> impl ExactSizeIterator<Item = &PreparedRelationOutput> + '_ {
         self.instances.iter().map(|instance| &instance.output)
+    }
+
+    /// Stable relation challenge slice consumed directly by resident
+    /// composition parameter materialization.
+    pub const fn z_source(&self) -> ArenaSlice {
+        self.z
+    }
+
+    /// Stable alpha-power table consumed directly by resident composition
+    /// parameter materialization.
+    pub const fn alpha_powers_source(&self) -> ArenaSlice {
+        self.alphas
     }
 
     /// Expand the device transcript's exact `LookupElements::draw` output
@@ -1306,6 +1654,8 @@ mod tests {
             reduction_b: id(),
             scan_eval_scratch: id(),
             scan_temp_scratch: id(),
+            fraction_pointers: id(),
+            fraction_geometry: id(),
             instances: (0..2)
                 .map(|_| RelationInstanceSlots {
                     source_pointers: id(),
@@ -1324,10 +1674,21 @@ mod tests {
         assert_eq!(requirements.descriptor_words, 2 * DESCRIPTOR_WORDS);
         assert_eq!(requirements.alpha_words, 6 * SECURE_FIELD_WORDS);
         assert_eq!(requirements.z_words, SECURE_FIELD_WORDS);
-        assert_eq!(requirements.inverse_words, 8 * SECURE_FIELD_WORDS);
-        assert_eq!(requirements.reduction_words, SECURE_FIELD_WORDS);
-        assert_eq!(requirements.scan_eval_words, 8);
-        assert_eq!(requirements.scan_temp_words, 16 + SCAN_TEMP_OVERHEAD_WORDS);
+        assert_eq!(requirements.inverse_words, 1);
+        assert_eq!(requirements.reduction_words, 2 * SECURE_FIELD_WORDS);
+        assert_eq!(requirements.scan_eval_words, 1);
+        assert_eq!(requirements.scan_temp_words, 1);
+        assert_eq!(
+            requirements.fraction_pointer_words,
+            2 * INSTANCE_POINTER_TABLES * POINTER_WORDS
+        );
+        assert_eq!(
+            requirements.fraction_geometry_words,
+            2 * INSTANCE_GEOMETRY_WORDS
+        );
+        assert_eq!(requirements.pair_blocks, 2);
+        assert_eq!(requirements.fraction_inverse_blocks, 2);
+        assert_eq!(requirements.fraction_chain_blocks, 2);
         assert_eq!(requirements.instances.len(), 2);
         assert_eq!(
             requirements.instances[0].output_words,
@@ -1346,9 +1707,9 @@ mod tests {
 
         let slots = sample_slots();
         let slot_requirements = requirements.arena_slot_requirements(&slots).unwrap();
-        assert_eq!(slot_requirements.len(), 8 + 2 * 8);
+        assert_eq!(slot_requirements.len(), 10 + 2 * 8);
         assert_eq!(
-            slot_requirements[8].alignment_words,
+            slot_requirements[10].alignment_words,
             RELATION_POINTER_ALIGNMENT_WORDS
         );
     }
@@ -1400,6 +1761,83 @@ mod tests {
                 },
             ),
             Err(RelationGraphError::SourceLayoutMismatch)
+        );
+    }
+
+    #[test]
+    fn oversized_fraction_batch_fails_before_cuda() {
+        let mut program = sample_program();
+        let repeated = program.batches[0].columns[0].clone();
+        program.template_use_count += repeated.uses.len();
+        program.batches[0].columns.push(repeated);
+        program.batches[0].instances[0] = RelationRowExtent::Exact {
+            n_real_rows: 1,
+            padded_rows: 1 << 30,
+            source_offset_rows: 0,
+        };
+
+        assert_eq!(
+            program.validate(),
+            Err(RelationGraphError::FractionChainTooLarge {
+                rows: 1 << 30,
+                columns: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn fused_eligibility_classifies_tuple_width_and_column_count() {
+        let program = sample_program();
+        // Both sample batches sit well inside the fused envelope.
+        assert!(relation_batch_fused_eligible(&program.batches[0]));
+        assert!(relation_batch_fused_eligible(&program.batches[1]));
+
+        // One use wider than the tuple-word cap routes the batch to the
+        // 3-stage lane.
+        let mut wide = program.batches[0].clone();
+        wide.columns[0].uses[0].tuple_words = RELATION_FUSED_MAX_TUPLE_WORDS + 1;
+        assert!(!relation_batch_fused_eligible(&wide));
+        wide.columns[0].uses[0].tuple_words = RELATION_FUSED_MAX_TUPLE_WORDS;
+        assert!(relation_batch_fused_eligible(&wide));
+
+        // A pathological chain length also fails closed.
+        let mut long = program.batches[0].clone();
+        let column = long.columns[0].clone();
+        long.columns = vec![column; RELATION_FUSED_MAX_COLUMNS + 1];
+        assert!(!relation_batch_fused_eligible(&long));
+        long.columns.pop();
+        assert!(relation_batch_fused_eligible(&long));
+    }
+
+    #[test]
+    fn fused_eligibility_mask_packs_bits_and_fails_closed() {
+        assert_eq!(
+            fused_eligibility_mask(&[]),
+            Some([0u32; RELATION_FUSED_MASK_WORDS])
+        );
+
+        let mut flags = vec![false; 200];
+        flags[0] = true;
+        flags[31] = true;
+        flags[32] = true;
+        flags[68] = true;
+        flags[199] = true;
+        let mask = fused_eligibility_mask(&flags).unwrap();
+        assert_eq!(mask[0], (1 << 0) | (1 << 31));
+        assert_eq!(mask[1], 1 << 0);
+        assert_eq!(mask[2], 1 << (68 - 64));
+        assert_eq!(mask[6], 1 << (199 - 192));
+        assert_eq!(mask[3], 0);
+        assert_eq!(mask[7], 0);
+
+        // Exactly at capacity: every bit set.
+        let full = fused_eligibility_mask(&vec![true; RELATION_FUSED_MAX_INSTANCES]).unwrap();
+        assert_eq!(full, [u32::MAX; RELATION_FUSED_MASK_WORDS]);
+
+        // One instance beyond the mask capacity fails closed for the proof.
+        assert_eq!(
+            fused_eligibility_mask(&vec![true; RELATION_FUSED_MAX_INSTANCES + 1]),
+            None
         );
     }
 

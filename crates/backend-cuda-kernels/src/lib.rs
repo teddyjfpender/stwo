@@ -35,7 +35,59 @@ mod tests {
     #[test]
     fn prepared_quotient_symbols_are_linked_in_cuda_and_stub_builds() {
         assert_ne!(raw::stwo_combine_quotients_from_numerators_on as usize, 0);
+        assert_ne!(raw::stwo_prepare_quotient_numerator_terms_on as usize, 0);
+        assert_ne!(raw::stwo_finalize_quotient_numerator_groups_on as usize, 0);
+        assert_ne!(raw::stwo_zero_quotient_numerator_outputs_on as usize, 0);
+        assert_ne!(raw::stwo_accumulate_quotient_numerator_batch_on as usize, 0);
         assert_ne!(raw::stwo_ntt_b2n_columns_on as usize, 0);
         assert_ne!(raw::stwo_lde_n2b_columns_on as usize, 0);
+    }
+
+    #[test]
+    fn hash_from_tile_symbols_are_linked_in_cuda_and_stub_builds() {
+        assert_ne!(raw::stwo_lde_n2b_columns_before_circle_on as usize, 0);
+        assert_ne!(raw::stwo_blake2s_leaf_group_from_lde_on as usize, 0);
+        assert_ne!(raw::stwo_lde_n2b_hash16_configure as usize, 0);
+        assert_ne!(raw::stwo_lde_n2b_hash16_on as usize, 0);
+    }
+
+    #[test]
+    fn prepared_oods_symbols_are_linked_in_cuda_and_stub_builds() {
+        assert_ne!(raw::stwo_oods_derive_points_on as usize, 0);
+        assert_ne!(raw::stwo_oods_eval_first_on as usize, 0);
+        assert_ne!(raw::stwo_oods_eval_reduce_on as usize, 0);
+        assert_ne!(raw::stwo_oods_store_results_on as usize, 0);
+        assert_ne!(raw::stwo_oods_barycentric_weights_on as usize, 0);
+        assert_ne!(raw::stwo_oods_barycentric_eval_many_on as usize, 0);
+    }
+
+    #[test]
+    fn prepared_composition_symbols_are_linked_in_cuda_and_stub_builds() {
+        assert_ne!(
+            raw::stwo_composition_generate_descending_powers_on as usize,
+            0
+        );
+        assert_ne!(raw::stwo_composition_lift_accumulate_on as usize, 0);
+        assert_ne!(raw::stwo_composition_materialize_ext_params_on as usize, 0);
+        assert_ne!(raw::stwo_cuda_jit_eval_fused_on as usize, 0);
+    }
+
+    #[test]
+    fn prepared_final_fri_and_pow_symbols_are_linked_in_cuda_and_stub_builds() {
+        assert_ne!(raw::stwo_fri_last_layer_on as usize, 0);
+        assert_ne!(raw::stwo_blake2s_pow_persistent_on as usize, 0);
+    }
+
+    #[test]
+    fn prepared_decommit_symbols_are_linked_in_cuda_and_stub_builds() {
+        assert_ne!(raw::stwo_blake2s_sparse_leaf_group_on as usize, 0);
+        assert_ne!(raw::stwo_decommit_normalize_queries_on as usize, 0);
+        assert_ne!(raw::stwo_decommit_prepare_trace_queries_on as usize, 0);
+        assert_ne!(raw::stwo_decommit_gather_trace_values_on as usize, 0);
+        assert_ne!(raw::stwo_decommit_sparse_parent_on as usize, 0);
+        assert_ne!(raw::stwo_decommit_assemble_trace_on as usize, 0);
+        assert_ne!(raw::stwo_decommit_prepare_fri_queries_on as usize, 0);
+        assert_ne!(raw::stwo_decommit_gather_fri_values_on as usize, 0);
+        assert_ne!(raw::stwo_decommit_assemble_fri_on as usize, 0);
     }
 }

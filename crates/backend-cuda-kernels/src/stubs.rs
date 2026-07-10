@@ -206,15 +206,62 @@ pub unsafe extern "C" fn stwo_relation_pairs_on(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_relation_pairs_global_on(
+    _source_tables: *const *const *const u32,
+    _descriptors: *const *const u32,
+    _output_tables: *const *const *mut u32,
+    _denominator_slabs: *const *mut u32,
+    _geometry: *const u32,
+    _n_instances: u32,
+    _total_pair_blocks: u32,
+    _alpha_powers: *const u32,
+    _n_alpha_powers: u32,
+    _z: *const u32,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_relation_pairs_global_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_relation_fused_on(
+    _source_tables: *const *const *const u32,
+    _descriptors: *const *const u32,
+    _output_tables: *const *const *mut u32,
+    _geometry: *const u32,
+    _n_instances: u32,
+    _total_row_blocks: u32,
+    _alpha_powers: *const u32,
+    _n_alpha_powers: u32,
+    _z: *const u32,
+    _eligible_mask: *const u32,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_relation_fused_on")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stwo_relation_fraction_chain_on(
     _outputs: *const *mut u32,
-    _denominators: *const u32,
+    _denominators: *mut u32,
     _inverse_scratch: *mut u32,
     _n_rows: u32,
     _n_columns: u32,
     _stream: *mut core::ffi::c_void,
 ) -> i32 {
     no_cuda_symbol("stwo_relation_fraction_chain_on")
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn stwo_relation_fraction_chain_global_on(
+    _output_tables: *const *const *mut u32,
+    _denominator_slabs: *const *mut u32,
+    _geometry: *const u32,
+    _n_instances: u32,
+    _total_inverse_blocks: u32,
+    _total_chain_blocks: u32,
+    _stream: *mut c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_relation_fraction_chain_global_on")
 }
 
 #[unsafe(no_mangle)]
@@ -244,6 +291,22 @@ pub unsafe extern "C" fn stwo_relation_prefix_scan_on(
     _stream: *mut core::ffi::c_void,
 ) -> i32 {
     no_cuda_symbol("stwo_relation_prefix_scan_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_relation_tail_global_on(
+    _output_tables: *const *const *mut u32,
+    _claimed_sums: *const *mut u32,
+    _geometry: *const u32,
+    _n_instances: u32,
+    _total_row_blocks: u32,
+    _reduction_partials: *mut u32,
+    _reduction_capacity: u32,
+    _scan_block_sums: *mut u32,
+    _scan_capacity: u32,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_relation_tail_global_on")
 }
 
 #[unsafe(no_mangle)]
@@ -306,6 +369,128 @@ pub unsafe extern "C" fn memory_limb_split_small(
 ) {
     let _ = (values, n_values, column_length, limb_cols);
     no_cuda_symbol("memory_limb_split_small")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn memory_limb_split_big_into_on(
+    values: *const u32,
+    n_values: u32,
+    column_length: u32,
+    limb_cols_host: *const *mut u32,
+    mults_host: *const u32,
+    mults: *mut u32,
+    stream: *mut core::ffi::c_void,
+) -> i32 {
+    let _ = (
+        values,
+        n_values,
+        column_length,
+        limb_cols_host,
+        mults_host,
+        mults,
+        stream,
+    );
+    no_cuda_symbol("memory_limb_split_big_into_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn memory_limb_split_small_into_on(
+    values: *const u32,
+    n_values: u32,
+    column_length: u32,
+    limb_cols_host: *const *mut u32,
+    mults_host: *const u32,
+    mults: *mut u32,
+    stream: *mut core::ffi::c_void,
+) -> i32 {
+    let _ = (
+        values,
+        n_values,
+        column_length,
+        limb_cols_host,
+        mults_host,
+        mults,
+        stream,
+    );
+    no_cuda_symbol("memory_limb_split_small_into_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn memory_limb_split_big_columns_on(
+    values: *const u32,
+    n_values: u32,
+    column_length: u32,
+    limb_cols_host: *const *mut u32,
+    stream: *mut core::ffi::c_void,
+) -> i32 {
+    let _ = (values, n_values, column_length, limb_cols_host, stream);
+    no_cuda_symbol("memory_limb_split_big_columns_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn memory_limb_split_small_columns_on(
+    values: *const u32,
+    n_values: u32,
+    column_length: u32,
+    limb_cols_host: *const *mut u32,
+    stream: *mut core::ffi::c_void,
+) -> i32 {
+    let _ = (values, n_values, column_length, limb_cols_host, stream);
+    no_cuda_symbol("memory_limb_split_small_columns_on")
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn memory_address_base_trace_on(
+    _raw_addr_to_id: *const u32,
+    _n_addrs: u32,
+    _multiplicities: *const u32,
+    _count_words: u32,
+    _column_length: u32,
+    _outputs_host: *const *mut u32,
+    _stream: *mut c_void,
+) -> i32 {
+    no_cuda_symbol("memory_address_base_trace_on")
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn memory_value_base_trace_on(
+    _sources_host: *const *const u32,
+    _n_limbs: u32,
+    _source_words: u32,
+    _source_offset: u32,
+    _multiplicities: *const u32,
+    _count_words: u32,
+    _column_length: u32,
+    _outputs_host: *const *mut u32,
+    _stream: *mut c_void,
+) -> i32 {
+    no_cuda_symbol("memory_value_base_trace_on")
+}
+
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn ec_op_builtin_witness_on(
+    _execution_tables: *const *const u32,
+    _n_addresses: u32,
+    _n_big: u32,
+    _n_small: u32,
+    _segment_start_source: *const u32,
+    _row_count: u32,
+    _trace_columns_host: *const *mut u32,
+    _lookup_words: *mut u32,
+    _partial_input_columns_host: *const *mut u32,
+    _partial_row_count: u32,
+    _address_counts: *mut u32,
+    _address_count_words: u32,
+    _big_counts: *mut u32,
+    _big_count_words: u32,
+    _small_counts: *mut u32,
+    _small_count_words: u32,
+    _range_check_8_counts: *mut u32,
+    _range_check_8_count_words: u32,
+    _stream: *mut c_void,
+) -> i32 {
+    no_cuda_symbol("ec_op_builtin_witness_on")
 }
 
 #[unsafe(no_mangle)]
@@ -432,6 +617,36 @@ pub unsafe extern "C" fn blake_g_write_trace(
 ) {
     let _ = (inputs, n_rows, column_length, cols);
     no_cuda_symbol("blake_g_write_trace")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn blake_g_write_trace_into_on(
+    inputs: *const u32,
+    producer_sub: *const u32,
+    producer_rows: u32,
+    producer_word_base: u32,
+    producer_instances: u32,
+    n_rows: u32,
+    column_length: u32,
+    trace_cols_host: *const *mut u32,
+    lookup: *mut u32,
+    sub: *mut u32,
+    stream: *mut core::ffi::c_void,
+) -> i32 {
+    let _ = (
+        inputs,
+        producer_sub,
+        producer_rows,
+        producer_word_base,
+        producer_instances,
+        n_rows,
+        column_length,
+        trace_cols_host,
+        lookup,
+        sub,
+        stream,
+    );
+    no_cuda_symbol("blake_g_write_trace_into_on")
 }
 
 #[unsafe(no_mangle)]
@@ -1003,6 +1218,23 @@ pub unsafe extern "C" fn stwo_blake2s_leaf_finalize_on(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_blake2s_leaf_group_from_lde_on(
+    _size: u32,
+    _group_n_cols: u32,
+    _prefinal_columns: *const *mut u32,
+    _column_log_sizes: *const u32,
+    _lifting_log_size: u32,
+    _cols_done: u32,
+    _is_final: u32,
+    _twiddles: *mut u32,
+    _twiddle_words: u32,
+    _state: *mut Blake2sHash,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_blake2s_leaf_group_from_lde_on")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stwo_blake2s_layer_on(
     _previous_layer: *const Blake2sHash,
     _output_size: u32,
@@ -1184,6 +1416,154 @@ pub unsafe extern "C" fn stwo_combine_quotients_from_numerators_on(
     _stream: *mut core::ffi::c_void,
 ) -> i32 {
     no_cuda_symbol("stwo_combine_quotients_from_numerators_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_prepare_quotient_numerator_terms_on(
+    _term_descriptors: *const u32,
+    _term_count: u32,
+    _sample_points: *const u32,
+    _sample_values: *const CudaSecureField,
+    _random_coefficient: *const CudaSecureField,
+    _term_points: *mut u32,
+    _line_coefficients: *mut CudaSecureField,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_prepare_quotient_numerator_terms_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_finalize_quotient_numerator_groups_on(
+    _group_offsets: *const u32,
+    _group_term_indices: *const u32,
+    _group_count: u32,
+    _term_points: *const u32,
+    _line_coefficients: *const CudaSecureField,
+    _sample_points: *mut u32,
+    _first_linear_terms: *mut CudaSecureField,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_finalize_quotient_numerator_groups_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_zero_quotient_numerator_outputs_on(
+    _group_log_sizes: *const u32,
+    _group_count: u32,
+    _max_output_size: u32,
+    _outputs_0: *const *mut u32,
+    _outputs_1: *const *mut u32,
+    _outputs_2: *const *mut u32,
+    _outputs_3: *const *mut u32,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_zero_quotient_numerator_outputs_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_accumulate_quotient_numerator_batch_on(
+    _group_offsets: *const u32,
+    _term_descriptors: *const u32,
+    _group_count: u32,
+    _max_output_size: u32,
+    _source_evaluations: *const *const u32,
+    _line_coefficients: *const CudaSecureField,
+    _group_log_sizes: *const u32,
+    _outputs_0: *const *mut u32,
+    _outputs_1: *const *mut u32,
+    _outputs_2: *const *mut u32,
+    _outputs_3: *const *mut u32,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_accumulate_quotient_numerator_batch_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_oods_derive_points_on(
+    _oods_parameter: *const CudaSecureField,
+    _offset_points: *const CirclePointBaseField,
+    _fold_counts: *const u32,
+    _output_indices: *const u32,
+    _sample_count: u32,
+    _coefficient_log_size: u32,
+    _sample_points: *mut u32,
+    _evaluation_points: *mut u32,
+    _folding_factors: *mut CudaSecureField,
+    _stream: *mut c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_oods_derive_points_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_oods_eval_first_on(
+    _coefficients: *const *const u32,
+    _coefficient_size: u32,
+    _sample_count: u32,
+    _folding_factors: *const CudaSecureField,
+    _scratch: *mut CudaSecureField,
+    _stream: *mut c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_oods_eval_first_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_oods_eval_reduce_on(
+    _input: *const CudaSecureField,
+    _input_size: u32,
+    _input_stride: u32,
+    _factor_index: u32,
+    _coefficient_log_size: u32,
+    _sample_count: u32,
+    _folding_factors: *const CudaSecureField,
+    _output: *mut CudaSecureField,
+    _output_stride: u32,
+    _stream: *mut c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_oods_eval_reduce_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_oods_store_results_on(
+    _reduced: *const CudaSecureField,
+    _reduced_stride: u32,
+    _output_indices: *const u32,
+    _sample_count: u32,
+    _sampled_values: *mut CudaSecureField,
+    _stream: *mut c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_oods_store_results_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_oods_barycentric_weights_on(
+    _half_coset_initial_index: u32,
+    _half_coset_step_size: u32,
+    _size: u32,
+    _log_size: u32,
+    _evaluation_point: *const u32,
+    _si0: CudaSecureField,
+    _vanishing_rotation: CirclePointBaseField,
+    _numerator_inverses: *mut CudaSecureField,
+    _weights: *mut CudaSecureField,
+    _scales: *mut CudaSecureField,
+    _stream: *mut c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_oods_barycentric_weights_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_oods_barycentric_eval_many_on(
+    _columns: *const *const u32,
+    _column_count: u32,
+    _weights: *const CudaSecureField,
+    _size: u32,
+    _partial_sums: *mut CudaSecureField,
+    _reduction_blocks: u32,
+    _output_indices: *const u32,
+    _sampled_values: *mut CudaSecureField,
+    _stream: *mut c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_oods_barycentric_eval_many_on")
 }
 
 #[unsafe(no_mangle)]
@@ -1387,6 +1767,43 @@ pub unsafe extern "C" fn stwo_lde_n2b_columns_on(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_lde_n2b_columns_before_circle_on(
+    _coefficient_values: *const *const u32,
+    _coefficient_sizes: *const u32,
+    _device_values: *const *mut u32,
+    _log_n: u32,
+    _num_poly: u32,
+    _g_twiddles: *mut u32,
+    _twiddles_size: u32,
+    _eval_domain_size: u32,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_lde_n2b_columns_before_circle_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_lde_n2b_hash16_configure(_log_n: u32) -> i32 {
+    no_cuda_symbol("stwo_lde_n2b_hash16_configure")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_lde_n2b_hash16_on(
+    _coefficient_values: *const *const u32,
+    _coefficient_sizes: *const u32,
+    _device_values: *const *mut u32,
+    _log_n: u32,
+    _g_twiddles: *mut u32,
+    _twiddles_size: u32,
+    _eval_domain_size: u32,
+    _cols_done: u32,
+    _is_final: u32,
+    _states: *mut Blake2sHash,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_lde_n2b_hash16_on")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn cuda_malloc_poseidon252_hash(size: usize) -> *mut [u8; 32] {
     no_cuda_symbol("cuda_malloc_poseidon252_hash")
 }
@@ -1507,6 +1924,70 @@ pub unsafe extern "C" fn stwo_cuda_jit_eval_fused(
 }
 
 #[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn stwo_cuda_jit_eval_fused_on(
+    _source: *const core::ffi::c_char,
+    _kernel_name: *const core::ffi::c_char,
+    _semantic_hash: u64,
+    _trace_values: *const u32,
+    _interaction_offsets: *const u32,
+    _base_params: *const u32,
+    _ext_params: *const u32,
+    _random_coeff_powers: *const u32,
+    _denom_inv: *const u32,
+    _coord_0: *mut u32,
+    _coord_1: *mut u32,
+    _coord_2: *mut u32,
+    _coord_3: *mut u32,
+    _row_count: u32,
+    _log_n_rows: u32,
+    _rc_base: u32,
+    _relax_opt: bool,
+    _stream: *mut core::ffi::c_void,
+) -> bool {
+    no_cuda_symbol("stwo_cuda_jit_eval_fused_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_composition_generate_descending_powers_on(
+    _random_coefficient: *const CudaSecureField,
+    _powers: *mut CudaSecureField,
+    _count: u32,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_composition_generate_descending_powers_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_composition_lift_accumulate_on(
+    _previous_coordinates: *const u32,
+    _previous_log_size: u32,
+    _current_coordinates: *mut u32,
+    _current_log_size: u32,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_composition_lift_accumulate_on")
+}
+
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn stwo_composition_materialize_ext_params_on(
+    _destinations: *const *mut CudaSecureField,
+    _source_kinds: *const u32,
+    _source_indices: *const u32,
+    _scales: *const u32,
+    _count: u32,
+    _z: *const CudaSecureField,
+    _alpha_powers: *const CudaSecureField,
+    _alpha_power_count: u32,
+    _claimed_sums: *const *const CudaSecureField,
+    _claimed_sum_count: u32,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_composition_materialize_ext_params_on")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stwo_cuda_jit_precompile(
     _source: *const core::ffi::c_char,
     _kernel_name: *const core::ffi::c_char,
@@ -1614,11 +2095,52 @@ pub unsafe extern "C" fn stwo_exec_context_sync(_handle: *mut core::ffi::c_void)
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_exec_context_stream_sync(
+    _handle: *mut core::ffi::c_void,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_exec_context_stream_sync")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stwo_exec_context_stream(
     _handle: *mut core::ffi::c_void,
     _out_stream: *mut *mut core::ffi::c_void,
 ) -> i32 {
     no_cuda_symbol("stwo_exec_context_stream")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_exec_context_lane_count(
+    _handle: *mut core::ffi::c_void,
+    _out_count: *mut u32,
+) -> i32 {
+    no_cuda_symbol("stwo_exec_context_lane_count")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_exec_context_lane_stream(
+    _handle: *mut core::ffi::c_void,
+    _lane: u32,
+    _out_stream: *mut *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_exec_context_lane_stream")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_exec_context_lane_fork(
+    _handle: *mut core::ffi::c_void,
+    _lane: u32,
+) -> i32 {
+    no_cuda_symbol("stwo_exec_context_lane_fork")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_exec_context_lane_join(
+    _handle: *mut core::ffi::c_void,
+    _lane: u32,
+) -> i32 {
+    no_cuda_symbol("stwo_exec_context_lane_join")
 }
 
 #[unsafe(no_mangle)]
@@ -1697,6 +2219,7 @@ pub unsafe extern "C" fn stwo_graph_capture_begin(_handle: *mut core::ffi::c_voi
 pub unsafe extern "C" fn stwo_graph_capture_end(
     _handle: *mut core::ffi::c_void,
     _out_exec: *mut *mut core::ffi::c_void,
+    _out_kernel_nodes: *mut u64,
 ) -> i32 {
     no_cuda_symbol("stwo_graph_capture_end")
 }
@@ -1869,6 +2392,98 @@ pub unsafe extern "C" fn stwo_witness_edge_gather(
 }
 
 #[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn stwo_witness_input_gather_on(
+    _producer_subs_dev: *const *const u32,
+    _edge_descs_dev: *const u32,
+    _n_edges: u32,
+    _input_width: u32,
+    _total_real_rows: u32,
+    _consumer_rows: u32,
+    _consumer_cols_dev: *const *mut u32,
+    _include_enabler: u32,
+    _include_iota: u32,
+    _stream: *mut c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_witness_input_gather_on")
+}
+
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn stwo_witness_input_seed_on(
+    _scalars_dev: *const u32,
+    _n_scalars: u32,
+    _n_real_rows: u32,
+    _consumer_rows: u32,
+    _consumer_cols_dev: *const *mut u32,
+    _include_enabler: u32,
+    _include_iota: u32,
+    _stream: *mut c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_witness_input_seed_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_witness_input_compact_sort_temp_bytes(_rows: u32) -> usize {
+    no_cuda_symbol("stwo_witness_input_compact_sort_temp_bytes")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_witness_input_compact_scan_temp_bytes(_rows: u32) -> usize {
+    no_cuda_symbol("stwo_witness_input_compact_scan_temp_bytes")
+}
+
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn stwo_witness_input_compact_on(
+    _producer_subs_dev: *const *const u32,
+    _edge_descs_dev: *const u32,
+    _n_edges: u32,
+    _tuple_words: u32,
+    _key_words: u32,
+    _total_rows: u32,
+    _sort_rows: u32,
+    _consumer_rows: u32,
+    _n_inputs: u32,
+    _consumer_cols_dev: *const *mut u32,
+    _enabler_slot: u32,
+    _iota_slot: u32,
+    _multiplicity_slot: u32,
+    _tuples_dev: *mut u32,
+    _keys_a_dev: *mut u32,
+    _keys_b_dev: *mut u32,
+    _indices_a_dev: *mut u32,
+    _indices_b_dev: *mut u32,
+    _heads_dev: *mut u32,
+    _positions_dev: *mut u32,
+    _n_unique_dev: *mut u32,
+    _sort_temp_dev: *mut c_void,
+    _sort_temp_bytes: usize,
+    _scan_temp_dev: *mut c_void,
+    _scan_temp_bytes: usize,
+    _stream: *mut c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_witness_input_compact_on")
+}
+
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn stwo_fixed_table_materialize_on(
+    _source_columns_dev: *const *const u32,
+    _multiplicity_columns_dev: *const *const u32,
+    _trace_multiplicity_columns_dev: *const u32,
+    _trace_outputs_dev: *const *mut u32,
+    _n_trace_outputs: u32,
+    _lookup_descriptors_dev: *const u32,
+    _lookup_outputs_dev: *const *mut u32,
+    _n_lookup_outputs: u32,
+    _row_count: u32,
+    _stream: *mut c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_fixed_table_materialize_on")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stwo_witness_feed_counts(
     _sub_words_dev: *const u32,
     _column_length: u32,
@@ -1878,4 +2493,217 @@ pub unsafe extern "C" fn stwo_witness_feed_counts(
     _counts_dev: *const *mut u32,
 ) -> i32 {
     no_cuda_symbol("stwo_witness_feed_counts")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_witness_feed_counts_on(
+    _sub_words_dev: *const u32,
+    _column_length: u32,
+    _descs_dev: *const u32,
+    _n_descs: u32,
+    _luts_dev: *const *const u32,
+    _counts_dev: *const *mut u32,
+    _stream: *mut c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_witness_feed_counts_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_witness_feed_clear_on(
+    _destinations_dev: *const *mut u32,
+    _lengths_dev: *const u32,
+    _n_destinations: u32,
+    _max_words: u32,
+    _stream: *mut c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_witness_feed_clear_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_fri_last_layer_on(
+    _evaluation: *const u32,
+    _evaluation_stride: u32,
+    _log_size: u32,
+    _inverse_twiddles: *const u32,
+    _inverse_twiddle_words: u32,
+    _log_degree_bound: u32,
+    _coefficients: *mut u32,
+    _degree_error: *mut u32,
+    _transcript_coefficients: *mut u32,
+    _stream: *mut c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_fri_last_layer_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_blake2s_pow_persistent_on(
+    _transcript_state: *const u32,
+    _pow_bits: u32,
+    _best_nonce: *mut u64,
+    _completed_blocks: *mut u32,
+    _transcript_nonce: *mut u32,
+    _stream: *mut c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_blake2s_pow_persistent_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_blake2s_sparse_leaf_group_on(
+    _leaf_indices: *const u32,
+    _leaf_count: *const u32,
+    _max_leaf_count: u32,
+    _group_n_cols: u32,
+    _columns: *const *mut u32,
+    _column_log_sizes: *const u32,
+    _lifting_log_size: u32,
+    _cols_done: u32,
+    _is_final: u32,
+    _states: *mut Blake2sHash,
+    _stream: *mut c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_blake2s_sparse_leaf_group_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_decommit_normalize_queries_on(
+    _raw_queries: *const u32,
+    _raw_query_count: u32,
+    _query_log_size: u32,
+    _tree_count: u32,
+    _unique_queries: *mut u32,
+    _unique_count: *mut u32,
+    _assembly: *mut u32,
+    _assembly_capacity_words: u32,
+    _stream: *mut c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_decommit_normalize_queries_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_decommit_prepare_trace_queries_on(
+    _unique_queries: *const u32,
+    _unique_count: *const u32,
+    _max_queries: u32,
+    _source_log_size: u32,
+    _tree_log_size: u32,
+    _leaf_log_size: u32,
+    _unretained_bottom_layers: u32,
+    _mapped_queries: *mut u32,
+    _mapped_count: *mut u32,
+    _walk_queries: *mut u32,
+    _walk_count: *mut u32,
+    _leaf_indices: *mut u32,
+    _leaf_count: *mut u32,
+    _stream: *mut c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_decommit_prepare_trace_queries_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_decommit_gather_trace_values_on(
+    _columns: *const *const u32,
+    _column_log_sizes: *const u32,
+    _column_count: u32,
+    _lifting_log_size: u32,
+    _mapped_queries: *const u32,
+    _mapped_count: *const u32,
+    _max_queries: u32,
+    _destination_first_column: u32,
+    _destination_stride: u32,
+    _queried_values: *mut u32,
+    _stream: *mut c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_decommit_gather_trace_values_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_decommit_sparse_parent_on(
+    _child_indices: *const u32,
+    _child_hashes: *const Blake2sHash,
+    _child_count: *const u32,
+    _max_child_count: u32,
+    _parent_indices: *mut u32,
+    _parent_hashes: *mut Blake2sHash,
+    _parent_count: *mut u32,
+    _stream: *mut c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_decommit_sparse_parent_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_decommit_assemble_trace_on(
+    _tree_index: u32,
+    _tree_role: u32,
+    _leaf_log_size: u32,
+    _first_retained_log_size: u32,
+    _column_count: u32,
+    _mapped_queries: *const u32,
+    _mapped_count: *const u32,
+    _max_queries: u32,
+    _walk_queries: *mut u32,
+    _walk_scratch: *mut u32,
+    _walk_count: *const u32,
+    _queried_values: *const u32,
+    _retained_layers_by_log: *const *const Blake2sHash,
+    _sparse_indices: *const u32,
+    _sparse_hashes: *const Blake2sHash,
+    _sparse_level_offsets: *const u32,
+    _sparse_level_counts: *const u32,
+    _sparse_level_count: u32,
+    _assembly: *mut u32,
+    _assembly_capacity_words: u32,
+    _stream: *mut c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_decommit_assemble_trace_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_decommit_prepare_fri_queries_on(
+    _unique_queries: *const u32,
+    _unique_count: *const u32,
+    _max_queries: u32,
+    _cumulative_fold: u32,
+    _fold_step: u32,
+    _log_rows_per_leaf: u32,
+    _tree_queries: *mut u32,
+    _tree_query_count: *mut u32,
+    _expanded_positions: *mut u32,
+    _expanded_count: *mut u32,
+    _walk_queries: *mut u32,
+    _walk_count: *mut u32,
+    _stream: *mut c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_decommit_prepare_fri_queries_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_decommit_gather_fri_values_on(
+    _coordinate_columns: *const *const u32,
+    _expanded_positions: *const u32,
+    _expanded_count: *const u32,
+    _max_expanded_positions: u32,
+    _expanded_values: *mut u32,
+    _stream: *mut c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_decommit_gather_fri_values_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_decommit_assemble_fri_on(
+    _tree_index: u32,
+    _leaf_log_size: u32,
+    _tree_queries: *const u32,
+    _tree_query_count: *const u32,
+    _expanded_positions: *const u32,
+    _expanded_count: *const u32,
+    _expanded_values: *const u32,
+    _walk_queries: *mut u32,
+    _walk_scratch: *mut u32,
+    _walk_count: *const u32,
+    _retained_layers_by_log: *const *const Blake2sHash,
+    _assembly: *mut u32,
+    _assembly_capacity_words: u32,
+    _stream: *mut c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_decommit_assemble_fri_on")
 }

@@ -102,6 +102,63 @@ extern "C" {
         rc_base: u32,
         relax_opt: bool,
     ) -> bool;
+    /// Allocation-free explicit-stream form used by resident composition graphs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stwo_cuda_jit_eval_fused_on(
+        source: *const core::ffi::c_char,
+        kernel_name: *const core::ffi::c_char,
+        semantic_hash: u64,
+        trace_values: *const u32,
+        interaction_offsets: *const u32,
+        base_params: *const u32,
+        ext_params: *const u32,
+        random_coeff_powers: *const u32,
+        denom_inv: *const u32,
+        coord_0: *mut u32,
+        coord_1: *mut u32,
+        coord_2: *mut u32,
+        coord_3: *mut u32,
+        row_count: u32,
+        log_n_rows: u32,
+        rc_base: u32,
+        relax_opt: bool,
+        stream: *mut c_void,
+    ) -> bool;
+    /// Generate `[alpha^(count-1), ..., alpha, 1]` from a device-resident
+    /// transcript parameter on the caller's stream.
+    pub fn stwo_composition_generate_descending_powers_on(
+        random_coefficient: *const CudaSecureField,
+        powers: *mut CudaSecureField,
+        count: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    /// Lift the smaller coordinate-major secure evaluation into the larger
+    /// bit-reversed circle domain and add it in place, on `stream`.
+    pub fn stwo_composition_lift_accumulate_on(
+        previous_coordinates: *const u32,
+        previous_log_size: u32,
+        current_coordinates: *mut u32,
+        current_log_size: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    /// Materialize statement-dependent extension parameters into stable
+    /// per-component destinations. Source kinds are 0 = z, 1 = alpha power,
+    /// and 2 = claimed sum; every result is multiplied by its M31 scale.
+    /// `claimed_sums` may be null exactly when `claimed_sum_count` is zero.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stwo_composition_materialize_ext_params_on(
+        destinations: *const *mut CudaSecureField,
+        source_kinds: *const u32,
+        source_indices: *const u32,
+        scales: *const u32,
+        count: u32,
+        z: *const CudaSecureField,
+        alpha_powers: *const CudaSecureField,
+        alpha_power_count: u32,
+        claimed_sums: *const *const CudaSecureField,
+        claimed_sum_count: u32,
+        stream: *mut c_void,
+    ) -> i32;
     /// Compile a generated kernel into the JIT cache WITHOUT launching it. Used to
     /// compile every kernel of a split component before the first launch, so a
     /// compile failure can still fall back to the CPU lane with an untouched
@@ -442,6 +499,22 @@ extern "C" {
         result: *mut Blake2sHash,
         stream: *mut core::ffi::c_void,
     ) -> i32;
+    /// Complete each column's final circle butterfly inside the leaf-hash
+    /// kernel instead of materializing and rereading the completed LDE.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stwo_blake2s_leaf_group_from_lde_on(
+        size: u32,
+        group_n_cols: u32,
+        prefinal_columns: *const *mut u32,
+        column_log_sizes: *const u32,
+        lifting_log_size: u32,
+        cols_done: u32,
+        is_final: u32,
+        twiddles: *mut u32,
+        twiddle_words: u32,
+        state: *mut Blake2sHash,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
     pub fn stwo_blake2s_layer_on(
         previous_layer: *const Blake2sHash,
         output_size: u32,
@@ -580,6 +653,125 @@ extern "C" {
         result_column_3: *mut u32,
         denominator_inverses: *mut u32,
         denominator_count: u64,
+        stream: *mut c_void,
+    ) -> i32;
+
+    pub fn stwo_prepare_quotient_numerator_terms_on(
+        term_descriptors: *const u32,
+        term_count: u32,
+        sample_points: *const u32,
+        sample_values: *const CudaSecureField,
+        random_coefficient: *const CudaSecureField,
+        term_points: *mut u32,
+        line_coefficients: *mut CudaSecureField,
+        stream: *mut c_void,
+    ) -> i32;
+
+    pub fn stwo_finalize_quotient_numerator_groups_on(
+        group_offsets: *const u32,
+        group_term_indices: *const u32,
+        group_count: u32,
+        term_points: *const u32,
+        line_coefficients: *const CudaSecureField,
+        sample_points: *mut u32,
+        first_linear_terms: *mut CudaSecureField,
+        stream: *mut c_void,
+    ) -> i32;
+
+    pub fn stwo_zero_quotient_numerator_outputs_on(
+        group_log_sizes: *const u32,
+        group_count: u32,
+        max_output_size: u32,
+        outputs_0: *const *mut u32,
+        outputs_1: *const *mut u32,
+        outputs_2: *const *mut u32,
+        outputs_3: *const *mut u32,
+        stream: *mut c_void,
+    ) -> i32;
+
+    pub fn stwo_accumulate_quotient_numerator_batch_on(
+        group_offsets: *const u32,
+        term_descriptors: *const u32,
+        group_count: u32,
+        max_output_size: u32,
+        source_evaluations: *const *const u32,
+        line_coefficients: *const CudaSecureField,
+        group_log_sizes: *const u32,
+        outputs_0: *const *mut u32,
+        outputs_1: *const *mut u32,
+        outputs_2: *const *mut u32,
+        outputs_3: *const *mut u32,
+        stream: *mut c_void,
+    ) -> i32;
+
+    /// Allocation-free coefficient-form OODS evaluation on an explicit proof stream.
+    pub fn stwo_oods_derive_points_on(
+        oods_parameter: *const CudaSecureField,
+        offset_points: *const CirclePointBaseField,
+        fold_counts: *const u32,
+        output_indices: *const u32,
+        sample_count: u32,
+        coefficient_log_size: u32,
+        sample_points: *mut u32,
+        evaluation_points: *mut u32,
+        folding_factors: *mut CudaSecureField,
+        stream: *mut c_void,
+    ) -> i32;
+
+    pub fn stwo_oods_eval_first_on(
+        coefficients: *const *const u32,
+        coefficient_size: u32,
+        sample_count: u32,
+        folding_factors: *const CudaSecureField,
+        scratch: *mut CudaSecureField,
+        stream: *mut c_void,
+    ) -> i32;
+
+    pub fn stwo_oods_eval_reduce_on(
+        input: *const CudaSecureField,
+        input_size: u32,
+        input_stride: u32,
+        factor_index: u32,
+        coefficient_log_size: u32,
+        sample_count: u32,
+        folding_factors: *const CudaSecureField,
+        output: *mut CudaSecureField,
+        output_stride: u32,
+        stream: *mut c_void,
+    ) -> i32;
+
+    pub fn stwo_oods_store_results_on(
+        reduced: *const CudaSecureField,
+        reduced_stride: u32,
+        output_indices: *const u32,
+        sample_count: u32,
+        sampled_values: *mut CudaSecureField,
+        stream: *mut c_void,
+    ) -> i32;
+
+    pub fn stwo_oods_barycentric_weights_on(
+        half_coset_initial_index: u32,
+        half_coset_step_size: u32,
+        size: u32,
+        log_size: u32,
+        evaluation_point: *const u32,
+        si0: CudaSecureField,
+        vanishing_rotation: CirclePointBaseField,
+        numerator_inverses: *mut CudaSecureField,
+        weights: *mut CudaSecureField,
+        scales: *mut CudaSecureField,
+        stream: *mut c_void,
+    ) -> i32;
+
+    pub fn stwo_oods_barycentric_eval_many_on(
+        columns: *const *const u32,
+        column_count: u32,
+        weights: *const CudaSecureField,
+        size: u32,
+        partial_sums: *mut CudaSecureField,
+        reduction_blocks: u32,
+        output_indices: *const u32,
+        sampled_values: *mut CudaSecureField,
         stream: *mut c_void,
     ) -> i32;
 
@@ -738,6 +930,41 @@ extern "C" {
         stream: *mut core::ffi::c_void,
     ) -> i32;
 
+    /// Allocation-free LDE prefix ending immediately before the final circle
+    /// butterfly; consumed by `stwo_blake2s_leaf_group_from_lde_on`.
+    pub fn stwo_lde_n2b_columns_before_circle_on(
+        coefficient_values: *const *const u32,
+        coefficient_sizes: *const u32,
+        device_values: *const *mut u32,
+        log_n: u32,
+        num_poly: u32,
+        g_twiddles: *mut u32,
+        twiddles_size: u32,
+        eval_domain_size: u32,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
+    /// Setup-time dynamic-shared-memory admission for the producer-fused
+    /// 16-column N2B→Blake kernel selected by `log_n`.
+    pub fn stwo_lde_n2b_hash16_configure(log_n: u32) -> i32;
+
+    /// Stage and transform 16 same-log full-lifting columns, feeding final N2B
+    /// values directly from registers/shared memory into leaf states.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stwo_lde_n2b_hash16_on(
+        coefficient_values: *const *const u32,
+        coefficient_sizes: *const u32,
+        device_values: *const *mut u32,
+        log_n: u32,
+        g_twiddles: *mut u32,
+        twiddles_size: u32,
+        eval_domain_size: u32,
+        cols_done: u32,
+        is_final: u32,
+        states: *mut Blake2sHash,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
     pub fn inclusive_prefix_sum(device_bit_rev_circle_domain_evals: *const u32, len: u32);
 
     pub fn inclusive_prefix_sum_x4(
@@ -806,9 +1033,42 @@ extern "C" {
         stream: *mut core::ffi::c_void,
     ) -> i32;
 
+    pub fn stwo_relation_pairs_global_on(
+        source_tables: *const *const *const u32,
+        descriptors: *const *const u32,
+        output_tables: *const *const *mut u32,
+        denominator_slabs: *const *mut u32,
+        geometry: *const u32,
+        n_instances: u32,
+        total_pair_blocks: u32,
+        alpha_powers: *const u32,
+        n_alpha_powers: u32,
+        z: *const u32,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
+    /// Fused pairs -> single-inversion -> fraction-chain lane: one proof-wide
+    /// launch over the shared 11-word geometry records. `eligible_mask` is a
+    /// HOST pointer to 8 words (256 instance bits) copied into the by-value
+    /// kernel parameter before launch; ineligible instances are skipped and
+    /// must be executed by the caller on the 3-stage path.
+    pub fn stwo_relation_fused_on(
+        source_tables: *const *const *const u32,
+        descriptors: *const *const u32,
+        output_tables: *const *const *mut u32,
+        geometry: *const u32,
+        n_instances: u32,
+        total_row_blocks: u32,
+        alpha_powers: *const u32,
+        n_alpha_powers: u32,
+        z: *const u32,
+        eligible_mask: *const u32,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
     pub fn stwo_relation_fraction_chain_on(
         outputs: *const *mut u32,
-        denominators: *const u32,
+        denominators: *mut u32,
         inverse_scratch: *mut u32,
         n_rows: u32,
         n_columns: u32,
@@ -835,6 +1095,19 @@ extern "C" {
         eval_scratch: *mut u32,
         scan_temp: *mut core::ffi::c_void,
         scan_temp_bytes: usize,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
+    pub fn stwo_relation_tail_global_on(
+        output_tables: *const *const *mut u32,
+        claimed_sums: *const *mut u32,
+        geometry: *const u32,
+        n_instances: u32,
+        total_row_blocks: u32,
+        reduction_partials: *mut u32,
+        reduction_capacity: u32,
+        scan_block_sums: *mut u32,
+        scan_capacity: u32,
         stream: *mut core::ffi::c_void,
     ) -> i32;
 
@@ -872,6 +1145,97 @@ extern "C" {
         column_length: u32,
         limb_cols: *const *const u32,
     );
+
+    pub fn memory_limb_split_big_into_on(
+        values: *const u32,
+        n_values: u32,
+        column_length: u32,
+        limb_cols_host: *const *mut u32,
+        mults_host: *const u32,
+        mults: *mut u32,
+        stream: *mut c_void,
+    ) -> i32;
+    pub fn stwo_relation_fraction_chain_global_on(
+        output_tables: *const *const *mut u32,
+        denominator_slabs: *const *mut u32,
+        geometry: *const u32,
+        n_instances: u32,
+        total_inverse_blocks: u32,
+        total_chain_blocks: u32,
+        stream: *mut c_void,
+    ) -> i32;
+
+    pub fn memory_limb_split_small_into_on(
+        values: *const u32,
+        n_values: u32,
+        column_length: u32,
+        limb_cols_host: *const *mut u32,
+        mults_host: *const u32,
+        mults: *mut u32,
+        stream: *mut c_void,
+    ) -> i32;
+
+    pub fn memory_limb_split_big_columns_on(
+        values: *const u32,
+        n_values: u32,
+        column_length: u32,
+        limb_cols_host: *const *mut u32,
+        stream: *mut c_void,
+    ) -> i32;
+
+    pub fn memory_limb_split_small_columns_on(
+        values: *const u32,
+        n_values: u32,
+        column_length: u32,
+        limb_cols_host: *const *mut u32,
+        stream: *mut c_void,
+    ) -> i32;
+    pub fn memory_address_base_trace_on(
+        raw_addr_to_id: *const u32,
+        n_addrs: u32,
+        multiplicities: *const u32,
+        count_words: u32,
+        column_length: u32,
+        outputs_host: *const *mut u32,
+        stream: *mut c_void,
+    ) -> i32;
+    pub fn memory_value_base_trace_on(
+        sources_host: *const *const u32,
+        n_limbs: u32,
+        source_words: u32,
+        source_offset: u32,
+        multiplicities: *const u32,
+        count_words: u32,
+        column_length: u32,
+        outputs_host: *const *mut u32,
+        stream: *mut c_void,
+    ) -> i32;
+
+    /// Capture-safe native Cairo `ec_op_builtin` writer. The execution-table
+    /// pointer table is device-resident; every destination points into the
+    /// proof arena.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ec_op_builtin_witness_on(
+        execution_tables: *const *const u32,
+        n_addresses: u32,
+        n_big: u32,
+        n_small: u32,
+        segment_start_source: *const u32,
+        row_count: u32,
+        trace_columns_host: *const *mut u32,
+        lookup_words: *mut u32,
+        partial_input_columns_host: *const *mut u32,
+        partial_row_count: u32,
+        address_counts: *mut u32,
+        address_count_words: u32,
+        big_counts: *mut u32,
+        big_count_words: u32,
+        small_counts: *mut u32,
+        small_count_words: u32,
+        range_check_8_counts: *mut u32,
+        range_check_8_count_words: u32,
+        stream: *mut c_void,
+    ) -> i32;
 
     pub fn memory_rc99_count(
         limb_cols: *const *const u32,
@@ -947,6 +1311,24 @@ extern "C" {
         column_length: u32,
         cols: *const *const u32,
     );
+
+    /// Allocation-free arena-native blake_g writer. Exactly one of `inputs`
+    /// (row-major) and `producer_sub` (blake_round word-major edge) is non-null.
+    /// `trace_cols_host` is a host array of 53 device addresses copied into the
+    /// kernel argument; lookup/sub are canonical word-major flat outputs.
+    pub fn blake_g_write_trace_into_on(
+        inputs: *const u32,
+        producer_sub: *const u32,
+        producer_rows: u32,
+        producer_word_base: u32,
+        producer_instances: u32,
+        n_rows: u32,
+        column_length: u32,
+        trace_cols_host: *const *mut u32,
+        lookup: *mut u32,
+        sub: *mut u32,
+        stream: *mut c_void,
+    ) -> i32;
 
     pub fn blake_g_xor_count(
         a_cols: *const *const u32,
@@ -1153,10 +1535,23 @@ extern "C" {
     pub fn stwo_exec_context_create(out_handle: *mut *mut core::ffi::c_void) -> i32;
     pub fn stwo_exec_context_destroy(handle: *mut core::ffi::c_void) -> i32;
     pub fn stwo_exec_context_sync(handle: *mut core::ffi::c_void) -> i32;
+    pub fn stwo_exec_context_stream_sync(
+        handle: *mut core::ffi::c_void,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
     pub fn stwo_exec_context_stream(
         handle: *mut core::ffi::c_void,
         out_stream: *mut *mut core::ffi::c_void,
     ) -> i32;
+    pub fn stwo_exec_context_lane_count(handle: *mut core::ffi::c_void, out_count: *mut u32)
+        -> i32;
+    pub fn stwo_exec_context_lane_stream(
+        handle: *mut core::ffi::c_void,
+        lane: u32,
+        out_stream: *mut *mut core::ffi::c_void,
+    ) -> i32;
+    pub fn stwo_exec_context_lane_fork(handle: *mut core::ffi::c_void, lane: u32) -> i32;
+    pub fn stwo_exec_context_lane_join(handle: *mut core::ffi::c_void, lane: u32) -> i32;
     pub fn stwo_exec_context_alloc_u32(
         handle: *mut core::ffi::c_void,
         count: usize,
@@ -1194,12 +1589,14 @@ extern "C" {
         bytes: usize,
     ) -> i32;
 
-    // Opaque single-stream CUDA graph exec lifecycle. Capture is bounded to the
-    // context stream; host transcript work remains outside the captured segment.
+    // Opaque CUDA graph lifecycle rooted on the context main stream. Explicit
+    // proof-owned lane fork/join edges admit auxiliary streams into the same
+    // captured segment; host transcript work remains outside.
     pub fn stwo_graph_capture_begin(handle: *mut core::ffi::c_void) -> i32;
     pub fn stwo_graph_capture_end(
         handle: *mut core::ffi::c_void,
         out_exec: *mut *mut core::ffi::c_void,
+        out_kernel_nodes: *mut u64,
     ) -> i32;
     pub fn stwo_graph_capture_abort(handle: *mut core::ffi::c_void) -> i32;
     pub fn stwo_graph_launch(
@@ -1298,7 +1695,7 @@ extern "C" {
 
     // Device DAG (B2): generalized multiplicity count feed over a witness
     // kernel's word-major sub buffer (see witness_feed_counts.cu). All pointer
-    // args are DEVICE pointers; descs is the flat 11-u32-stride descriptor
+    // args are DEVICE pointers; descs is the flat 14-u32-stride descriptor
     // array. Returns 0 on success.
     // Commit fusion (C2): the top K Merkle levels in one launch (see the tail
     // kernel in blake2s.cu). out_levels is a DEVICE array of per-level output
@@ -1340,6 +1737,77 @@ extern "C" {
         consumer_rows: u32,
         consumer_cols_dev: *const *mut u32,
     ) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    pub fn stwo_witness_input_gather_on(
+        producer_subs_dev: *const *const u32,
+        edge_descs_dev: *const u32,
+        n_edges: u32,
+        input_width: u32,
+        total_real_rows: u32,
+        consumer_rows: u32,
+        consumer_cols_dev: *const *mut u32,
+        include_enabler: u32,
+        include_iota: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    pub fn stwo_witness_input_seed_on(
+        scalars_dev: *const u32,
+        n_scalars: u32,
+        n_real_rows: u32,
+        consumer_rows: u32,
+        consumer_cols_dev: *const *mut u32,
+        include_enabler: u32,
+        include_iota: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    pub fn stwo_witness_input_compact_sort_temp_bytes(rows: u32) -> usize;
+    pub fn stwo_witness_input_compact_scan_temp_bytes(rows: u32) -> usize;
+    #[allow(clippy::too_many_arguments)]
+    pub fn stwo_witness_input_compact_on(
+        producer_subs_dev: *const *const u32,
+        edge_descs_dev: *const u32,
+        n_edges: u32,
+        tuple_words: u32,
+        key_words: u32,
+        total_rows: u32,
+        sort_rows: u32,
+        consumer_rows: u32,
+        n_inputs: u32,
+        consumer_cols_dev: *const *mut u32,
+        enabler_slot: u32,
+        iota_slot: u32,
+        multiplicity_slot: u32,
+        tuples_dev: *mut u32,
+        keys_a_dev: *mut u32,
+        keys_b_dev: *mut u32,
+        indices_a_dev: *mut u32,
+        indices_b_dev: *mut u32,
+        heads_dev: *mut u32,
+        positions_dev: *mut u32,
+        n_unique_dev: *mut u32,
+        sort_temp_dev: *mut c_void,
+        sort_temp_bytes: usize,
+        scan_temp_dev: *mut c_void,
+        scan_temp_bytes: usize,
+        stream: *mut c_void,
+    ) -> i32;
+
+    /// Capture-safe fixed-table BaseTrace/LookupInputs materialization from
+    /// stable device descriptor and pointer tables.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stwo_fixed_table_materialize_on(
+        source_columns_dev: *const *const u32,
+        multiplicity_columns_dev: *const *const u32,
+        trace_multiplicity_columns_dev: *const u32,
+        trace_outputs_dev: *const *mut u32,
+        n_trace_outputs: u32,
+        lookup_descriptors_dev: *const u32,
+        lookup_outputs_dev: *const *mut u32,
+        n_lookup_outputs: u32,
+        row_count: u32,
+        stream: *mut c_void,
+    ) -> i32;
 
     pub fn stwo_witness_feed_counts(
         sub_words_dev: *const u32,
@@ -1348,5 +1816,174 @@ extern "C" {
         n_descs: u32,
         luts_dev: *const *const u32,
         counts_dev: *const *mut u32,
+    ) -> i32;
+    pub fn stwo_witness_feed_counts_on(
+        sub_words_dev: *const u32,
+        column_length: u32,
+        descs_dev: *const u32,
+        n_descs: u32,
+        luts_dev: *const *const u32,
+        counts_dev: *const *mut u32,
+        stream: *mut c_void,
+    ) -> i32;
+    pub fn stwo_witness_feed_clear_on(
+        destinations_dev: *const *mut u32,
+        lengths_dev: *const u32,
+        n_destinations: u32,
+        max_words: u32,
+        stream: *mut c_void,
+    ) -> i32;
+
+    /// Allocation-free final line interpolation, degree validation, and direct
+    /// row-major transcript-input emission.
+    pub fn stwo_fri_last_layer_on(
+        evaluation: *const u32,
+        evaluation_stride: u32,
+        log_size: u32,
+        inverse_twiddles: *const u32,
+        inverse_twiddle_words: u32,
+        log_degree_bound: u32,
+        coefficients: *mut u32,
+        degree_error: *mut u32,
+        transcript_coefficients: *mut u32,
+        stream: *mut c_void,
+    ) -> i32;
+
+    /// Persistent, globally minimal numeric-u64 Blake2s nonce search from the
+    /// current device transcript state.
+    pub fn stwo_blake2s_pow_persistent_on(
+        transcript_state: *const u32,
+        pow_bits: u32,
+        best_nonce: *mut u64,
+        completed_blocks: *mut u32,
+        transcript_nonce: *mut u32,
+        stream: *mut c_void,
+    ) -> i32;
+
+    pub fn stwo_blake2s_sparse_leaf_group_on(
+        leaf_indices: *const u32,
+        leaf_count: *const u32,
+        max_leaf_count: u32,
+        group_n_cols: u32,
+        columns: *const *mut u32,
+        column_log_sizes: *const u32,
+        lifting_log_size: u32,
+        cols_done: u32,
+        is_final: u32,
+        states: *mut Blake2sHash,
+        stream: *mut c_void,
+    ) -> i32;
+
+    pub fn stwo_decommit_normalize_queries_on(
+        raw_queries: *const u32,
+        raw_query_count: u32,
+        query_log_size: u32,
+        tree_count: u32,
+        unique_queries: *mut u32,
+        unique_count: *mut u32,
+        assembly: *mut u32,
+        assembly_capacity_words: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    pub fn stwo_decommit_prepare_trace_queries_on(
+        unique_queries: *const u32,
+        unique_count: *const u32,
+        max_queries: u32,
+        source_log_size: u32,
+        tree_log_size: u32,
+        leaf_log_size: u32,
+        unretained_bottom_layers: u32,
+        mapped_queries: *mut u32,
+        mapped_count: *mut u32,
+        walk_queries: *mut u32,
+        walk_count: *mut u32,
+        leaf_indices: *mut u32,
+        leaf_count: *mut u32,
+        stream: *mut c_void,
+    ) -> i32;
+    pub fn stwo_decommit_gather_trace_values_on(
+        columns: *const *const u32,
+        column_log_sizes: *const u32,
+        column_count: u32,
+        lifting_log_size: u32,
+        mapped_queries: *const u32,
+        mapped_count: *const u32,
+        max_queries: u32,
+        destination_first_column: u32,
+        destination_stride: u32,
+        queried_values: *mut u32,
+        stream: *mut c_void,
+    ) -> i32;
+    pub fn stwo_decommit_sparse_parent_on(
+        child_indices: *const u32,
+        child_hashes: *const Blake2sHash,
+        child_count: *const u32,
+        max_child_count: u32,
+        parent_indices: *mut u32,
+        parent_hashes: *mut Blake2sHash,
+        parent_count: *mut u32,
+        stream: *mut c_void,
+    ) -> i32;
+    pub fn stwo_decommit_assemble_trace_on(
+        tree_index: u32,
+        tree_role: u32,
+        leaf_log_size: u32,
+        first_retained_log_size: u32,
+        column_count: u32,
+        mapped_queries: *const u32,
+        mapped_count: *const u32,
+        max_queries: u32,
+        walk_queries: *mut u32,
+        walk_scratch: *mut u32,
+        walk_count: *const u32,
+        queried_values: *const u32,
+        retained_layers_by_log: *const *const Blake2sHash,
+        sparse_indices: *const u32,
+        sparse_hashes: *const Blake2sHash,
+        sparse_level_offsets: *const u32,
+        sparse_level_counts: *const u32,
+        sparse_level_count: u32,
+        assembly: *mut u32,
+        assembly_capacity_words: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    pub fn stwo_decommit_prepare_fri_queries_on(
+        unique_queries: *const u32,
+        unique_count: *const u32,
+        max_queries: u32,
+        cumulative_fold: u32,
+        fold_step: u32,
+        log_rows_per_leaf: u32,
+        tree_queries: *mut u32,
+        tree_query_count: *mut u32,
+        expanded_positions: *mut u32,
+        expanded_count: *mut u32,
+        walk_queries: *mut u32,
+        walk_count: *mut u32,
+        stream: *mut c_void,
+    ) -> i32;
+    pub fn stwo_decommit_gather_fri_values_on(
+        coordinate_columns: *const *const u32,
+        expanded_positions: *const u32,
+        expanded_count: *const u32,
+        max_expanded_positions: u32,
+        expanded_values: *mut u32,
+        stream: *mut c_void,
+    ) -> i32;
+    pub fn stwo_decommit_assemble_fri_on(
+        tree_index: u32,
+        leaf_log_size: u32,
+        tree_queries: *const u32,
+        tree_query_count: *const u32,
+        expanded_positions: *const u32,
+        expanded_count: *const u32,
+        expanded_values: *const u32,
+        walk_queries: *mut u32,
+        walk_scratch: *mut u32,
+        walk_count: *const u32,
+        retained_layers_by_log: *const *const Blake2sHash,
+        assembly: *mut u32,
+        assembly_capacity_words: u32,
+        stream: *mut c_void,
     ) -> i32;
 }

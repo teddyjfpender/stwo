@@ -56,7 +56,8 @@ pub fn aot_pack_manifest_hash() -> u64 {
             hash = hash.wrapping_mul(0x100000001b3);
         }
     };
-    feed(b"stwo-cuda-aot-pack-v1\0");
+    feed(b"stwo-cuda-aot-pack-v2\0");
+    feed(&(AOT_CONSTRAINT_MAX_INSTRS as u64).to_le_bytes());
     feed(&(AOT_INDEX.len() as u64).to_le_bytes());
     for &(cache_key, sm, _offset, len) in AOT_INDEX {
         feed(&cache_key.to_le_bytes());
@@ -64,6 +65,17 @@ pub fn aot_pack_manifest_hash() -> u64 {
         feed(&(len as u64).to_le_bytes());
     }
     hash
+}
+
+/// Constraint-lowering split cap used to generate the embedded semantic keys.
+/// Zero is returned for an empty/stub pack so strict planning cannot guess a
+/// cap that has no corresponding loaded kernels.
+pub fn aot_pack_constraint_max_instrs() -> usize {
+    if AOT_INDEX.is_empty() {
+        0
+    } else {
+        AOT_CONSTRAINT_MAX_INSTRS
+    }
 }
 
 /// True when this binary contains at least one kernel for `sm_major.sm_minor`.
@@ -82,8 +94,10 @@ mod manifest_tests {
     fn empty_pack_is_explicitly_unbound() {
         if AOT_INDEX.is_empty() {
             assert_eq!(aot_pack_manifest_hash(), 0);
+            assert_eq!(aot_pack_constraint_max_instrs(), 0);
         } else {
             assert_ne!(aot_pack_manifest_hash(), 0);
+            assert_ne!(aot_pack_constraint_max_instrs(), 0);
         }
     }
 

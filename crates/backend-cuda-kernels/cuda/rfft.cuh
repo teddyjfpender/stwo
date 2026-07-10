@@ -2,6 +2,7 @@
 #define POLY_RFFT_H
 
 #include "fields.cuh"
+#include "utils.cuh"
 
 #define LOG_WARP 5
 
@@ -65,6 +66,45 @@ int stwo_lde_n2b_columns_on(
     uint32_t *g_twiddles,
     unsigned twiddles_size,
     unsigned eval_domain_size,
+    void *stream
+);
+
+// Same staging and transform, stopping immediately before the final circle
+// butterfly. The commit leaf kernel consumes that last butterfly directly,
+// avoiding a full evaluation write followed by a leaf-hash reread.
+extern "C"
+int stwo_lde_n2b_columns_before_circle_on(
+    const uint32_t *const *coefficient_values,
+    const uint32_t *coefficient_sizes,
+    uint32_t **device_values,
+    unsigned log_n,
+    unsigned num_poly,
+    uint32_t *g_twiddles,
+    unsigned twiddles_size,
+    unsigned eval_domain_size,
+    void *stream
+);
+
+// Setup-time dynamic-shared-memory admission for the exact optimized final
+// N2B kernel selected by `log_n`. Must run before graph capture.
+extern "C"
+int stwo_lde_n2b_hash16_configure(unsigned log_n);
+
+// Same-log, full-lifting 16-column fast lane: stage coefficients, run the
+// optimized N2B prefix, then feed final values from registers/shared directly
+// into the running leaf states without materializing the completed LDE.
+extern "C"
+int stwo_lde_n2b_hash16_on(
+    const uint32_t *const *coefficient_values,
+    const uint32_t *coefficient_sizes,
+    uint32_t **device_values,
+    unsigned log_n,
+    uint32_t *twiddles,
+    unsigned twiddle_words,
+    unsigned eval_domain_size,
+    uint32_t cols_done,
+    uint32_t is_final,
+    Blake2sHash *states,
     void *stream
 );
 

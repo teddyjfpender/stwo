@@ -46,6 +46,10 @@ pub struct CommitLeafGroup {
     pub column_ptrs: ArenaSlice,
     pub column_log_sizes: ArenaSlice,
     pub lde_batches: Vec<CommitLdeBatch>,
+    /// Persistent outputs must complete the circle transform in memory. The
+    /// producer-fused/hash-from-pre-circle lanes are valid only for streamed
+    /// scratch whose contents are dead after leaf hashing.
+    pub retain_evaluations: bool,
 }
 
 /// Fused top-of-tree tail. `level_ptrs` is a DEVICE pointer table containing
@@ -69,6 +73,11 @@ pub enum CommitLaunchKind {
         columns: u32,
         log_n: u32,
     },
+    NttHash {
+        group: u32,
+        columns: u32,
+        log_n: u32,
+    },
     LeafUpdate {
         group: u32,
         first_column: u32,
@@ -87,6 +96,17 @@ pub enum CommitLaunchKind {
         first_hashes: u32,
         levels: u32,
     },
+}
+
+/// Physical traffic removed by the native-final or producer-fused N2B→leaf
+/// lanes. `bytes_avoided` is exactly the eliminated completed-LDE write plus
+/// its leaf-hash reread; `unfused_groups` exposes every legacy full-LDE group.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CommitHashFromTileTelemetry {
+    pub fused_groups: u64,
+    pub fused_columns: u64,
+    pub unfused_groups: u64,
+    pub bytes_avoided: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -138,6 +158,10 @@ pub enum CommitGraphError {
     TailTooWide(u32),
     TooManyTailLevels(usize),
     IncompleteTree(u32),
+    InconsistentGroupTwiddles {
+        group: u32,
+        batch: u32,
+    },
     SizeOverflow,
     Cuda(CudaRuntimeError),
 }
@@ -166,6 +190,14 @@ enum CommitLaunch {
         group: u32,
         batch: u32,
         params: CommitLdeBatch,
+        before_circle: bool,
+    },
+    NttHash {
+        group: u32,
+        first_column: u32,
+        is_final: bool,
+        params: CommitLdeBatch,
+        state: ArenaSlice,
     },
     LeafUpdate {
         group: u32,
@@ -174,6 +206,9 @@ enum CommitLaunch {
         column_ptrs: ArenaSlice,
         column_log_sizes: ArenaSlice,
         lifting_log_size: u32,
+        twiddles: ArenaSlice,
+        twiddle_words: u32,
+        from_lde: bool,
         state: ArenaSlice,
     },
     LeafFinalize {
@@ -183,6 +218,9 @@ enum CommitLaunch {
         column_ptrs: ArenaSlice,
         column_log_sizes: ArenaSlice,
         lifting_log_size: u32,
+        twiddles: ArenaSlice,
+        twiddle_words: u32,
+        from_lde: bool,
         state: ArenaSlice,
     },
     InteriorLayer {
@@ -207,9 +245,15 @@ impl CommitLaunch {
                 group,
                 batch,
                 params,
+                ..
             } => CommitLaunchKind::Lde {
                 group,
                 batch,
+                columns: params.column_count,
+                log_n: params.log_n,
+            },
+            Self::NttHash { group, params, .. } => CommitLaunchKind::NttHash {
+                group,
                 columns: params.column_count,
                 log_n: params.log_n,
             },
@@ -259,6 +303,8 @@ pub struct CommitGraphPlan {
     context_token: NonNull<c_void>,
     launches: Vec<CommitLaunch>,
     root: ArenaSlice,
+    hash_from_tile: CommitHashFromTileTelemetry,
+    producer_fused_log_sizes: Vec<u32>,
 }
 
 impl CommitGraphPlan {
@@ -320,6 +366,8 @@ impl CommitGraphPlan {
         let mut input_slots = BTreeSet::new();
 
         let mut launches = Vec::new();
+        let mut hash_from_tile = CommitHashFromTileTelemetry::default();
+        let mut producer_fused_log_sizes = BTreeSet::new();
         launches.push(CommitLaunch::LeafInit {
             size: leaf_size,
             state: leaf_state,
@@ -354,12 +402,25 @@ impl CommitGraphPlan {
             }
 
             let mut lde_columns = 0u32;
+            let mut group_twiddles = None;
             for (batch_index, &batch) in group.lde_batches.iter().enumerate() {
                 require_same_context(context_token, batch.coefficient_ptrs)?;
                 require_same_context(context_token, batch.coefficient_sizes)?;
                 require_same_context(context_token, batch.column_ptrs)?;
                 require_same_context(context_token, batch.twiddles)?;
                 validate_lde_batch(group_index, batch_index as u32, batch)?;
+                let identity = (
+                    batch.twiddles.id(),
+                    batch.twiddles.as_u32_ptr(),
+                    batch.twiddles_size,
+                );
+                if group_twiddles.is_some_and(|expected| expected != identity) {
+                    return Err(CommitGraphError::InconsistentGroupTwiddles {
+                        group: group_index,
+                        batch: batch_index as u32,
+                    });
+                }
+                group_twiddles = Some(identity);
                 input_slots.insert(batch.coefficient_ptrs.id());
                 input_slots.insert(batch.coefficient_sizes.id());
                 input_slots.insert(batch.column_ptrs.id());
@@ -367,11 +428,6 @@ impl CommitGraphPlan {
                 lde_columns = lde_columns
                     .checked_add(batch.column_count)
                     .ok_or(CommitGraphError::TooManyColumns)?;
-                launches.push(CommitLaunch::Lde {
-                    group: group_index,
-                    batch: batch_index as u32,
-                    params: batch,
-                });
             }
             if lde_columns != group.column_count {
                 return Err(CommitGraphError::LdeColumnCountMismatch {
@@ -382,6 +438,8 @@ impl CommitGraphPlan {
             }
 
             let is_final = group_index as usize == last_group;
+            let (_, _, twiddle_words) = group_twiddles.expect("non-empty LDE batches");
+            let twiddles = group.lde_batches[0].twiddles;
             if is_final {
                 if group.column_count > 16 {
                     return Err(CommitGraphError::InvalidFinalWidth {
@@ -389,15 +447,6 @@ impl CommitGraphPlan {
                         columns: group.column_count,
                     });
                 }
-                launches.push(CommitLaunch::LeafFinalize {
-                    group: group_index,
-                    first_column: cols_done,
-                    columns: group.column_count,
-                    column_ptrs: group.column_ptrs,
-                    column_log_sizes: group.column_log_sizes,
-                    lifting_log_size,
-                    state: leaf_state,
-                });
             } else {
                 if group.column_count % 16 != 0 {
                     return Err(CommitGraphError::InvalidUpdateWidth {
@@ -405,15 +454,82 @@ impl CommitGraphPlan {
                         columns: group.column_count,
                     });
                 }
-                launches.push(CommitLaunch::LeafUpdate {
+            }
+
+            let producer_fused = group.column_count == 16
+                && group.lde_batches.len() == 1
+                && group.lde_batches[0].log_n == lifting_log_size
+                && group.lde_batches[0].log_n >= 13
+                && !group.retain_evaluations;
+            let prefix_fused =
+                !group.retain_evaluations && group.lde_batches.iter().all(|batch| batch.log_n < 13);
+            if producer_fused || prefix_fused {
+                hash_from_tile.fused_groups += 1;
+                hash_from_tile.fused_columns += u64::from(group.column_count);
+                for batch in &group.lde_batches {
+                    let evaluation_words = (1u64 << batch.log_n)
+                        .checked_mul(u64::from(batch.column_count))
+                        .ok_or(CommitGraphError::SizeOverflow)?;
+                    hash_from_tile.bytes_avoided = hash_from_tile
+                        .bytes_avoided
+                        .checked_add(
+                            evaluation_words
+                                .checked_mul(2 * core::mem::size_of::<u32>() as u64)
+                                .ok_or(CommitGraphError::SizeOverflow)?,
+                        )
+                        .ok_or(CommitGraphError::SizeOverflow)?;
+                }
+            } else {
+                hash_from_tile.unfused_groups += 1;
+            }
+
+            if producer_fused {
+                let params = group.lde_batches[0];
+                producer_fused_log_sizes.insert(params.log_n);
+                launches.push(CommitLaunch::NttHash {
                     group: group_index,
                     first_column: cols_done,
-                    columns: group.column_count,
-                    column_ptrs: group.column_ptrs,
-                    column_log_sizes: group.column_log_sizes,
-                    lifting_log_size,
+                    is_final,
+                    params,
                     state: leaf_state,
                 });
+            } else {
+                for (batch_index, &params) in group.lde_batches.iter().enumerate() {
+                    launches.push(CommitLaunch::Lde {
+                        group: group_index,
+                        batch: batch_index as u32,
+                        params,
+                        before_circle: prefix_fused,
+                    });
+                }
+                let launch = if is_final {
+                    CommitLaunch::LeafFinalize {
+                        group: group_index,
+                        first_column: cols_done,
+                        columns: group.column_count,
+                        column_ptrs: group.column_ptrs,
+                        column_log_sizes: group.column_log_sizes,
+                        lifting_log_size,
+                        twiddles,
+                        twiddle_words,
+                        from_lde: prefix_fused,
+                        state: leaf_state,
+                    }
+                } else {
+                    CommitLaunch::LeafUpdate {
+                        group: group_index,
+                        first_column: cols_done,
+                        columns: group.column_count,
+                        column_ptrs: group.column_ptrs,
+                        column_log_sizes: group.column_log_sizes,
+                        lifting_log_size,
+                        twiddles,
+                        twiddle_words,
+                        from_lde: prefix_fused,
+                        state: leaf_state,
+                    }
+                };
+                launches.push(launch);
             }
             cols_done = cols_done
                 .checked_add(group.column_count)
@@ -508,6 +624,8 @@ impl CommitGraphPlan {
             context_token,
             launches,
             root: current,
+            hash_from_tile,
+            producer_fused_log_sizes: producer_fused_log_sizes.into_iter().collect(),
         })
     }
 
@@ -519,6 +637,14 @@ impl CommitGraphPlan {
     /// Exact eager/capture launch topology, without allocating.
     pub fn launch_sequence(&self) -> impl ExactSizeIterator<Item = CommitLaunchKind> + '_ {
         self.launches.iter().copied().map(CommitLaunch::kind)
+    }
+
+    pub fn hash_from_tile_telemetry(&self) -> CommitHashFromTileTelemetry {
+        self.hash_from_tile
+    }
+
+    pub fn producer_fused_log_sizes(&self) -> &[u32] {
+        &self.producer_fused_log_sizes
     }
 
     /// Enqueue the complete allocation-free commit sequence on `context`.
@@ -535,17 +661,57 @@ impl CommitGraphPlan {
                         "commit_leaf_init",
                         raw::stwo_blake2s_leaf_init_on(size, state.as_u32_ptr().cast(), stream),
                     ),
-                    CommitLaunch::Lde { params, .. } => (
-                        "commit_lde_n2b",
-                        raw::stwo_lde_n2b_columns_on(
+                    CommitLaunch::Lde {
+                        params,
+                        before_circle,
+                        ..
+                    } => {
+                        let code = if before_circle {
+                            raw::stwo_lde_n2b_columns_before_circle_on(
+                                params.coefficient_ptrs.as_u32_ptr().cast(),
+                                params.coefficient_sizes.as_u32_ptr(),
+                                params.column_ptrs.as_u32_ptr().cast(),
+                                params.log_n,
+                                params.column_count,
+                                params.twiddles.as_u32_ptr(),
+                                params.twiddles_size,
+                                params.eval_domain_size,
+                                stream,
+                            )
+                        } else {
+                            raw::stwo_lde_n2b_columns_on(
+                                params.coefficient_ptrs.as_u32_ptr().cast(),
+                                params.coefficient_sizes.as_u32_ptr(),
+                                params.column_ptrs.as_u32_ptr().cast(),
+                                params.log_n,
+                                params.column_count,
+                                params.twiddles.as_u32_ptr(),
+                                params.twiddles_size,
+                                params.eval_domain_size,
+                                stream,
+                            )
+                        };
+                        ("commit_lde_n2b", code)
+                    }
+                    CommitLaunch::NttHash {
+                        first_column,
+                        is_final,
+                        params,
+                        state,
+                        ..
+                    } => (
+                        "commit_lde_n2b_hash16",
+                        raw::stwo_lde_n2b_hash16_on(
                             params.coefficient_ptrs.as_u32_ptr().cast(),
                             params.coefficient_sizes.as_u32_ptr(),
                             params.column_ptrs.as_u32_ptr().cast(),
                             params.log_n,
-                            params.column_count,
                             params.twiddles.as_u32_ptr(),
                             params.twiddles_size,
                             params.eval_domain_size,
+                            first_column,
+                            u32::from(is_final),
+                            state.as_u32_ptr().cast(),
                             stream,
                         ),
                     ),
@@ -554,43 +720,81 @@ impl CommitGraphPlan {
                         column_ptrs,
                         column_log_sizes,
                         lifting_log_size,
+                        twiddles,
+                        twiddle_words,
+                        from_lde,
                         first_column,
                         state,
                         ..
-                    } => (
-                        "commit_leaf_update",
-                        raw::stwo_blake2s_leaf_update_on(
-                            1u32 << lifting_log_size,
-                            columns,
-                            column_ptrs.as_u32_ptr().cast(),
-                            column_log_sizes.as_u32_ptr(),
-                            lifting_log_size,
-                            first_column,
-                            state.as_u32_ptr().cast(),
-                            stream,
-                        ),
-                    ),
+                    } => {
+                        let code = if from_lde {
+                            raw::stwo_blake2s_leaf_group_from_lde_on(
+                                1u32 << lifting_log_size,
+                                columns,
+                                column_ptrs.as_u32_ptr().cast(),
+                                column_log_sizes.as_u32_ptr(),
+                                lifting_log_size,
+                                first_column,
+                                0,
+                                twiddles.as_u32_ptr(),
+                                twiddle_words,
+                                state.as_u32_ptr().cast(),
+                                stream,
+                            )
+                        } else {
+                            raw::stwo_blake2s_leaf_update_on(
+                                1u32 << lifting_log_size,
+                                columns,
+                                column_ptrs.as_u32_ptr().cast(),
+                                column_log_sizes.as_u32_ptr(),
+                                lifting_log_size,
+                                first_column,
+                                state.as_u32_ptr().cast(),
+                                stream,
+                            )
+                        };
+                        ("commit_leaf_update", code)
+                    }
                     CommitLaunch::LeafFinalize {
                         columns,
                         column_ptrs,
                         column_log_sizes,
                         lifting_log_size,
+                        twiddles,
+                        twiddle_words,
+                        from_lde,
                         first_column,
                         state,
                         ..
-                    } => (
-                        "commit_leaf_finalize",
-                        raw::stwo_blake2s_leaf_finalize_on(
-                            1u32 << lifting_log_size,
-                            columns,
-                            column_ptrs.as_u32_ptr().cast(),
-                            column_log_sizes.as_u32_ptr(),
-                            lifting_log_size,
-                            first_column,
-                            state.as_u32_ptr().cast(),
-                            stream,
-                        ),
-                    ),
+                    } => {
+                        let code = if from_lde {
+                            raw::stwo_blake2s_leaf_group_from_lde_on(
+                                1u32 << lifting_log_size,
+                                columns,
+                                column_ptrs.as_u32_ptr().cast(),
+                                column_log_sizes.as_u32_ptr(),
+                                lifting_log_size,
+                                first_column,
+                                1,
+                                twiddles.as_u32_ptr(),
+                                twiddle_words,
+                                state.as_u32_ptr().cast(),
+                                stream,
+                            )
+                        } else {
+                            raw::stwo_blake2s_leaf_finalize_on(
+                                1u32 << lifting_log_size,
+                                columns,
+                                column_ptrs.as_u32_ptr().cast(),
+                                column_log_sizes.as_u32_ptr(),
+                                lifting_log_size,
+                                first_column,
+                                state.as_u32_ptr().cast(),
+                                stream,
+                            )
+                        };
+                        ("commit_leaf_finalize", code)
+                    }
                     CommitLaunch::InteriorLayer {
                         input,
                         output,
@@ -746,6 +950,7 @@ mod tests {
                 column_ptrs: slice(10, 32),
                 column_log_sizes: slice(11, 16),
                 lde_batches: vec![batch(20, 16)],
+                retain_evaluations: false,
             },
             CommitLeafGroup {
                 first_column: 16,
@@ -753,6 +958,7 @@ mod tests {
                 column_ptrs: slice(13, 6),
                 column_log_sizes: slice(14, 3),
                 lde_batches: vec![batch(30, 3)],
+                retain_evaluations: false,
             },
         ]
     }
@@ -777,6 +983,15 @@ mod tests {
         .unwrap();
 
         assert_eq!(plan.root().id().0, 8);
+        assert_eq!(
+            plan.hash_from_tile_telemetry(),
+            CommitHashFromTileTelemetry {
+                fused_groups: 2,
+                fused_columns: 19,
+                unfused_groups: 0,
+                bytes_avoided: 64 * 19 * 8,
+            }
+        );
         assert_eq!(
             plan.launch_sequence().collect::<Vec<_>>(),
             vec![
@@ -820,6 +1035,48 @@ mod tests {
     }
 
     #[test]
+    fn full_lifting_hash16_replaces_the_lde_write_and_leaf_reread() {
+        let mut group = groups().remove(0);
+        group.lde_batches[0].log_n = 13;
+        group.lde_batches[0].eval_domain_size = 1 << 12;
+        group.lde_batches[0].twiddles = slice(23, 1 << 12);
+        group.lde_batches[0].twiddles_size = 1 << 12;
+        let interior_outputs = (0..13)
+            .map(|level| slice(100 + level, (1usize << (12 - level)) * HASH_WORDS))
+            .collect();
+        let plan = CommitGraphPlan::new(
+            13,
+            slice(1, (1 << 13) * HASH_WORDS),
+            vec![group],
+            interior_outputs,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan.launch_sequence().take(2).collect::<Vec<_>>(),
+            vec![
+                CommitLaunchKind::LeafInit { hashes: 1 << 13 },
+                CommitLaunchKind::NttHash {
+                    group: 0,
+                    columns: 16,
+                    log_n: 13,
+                },
+            ]
+        );
+        assert_eq!(plan.producer_fused_log_sizes(), &[13]);
+        assert_eq!(
+            plan.hash_from_tile_telemetry(),
+            CommitHashFromTileTelemetry {
+                fused_groups: 1,
+                fused_columns: 16,
+                unfused_groups: 0,
+                bytes_avoided: 16 * (1 << 13) * 8,
+            }
+        );
+    }
+
+    #[test]
     fn plan_rejects_noncanonical_groups_and_incomplete_tree() {
         let mut bad_groups = groups();
         bad_groups[1].first_column = 17;
@@ -858,6 +1115,13 @@ mod tests {
                 role: "leaf_column_log_sizes",
                 ..
             })
+        ));
+
+        let mut bad_groups = groups();
+        bad_groups[1].lde_batches = vec![batch(30, 1), batch(40, 2)];
+        assert!(matches!(
+            CommitGraphPlan::new(6, slice(1, 64 * HASH_WORDS), bad_groups, vec![], None,),
+            Err(CommitGraphError::InconsistentGroupTwiddles { .. })
         ));
     }
 

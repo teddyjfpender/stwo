@@ -62,6 +62,11 @@ impl BackendForChannel<Blake2sMerkleChannel> for CudaBackend {
     ) -> stwo::core::pcs::quotients::ExtendedCommitmentSchemeProof<
         <Blake2sMerkleChannel as stwo::core::channel::MerkleChannel>::H,
     > {
+        // Migration-only escape hatch for same-binary typed-driver review.
+        // Strict gpu-native orchestration rejects this variable before proving.
+        if std::env::var("STWO_CUDA_PCS_REFERENCE").as_deref() == Ok("1") {
+            return commitment_scheme.prove_values_reference(sampled_points, channel);
+        }
         let mut config = super::pcs_driver::CudaPcsDriverConfig::detached_eager();
         super::pcs_driver::prove_values_with_config(
             commitment_scheme,
@@ -90,6 +95,9 @@ impl BackendForChannel<Blake2sM31MerkleChannel> for CudaBackend {
     ) -> stwo::core::pcs::quotients::ExtendedCommitmentSchemeProof<
         <Blake2sM31MerkleChannel as stwo::core::channel::MerkleChannel>::H,
     > {
+        if std::env::var("STWO_CUDA_PCS_REFERENCE").as_deref() == Ok("1") {
+            return commitment_scheme.prove_values_reference(sampled_points, channel);
+        }
         let mut config = super::pcs_driver::CudaPcsDriverConfig::detached_eager();
         super::pcs_driver::prove_values_with_config(
             commitment_scheme,

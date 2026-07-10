@@ -19,6 +19,12 @@ pub fn loaded_manifest_hash() -> u64 {
     stwo_backend_cuda_kernels::aot_pack::aot_pack_manifest_hash()
 }
 
+/// Exact constraint split cap used by the loaded AOT pack. Zero means the
+/// current binary has no pack and is invalid for resident composition planning.
+pub fn loaded_constraint_max_instrs() -> usize {
+    stwo_backend_cuda_kernels::aot_pack::aot_pack_constraint_max_instrs()
+}
+
 /// Cheap device-architecture admission check. Individual semantic lookups still
 /// fail closed in strict GPU-native mode, so a partial pack cannot masquerade as
 /// complete merely because it contains one kernel for the device.
@@ -59,6 +65,66 @@ pub struct EmittedKernel {
     pub source: String,
 }
 
+/// One split part of a prepared constraint program. `rc_base` is the exact
+/// global offset into that component's random-coefficient slice used by the
+/// generated kernel ABI.
+pub struct EmittedConstraintKernel {
+    pub kernel: EmittedKernel,
+    pub rc_base: u32,
+}
+
+/// Structural constraint program plus the evaluator constants hoisted into its
+/// mutable extension-parameter table. The kernel identities are statement
+/// independent; `ext_param_values` is the setup oracle used by higher layers to
+/// bind each stable slot to its device-side transcript/claim producer.
+pub struct EmittedConstraintProgram {
+    pub kernels: Vec<EmittedConstraintKernel>,
+    pub ext_param_values: Vec<SecureField>,
+}
+
+/// Emit the complete prepared-program description for one concrete component.
+/// This is the source of truth shared by offline AOT generation and the resident
+/// composition planner; neither side may reconstruct split offsets or parameter
+/// ordering from the manifest filename.
+pub fn constraint_program<F: FrameworkEval>(
+    eval: &F,
+    n_interactions: u32,
+    claimed_sum: SecureField,
+    log_size: u32,
+    max_kernel_instrs: usize,
+) -> Option<EmittedConstraintProgram> {
+    let (parts, ext_param_values) = lower_framework_eval_to_v1_split(
+        eval,
+        n_interactions,
+        0,
+        0,
+        claimed_sum,
+        log_size,
+        max_kernel_instrs,
+    )
+    .ok()?;
+    let kernels = parts
+        .iter()
+        .map(|part| {
+            let semantic_hash = part.program.header().semantic_hash;
+            let source = cuda_codegen::compile_v1_to_cuda_source(&part.program)?;
+            Some(EmittedConstraintKernel {
+                kernel: EmittedKernel {
+                    kernel_name: cuda_codegen::fused_kernel_name(semantic_hash),
+                    cache_key: cuda_codegen::jit_cache_key(semantic_hash),
+                    semantic_hash,
+                    source,
+                },
+                rc_base: part.rc_base,
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(EmittedConstraintProgram {
+        kernels,
+        ext_param_values,
+    })
+}
+
 /// Emit the fused constraint kernel(s) for a component's evaluator. The lowering
 /// hoists every statement constant into parameters, so the sources and cache
 /// keys depend only on the AIR structure — any statement's evaluator emits the
@@ -71,29 +137,19 @@ pub fn constraint_kernel_sources<F: FrameworkEval>(
     log_size: u32,
     max_kernel_instrs: usize,
 ) -> Option<Vec<EmittedKernel>> {
-    let (parts, _ext_params) = lower_framework_eval_to_v1_split(
-        eval,
-        n_interactions,
-        0,
-        0,
-        claimed_sum,
-        log_size,
-        max_kernel_instrs,
+    Some(
+        constraint_program(
+            eval,
+            n_interactions,
+            claimed_sum,
+            log_size,
+            max_kernel_instrs,
+        )?
+        .kernels
+        .into_iter()
+        .map(|part| part.kernel)
+        .collect(),
     )
-    .ok()?;
-    parts
-        .iter()
-        .map(|part| {
-            let semantic_hash = part.program.header().semantic_hash;
-            let source = cuda_codegen::compile_v1_to_cuda_source(&part.program)?;
-            Some(EmittedKernel {
-                kernel_name: cuda_codegen::fused_kernel_name(semantic_hash),
-                cache_key: cuda_codegen::jit_cache_key(semantic_hash),
-                semantic_hash,
-                source,
-            })
-        })
-        .collect()
 }
 
 /// Emit a witness kernel from a recorded program (the lane's own codegen).

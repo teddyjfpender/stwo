@@ -14,13 +14,6 @@ use crate::core::vcs_lifted::verifier::{
 use crate::core::ColumnVec;
 use crate::prover::backend::{Col, Column};
 
-/// The number of bottom tree layers (leaves upwards) that [`MerkleProverLifted::commit_pruned`]
-/// does not retain. The unretained nodes are recomputed from the committed columns at decommit
-/// time. Each successive dropped layer halves in size, so dropping `k` layers saves
-/// `(2 - 2^{1-k})` times the leaf layer's memory; the decommit-time recomputation cost grows as
-/// `2^k` leaf hashes per query and stays negligible for small `k`.
-const N_UNRETAINED_BOTTOM_LAYERS: u32 = 4;
-
 /// Represents the prover side of a Merkle commitment scheme.
 #[derive(Debug)]
 pub struct MerkleProverLifted<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> {
@@ -28,8 +21,8 @@ pub struct MerkleProverLifted<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> {
     /// The first layer is a column of length 1, containing the root commitment.
     ///
     /// Trees built with [`Self::commit_pruned`] do not retain the bottom
-    /// [`N_UNRETAINED_BOTTOM_LAYERS`] layers; those nodes are recomputed from the committed
-    /// columns during decommit.
+    /// [`MerkleOpsLifted::merkle_prune_depth`] layers; those nodes are recomputed from the
+    /// committed columns during decommit.
     pub layers: Vec<Col<B, H::Hash>>,
     /// Log size of the leaf layer (i.e. the height of the tree).
     leaf_log_size: u32,
@@ -59,15 +52,17 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
     }
 
     /// Same as [`Self::commit`], but does not retain the bottom
-    /// [`N_UNRETAINED_BOTTOM_LAYERS`] layers of the tree, reducing the memory held between
-    /// commitment and decommitment by almost 2x the leaf layer's size. The unretained nodes are
+    /// [`MerkleOpsLifted::merkle_prune_depth`] layers of the tree. The unretained nodes are
     /// recomputed from the committed columns at decommit time, so callers must pass the same
-    /// columns to [`Self::decommit`].
+    /// columns to [`Self::decommit`]. Backends choose the memory/recomputation tradeoff; the
+    /// default omits four layers.
     ///
     /// Not supported for packed leaves (`log_rows_per_leaf > 0`), where decommit does not
     /// receive the packed columns.
     pub fn commit_pruned(columns: Vec<&Col<B, BaseField>>, lifting_log_size: u32) -> Self {
-        Self::commit_inner(columns, lifting_log_size, 0, N_UNRETAINED_BOTTOM_LAYERS)
+        let prune_depth = B::merkle_prune_depth();
+        assert!(prune_depth > 0, "Merkle prune depth must be at least one.");
+        Self::commit_inner(columns, lifting_log_size, 0, prune_depth)
     }
 
     fn commit_inner(
@@ -173,7 +168,9 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
     /// for the same (sorted) columns (gated by the backend's streaming tests +
     /// whole-proof byte-identity).
     pub fn commit_pruned_from_leaves(leaves: Col<B, H::Hash>, lifting_log_size: u32) -> Self {
-        Self::tree_from_leaves(leaves, lifting_log_size, N_UNRETAINED_BOTTOM_LAYERS)
+        let prune_depth = B::merkle_prune_depth();
+        assert!(prune_depth > 0, "Merkle prune depth must be at least one.");
+        Self::tree_from_leaves(leaves, lifting_log_size, prune_depth)
     }
 
     /// Decommits to columns on the given queries.
@@ -732,21 +729,44 @@ mod test {
             columns.iter().collect(),
             lifting_log_size,
         );
+        let depth_one = MerkleProverLifted::<CpuBackend, Blake2sMerkleHasher>::commit_inner(
+            columns.iter().collect(),
+            lifting_log_size,
+            0,
+            1,
+        );
 
+        assert_eq!(
+            <CpuBackend as MerkleOpsLifted<Blake2sMerkleHasher>>::merkle_prune_depth(),
+            4
+        );
         assert_eq!(full.root(), pruned.root());
+        assert_eq!(full.root(), depth_one.root());
         assert_eq!(full.log_size(), pruned.log_size());
-        assert!(pruned.layers.len() < full.layers.len());
+        assert_eq!(full.layers.len() - pruned.layers.len(), 4);
+        assert_eq!(full.layers.len() - depth_one.layers.len(), 1);
 
         let queries: Vec<usize> = vec![0, 5, 6, 7, 100, 201, 255];
         let (values_full, dec_full) = full.decommit(&queries, columns.iter().collect_vec());
         let (values_pruned, dec_pruned) = pruned.decommit(&queries, columns.iter().collect_vec());
+        let (values_depth_one, dec_depth_one) =
+            depth_one.decommit(&queries, columns.iter().collect_vec());
 
         assert_eq!(values_full, values_pruned);
+        assert_eq!(values_full, values_depth_one);
         assert_eq!(
             dec_full.decommitment.hash_witness,
             dec_pruned.decommitment.hash_witness
         );
+        assert_eq!(
+            dec_full.decommitment.hash_witness,
+            dec_depth_one.decommitment.hash_witness
+        );
         assert_eq!(dec_full.aux.all_node_values, dec_pruned.aux.all_node_values);
+        assert_eq!(
+            dec_full.aux.all_node_values,
+            dec_depth_one.aux.all_node_values
+        );
     }
 
     /// Decommitting from a sparse row-gathered view (queried rows + the rows of unretained

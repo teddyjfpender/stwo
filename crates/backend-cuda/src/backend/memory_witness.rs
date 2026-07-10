@@ -19,6 +19,7 @@ use stwo::prover::poly::BitReversedOrder;
 use crate::backend::{CudaBackend, UploadedDevicePointerVec};
 use crate::columns::base_field_vec::BaseFieldVec;
 use crate::columns::bindings::{self, CudaSecureField};
+use crate::{CudaLaunchContext, CudaRuntimeError};
 
 /// A logup column whose raw inputs already live on the device: numerator
 /// coordinate columns plus element-major qm31 denominators. The device-native
@@ -46,6 +47,114 @@ pub fn limb_split_small(
     column_length: usize,
 ) -> Vec<BaseFieldVec> {
     limb_split(values, n_values, column_length, 8, false)
+}
+
+/// Arena-native big-memory writer: the 28 limb columns and multiplicity column
+/// are final borrowed BaseTrace destinations. The launch is allocation-free and
+/// stream-explicit; `mults` already includes zero padding to `column_length`.
+pub fn limb_split_big_into_on(
+    values: &BaseFieldVec,
+    n_values: usize,
+    column_length: usize,
+    mults: &[u32],
+    trace: &[BaseFieldVec],
+    context: CudaLaunchContext,
+) -> Result<(), CudaRuntimeError> {
+    limb_split_into_on(
+        values,
+        n_values,
+        column_length,
+        mults,
+        trace,
+        28,
+        true,
+        context,
+    )
+}
+
+/// Arena-native small-memory counterpart of [`limb_split_big_into_on`].
+pub fn limb_split_small_into_on(
+    values: &BaseFieldVec,
+    n_values: usize,
+    column_length: usize,
+    mults: &[u32],
+    trace: &[BaseFieldVec],
+    context: CudaLaunchContext,
+) -> Result<(), CudaRuntimeError> {
+    limb_split_into_on(
+        values,
+        n_values,
+        column_length,
+        mults,
+        trace,
+        8,
+        false,
+        context,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn limb_split_into_on(
+    values: &BaseFieldVec,
+    n_values: usize,
+    column_length: usize,
+    mults: &[u32],
+    trace: &[BaseFieldVec],
+    n_limbs: usize,
+    big: bool,
+    context: CudaLaunchContext,
+) -> Result<(), CudaRuntimeError> {
+    if !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
+        return Err(CudaRuntimeError::Unavailable);
+    }
+    let required_input_words = n_values.checked_mul(if big { 8 } else { 4 });
+    if trace.len() != n_limbs + 1
+        || trace.iter().any(|column| column.size != column_length)
+        || mults.len() != column_length
+        || n_values > column_length
+        || required_input_words.is_none_or(|required| required > values.size)
+    {
+        return Err(CudaRuntimeError::Cuda {
+            operation: "memory_limb_split_into_on_geometry",
+            code: -1,
+        });
+    }
+    let limb_ptrs: Vec<*mut u32> = trace[..n_limbs]
+        .iter()
+        .map(|column| column.device_ptr.cast_mut())
+        .collect();
+    let args = (
+        values.device_ptr,
+        u32::try_from(n_values).map_err(|_| CudaRuntimeError::SizeOverflow)?,
+        u32::try_from(column_length).map_err(|_| CudaRuntimeError::SizeOverflow)?,
+        limb_ptrs.as_ptr(),
+        mults.as_ptr(),
+        trace[n_limbs].device_ptr.cast_mut(),
+        context.stream_raw().as_ptr(),
+    );
+    let code = unsafe {
+        if big {
+            stwo_backend_cuda_kernels::raw::memory_limb_split_big_into_on(
+                args.0, args.1, args.2, args.3, args.4, args.5, args.6,
+            )
+        } else {
+            stwo_backend_cuda_kernels::raw::memory_limb_split_small_into_on(
+                args.0, args.1, args.2, args.3, args.4, args.5, args.6,
+            )
+        }
+    };
+    if code == 0 {
+        Ok(())
+    } else {
+        Err(CudaRuntimeError::Cuda {
+            operation: if big {
+                "memory_limb_split_big_into_on"
+            } else {
+                "memory_limb_split_small_into_on"
+            },
+            code,
+        })
+    }
 }
 
 fn limb_split(

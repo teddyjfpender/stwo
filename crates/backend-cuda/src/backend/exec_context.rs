@@ -1,5 +1,6 @@
 //! Per-proof CUDA execution resources: an isolated stream/pool, a stable device
-//! arena, and transcript-bounded single-stream graph capture.
+//! arena, and transcript-bounded dependency-graph capture. The main stream owns
+//! transcript order; fixed auxiliary lanes express independent component work.
 //!
 //! There is deliberately no default/TLS context. A proof workspace owns one
 //! [`DeviceArena`], which in turn owns its [`CudaExecContext`]. Graphs must be
@@ -14,6 +15,34 @@ use std::rc::Rc;
 
 const CUDA_SUCCESS: i32 = 0;
 
+/// Auditable host/runtime boundary counters for one proof-owned context. These
+/// count API operations issued by the resident runtime; CUDA work replayed from
+/// an instantiated graph is represented by `graph_launches`, not re-counted as
+/// fresh host calls.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CudaExecTelemetry {
+    pub sync_calls: u64,
+    pub allocations: u64,
+    pub allocation_bytes: u64,
+    pub frees: u64,
+    pub memset_bytes: u64,
+    pub fill_words: u64,
+    pub h2d_bytes: u64,
+    pub d2h_bytes: u64,
+    pub d2d_bytes: u64,
+    pub capture_begins: u64,
+    pub capture_finishes: u64,
+    pub capture_aborts: u64,
+    pub graph_launches: u64,
+    pub lane_forks: u64,
+    pub lane_joins: u64,
+    /// Kernel nodes submitted by graph replay. Capture-time execution is setup
+    /// and excluded after the hot-path telemetry reset.
+    pub kernel_launches: u64,
+    pub graph_submit_gap_ns_total: u64,
+    pub graph_submit_gap_ns_max: u64,
+}
+
 /// Checked failure from the CUDA runtime boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CudaRuntimeError {
@@ -27,6 +56,8 @@ pub enum CudaRuntimeError {
     SizeOverflow,
     /// A graph or arena-backed plan was launched on a different context.
     ContextMismatch,
+    /// A component scheduler selected a lane not owned by this context.
+    InvalidLane { lane: usize, lane_count: usize },
 }
 
 impl core::fmt::Display for CudaRuntimeError {
@@ -41,6 +72,12 @@ impl core::fmt::Display for CudaRuntimeError {
             }
             Self::SizeOverflow => f.write_str("CUDA allocation size overflow"),
             Self::ContextMismatch => f.write_str("CUDA context identity mismatch"),
+            Self::InvalidLane { lane, lane_count } => {
+                write!(
+                    f,
+                    "CUDA lane {lane} is outside the {lane_count} owned lanes"
+                )
+            }
         }
     }
 }
@@ -63,12 +100,56 @@ pub(crate) fn check_cuda(operation: &'static str, code: i32) -> Result<(), CudaR
 pub struct CudaExecContext {
     handle: NonNull<c_void>,
     stream: NonNull<c_void>,
+    lanes: Vec<NonNull<c_void>>,
+    telemetry: Cell<CudaExecTelemetry>,
+    last_graph_submit: Cell<Option<std::time::Instant>>,
     _not_sync: PhantomData<Cell<()>>,
 }
 
 // A context and its stream may be moved to one owning host thread. It is not Sync
 // (the Cell marker above), so capture/enqueue cannot be driven concurrently.
 unsafe impl Send for CudaExecContext {}
+
+/// Copyable, non-owning launch handle for producers that must target a
+/// [`DeviceArena`] before the higher-level prepared graph is constructed.
+///
+/// The owning [`CudaExecContext`] must outlive this value.  This deliberately
+/// exposes only the stream and a fence: allocation and copies remain owned by
+/// the arena/context API, while witness kernels can write their final columns
+/// directly into borrowed arena slices.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CudaLaunchContext {
+    handle: NonNull<c_void>,
+    stream: NonNull<c_void>,
+}
+
+// CUDA streams may be enqueued from multiple host threads. Ownership and
+// destruction remain with the non-Sync CudaExecContext.
+unsafe impl Send for CudaLaunchContext {}
+unsafe impl Sync for CudaLaunchContext {}
+
+impl CudaLaunchContext {
+    pub fn stream_raw(self) -> NonNull<c_void> {
+        self.stream
+    }
+
+    pub(crate) fn identity_token(self) -> NonNull<c_void> {
+        self.handle
+    }
+
+    /// Fence work issued through this borrowed handle. Resident witness code
+    /// uses this only while migration-era host artifacts still require a
+    /// completion boundary before their temporary inputs may be dropped.
+    pub fn sync(self) -> Result<(), CudaRuntimeError> {
+        let code = unsafe {
+            stwo_backend_cuda_kernels::raw::stwo_exec_context_stream_sync(
+                self.handle.as_ptr(),
+                self.stream.as_ptr(),
+            )
+        };
+        check_cuda("exec_context_stream_sync", code)
+    }
+}
 
 impl CudaExecContext {
     /// Create an isolated CUDA stream/pool context.
@@ -107,16 +188,129 @@ impl CudaExecContext {
             });
         };
 
+        let mut lane_count = 0u32;
+        let code = unsafe {
+            stwo_backend_cuda_kernels::raw::stwo_exec_context_lane_count(
+                handle.as_ptr(),
+                &mut lane_count,
+            )
+        };
+        if let Err(error) = check_cuda("exec_context_lane_count", code) {
+            unsafe {
+                stwo_backend_cuda_kernels::raw::stwo_exec_context_destroy(handle.as_ptr());
+            }
+            return Err(error);
+        }
+        let mut lanes = Vec::with_capacity(lane_count as usize);
+        for lane in 0..lane_count {
+            let mut raw_lane = core::ptr::null_mut();
+            let code = unsafe {
+                stwo_backend_cuda_kernels::raw::stwo_exec_context_lane_stream(
+                    handle.as_ptr(),
+                    lane,
+                    &mut raw_lane,
+                )
+            };
+            if let Err(error) = check_cuda("exec_context_lane_stream", code) {
+                unsafe {
+                    stwo_backend_cuda_kernels::raw::stwo_exec_context_destroy(handle.as_ptr());
+                }
+                return Err(error);
+            }
+            let Some(lane_stream) = NonNull::new(raw_lane) else {
+                unsafe {
+                    stwo_backend_cuda_kernels::raw::stwo_exec_context_destroy(handle.as_ptr());
+                }
+                return Err(CudaRuntimeError::NullPointer {
+                    operation: "exec_context_lane_stream",
+                });
+            };
+            lanes.push(lane_stream);
+        }
+
         Ok(Self {
             handle,
             stream,
+            lanes,
+            telemetry: Cell::new(CudaExecTelemetry::default()),
+            last_graph_submit: Cell::new(None),
             _not_sync: PhantomData,
         })
+    }
+
+    pub fn telemetry(&self) -> CudaExecTelemetry {
+        self.telemetry.get()
+    }
+
+    pub fn reset_telemetry(&self) {
+        self.telemetry.set(CudaExecTelemetry::default());
+        self.last_graph_submit.set(None);
+    }
+
+    fn record(&self, update: impl FnOnce(&mut CudaExecTelemetry)) {
+        let mut telemetry = self.telemetry.get();
+        update(&mut telemetry);
+        self.telemetry.set(telemetry);
     }
 
     /// Opaque CUDA stream pointer for stream-explicit kernel launch wrappers.
     pub fn stream_raw(&self) -> NonNull<c_void> {
         self.stream
+    }
+
+    pub fn launch_context(&self) -> CudaLaunchContext {
+        CudaLaunchContext {
+            handle: self.handle,
+            stream: self.stream,
+        }
+    }
+
+    pub fn lane_count(&self) -> usize {
+        self.lanes.len()
+    }
+
+    pub fn lane(&self, lane: usize) -> Result<CudaLaunchContext, CudaRuntimeError> {
+        let stream = self
+            .lanes
+            .get(lane)
+            .copied()
+            .ok_or(CudaRuntimeError::InvalidLane {
+                lane,
+                lane_count: self.lanes.len(),
+            })?;
+        Ok(CudaLaunchContext {
+            handle: self.handle,
+            stream,
+        })
+    }
+
+    /// Fork one independent component wave from the main transcript stream.
+    /// During capture this records the cross-stream dependency in the graph.
+    pub fn fork_lane(&self, lane: usize) -> Result<CudaLaunchContext, CudaRuntimeError> {
+        let launch = self.lane(lane)?;
+        let code = unsafe {
+            stwo_backend_cuda_kernels::raw::stwo_exec_context_lane_fork(
+                self.handle.as_ptr(),
+                lane as u32,
+            )
+        };
+        check_cuda("exec_context_lane_fork", code)?;
+        self.record(|telemetry| telemetry.lane_forks += 1);
+        Ok(launch)
+    }
+
+    /// Join one component lane back into the main transcript stream.
+    pub fn join_lane(&self, lane: usize) -> Result<(), CudaRuntimeError> {
+        self.lane(lane)?;
+        let code = unsafe {
+            stwo_backend_cuda_kernels::raw::stwo_exec_context_lane_join(
+                self.handle.as_ptr(),
+                lane as u32,
+            )
+        };
+        check_cuda("exec_context_lane_join", code)?;
+        self.record(|telemetry| telemetry.lane_joins += 1);
+        Ok(())
     }
 
     pub(crate) fn identity_token(&self) -> NonNull<c_void> {
@@ -127,7 +321,9 @@ impl CudaExecContext {
     pub fn sync(&self) -> Result<(), CudaRuntimeError> {
         let code =
             unsafe { stwo_backend_cuda_kernels::raw::stwo_exec_context_sync(self.handle.as_ptr()) };
-        check_cuda("exec_context_sync", code)
+        check_cuda("exec_context_sync", code)?;
+        self.record(|telemetry| telemetry.sync_calls += 1);
+        Ok(())
     }
 
     /// Allocate `count` u32 words from this context's isolated pool.
@@ -144,9 +340,14 @@ impl CudaExecContext {
             )
         };
         check_cuda("exec_context_alloc_u32", code)?;
-        NonNull::new(raw_ptr).ok_or(CudaRuntimeError::NullPointer {
+        let pointer = NonNull::new(raw_ptr).ok_or(CudaRuntimeError::NullPointer {
             operation: "exec_context_alloc_u32",
-        })
+        })?;
+        self.record(|telemetry| {
+            telemetry.allocations += 1;
+            telemetry.allocation_bytes += (count * core::mem::size_of::<u32>()) as u64;
+        });
+        Ok(pointer)
     }
 
     /// Free a context allocation, ordered after prior work on this stream.
@@ -162,7 +363,9 @@ impl CudaExecContext {
                 ptr.as_ptr(),
             )
         };
-        check_cuda("exec_context_free_u32", code)
+        check_cuda("exec_context_free_u32", code)?;
+        self.record(|telemetry| telemetry.frees += 1);
+        Ok(())
     }
 
     /// Enqueue a byte memset on this context's stream.
@@ -185,7 +388,9 @@ impl CudaExecContext {
                 bytes,
             )
         };
-        check_cuda("exec_context_memset_async", code)
+        check_cuda("exec_context_memset_async", code)?;
+        self.record(|telemetry| telemetry.memset_bytes += bytes as u64);
+        Ok(())
     }
 
     /// Enqueue an arbitrary u32 fill on this context's stream.
@@ -208,7 +413,9 @@ impl CudaExecContext {
                 count,
             )
         };
-        check_cuda("exec_context_fill_u32_async", code)
+        check_cuda("exec_context_fill_u32_async", code)?;
+        self.record(|telemetry| telemetry.fill_words += count as u64);
+        Ok(())
     }
 
     /// Enqueue a device-to-device copy on this context's stream.
@@ -231,7 +438,9 @@ impl CudaExecContext {
                 bytes,
             )
         };
-        check_cuda("exec_context_memcpy_d2d_async", code)
+        check_cuda("exec_context_memcpy_d2d_async", code)?;
+        self.record(|telemetry| telemetry.d2d_bytes += bytes as u64);
+        Ok(())
     }
 
     /// Enqueue a host-to-device copy on this context's stream.
@@ -255,7 +464,9 @@ impl CudaExecContext {
                 bytes,
             )
         };
-        check_cuda("exec_context_memcpy_h2d_async", code)
+        check_cuda("exec_context_memcpy_h2d_async", code)?;
+        self.record(|telemetry| telemetry.h2d_bytes += bytes as u64);
+        Ok(())
     }
 
     /// Enqueue a device-to-host copy on this context's stream.
@@ -279,7 +490,9 @@ impl CudaExecContext {
                 bytes,
             )
         };
-        check_cuda("exec_context_memcpy_d2h_async", code)
+        check_cuda("exec_context_memcpy_d2h_async", code)?;
+        self.record(|telemetry| telemetry.d2h_bytes += bytes as u64);
+        Ok(())
     }
 
     /// Begin thread-local capture on this context's stream.
@@ -288,6 +501,7 @@ impl CudaExecContext {
             stwo_backend_cuda_kernels::raw::stwo_graph_capture_begin(self.handle.as_ptr())
         };
         check_cuda("graph_capture_begin", code)?;
+        self.record(|telemetry| telemetry.capture_begins += 1);
         Ok(CudaGraphCapture {
             context: self,
             active: true,
@@ -320,21 +534,26 @@ impl CudaGraphCapture<'_> {
     /// Finish capture, instantiate it, and return an owned executable graph.
     pub fn finish(mut self) -> Result<CudaGraphExec, CudaRuntimeError> {
         let mut raw_exec = core::ptr::null_mut();
+        let mut kernel_nodes = 0u64;
         let code = unsafe {
             stwo_backend_cuda_kernels::raw::stwo_graph_capture_end(
                 self.context.handle.as_ptr(),
                 &mut raw_exec,
+                &mut kernel_nodes,
             )
         };
         // EndCapture exits capture mode even when instantiation later fails.
         self.active = false;
         check_cuda("graph_capture_end", code)?;
+        self.context
+            .record(|telemetry| telemetry.capture_finishes += 1);
         let handle = NonNull::new(raw_exec).ok_or(CudaRuntimeError::NullPointer {
             operation: "graph_capture_end",
         })?;
         Ok(CudaGraphExec {
             handle,
             context_token: self.context.identity_token(),
+            kernel_nodes,
         })
     }
 
@@ -344,7 +563,10 @@ impl CudaGraphCapture<'_> {
             stwo_backend_cuda_kernels::raw::stwo_graph_capture_abort(self.context.handle.as_ptr())
         };
         self.active = false;
-        check_cuda("graph_capture_abort", code)
+        check_cuda("graph_capture_abort", code)?;
+        self.context
+            .record(|telemetry| telemetry.capture_aborts += 1);
+        Ok(())
     }
 }
 
@@ -360,6 +582,10 @@ impl Drop for CudaGraphCapture<'_> {
         if code != CUDA_SUCCESS && !std::thread::panicking() {
             eprintln!("stwo-backend-cuda: graph capture abort failed with status {code}");
         }
+        if code == CUDA_SUCCESS {
+            self.context
+                .record(|telemetry| telemetry.capture_aborts += 1);
+        }
     }
 }
 
@@ -367,23 +593,45 @@ impl Drop for CudaGraphCapture<'_> {
 pub struct CudaGraphExec {
     handle: NonNull<c_void>,
     context_token: NonNull<c_void>,
+    kernel_nodes: u64,
 }
 
 unsafe impl Send for CudaGraphExec {}
 
 impl CudaGraphExec {
+    pub fn kernel_nodes(&self) -> u64 {
+        self.kernel_nodes
+    }
+
     /// Enqueue one replay on `context`'s stream.
     pub fn launch(&self, context: &CudaExecContext) -> Result<(), CudaRuntimeError> {
         if context.identity_token() != self.context_token {
             return Err(CudaRuntimeError::ContextMismatch);
         }
+        let submitted_at = std::time::Instant::now();
+        let gap_ns = context
+            .last_graph_submit
+            .replace(Some(submitted_at))
+            .map(|previous| {
+                u64::try_from(submitted_at.duration_since(previous).as_nanos()).unwrap_or(u64::MAX)
+            });
         let code = unsafe {
             stwo_backend_cuda_kernels::raw::stwo_graph_launch(
                 self.handle.as_ptr(),
                 context.handle.as_ptr(),
             )
         };
-        check_cuda("graph_launch", code)
+        check_cuda("graph_launch", code)?;
+        context.record(|telemetry| {
+            telemetry.graph_launches += 1;
+            telemetry.kernel_launches += self.kernel_nodes;
+            if let Some(gap_ns) = gap_ns {
+                telemetry.graph_submit_gap_ns_total =
+                    telemetry.graph_submit_gap_ns_total.saturating_add(gap_ns);
+                telemetry.graph_submit_gap_ns_max = telemetry.graph_submit_gap_ns_max.max(gap_ns);
+            }
+        });
+        Ok(())
     }
 }
 

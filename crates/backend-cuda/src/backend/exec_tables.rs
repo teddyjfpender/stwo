@@ -352,7 +352,7 @@ impl interp::TableOracle for ExecTablesOracle<'_> {
 /// codegen): pointer slots [0]=addr_to_id, [1..29]=the 28 big limb columns,
 /// [29..37]=the 8 small limb columns; the strides array carries the clamp lengths
 /// [n_addrs, n_big, n_small].
-fn witness_table_pointers(t: &DeviceExecutionTables) -> (Vec<*const u32>, Vec<u32>) {
+pub(super) fn witness_table_pointers(t: &DeviceExecutionTables) -> (Vec<*const u32>, Vec<u32>) {
     let mut ptrs = Vec::with_capacity(37);
     ptrs.push(t.addr_to_id.device_ptr);
     for c in &t.big_limbs {
@@ -584,19 +584,68 @@ fn fork_stream_ptr(fork: &Option<StreamFork>) -> *mut core::ffi::c_void {
     fork.as_ref().map_or(core::ptr::null_mut(), |f| f.stream)
 }
 
+/// Arena-backed outputs for one recorded witness launch.  Every buffer is
+/// borrowed (`BaseFieldVec::owns_memory == false`) by the resident prover and
+/// must outlive the returned trace/lookup/sub handles.
+#[derive(Debug)]
+pub struct WitnessLaunchDestinations {
+    pub trace: Vec<BaseFieldVec>,
+    pub lookup: BaseFieldVec,
+    pub sub: BaseFieldVec,
+    pub context: crate::CudaLaunchContext,
+}
+
+type WitnessLaunchResult = (
+    Vec<BaseFieldVec>,
+    BaseFieldVec,
+    Vec<u32>,
+    BaseFieldVec,
+    Vec<u32>,
+);
+
 pub fn launch_recorded_witness_for_prove(
     label: &str,
     samples: &[(u32, u32, u32)],
     n_real: usize,
     tables: &DeviceExecutionTables,
     want_host_lookup: bool,
-) -> Option<(
-    Vec<BaseFieldVec>,
-    BaseFieldVec,
-    Vec<u32>,
-    BaseFieldVec,
-    Vec<u32>,
-)> {
+) -> Option<WitnessLaunchResult> {
+    launch_recorded_witness_for_prove_with_destinations(
+        label,
+        samples,
+        n_real,
+        tables,
+        want_host_lookup,
+        None,
+    )
+}
+
+pub fn launch_recorded_witness_for_prove_into(
+    label: &str,
+    samples: &[(u32, u32, u32)],
+    n_real: usize,
+    tables: &DeviceExecutionTables,
+    want_host_lookup: bool,
+    destinations: WitnessLaunchDestinations,
+) -> Option<WitnessLaunchResult> {
+    launch_recorded_witness_for_prove_with_destinations(
+        label,
+        samples,
+        n_real,
+        tables,
+        want_host_lookup,
+        Some(destinations),
+    )
+}
+
+fn launch_recorded_witness_for_prove_with_destinations(
+    label: &str,
+    samples: &[(u32, u32, u32)],
+    n_real: usize,
+    tables: &DeviceExecutionTables,
+    want_host_lookup: bool,
+    destinations: Option<WitnessLaunchDestinations>,
+) -> Option<WitnessLaunchResult> {
     if !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
         return None;
     }
@@ -633,6 +682,7 @@ pub fn launch_recorded_witness_for_prove(
         want_host_lookup,
         // want_host_sub
         true,
+        destinations,
     );
     // Inputs may be dropped now (the core launch is synchronous through its D2H).
     drop((pc_col, ap_col, fp_col, enabler_col));
@@ -656,13 +706,43 @@ pub fn launch_recorded_builtin_for_prove(
     tables: &DeviceExecutionTables,
     want_host_lookup: bool,
     want_host_sub: bool,
-) -> Option<(
-    Vec<BaseFieldVec>,
-    BaseFieldVec,
-    Vec<u32>,
-    BaseFieldVec,
-    Vec<u32>,
-)> {
+) -> Option<WitnessLaunchResult> {
+    launch_recorded_builtin_for_prove_with_destinations(
+        label,
+        input_cols,
+        tables,
+        want_host_lookup,
+        want_host_sub,
+        None,
+    )
+}
+
+pub fn launch_recorded_builtin_for_prove_into(
+    label: &str,
+    input_cols: &[Vec<u32>],
+    tables: &DeviceExecutionTables,
+    want_host_lookup: bool,
+    want_host_sub: bool,
+    destinations: WitnessLaunchDestinations,
+) -> Option<WitnessLaunchResult> {
+    launch_recorded_builtin_for_prove_with_destinations(
+        label,
+        input_cols,
+        tables,
+        want_host_lookup,
+        want_host_sub,
+        Some(destinations),
+    )
+}
+
+fn launch_recorded_builtin_for_prove_with_destinations(
+    label: &str,
+    input_cols: &[Vec<u32>],
+    tables: &DeviceExecutionTables,
+    want_host_lookup: bool,
+    want_host_sub: bool,
+    destinations: Option<WitnessLaunchDestinations>,
+) -> Option<WitnessLaunchResult> {
     if !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
         return None;
     }
@@ -694,6 +774,7 @@ pub fn launch_recorded_builtin_for_prove(
         tables,
         want_host_lookup,
         want_host_sub,
+        destinations,
     );
     drop(uploaded);
     result
@@ -710,13 +791,47 @@ pub fn launch_recorded_builtin_from_device_cols(
     tables: &DeviceExecutionTables,
     want_host_lookup: bool,
     want_host_sub: bool,
-) -> Option<(
-    Vec<BaseFieldVec>,
-    BaseFieldVec,
-    Vec<u32>,
-    BaseFieldVec,
-    Vec<u32>,
-)> {
+) -> Option<WitnessLaunchResult> {
+    launch_recorded_builtin_from_device_cols_with_destinations(
+        label,
+        input_ptrs,
+        n,
+        tables,
+        want_host_lookup,
+        want_host_sub,
+        None,
+    )
+}
+
+pub fn launch_recorded_builtin_from_device_cols_into(
+    label: &str,
+    input_ptrs: &[*const u32],
+    n: usize,
+    tables: &DeviceExecutionTables,
+    want_host_lookup: bool,
+    want_host_sub: bool,
+    destinations: WitnessLaunchDestinations,
+) -> Option<WitnessLaunchResult> {
+    launch_recorded_builtin_from_device_cols_with_destinations(
+        label,
+        input_ptrs,
+        n,
+        tables,
+        want_host_lookup,
+        want_host_sub,
+        Some(destinations),
+    )
+}
+
+fn launch_recorded_builtin_from_device_cols_with_destinations(
+    label: &str,
+    input_ptrs: &[*const u32],
+    n: usize,
+    tables: &DeviceExecutionTables,
+    want_host_lookup: bool,
+    want_host_sub: bool,
+    destinations: Option<WitnessLaunchDestinations>,
+) -> Option<WitnessLaunchResult> {
     if !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
         return None;
     }
@@ -737,6 +852,7 @@ pub fn launch_recorded_builtin_from_device_cols(
         tables,
         want_host_lookup,
         want_host_sub,
+        destinations,
     )
 }
 
@@ -752,13 +868,51 @@ pub fn launch_recorded_builtin_mixed(
     tables: &DeviceExecutionTables,
     want_host_lookup: bool,
     want_host_sub: bool,
-) -> Option<(
-    Vec<BaseFieldVec>,
-    BaseFieldVec,
-    Vec<u32>,
-    BaseFieldVec,
-    Vec<u32>,
-)> {
+) -> Option<WitnessLaunchResult> {
+    launch_recorded_builtin_mixed_with_destinations(
+        label,
+        device_ptrs,
+        host_tail_cols,
+        n,
+        tables,
+        want_host_lookup,
+        want_host_sub,
+        None,
+    )
+}
+
+pub fn launch_recorded_builtin_mixed_into(
+    label: &str,
+    device_ptrs: &[*const u32],
+    host_tail_cols: &[Vec<u32>],
+    n: usize,
+    tables: &DeviceExecutionTables,
+    want_host_lookup: bool,
+    want_host_sub: bool,
+    destinations: WitnessLaunchDestinations,
+) -> Option<WitnessLaunchResult> {
+    launch_recorded_builtin_mixed_with_destinations(
+        label,
+        device_ptrs,
+        host_tail_cols,
+        n,
+        tables,
+        want_host_lookup,
+        want_host_sub,
+        Some(destinations),
+    )
+}
+
+fn launch_recorded_builtin_mixed_with_destinations(
+    label: &str,
+    device_ptrs: &[*const u32],
+    host_tail_cols: &[Vec<u32>],
+    n: usize,
+    tables: &DeviceExecutionTables,
+    want_host_lookup: bool,
+    want_host_sub: bool,
+    destinations: Option<WitnessLaunchDestinations>,
+) -> Option<WitnessLaunchResult> {
     if !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
         return None;
     }
@@ -785,6 +939,7 @@ pub fn launch_recorded_builtin_mixed(
         tables,
         want_host_lookup,
         want_host_sub,
+        destinations,
     );
     drop(uploaded);
     result
@@ -894,13 +1049,8 @@ fn launch_witness_program_core(
     tables: &DeviceExecutionTables,
     want_host_lookup: bool,
     want_host_sub: bool,
-) -> Option<(
-    Vec<BaseFieldVec>,
-    BaseFieldVec,
-    Vec<u32>,
-    BaseFieldVec,
-    Vec<u32>,
-)> {
+    destinations: Option<WitnessLaunchDestinations>,
+) -> Option<WitnessLaunchResult> {
     let n_cols = program.n_cols as usize;
     if program.n_mult_tables > 0 {
         // Multiplicity tables need real device columns + a host merge that this path
@@ -934,7 +1084,35 @@ fn launch_witness_program_core(
     let base_table = UploadedDevicePointerVec::upload(&table_ptrs);
     let strides = UploadedUint32Vec::upload(&table_lens);
 
-    let out_cols: Vec<BaseFieldVec> = (0..n_cols).map(|_| BaseFieldVec::new_zeroes(n)).collect();
+    let (out_cols, lookup_words, sub_words, resident_context) = match destinations {
+        Some(destinations) => {
+            if destinations.trace.len() != n_cols
+                || destinations.trace.iter().any(|column| column.size != n)
+                || destinations.lookup.size < (program.n_lookup_words as usize * n).max(1)
+                || destinations.sub.size < (program.n_sub_words as usize * n).max(1)
+                || destinations.trace.iter().any(|column| column.owns_memory)
+                || destinations.lookup.owns_memory
+                || destinations.sub.owns_memory
+            {
+                eprintln!("jit_prove[{label}]: resident destination geometry/ownership mismatch");
+                return None;
+            }
+            (
+                destinations.trace,
+                destinations.lookup,
+                destinations.sub,
+                Some(destinations.context),
+            )
+        }
+        None => {
+            let out_cols = (0..n_cols).map(|_| BaseFieldVec::new_zeroes(n)).collect();
+            let lookup_len = (program.n_lookup_words as usize * n).max(1);
+            let lookup_words = BaseFieldVec::new_zeroes(lookup_len);
+            let sub_len = (program.n_sub_words as usize * n).max(1);
+            let sub_words = BaseFieldVec::new_zeroes(sub_len);
+            (out_cols, lookup_words, sub_words, None)
+        }
+    };
     let out_ptrs: Vec<*const u32> = out_cols.iter().map(|c| c.device_ptr).collect();
     let out_table = UploadedDevicePointerVec::upload(&out_ptrs);
 
@@ -942,11 +1120,6 @@ fn launch_witness_program_core(
     let mult_cols: Vec<BaseFieldVec> = (0..n_mult).map(|_| BaseFieldVec::new_zeroes(1)).collect();
     let mult_ptrs: Vec<*const u32> = mult_cols.iter().map(|c| c.device_ptr).collect();
     let mult_table = UploadedDevicePointerVec::upload(&mult_ptrs);
-    let lookup_len = (program.n_lookup_words as usize * n).max(1);
-    let lookup_words = BaseFieldVec::new_zeroes(lookup_len);
-    let sub_len = (program.n_sub_words as usize * n).max(1);
-    let sub_words = BaseFieldVec::new_zeroes(sub_len);
-
     let source = codegen::compile_witness_to_cuda_source(program)?;
     let name = codegen::witness_kernel_name(program.semantic_hash());
     let cache_key = codegen::witness_jit_cache_key(program.semantic_hash());
@@ -959,8 +1132,20 @@ fn launch_witness_program_core(
     // lanes (rayon) each take a different pool stream, so their kernels overlap on the
     // GPU while their host threads block on their own D2Hs. Null stream = legacy (off).
     let ok = {
-        let _fork = StreamFork::acquire();
-        let stream = fork_stream_ptr(&_fork);
+        // All tables and temporary inputs above are still allocated/uploaded by
+        // the legacy backend. Fence them once before an arena-stream launch;
+        // the trace/lookup/sub outputs themselves never migrate.
+        if resident_context.is_some() {
+            crate::synchronize_legacy_stream_for_arena_handoff();
+        }
+        let fork = resident_context
+            .is_none()
+            .then(StreamFork::acquire)
+            .flatten();
+        let stream = resident_context.map_or_else(
+            || fork_stream_ptr(&fork),
+            |context| context.stream_raw().as_ptr(),
+        );
         unsafe {
             stwo_backend_cuda_kernels::raw::stwo_cuda_jit_witness_launch(
                 c_source.as_ptr(),
@@ -978,10 +1163,15 @@ fn launch_witness_program_core(
                 stream,
             )
         }
-        // `_fork` drops here → joins the pool stream into legacy before the D2H.
+        // `fork` drops here → joins the pool stream into legacy before the D2H.
     };
     if !ok {
         return None;
+    }
+    if let Some(context) = resident_context {
+        // Temporary input/table allocations are legacy-owned and may be dropped
+        // when this function returns. Fence their arena-stream consumers first.
+        context.sync().ok()?;
     }
     // §6a: when the device-interaction lane owns the lookup buffer, the host copy
     // (the largest D2H of the witness path) is skipped entirely.

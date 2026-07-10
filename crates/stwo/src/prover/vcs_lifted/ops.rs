@@ -10,6 +10,13 @@ use crate::prover::backend::{Col, Column, ColumnOps};
 pub trait MerkleOpsLifted<H: MerkleHasherLifted>:
     ColumnOps<BaseField> + ColumnOps<H::Hash> + PackLeavesOps + for<'de> Deserialize<'de> + Serialize
 {
+    /// Number of bottom Merkle layers omitted by `commit_pruned` and recomputed
+    /// during decommitment. The default preserves the historical low-memory policy;
+    /// backends may retain more layers to trade memory for faster decommitment.
+    fn merkle_prune_depth() -> u32 {
+        4
+    }
+
     /// Computes the leaves of the lifted Merkle commitment.
     fn build_leaves(columns: &[&Col<Self, BaseField>], lifting_log_size: u32)
         -> Col<Self, H::Hash>;

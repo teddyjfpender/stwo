@@ -23,6 +23,9 @@
 #ifndef STWO_WIT_DEDUCE_CUH
 #define STWO_WIT_DEDUCE_CUH
 
+#include "poseidon_witness_round_keys.cuh"
+
+#if !defined(STWO_WIT_EMBED) || defined(STWO_WIT_NEEDS_PEDERSEN)
 // Module-local pedersen table globals — DEFINITIONS, not externs. Device
 // globals never cross CUmodule boundaries, so each module embedding this
 // header carries its own copy; `runtime_jit.cu` fills them right after
@@ -82,6 +85,7 @@ static __device__ __forceinline__ void stwo_wit_deduce_partial_ec_mul_w18(
     felt252_to_m31_limbs(sum.x, out + 16);
     felt252_to_m31_limbs(sum.y, out + 44);
 }
+#endif
 
 // ---- DeduceKind::Felt{Add,Sub,Mul,Div} (4-7): fp256 body arithmetic ---------------
 //
@@ -134,6 +138,122 @@ static __device__ __forceinline__ void stwo_wit_deduce_felt_div(
     felt252 r =
         felt_from_mont(felt_mul(felt_to_mont(a), felt_inverse(felt_to_mont(b))));
     felt252_to_m31_limbs(r, out);
+}
+
+// ---- Cairo Poseidon fast-deduction ABI (kinds 8-11) -----------------------------
+// Width27 values are ten canonical M31 words. Convert through the same canonical
+// 28x9 representation used by the existing fp256 helpers; no Montgomery state is
+// exposed across the ABI.
+static __device__ __forceinline__ void stwo_wit_felt_from_w27(
+    felt252& out, const unsigned* words) {
+    m31 limbs[28];
+    for (int j = 0; j < 9; ++j) {
+        limbs[3 * j] = words[j] & 0x1ffu;
+        limbs[3 * j + 1] = (words[j] >> 9) & 0x1ffu;
+        limbs[3 * j + 2] = (words[j] >> 18) & 0x1ffu;
+    }
+    limbs[27] = words[9] & 0x1ffu;
+    felt252_from_m31_limbs(out, limbs);
+}
+
+static __device__ __forceinline__ void stwo_wit_felt_to_w27(
+    const felt252& value, unsigned* words) {
+    m31 limbs[28];
+    felt252_to_m31_limbs(value, limbs);
+    for (int j = 0; j < 9; ++j) {
+        words[j] = limbs[3 * j] | (limbs[3 * j + 1] << 9) |
+                   (limbs[3 * j + 2] << 18);
+    }
+    words[9] = limbs[27];
+}
+
+static __device__ __forceinline__ felt252 stwo_wit_felt_value_mul(
+    const felt252& a, const felt252& b) {
+    return felt_from_mont(felt_mul(felt_to_mont(a), felt_to_mont(b)));
+}
+
+static __device__ __forceinline__ felt252 stwo_wit_felt_value_cube(
+    const felt252& a) {
+    felt252 square = stwo_wit_felt_value_mul(a, a);
+    return stwo_wit_felt_value_mul(square, a);
+}
+
+static __device__ __forceinline__ felt252 stwo_wit_poseidon_key(
+    unsigned round, int key) {
+    felt252 result;
+    unsigned safe_round = round < 35u ? round : 0u;
+    stwo_wit_felt_from_w27(result, &STWO_WIT_POSEIDON_ROUND_KEYS[safe_round][key * 10]);
+    return result;
+}
+
+static __device__ __forceinline__ void stwo_wit_deduce_poseidon_round_keys(
+    const unsigned* in, unsigned* out) {
+    unsigned round = in[0] < 35u ? in[0] : 0u;
+    for (int word = 0; word < 30; ++word) {
+        out[word] = STWO_WIT_POSEIDON_ROUND_KEYS[round][word];
+    }
+}
+
+static __device__ __forceinline__ void stwo_wit_deduce_cube_252(
+    const unsigned* in, unsigned* out) {
+    felt252 value;
+    stwo_wit_felt_from_w27(value, in);
+    felt252 cube = stwo_wit_felt_value_cube(value);
+    stwo_wit_felt_to_w27(cube, out);
+}
+
+static __device__ __forceinline__ void stwo_wit_deduce_poseidon_full_round_chain(
+    const unsigned* in, unsigned* out) {
+    felt252 x, y, z;
+    stwo_wit_felt_from_w27(x, in + 2);
+    stwo_wit_felt_from_w27(y, in + 12);
+    stwo_wit_felt_from_w27(z, in + 22);
+    x = stwo_wit_felt_value_cube(x);
+    y = stwo_wit_felt_value_cube(y);
+    z = stwo_wit_felt_value_cube(z);
+
+    felt252 y_z = felt_sub(y, z);
+    felt252 x_y_z = felt_sub(x, y_z);
+    felt252 x_y_z_neg = felt_add(x, y_z);
+    felt252 x_y = felt_add(x, y);
+    felt252 two_x_y = felt_add(x_y, x_y);
+    felt252 new_x = felt_add(felt_add(two_x_y, x_y_z), stwo_wit_poseidon_key(in[1], 0));
+    felt252 new_y = felt_add(x_y_z, stwo_wit_poseidon_key(in[1], 1));
+    felt252 new_z = felt_add(felt_sub(x_y_z_neg, z), stwo_wit_poseidon_key(in[1], 2));
+
+    out[0] = in[0];
+    out[1] = in[1] + 1u;
+    stwo_wit_felt_to_w27(new_x, out + 2);
+    stwo_wit_felt_to_w27(new_y, out + 12);
+    stwo_wit_felt_to_w27(new_z, out + 22);
+}
+
+static __device__ __forceinline__ void stwo_wit_deduce_poseidon_3_partial_rounds_chain(
+    const unsigned* in, unsigned* out) {
+    felt252 state[4];
+    for (int i = 0; i < 4; ++i) {
+        stwo_wit_felt_from_w27(state[i], in + 2 + i * 10);
+    }
+    for (int key = 0; key < 3; ++key) {
+        felt252 z23 = stwo_wit_felt_value_cube(state[3]);
+        felt252 z03_z13 = felt_add(state[0], state[2]);
+        felt252 z03_z13_z1 = felt_add(z03_z13, state[1]);
+        felt252 longsum = felt_add(
+            felt_sub(felt_add(z03_z13_z1, state[3]), z23),
+            stwo_wit_poseidon_key(in[1], key));
+        felt252 half_z3 = felt_add(
+            felt_add(felt_add(longsum, z03_z13_z1), z03_z13), state[0]);
+        felt252 z3 = felt_add(half_z3, half_z3);
+        state[0] = state[2];
+        state[1] = state[3];
+        state[2] = z23;
+        state[3] = z3;
+    }
+    out[0] = in[0];
+    out[1] = in[1] + 1u;
+    for (int i = 0; i < 4; ++i) {
+        stwo_wit_felt_to_w27(state[i], out + 2 + i * 10);
+    }
 }
 
 #endif // STWO_WIT_DEDUCE_CUH

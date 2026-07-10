@@ -2,6 +2,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <new>
+#include <vector>
 
 // ---------------------------------------------------------------------------
 // Resource-owning execution context for ONE resident proof (design §19).
@@ -24,8 +25,13 @@
 // ---------------------------------------------------------------------------
 
 namespace {
+constexpr uint32_t STWO_EXEC_LANE_COUNT = 8;
+
 struct StwoExecContext {
     cudaStream_t stream;
+    cudaStream_t lanes[STWO_EXEC_LANE_COUNT];
+    cudaEvent_t lane_forks[STWO_EXEC_LANE_COUNT];
+    cudaEvent_t lane_joins[STWO_EXEC_LANE_COUNT];
     cudaMemPool_t pool;
 };
 
@@ -59,6 +65,11 @@ extern "C" int stwo_exec_context_create(void **out_handle) {
         return cudaErrorMemoryAllocation;
     }
     ctx->stream = nullptr;
+    for (uint32_t lane = 0; lane < STWO_EXEC_LANE_COUNT; ++lane) {
+        ctx->lanes[lane] = nullptr;
+        ctx->lane_forks[lane] = nullptr;
+        ctx->lane_joins[lane] = nullptr;
+    }
     ctx->pool = nullptr;
 
     cudaError_t err = cudaStreamCreateWithFlags(&ctx->stream, cudaStreamNonBlocking);
@@ -67,9 +78,40 @@ extern "C" int stwo_exec_context_create(void **out_handle) {
         return err;
     }
 
+    for (uint32_t lane = 0; lane < STWO_EXEC_LANE_COUNT; ++lane) {
+        err = cudaStreamCreateWithFlags(&ctx->lanes[lane], cudaStreamNonBlocking);
+        if (err == cudaSuccess) {
+            err = cudaEventCreateWithFlags(&ctx->lane_forks[lane], cudaEventDisableTiming);
+        }
+        if (err == cudaSuccess) {
+            err = cudaEventCreateWithFlags(&ctx->lane_joins[lane], cudaEventDisableTiming);
+        }
+        if (err != cudaSuccess) {
+            for (uint32_t cleanup = 0; cleanup <= lane; ++cleanup) {
+                if (ctx->lane_joins[cleanup] != nullptr) {
+                    cudaEventDestroy(ctx->lane_joins[cleanup]);
+                }
+                if (ctx->lane_forks[cleanup] != nullptr) {
+                    cudaEventDestroy(ctx->lane_forks[cleanup]);
+                }
+                if (ctx->lanes[cleanup] != nullptr) {
+                    cudaStreamDestroy(ctx->lanes[cleanup]);
+                }
+            }
+            cudaStreamDestroy(ctx->stream);
+            delete ctx;
+            return err;
+        }
+    }
+
     int device_id = 0;
     err = cudaGetDevice(&device_id);
     if (err != cudaSuccess) {
+        for (uint32_t lane = 0; lane < STWO_EXEC_LANE_COUNT; ++lane) {
+            cudaEventDestroy(ctx->lane_joins[lane]);
+            cudaEventDestroy(ctx->lane_forks[lane]);
+            cudaStreamDestroy(ctx->lanes[lane]);
+        }
         cudaStreamDestroy(ctx->stream);
         delete ctx;
         return err;
@@ -82,6 +124,11 @@ extern "C" int stwo_exec_context_create(void **out_handle) {
     props.location.id = device_id;
     err = cudaMemPoolCreate(&ctx->pool, &props);
     if (err != cudaSuccess || ctx->pool == nullptr) {
+        for (uint32_t lane = 0; lane < STWO_EXEC_LANE_COUNT; ++lane) {
+            cudaEventDestroy(ctx->lane_joins[lane]);
+            cudaEventDestroy(ctx->lane_forks[lane]);
+            cudaStreamDestroy(ctx->lanes[lane]);
+        }
         cudaStreamDestroy(ctx->stream);
         delete ctx;
         return err == cudaSuccess ? cudaErrorMemoryAllocation : err;
@@ -93,6 +140,11 @@ extern "C" int stwo_exec_context_create(void **out_handle) {
     err = cudaMemPoolSetAttribute(ctx->pool, cudaMemPoolAttrReleaseThreshold, &threshold);
     if (err != cudaSuccess) {
         cudaMemPoolDestroy(ctx->pool);
+        for (uint32_t lane = 0; lane < STWO_EXEC_LANE_COUNT; ++lane) {
+            cudaEventDestroy(ctx->lane_joins[lane]);
+            cudaEventDestroy(ctx->lane_forks[lane]);
+            cudaStreamDestroy(ctx->lanes[lane]);
+        }
         cudaStreamDestroy(ctx->stream);
         delete ctx;
         return err;
@@ -102,16 +154,34 @@ extern "C" int stwo_exec_context_create(void **out_handle) {
     return cudaSuccess;
 }
 
-// Sync + tear down. Synchronizes the stream first so no pending free/kernel outlives
-// the pool/stream it references.
+// Sync + tear down. Every component lane and the main stream are drained before
+// their events, streams, and shared proof pool are destroyed.
 extern "C" int stwo_exec_context_destroy(void *handle) {
     if (handle == nullptr) {
         return cudaSuccess;
     }
     StwoExecContext *ctx = context_from(handle);
     cudaError_t err = cudaSuccess;
+    for (uint32_t lane = 0; lane < STWO_EXEC_LANE_COUNT; ++lane) {
+        if (ctx->lanes[lane] != nullptr) {
+            err = first_error(err, cudaStreamSynchronize(ctx->lanes[lane]));
+        }
+    }
     if (ctx->stream != nullptr) {
         err = first_error(err, cudaStreamSynchronize(ctx->stream));
+    }
+    for (uint32_t lane = 0; lane < STWO_EXEC_LANE_COUNT; ++lane) {
+        if (ctx->lane_joins[lane] != nullptr) {
+            err = first_error(err, cudaEventDestroy(ctx->lane_joins[lane]));
+        }
+        if (ctx->lane_forks[lane] != nullptr) {
+            err = first_error(err, cudaEventDestroy(ctx->lane_forks[lane]));
+        }
+        if (ctx->lanes[lane] != nullptr) {
+            err = first_error(err, cudaStreamDestroy(ctx->lanes[lane]));
+        }
+    }
+    if (ctx->stream != nullptr) {
         err = first_error(err, cudaStreamDestroy(ctx->stream));
     }
     if (ctx->pool != nullptr) {
@@ -129,6 +199,24 @@ extern "C" int stwo_exec_context_sync(void *handle) {
     return cudaStreamSynchronize(context_from(handle)->stream);
 }
 
+// Fence exactly one borrowed launch stream. The ownership check prevents a
+// stale or foreign stream handle from being synchronized through this context.
+extern "C" int stwo_exec_context_stream_sync(void *handle, void *stream) {
+    if (handle == nullptr || stream == nullptr) {
+        return cudaErrorInvalidResourceHandle;
+    }
+    StwoExecContext *ctx = context_from(handle);
+    cudaStream_t target = reinterpret_cast<cudaStream_t>(stream);
+    bool owned = target == ctx->stream;
+    for (uint32_t lane = 0; lane < STWO_EXEC_LANE_COUNT && !owned; ++lane) {
+        owned = target == ctx->lanes[lane];
+    }
+    if (!owned) {
+        return cudaErrorInvalidResourceHandle;
+    }
+    return cudaStreamSynchronize(target);
+}
+
 // The context's stream as an opaque handle, to pass to `_on(stream)` kernel variants.
 extern "C" int stwo_exec_context_stream(void *handle, void **out_stream) {
     if (handle == nullptr || out_stream == nullptr) {
@@ -136,6 +224,51 @@ extern "C" int stwo_exec_context_stream(void *handle, void **out_stream) {
     }
     *out_stream = reinterpret_cast<void *>(context_from(handle)->stream);
     return *out_stream == nullptr ? cudaErrorInvalidResourceHandle : cudaSuccess;
+}
+
+// Capture-safe component lanes owned by the proof context. Streams and events
+// are created once with the context; fork/join only enqueue dependency nodes,
+// so no resource creation or host synchronization occurs during graph capture.
+extern "C" int stwo_exec_context_lane_count(void *handle, uint32_t *out_count) {
+    if (handle == nullptr || out_count == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    *out_count = STWO_EXEC_LANE_COUNT;
+    return cudaSuccess;
+}
+
+extern "C" int stwo_exec_context_lane_stream(
+    void *handle, uint32_t lane, void **out_stream
+) {
+    if (handle == nullptr || out_stream == nullptr || lane >= STWO_EXEC_LANE_COUNT) {
+        return cudaErrorInvalidValue;
+    }
+    *out_stream = reinterpret_cast<void *>(context_from(handle)->lanes[lane]);
+    return *out_stream == nullptr ? cudaErrorInvalidResourceHandle : cudaSuccess;
+}
+
+extern "C" int stwo_exec_context_lane_fork(void *handle, uint32_t lane) {
+    if (handle == nullptr || lane >= STWO_EXEC_LANE_COUNT) {
+        return cudaErrorInvalidValue;
+    }
+    StwoExecContext *ctx = context_from(handle);
+    cudaError_t err = cudaEventRecord(ctx->lane_forks[lane], ctx->stream);
+    if (err != cudaSuccess) {
+        return err;
+    }
+    return cudaStreamWaitEvent(ctx->lanes[lane], ctx->lane_forks[lane], 0);
+}
+
+extern "C" int stwo_exec_context_lane_join(void *handle, uint32_t lane) {
+    if (handle == nullptr || lane >= STWO_EXEC_LANE_COUNT) {
+        return cudaErrorInvalidValue;
+    }
+    StwoExecContext *ctx = context_from(handle);
+    cudaError_t err = cudaEventRecord(ctx->lane_joins[lane], ctx->lanes[lane]);
+    if (err != cudaSuccess) {
+        return err;
+    }
+    return cudaStreamWaitEvent(ctx->stream, ctx->lane_joins[lane], 0);
 }
 
 // Allocate `count` u32 from the context's pool, ordered on its stream. The returned
@@ -247,8 +380,9 @@ extern "C" int stwo_exec_context_memcpy_d2h_async(
 }
 
 // ---------------------------------------------------------------------------
-// Single-stream CUDA graph lifecycle. A graph exec contains only work captured
-// from the context stream; transcript boundaries and host reads remain outside.
+// CUDA graph lifecycle rooted on the context's main stream. Auxiliary streams
+// become part of the same graph only through the explicit lane fork/join edges
+// above; transcript boundaries and host reads remain outside.
 // ---------------------------------------------------------------------------
 
 extern "C" int stwo_graph_capture_begin(void *handle) {
@@ -259,11 +393,13 @@ extern "C" int stwo_graph_capture_begin(void *handle) {
         context_from(handle)->stream, cudaStreamCaptureModeThreadLocal);
 }
 
-extern "C" int stwo_graph_capture_end(void *handle, void **out_exec) {
-    if (handle == nullptr || out_exec == nullptr) {
+extern "C" int stwo_graph_capture_end(void *handle, void **out_exec,
+                                        uint64_t *out_kernel_nodes) {
+    if (handle == nullptr || out_exec == nullptr || out_kernel_nodes == nullptr) {
         return cudaErrorInvalidValue;
     }
     *out_exec = nullptr;
+    *out_kernel_nodes = 0;
 
     cudaGraph_t graph = nullptr;
     cudaError_t err = cudaStreamEndCapture(context_from(handle)->stream, &graph);
@@ -275,6 +411,31 @@ extern "C" int stwo_graph_capture_end(void *handle, void **out_exec) {
     }
     if (graph == nullptr) {
         return cudaErrorInvalidResourceHandle;
+    }
+
+    size_t node_count = 0;
+    err = cudaGraphGetNodes(graph, nullptr, &node_count);
+    if (err != cudaSuccess) {
+        cudaGraphDestroy(graph);
+        return err;
+    }
+    std::vector<cudaGraphNode_t> nodes(node_count);
+    if (node_count != 0) {
+        err = cudaGraphGetNodes(graph, nodes.data(), &node_count);
+        if (err != cudaSuccess) {
+            cudaGraphDestroy(graph);
+            return err;
+        }
+    }
+    uint64_t kernel_nodes = 0;
+    for (cudaGraphNode_t node : nodes) {
+        cudaGraphNodeType type;
+        err = cudaGraphNodeGetType(node, &type);
+        if (err != cudaSuccess) {
+            cudaGraphDestroy(graph);
+            return err;
+        }
+        kernel_nodes += type == cudaGraphNodeTypeKernel;
     }
 
     cudaGraphExec_t exec = nullptr;
@@ -291,6 +452,7 @@ extern "C" int stwo_graph_capture_end(void *handle, void **out_exec) {
         return cudaErrorInvalidResourceHandle;
     }
     *out_exec = reinterpret_cast<void *>(exec);
+    *out_kernel_nodes = kernel_nodes;
     return cudaSuccess;
 }
 

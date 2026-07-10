@@ -1,6 +1,7 @@
 #include "blake2s.cuh"
 #include <cstdio>
 #include <cstdlib>
+#include "poly_utils.cuh"
 #include "utils.cuh"
 
 __device__ __constant__ uint32_t blake2s_IV[8] = {
@@ -204,6 +205,20 @@ __device__ __forceinline__ void blake2s_init_words(uint32_t h[8]) {
     h[0] ^= 0x01010020; // digest len = 32, fanout/depth 1 — same as blake2s_init
 }
 
+__device__ void stwo_blake2s_compress_leaf_block_device(
+    Blake2sHash *state,
+    const uint32_t message[16],
+    uint32_t total_bytes,
+    uint32_t lastblock
+) {
+    uint32_t h[8];
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) h[i] = state->s[i];
+    blake2s_compress_words(h, message, total_bytes, lastblock);
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) state->s[i] = h[i];
+}
+
 // Hash a row's column words: unrolled 16-word groups (m stays in registers),
 // zero-padded tail block with the exact byte count + lastblock flag.
 __device__ __forceinline__ void blake2s_hash_column_words(
@@ -398,6 +413,141 @@ __global__ void __launch_bounds__(BLOCK_SIZE) stream_leaf_finalize_in_gpu(
     blake2s_compress_words(h, m, t, 0xFFFFFFFF);
     #pragma unroll
     for (int i = 0; i < 8; i++) result[index].s[i] = h[i];
+}
+
+// `prefinal` is the in-place N2B state after stage log_n-1. Reproduce exactly
+// the ordinary final circle butterfly for one bit-reversed evaluation word.
+__device__ __forceinline__ uint32_t n2b_final_value(
+    const uint32_t *prefinal,
+    uint32_t evaluation_index,
+    uint32_t evaluation_log_size,
+    uint32_t *twiddles,
+    uint32_t twiddle_words
+) {
+    const uint32_t half_domain = 1u << (evaluation_log_size - 1);
+    m31 *domain_twiddles = reinterpret_cast<m31 *>(twiddles + twiddle_words - half_domain);
+    const uint32_t pair = evaluation_index >> 1;
+    const m31 left = prefinal[2 * pair];
+    const m31 right = prefinal[2 * pair + 1];
+    const m31 product = mul(get_circle_twiddle(domain_twiddles, pair), right);
+    return (evaluation_index & 1) == 0 ? add(left, product) : sub(left, product);
+}
+
+// Hash-from-tile fusion. One bounded block owns 256 lifted leaves and performs
+// the producer's final butterfly immediately before Blake2s consumes each raw
+// M31 word. Group boundaries and 16-word compression blocks are unchanged.
+__global__ void __launch_bounds__(BLOCK_SIZE) stream_leaf_group_from_lde_in_gpu(
+    uint32_t size,
+    uint32_t group_n_cols,
+    uint32_t **prefinal_columns,
+    const uint32_t *column_log_sizes,
+    uint32_t lifting_log_size,
+    uint32_t cols_done,
+    uint32_t is_final,
+    uint32_t *twiddles,
+    uint32_t twiddle_words,
+    Blake2sHash *state
+) {
+    const uint32_t leaf_index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (leaf_index >= size) return;
+
+    uint32_t h[8];
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) h[i] = state[leaf_index].s[i];
+    uint32_t m[16];
+    uint32_t t = 4u * cols_done;
+    uint32_t column = 0;
+    if (is_final == 0) {
+        while (column < group_n_cols) {
+            #pragma unroll
+            for (int k = 0; k < 16; ++k) {
+                const uint32_t evaluation_log_size = column_log_sizes[column + k];
+                const uint32_t local_index = lifted_column_index(
+                    leaf_index, lifting_log_size - evaluation_log_size);
+                m[k] = n2b_final_value(
+                    prefinal_columns[column + k], local_index,
+                    evaluation_log_size, twiddles, twiddle_words);
+            }
+            t += 64;
+            blake2s_compress_words(h, m, t, 0);
+            column += 16;
+        }
+    } else {
+        #pragma unroll
+        for (int k = 0; k < 16; ++k) {
+            if ((uint32_t)k < group_n_cols) {
+                const uint32_t evaluation_log_size = column_log_sizes[k];
+                const uint32_t local_index = lifted_column_index(
+                    leaf_index, lifting_log_size - evaluation_log_size);
+                m[k] = n2b_final_value(
+                    prefinal_columns[k], local_index, evaluation_log_size,
+                    twiddles, twiddle_words);
+            } else {
+                m[k] = 0;
+            }
+        }
+        t += 4u * group_n_cols;
+        blake2s_compress_words(h, m, t, 0xFFFFFFFF);
+    }
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) state[leaf_index].s[i] = h[i];
+}
+
+__global__ void __launch_bounds__(BLOCK_SIZE) sparse_leaf_group_in_gpu(
+    const uint32_t *leaf_indices,
+    const uint32_t *leaf_count,
+    uint32_t max_leaf_count,
+    uint32_t group_n_cols,
+    uint32_t **group_data,
+    const uint32_t *group_col_log_sizes,
+    uint32_t lifting_log_size,
+    uint32_t cols_done,
+    uint32_t is_final,
+    Blake2sHash *states
+) {
+    const uint32_t sparse_index = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t count = min(*leaf_count, max_leaf_count);
+    if (sparse_index >= count) return;
+    const uint32_t leaf_index = leaf_indices[sparse_index];
+
+    uint32_t h[8];
+    if (cols_done == 0) {
+        blake2s_init_words(h);
+    } else {
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) h[i] = states[sparse_index].s[i];
+    }
+    uint32_t m[16];
+    uint32_t t = 4u * cols_done;
+    uint32_t col = 0;
+    if (!is_final) {
+        while (col < group_n_cols) {
+            #pragma unroll
+            for (int k = 0; k < 16; ++k) {
+                const uint32_t log_ratio =
+                    lifting_log_size - group_col_log_sizes[col + k];
+                m[k] = group_data[col + k][lifted_column_index(leaf_index, log_ratio)];
+            }
+            t += 64;
+            blake2s_compress_words(h, m, t, 0);
+            col += 16;
+        }
+    } else {
+        #pragma unroll
+        for (int k = 0; k < 16; ++k) {
+            if ((uint32_t)k < group_n_cols) {
+                const uint32_t log_ratio =
+                    lifting_log_size - group_col_log_sizes[k];
+                m[k] = group_data[k][lifted_column_index(leaf_index, log_ratio)];
+            } else {
+                m[k] = 0;
+            }
+        }
+        t += 4u * group_n_cols;
+        blake2s_compress_words(h, m, t, 0xFFFFFFFF);
+    }
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) states[sparse_index].s[i] = h[i];
 }
 
 // FRI's packed-leaf transform is purely a byte-layout transform:
@@ -701,6 +851,36 @@ extern "C" int stwo_blake2s_leaf_finalize_on(
     return cudaGetLastError();
 }
 
+extern "C" int stwo_blake2s_leaf_group_from_lde_on(
+    uint32_t size,
+    uint32_t group_n_cols,
+    uint32_t **prefinal_columns,
+    const uint32_t *column_log_sizes,
+    uint32_t lifting_log_size,
+    uint32_t cols_done,
+    uint32_t is_final,
+    uint32_t *twiddles,
+    uint32_t twiddle_words,
+    Blake2sHash *state,
+    void *stream
+) {
+    const bool valid_width = is_final != 0
+        ? group_n_cols > 0 && group_n_cols <= 16
+        : group_n_cols > 0 && (group_n_cols % 16) == 0;
+    if (size == 0 || !valid_width || prefinal_columns == nullptr ||
+        column_log_sizes == nullptr || lifting_log_size >= 31 ||
+        size != (1u << lifting_log_size) || (cols_done % 16) != 0 ||
+        twiddles == nullptr || twiddle_words == 0 || state == nullptr ||
+        stream == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    stream_leaf_group_from_lde_in_gpu<<<number_of_blocks_for(size), BLOCK_SIZE, 0,
+        reinterpret_cast<cudaStream_t>(stream)>>>(
+        size, group_n_cols, prefinal_columns, column_log_sizes,
+        lifting_log_size, cols_done, is_final, twiddles, twiddle_words, state);
+    return cudaGetLastError();
+}
+
 // One column-free interior Merkle level: result[i] = H(prev[2i], prev[2i+1]).
 extern "C" int stwo_blake2s_layer_on(
     const Blake2sHash *previous_layer,
@@ -740,6 +920,35 @@ extern "C" int stwo_blake2s_fri_leaf_on(
         reinterpret_cast<m31 **>(coordinate_columns),
         log_rows_per_leaf,
         result);
+    return cudaGetLastError();
+}
+
+extern "C" int stwo_blake2s_sparse_leaf_group_on(
+    const uint32_t *leaf_indices,
+    const uint32_t *leaf_count,
+    uint32_t max_leaf_count,
+    uint32_t group_n_cols,
+    uint32_t **columns,
+    const uint32_t *column_log_sizes,
+    uint32_t lifting_log_size,
+    uint32_t cols_done,
+    uint32_t is_final,
+    Blake2sHash *states,
+    void *stream
+) {
+    const bool valid_width = is_final != 0
+        ? group_n_cols > 0 && group_n_cols <= 16
+        : group_n_cols > 0 && (group_n_cols % 16) == 0;
+    if (leaf_indices == nullptr || leaf_count == nullptr || max_leaf_count == 0 ||
+        !valid_width || columns == nullptr || column_log_sizes == nullptr ||
+        lifting_log_size >= 31 || (cols_done % 16) != 0 || states == nullptr ||
+        stream == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    sparse_leaf_group_in_gpu<<<number_of_blocks_for(max_leaf_count), BLOCK_SIZE, 0,
+        reinterpret_cast<cudaStream_t>(stream)>>>(
+        leaf_indices, leaf_count, max_leaf_count, group_n_cols, columns,
+        column_log_sizes, lifting_log_size, cols_done, is_final, states);
     return cudaGetLastError();
 }
 

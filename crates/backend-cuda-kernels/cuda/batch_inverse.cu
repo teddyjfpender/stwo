@@ -22,7 +22,8 @@ DEVICE_FORCEINLINE void new_backward_children(T *from, T *dst, int index) {
 }
 
 template<typename T>
-DEVICE_FORCEINLINE void batch_inverse(T *from, T *dst, int size, int log_size, T *s_from, T *s_inner_tree) {
+DEVICE_FORCEINLINE void batch_inverse(T *from, T *dst, int size, int log_size,
+                                      int block_index, T *s_from, T *s_inner_tree) {
     // Input:
     // - from      : array of T representing field elements.
     // - inner_tree: array of T used as an auxiliary variable.
@@ -44,11 +45,11 @@ DEVICE_FORCEINLINE void batch_inverse(T *from, T *dst, int size, int log_size, T
     //          inv_right_child = inv_parent * left_child
     int index = threadIdx.x;
 
-    s_from[index] = from[2 * blockIdx.x * blockDim.x + index];
-    s_from[index + blockDim.x] = from[2 * blockIdx.x * blockDim.x + index + blockDim.x];
+    s_from[index] = from[2 * block_index * blockDim.x + index];
+    s_from[index + blockDim.x] = from[2 * block_index * blockDim.x + index + blockDim.x];
     __syncthreads();
 
-    dst = &dst[2 * blockIdx.x * blockDim.x];
+    dst = &dst[2 * block_index * blockDim.x];
 
     // Size tracks the number of threads working.
 
@@ -136,7 +137,8 @@ __global__ void batch_inverse_base_field_kernel(m31 *from, m31 *dst, int size, i
     m31 *s_from_basefield = shared_basefield;
     m31 *s_inner_trees_basefield = &shared_basefield[size];
 
-    batch_inverse(from, dst, size, log_size, s_from_basefield, s_inner_trees_basefield);
+    batch_inverse(from, dst, size, log_size, blockIdx.x, s_from_basefield,
+                  s_inner_trees_basefield);
 }
 
 __global__ void batch_inverse_secure_field_kernel(qm31 *from, qm31 *dst, int size, int log_size) {
@@ -151,7 +153,56 @@ __global__ void batch_inverse_secure_field_kernel(qm31 *from, qm31 *dst, int siz
     qm31 *s_from_qm31 = shared_qm31;
     qm31 *s_inner_trees_qm31 = &shared_qm31[size];
 
-    batch_inverse(from, dst, size, log_size, s_from_qm31, s_inner_trees_qm31);
+    batch_inverse(from, dst, size, log_size, blockIdx.x, s_from_qm31,
+                  s_inner_trees_qm31);
+}
+
+// One proof-wide launch over heterogeneous relation denominator slabs. Geometry
+// uses the shared relation geometry ABI from batch_inverse.cuh.
+// Large power-of-two rows preserve the exact 1024-leaf Montgomery partitions;
+// small slabs use direct inverses in 1024-element chunks within the same launch.
+__global__ void batch_inverse_secure_field_ragged_kernel(
+    qm31 *const *slabs, const uint32_t *geometry, uint32_t n_instances) {
+    uint32_t global_block = blockIdx.x;
+    uint32_t lo = 0;
+    uint32_t hi = n_instances;
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2u;
+        if (geometry[mid * RELATION_GEOMETRY_WORDS + RELATION_INVERSE_FIRST] <= global_block) {
+            lo = mid + 1u;
+        } else {
+            hi = mid;
+        }
+    }
+    if (lo == 0u) {
+        return;
+    }
+    uint32_t instance = lo - 1u;
+    const uint32_t *g = geometry + instance * RELATION_GEOMETRY_WORDS;
+    uint32_t local_block = global_block - g[RELATION_INVERSE_FIRST];
+    if (local_block >= g[RELATION_INVERSE_BLOCKS]) {
+        return;
+    }
+    uint32_t rows = g[RELATION_ROWS];
+    uint32_t columns = g[RELATION_COLUMNS];
+    qm31 *slab = slabs[instance];
+    uint32_t offset = local_block * 1024u;
+    uint32_t total = rows * columns;
+    if (rows >= 1024u) {
+        extern __shared__ qm31 shared_qm31[];
+        qm31 *s_from = shared_qm31;
+        qm31 *s_tree = &shared_qm31[1024];
+        batch_inverse(slab + offset, slab + offset, 1024, 10, 0, s_from, s_tree);
+        return;
+    }
+    uint32_t first = offset + threadIdx.x;
+    if (first < total) {
+        slab[first] = inv(slab[first]);
+    }
+    uint32_t second = first + blockDim.x;
+    if (second < total) {
+        slab[second] = inv(slab[second]);
+    }
 }
 
 // Simple element-by-element inverse kernel for small sizes
@@ -201,6 +252,54 @@ cudaError_t batch_inverse_secure_field_on(
 
     batch_inverse_secure_field_kernel<<<num_blocks, block_size, shared_memory_bytes, stream>>>(
         from, dst, size, log_size);
+    return cudaGetLastError();
+}
+
+cudaError_t batch_inverse_secure_field_columns_on(
+    cudaStream_t stream, qm31 *from, qm31 *dst, int rows, int columns
+) {
+    if (rows <= 0 || columns <= 0 || rows > 0x7fffffff / columns) {
+        return cudaErrorInvalidValue;
+    }
+    int total = rows * columns;
+    int log_rows = log_2(rows);
+    bool rows_are_power_of_2 = (rows & (rows - 1)) == 0;
+
+    // Prepared relation extents are powers of two. Small columns use the same
+    // element-wise inverse as before, now over one flattened launch.
+    if (rows < 1024 || !rows_are_power_of_2) {
+        int block_size = total < 256 ? total : 256;
+        int num_blocks = (total + block_size - 1) / block_size;
+        batch_inverse_secure_field_simple_kernel<<<num_blocks, block_size, 0, stream>>>(
+            from, dst, total);
+        return cudaGetLastError();
+    }
+
+    // `rows` is a multiple of 1024, so flattening the launch preserves the
+    // previous per-column 1024-element tree boundaries exactly. `from == dst`
+    // is safe: each block loads its disjoint leaves before writing them back.
+    int block_size = 512;
+    int blocks_per_column = ((rows >> 1) + block_size - 1) / block_size;
+    int num_blocks = blocks_per_column * columns;
+    int shared_memory_bytes = 1024 * 4 * 4 + (1024 - 32) * 4 * 4;
+    batch_inverse_secure_field_kernel<<<num_blocks, block_size, shared_memory_bytes, stream>>>(
+        from, dst, rows, log_rows);
+    return cudaGetLastError();
+}
+
+cudaError_t batch_inverse_secure_field_ragged_on(
+    cudaStream_t stream, qm31 *const *slabs, const uint32_t *geometry,
+    int instances, int total_blocks
+) {
+    if (slabs == nullptr || geometry == nullptr || instances <= 0 ||
+        total_blocks <= 0) {
+        return cudaErrorInvalidValue;
+    }
+    int block_size = 512;
+    int shared_memory_bytes = 1024 * 4 * 4 + (1024 - 32) * 4 * 4;
+    batch_inverse_secure_field_ragged_kernel<<<
+        total_blocks, block_size, shared_memory_bytes, stream>>>(
+        slabs, geometry, static_cast<uint32_t>(instances));
     return cudaGetLastError();
 }
 

@@ -8,8 +8,8 @@ mod backend;
 
 pub use backend::aot;
 pub use backend::commit_graph::{
-    CommitGraphError, CommitGraphPlan, CommitLaunchKind, CommitLdeBatch, CommitLeafGroup,
-    CommitTailPlan,
+    CommitGraphError, CommitGraphPlan, CommitHashFromTileTelemetry, CommitLaunchKind,
+    CommitLdeBatch, CommitLeafGroup, CommitTailPlan,
 };
 pub use backend::decommit_gather::{
     column_row_gather_requirements, gather_column_rows_host, ColumnRowGatherError,
@@ -27,7 +27,8 @@ pub use backend::device_transcript::{
 };
 pub use backend::exec_context::{
     ArenaError, ArenaLayout, ArenaSlice, ArenaSlotId, ArenaSlotSpec, CudaExecContext,
-    CudaGraphCapture, CudaGraphExec, CudaRuntimeError, DeviceArena,
+    CudaExecTelemetry, CudaGraphCapture, CudaGraphExec, CudaLaunchContext, CudaRuntimeError,
+    DeviceArena,
 };
 pub use backend::pcs_driver::{
     prove_values_with_config as prove_cuda_pcs_values, CudaPcsDriverConfig, CudaPcsDriverError,
@@ -36,10 +37,43 @@ pub use backend::pcs_driver::{
 };
 pub use backend::prepared_commit::{
     commit_workspace_requirements, CommitArenaSlotRequirement, CommitBatchRequirements,
-    CommitBatchSlots, CommitCoefficientColumn, CommitCoefficientGroup, CommitGroupRequirements,
-    CommitGroupSlots, CommitLayerRequirements, CommitWorkspaceConfig, CommitWorkspaceRequirements,
-    CommitWorkspaceSlots, PreparedCommitError, PreparedCommitGraph, COMMIT_HASH_ALIGNMENT_WORDS,
-    COMMIT_POINTER_ALIGNMENT_WORDS,
+    CommitBatchSlots, CommitCoefficientColumn, CommitCoefficientGroup, CommitEvaluationGroup,
+    CommitGroupRequirements, CommitGroupSlots, CommitLayerRequirements, CommitWorkspaceConfig,
+    CommitWorkspaceRequirements, CommitWorkspaceSlots, PreparedCommitError, PreparedCommitGraph,
+    COMMIT_HASH_ALIGNMENT_WORDS, COMMIT_POINTER_ALIGNMENT_WORDS,
+};
+pub use backend::prepared_decommit::{
+    decommit_workspace_requirements, DecommitArenaSlotRequirement, DecommitAssembly,
+    DecommitColumnGeometry, DecommitColumnSource, DecommitSourceMode, DecommitTreeGeometry,
+    DecommitTreeMeta, DecommitTreeRequirements, DecommitTreeSlots, DecommitTreeSources,
+    DecommitWorkspaceConfig, DecommitWorkspaceRequirements, DecommitWorkspaceSlots,
+    FriDecommitGeometry, FriDecommitOwnedSources, FriDecommitSlots, FriTreeRequirements,
+    PreparedDecommitError, PreparedDecommitGraph, TraceDecommitGeometry, TraceDecommitSlots,
+    TraceDecommitSources, TraceGroupRequirements, TraceSourceGroup, TraceSourceGroupGeometry,
+    TraceSourceGroupSlots, TraceTreeRequirements, TraceTreeRole, DECOMMIT_HASH_ALIGNMENT_WORDS,
+    DECOMMIT_POINTER_ALIGNMENT_WORDS,
+};
+pub use backend::prepared_ec_op::{
+    ec_op_workspace_requirements, EcOpArenaSlotRequirement, EcOpMultiplicityGeometry,
+    EcOpWorkspaceRequirements, EcOpWorkspaceSlots, PreparedEcOpError, PreparedEcOpGraph,
+    PreparedEcOpIngestTelemetry, PreparedEcOpLaunchTelemetry, EC_OP_LOOKUP_WORDS_PER_ROW,
+    EC_OP_PARTIAL_INPUT_COLUMNS, EC_OP_PARTIAL_PADDED_ROUNDS, EC_OP_PARTIAL_REAL_ROUNDS,
+    EC_OP_TRACE_COLUMNS,
+};
+pub use backend::prepared_execution_tables::{
+    execution_tables_workspace_requirements, ExecutionTablesArenaSlotRequirement,
+    ExecutionTablesHostData, ExecutionTablesWorkspaceRequirements, ExecutionTablesWorkspaceSlots,
+    PreparedExecutionTablesError, PreparedExecutionTablesGraph,
+    PreparedExecutionTablesIngestTelemetry, PreparedExecutionTablesLaunchTelemetry,
+    PreparedExecutionTablesView, EXECUTION_TABLE_BIG_LIMBS, EXECUTION_TABLE_POINTERS,
+    EXECUTION_TABLE_POINTER_ALIGNMENT_WORDS, EXECUTION_TABLE_SMALL_LIMBS, EXECUTION_TABLE_STRIDES,
+};
+pub use backend::prepared_fixed_table::{
+    fixed_table_workspace_requirements, FixedTableArenaSlotRequirement,
+    FixedTableContiguousWorkspaceSlots, FixedTableLookupSource, FixedTableMaterializationConfig,
+    FixedTableWorkspaceRequirements, FixedTableWorkspaceSlots, PreparedFixedTableError,
+    PreparedFixedTableGraph, FIXED_TABLE_LOOKUP_DESCRIPTOR_WORDS,
+    FIXED_TABLE_POINTER_ALIGNMENT_WORDS,
 };
 pub use backend::prepared_fri::{
     fri_workspace_requirements, FriArenaSlotRequirement, FriMerkleLayerRequirements,
@@ -47,19 +81,83 @@ pub use backend::prepared_fri::{
     FriWorkspaceRequirements, FriWorkspaceSlots, PreparedFriError, PreparedFriEvaluation,
     PreparedFriGraph, FRI_CHALLENGE_WORDS, FRI_HASH_ALIGNMENT_WORDS, FRI_POINTER_ALIGNMENT_WORDS,
 };
+pub use backend::prepared_fri_final::{
+    fri_final_workspace_requirements, FriFinalArenaSlotRequirement, FriFinalWorkspaceRequirements,
+    FriFinalWorkspaceSlots, PreparedFriFinalError, PreparedFriFinalGraph,
+};
+pub use backend::prepared_interpolation::{
+    InterpolationBatch, InterpolationColumn, PreparedInterpolationError,
+    PreparedInterpolationGraph, INTERPOLATION_POINTER_ALIGNMENT_WORDS,
+};
+pub use backend::prepared_memory_trace::{
+    MemoryBaseTracePart, PreparedMemoryBaseTraceError, PreparedMemoryBaseTraceGraph,
+    MEMORY_ADDRESS_BASE_COLUMNS, MEMORY_BIG_BASE_COLUMNS, MEMORY_SMALL_BASE_COLUMNS,
+};
+pub use backend::prepared_oods::{
+    oods_workspace_requirements, OodsArenaSlotRequirement, OodsCoefficientColumn,
+    OodsColumnSampleRange, OodsColumnSource, OodsColumnTopology, OodsEvaluationGroupRequirements,
+    OodsLogGroupRequirements, OodsMaskTopology, OodsPolynomialColumn, OodsSourceKind,
+    OodsWorkspaceConfig, OodsWorkspaceRequirements, OodsWorkspaceSlots, PreparedOodsError,
+    PreparedOodsGraph, OODS_PARAMETER_WORDS, OODS_POINTER_ALIGNMENT_WORDS,
+};
+pub use backend::prepared_pow::{
+    blake2s_pow_workspace_requirements, Blake2sPowArenaSlotRequirement,
+    Blake2sPowWorkspaceRequirements, Blake2sPowWorkspaceSlots, PreparedBlake2sPowError,
+    PreparedBlake2sPowGraph, POW_NONCE_WORDS, POW_U64_ALIGNMENT_WORDS,
+};
 pub use backend::prepared_quotient::{
     quotient_workspace_requirements, PreparedQuotientError, PreparedQuotientGraph,
     QuotientArenaSlotRequirement, QuotientNumeratorSource, QuotientSampleConstants,
     QuotientWorkspaceConfig, QuotientWorkspaceRequirements, QuotientWorkspaceSlots,
     QUOTIENT_POINTER_ALIGNMENT_WORDS,
 };
+pub use backend::prepared_quotient_numerator::{
+    quotient_numerator_workspace_requirements, PreparedQuotientNumeratorError,
+    PreparedQuotientNumeratorGraph, QuotientNumeratorArenaSlotRequirement,
+    QuotientNumeratorBatchRequirements, QuotientNumeratorColumn, QuotientNumeratorColumnSource,
+    QuotientNumeratorColumnTopology, QuotientNumeratorDestination,
+    QuotientNumeratorGroupRequirements, QuotientNumeratorSourceKind,
+    QuotientNumeratorWorkspaceConfig, QuotientNumeratorWorkspaceRequirements,
+    QuotientNumeratorWorkspaceSlots, QuotientOodsSample,
+    QUOTIENT_NUMERATOR_POINTER_ALIGNMENT_WORDS,
+};
+pub use backend::prepared_witness::{
+    witness_workspace_requirements, PreparedWitnessError, PreparedWitnessGraph,
+    PreparedWitnessLaunchTelemetry, PreparedWitnessMode, WitnessArenaSlotRequirement,
+    WitnessKernelIdentity, WitnessWorkspaceRequirements, WitnessWorkspaceSlots,
+    WITNESS_POINTER_ALIGNMENT_WORDS,
+};
+pub use backend::prepared_witness_feed::{
+    clear_witness_feed_destinations_once, witness_feed_clear_workspace_requirements,
+    witness_feed_workspace_requirements, PreparedWitnessFeedClearGraph, PreparedWitnessFeedError,
+    PreparedWitnessFeedGraph, WitnessFeedArenaSlotRequirement,
+    WitnessFeedClearWorkspaceRequirements, WitnessFeedClearWorkspaceSlots,
+    WitnessFeedWorkspaceRequirements, WitnessFeedWorkspaceSlots, WITNESS_FEED_DESCRIPTOR_WORDS,
+    WITNESS_FEED_MAX_TUPLE_WORDS, WITNESS_FEED_NO_LUT, WITNESS_FEED_POINTER_ALIGNMENT_WORDS,
+};
+pub use backend::prepared_witness_input::{
+    witness_input_compact_requirements, witness_input_gather_requirements,
+    witness_input_seed_requirements, PreparedWitnessInputCompactGraph,
+    PreparedWitnessInputGatherError, PreparedWitnessInputGatherGraph,
+    PreparedWitnessInputSeedGraph, WitnessInputCompactLayout, WitnessInputCompactRequirements,
+    WitnessInputCompactSlots, WitnessInputGatherArenaSlotRequirement, WitnessInputGatherEdge,
+    WitnessInputGatherEdgePlan, WitnessInputGatherRequirements, WitnessInputGatherSlots,
+    WitnessInputSeedRequirements, WitnessInputSeedSlots, WITNESS_INPUT_GATHER_DESCRIPTOR_WORDS,
+    WITNESS_INPUT_GATHER_PACKED_LANES, WITNESS_INPUT_GATHER_POINTER_ALIGNMENT_WORDS,
+};
+pub use backend::proof_assembly::{
+    assemble_blake2s_stark_proof, Blake2sFriAssemblyShape, Blake2sProofAssemblyError,
+    Blake2sProofAssemblyInput, Blake2sProofAssemblyShape, Blake2sTraceAssemblyShape,
+};
 pub use backend::relation_graph::{
-    relation_graph_requirements, PreparedRelationGraph, PreparedRelationOutput,
-    RelationArenaSlotRequirement, RelationBatchProgram, RelationChallenges,
+    relation_batch_fused_eligible, relation_graph_requirements, PreparedRelationGraph,
+    PreparedRelationOutput, RelationArenaSlotRequirement, RelationBatchProgram, RelationChallenges,
     RelationColumnDescriptor, RelationGraphError, RelationGraphRequirements, RelationGraphSlots,
     RelationInstanceRequirement, RelationInstanceSlots, RelationInstanceSources,
-    RelationKernelProgram, RelationMultiplicityKind, RelationRowExtent, RelationSourceLayout,
-    RelationTupleKind, RelationUseDescriptor, RELATION_POINTER_ALIGNMENT_WORDS,
+    RelationKernelProgram, RelationLaunchMode, RelationMultiplicityKind, RelationRowExtent,
+    RelationSourceLayout, RelationTupleKind, RelationUseDescriptor, RELATION_FUSED_MASK_WORDS,
+    RELATION_FUSED_MAX_COLUMNS, RELATION_FUSED_MAX_INSTANCES, RELATION_FUSED_MAX_TUPLE_WORDS,
+    RELATION_POINTER_ALIGNMENT_WORDS,
 };
 mod columns;
 

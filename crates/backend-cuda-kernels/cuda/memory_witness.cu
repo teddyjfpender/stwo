@@ -28,6 +28,19 @@ namespace {
 constexpr uint32_t MW_BLOCK = 256;
 constexpr uint32_t FELT252_BITS_PER_WORD = 9;
 constexpr uint32_t LIMB_MASK = (1u << FELT252_BITS_PER_WORD) - 1;
+constexpr int MW_MAX_LIMBS = 28;
+
+struct MemoryResidentOutputs {
+    uint32_t *limbs[MW_MAX_LIMBS];
+};
+
+struct MemoryBaseTraceColumns {
+    uint32_t *columns[32];
+};
+
+struct MemoryBaseTraceSources {
+    const uint32_t *columns[MW_MAX_LIMBS];
+};
 
 // LSB-first split of `n_words` 32-bit words into `n_limbs` 9-bit limbs —
 // line-for-line the generic `split` in stwo-cairo-common/prover_types/felt.rs.
@@ -78,6 +91,81 @@ __global__ void memory_limb_split_kernel(
     for (int j = 0; j < N_LIMBS; ++j) {
         limb_cols[j][row] = limbs[j];
     }
+}
+
+// Arena-native counterpart: output addresses travel as kernel arguments, so
+// there is no per-proof device pointer-table allocation/upload.
+template <int N_WORDS, int N_LIMBS>
+__global__ void memory_limb_split_into_kernel(
+    const uint32_t *values,
+    uint32_t n_values,
+    uint32_t column_length,
+    MemoryResidentOutputs outputs
+) {
+    uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= column_length) {
+        return;
+    }
+    uint32_t words[N_WORDS] = {0};
+    if (row < n_values) {
+        for (int word = 0; word < N_WORDS; ++word) {
+            words[word] = values[(size_t)row * N_WORDS + word];
+        }
+    }
+    uint32_t limbs[N_LIMBS];
+    split_le_9bit<N_WORDS, N_LIMBS>(words, limbs);
+    for (int limb = 0; limb < N_LIMBS; ++limb) {
+        outputs.limbs[limb][row] = limbs[limb];
+    }
+}
+
+__global__ void memory_address_base_trace_kernel(
+    const uint32_t *raw_addr_to_id,
+    uint32_t n_addrs,
+    const uint32_t *multiplicities,
+    uint32_t count_words,
+    uint32_t column_length,
+    MemoryBaseTraceColumns outputs
+) {
+    uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= column_length) {
+        return;
+    }
+    for (uint32_t chunk = 0; chunk < 16; ++chunk) {
+        uint32_t index = chunk * column_length + row;
+        // Address zero is reserved; host AddressToId stores address 1 at row 0.
+        outputs.columns[2 * chunk][row] = index + 1 < n_addrs
+            ? raw_addr_to_id[index + 1]
+            : 0u;
+        outputs.columns[2 * chunk + 1][row] = index < count_words
+            ? multiplicities[index]
+            : 0u;
+    }
+}
+
+__global__ void memory_value_base_trace_kernel(
+    MemoryBaseTraceSources sources,
+    uint32_t n_limbs,
+    uint32_t source_words,
+    uint32_t source_offset,
+    const uint32_t *multiplicities,
+    uint32_t count_words,
+    uint32_t column_length,
+    MemoryBaseTraceColumns outputs
+) {
+    uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= column_length) {
+        return;
+    }
+    uint32_t index = source_offset + row;
+    for (uint32_t limb = 0; limb < n_limbs; ++limb) {
+        outputs.columns[limb][row] = index < source_words
+            ? sources.columns[limb][index]
+            : 0u;
+    }
+    outputs.columns[n_limbs][row] = index < count_words
+        ? multiplicities[index]
+        : 0u;
 }
 
 // rc_9_9 feed: per row, limb pairs (2j, 2j+1) for j in [0, n_pairs) count into
@@ -206,6 +294,178 @@ extern "C" void memory_limb_split_small(
         values, n_values, column_length, const_cast<uint32_t *const *>(limb_cols));
     stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
+}
+
+template <int N_WORDS, int N_LIMBS>
+int memory_limb_split_into_on_impl(
+    const uint32_t *values,
+    uint32_t n_values,
+    uint32_t column_length,
+    uint32_t *const *limb_cols_host,
+    const uint32_t *mults_host,
+    uint32_t *mults,
+    cudaStream_t stream
+) {
+    if (column_length == 0 || values == nullptr || limb_cols_host == nullptr ||
+        mults_host == nullptr || mults == nullptr || n_values > column_length) {
+        return static_cast<int>(cudaErrorInvalidValue);
+    }
+    MemoryResidentOutputs outputs = {};
+    for (int limb = 0; limb < N_LIMBS; ++limb) {
+        if (limb_cols_host[limb] == nullptr) {
+            return static_cast<int>(cudaErrorInvalidDevicePointer);
+        }
+        outputs.limbs[limb] = limb_cols_host[limb];
+    }
+    cudaError_t status = cudaMemcpyAsync(
+        mults, mults_host, (size_t)column_length * sizeof(uint32_t),
+        cudaMemcpyHostToDevice, stream);
+    if (status != cudaSuccess) {
+        return static_cast<int>(status);
+    }
+    uint32_t blocks = (column_length + MW_BLOCK - 1) / MW_BLOCK;
+    memory_limb_split_into_kernel<N_WORDS, N_LIMBS><<<blocks, MW_BLOCK, 0, stream>>>(
+        values, n_values, column_length, outputs);
+    return static_cast<int>(cudaGetLastError());
+}
+
+// Prepared execution-table counterpart: split compact values directly into
+// stable arena columns on the caller's stream. Unlike the migration-era
+// `*_into_on` entry points this performs no host transfer and owns no temporary
+// allocation, so it is safe both during capture and graph replay.
+template <int N_WORDS, int N_LIMBS>
+int memory_limb_split_columns_on_impl(
+    const uint32_t *values,
+    uint32_t n_values,
+    uint32_t column_length,
+    uint32_t *const *limb_cols_host,
+    cudaStream_t stream
+) {
+    if (column_length == 0 || values == nullptr || limb_cols_host == nullptr ||
+        stream == nullptr || n_values > column_length) {
+        return static_cast<int>(cudaErrorInvalidValue);
+    }
+    MemoryResidentOutputs outputs = {};
+    for (int limb = 0; limb < N_LIMBS; ++limb) {
+        if (limb_cols_host[limb] == nullptr) {
+            return static_cast<int>(cudaErrorInvalidDevicePointer);
+        }
+        outputs.limbs[limb] = limb_cols_host[limb];
+    }
+    uint32_t blocks = (column_length + MW_BLOCK - 1) / MW_BLOCK;
+    memory_limb_split_into_kernel<N_WORDS, N_LIMBS><<<blocks, MW_BLOCK, 0, stream>>>(
+        values, n_values, column_length, outputs);
+    return static_cast<int>(cudaGetLastError());
+}
+
+extern "C" int memory_limb_split_big_into_on(
+    const uint32_t *values,
+    uint32_t n_values,
+    uint32_t column_length,
+    uint32_t *const *limb_cols_host,
+    const uint32_t *mults_host,
+    uint32_t *mults,
+    cudaStream_t stream
+) {
+    return memory_limb_split_into_on_impl<8, 28>(
+        values, n_values, column_length, limb_cols_host, mults_host, mults, stream);
+}
+
+extern "C" int memory_limb_split_small_into_on(
+    const uint32_t *values,
+    uint32_t n_values,
+    uint32_t column_length,
+    uint32_t *const *limb_cols_host,
+    const uint32_t *mults_host,
+    uint32_t *mults,
+    cudaStream_t stream
+) {
+    return memory_limb_split_into_on_impl<4, 8>(
+        values, n_values, column_length, limb_cols_host, mults_host, mults, stream);
+}
+
+extern "C" int memory_limb_split_big_columns_on(
+    const uint32_t *values,
+    uint32_t n_values,
+    uint32_t column_length,
+    uint32_t *const *limb_cols_host,
+    cudaStream_t stream
+) {
+    return memory_limb_split_columns_on_impl<8, 28>(
+        values, n_values, column_length, limb_cols_host, stream);
+}
+
+extern "C" int memory_limb_split_small_columns_on(
+    const uint32_t *values,
+    uint32_t n_values,
+    uint32_t column_length,
+    uint32_t *const *limb_cols_host,
+    cudaStream_t stream
+) {
+    return memory_limb_split_columns_on_impl<4, 8>(
+        values, n_values, column_length, limb_cols_host, stream);
+}
+
+extern "C" int memory_address_base_trace_on(
+    const uint32_t *raw_addr_to_id,
+    uint32_t n_addrs,
+    const uint32_t *multiplicities,
+    uint32_t count_words,
+    uint32_t column_length,
+    uint32_t *const *outputs_host,
+    cudaStream_t stream
+) {
+    if (raw_addr_to_id == nullptr || multiplicities == nullptr || outputs_host == nullptr ||
+        stream == nullptr || column_length == 0 || count_words != 16u * column_length) {
+        return static_cast<int>(cudaErrorInvalidValue);
+    }
+    MemoryBaseTraceColumns outputs = {};
+    for (uint32_t column = 0; column < 32; ++column) {
+        if (outputs_host[column] == nullptr) {
+            return static_cast<int>(cudaErrorInvalidDevicePointer);
+        }
+        outputs.columns[column] = outputs_host[column];
+    }
+    uint32_t blocks = (column_length + MW_BLOCK - 1) / MW_BLOCK;
+    memory_address_base_trace_kernel<<<blocks, MW_BLOCK, 0, stream>>>(
+        raw_addr_to_id, n_addrs, multiplicities, count_words, column_length, outputs);
+    return static_cast<int>(cudaGetLastError());
+}
+
+extern "C" int memory_value_base_trace_on(
+    const uint32_t *const *sources_host,
+    uint32_t n_limbs,
+    uint32_t source_words,
+    uint32_t source_offset,
+    const uint32_t *multiplicities,
+    uint32_t count_words,
+    uint32_t column_length,
+    uint32_t *const *outputs_host,
+    cudaStream_t stream
+) {
+    if (sources_host == nullptr || multiplicities == nullptr || outputs_host == nullptr ||
+        stream == nullptr || column_length == 0 || n_limbs == 0 || n_limbs > MW_MAX_LIMBS ||
+        source_offset > count_words || column_length > count_words - source_offset) {
+        return static_cast<int>(cudaErrorInvalidValue);
+    }
+    MemoryBaseTraceSources sources = {};
+    MemoryBaseTraceColumns outputs = {};
+    for (uint32_t limb = 0; limb < n_limbs; ++limb) {
+        if (sources_host[limb] == nullptr || outputs_host[limb] == nullptr) {
+            return static_cast<int>(cudaErrorInvalidDevicePointer);
+        }
+        sources.columns[limb] = sources_host[limb];
+        outputs.columns[limb] = outputs_host[limb];
+    }
+    if (outputs_host[n_limbs] == nullptr) {
+        return static_cast<int>(cudaErrorInvalidDevicePointer);
+    }
+    outputs.columns[n_limbs] = outputs_host[n_limbs];
+    uint32_t blocks = (column_length + MW_BLOCK - 1) / MW_BLOCK;
+    memory_value_base_trace_kernel<<<blocks, MW_BLOCK, 0, stream>>>(
+        sources, n_limbs, source_words, source_offset, multiplicities, count_words,
+        column_length, outputs);
+    return static_cast<int>(cudaGetLastError());
 }
 
 extern "C" void memory_rc99_count(

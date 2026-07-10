@@ -26,6 +26,10 @@ namespace {
 
 constexpr unsigned KIND_PARTIAL_EC_MUL_W18 = 2;
 constexpr unsigned KIND_PEDERSEN_POINTS_W18 = 3;
+constexpr unsigned KIND_POSEIDON_ROUND_KEYS = 8;
+constexpr unsigned KIND_CUBE_252 = 9;
+constexpr unsigned KIND_POSEIDON_FULL_ROUND_CHAIN = 10;
+constexpr unsigned KIND_POSEIDON_3_PARTIAL_ROUNDS_CHAIN = 11;
 
 __global__ void oracle_partial_ec_mul_w18_kernel(
     const unsigned* in, unsigned* out, unsigned n_items) {
@@ -43,6 +47,40 @@ __global__ void oracle_pedersen_points_w18_kernel(
         return;
     }
     stwo_wit_deduce_pedersen_points_w18(in + idx, out + (size_t)idx * 56);
+}
+
+__global__ void oracle_poseidon_round_keys_kernel(
+    const unsigned* in, unsigned* out, unsigned n_items) {
+    unsigned idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n_items) {
+        stwo_wit_deduce_poseidon_round_keys(in + idx, out + (size_t)idx * 30);
+    }
+}
+
+__global__ void oracle_cube_252_kernel(
+    const unsigned* in, unsigned* out, unsigned n_items) {
+    unsigned idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n_items) {
+        stwo_wit_deduce_cube_252(in + (size_t)idx * 10, out + (size_t)idx * 10);
+    }
+}
+
+__global__ void oracle_poseidon_full_round_chain_kernel(
+    const unsigned* in, unsigned* out, unsigned n_items) {
+    unsigned idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n_items) {
+        stwo_wit_deduce_poseidon_full_round_chain(
+            in + (size_t)idx * 32, out + (size_t)idx * 32);
+    }
+}
+
+__global__ void oracle_poseidon_3_partial_rounds_chain_kernel(
+    const unsigned* in, unsigned* out, unsigned n_items) {
+    unsigned idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n_items) {
+        stwo_wit_deduce_poseidon_3_partial_rounds_chain(
+            in + (size_t)idx * 42, out + (size_t)idx * 42);
+    }
 }
 
 // Fill this module's copy of the witness table globals from the runtime table
@@ -95,10 +133,23 @@ extern "C" int stwo_wit_deduce_oracle_run(
     } else if (kind == KIND_PEDERSEN_POINTS_W18) {
         in_words = 1;
         out_words = 56;
+    } else if (kind == KIND_POSEIDON_ROUND_KEYS) {
+        in_words = 1;
+        out_words = 30;
+    } else if (kind == KIND_CUBE_252) {
+        in_words = 10;
+        out_words = 10;
+    } else if (kind == KIND_POSEIDON_FULL_ROUND_CHAIN) {
+        in_words = 32;
+        out_words = 32;
+    } else if (kind == KIND_POSEIDON_3_PARTIAL_ROUNDS_CHAIN) {
+        in_words = 42;
+        out_words = 42;
     } else {
         return 1;
     }
-    if (!fill_oracle_table_globals()) {
+    if ((kind == KIND_PARTIAL_EC_MUL_W18 || kind == KIND_PEDERSEN_POINTS_W18) &&
+        !fill_oracle_table_globals()) {
         return 2;
     }
 
@@ -122,8 +173,17 @@ extern "C" int stwo_wit_deduce_oracle_run(
         unsigned grid = (n_items + block - 1) / block;
         if (kind == KIND_PARTIAL_EC_MUL_W18) {
             oracle_partial_ec_mul_w18_kernel<<<grid, block>>>(d_in, d_out, n_items);
-        } else {
+        } else if (kind == KIND_PEDERSEN_POINTS_W18) {
             oracle_pedersen_points_w18_kernel<<<grid, block>>>(d_in, d_out, n_items);
+        } else if (kind == KIND_POSEIDON_ROUND_KEYS) {
+            oracle_poseidon_round_keys_kernel<<<grid, block>>>(d_in, d_out, n_items);
+        } else if (kind == KIND_CUBE_252) {
+            oracle_cube_252_kernel<<<grid, block>>>(d_in, d_out, n_items);
+        } else if (kind == KIND_POSEIDON_FULL_ROUND_CHAIN) {
+            oracle_poseidon_full_round_chain_kernel<<<grid, block>>>(d_in, d_out, n_items);
+        } else {
+            oracle_poseidon_3_partial_rounds_chain_kernel<<<grid, block>>>(
+                d_in, d_out, n_items);
         }
         if (cudaGetLastError() != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess) {
             rc = 5;

@@ -7,7 +7,6 @@ use std::array;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use hashbrown::HashMap;
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::{SecureField, QM31};
 use stwo::core::fri::{ExtendedFriLayerProof, FriLayerProof, FriLayerProofAux};
@@ -242,7 +241,7 @@ impl<H: MerkleHasherLifted> MetalLineCommitment<H> {
         for layer_log_size in (0..self.layers.len() - 1).rev() {
             let prev_layer_hashes = &self.layers[layer_log_size + 1];
             let mut curr_layer_queries = Vec::new();
-            let mut all_node_values_for_layer = HashMap::new();
+            let mut all_node_values_for_layer = BTreeMap::new();
 
             for queries_chunk in prev_layer_queries.as_slice().chunk_by(|a, b| a ^ 1 == *b) {
                 let first = queries_chunk[0];
@@ -291,7 +290,7 @@ fn compute_decommitment_positions_and_witness_evals(
     evaluation: &MetalLineEvaluation,
     query_positions: &[usize],
     fold_step: u32,
-) -> (Vec<usize>, Vec<SecureField>, HashMap<usize, QM31>) {
+) -> (Vec<usize>, Vec<SecureField>, BTreeMap<usize, QM31>) {
     assert!(
         query_positions.is_sorted(),
         "FRI layer decommitment requires sorted query positions"
@@ -305,7 +304,7 @@ fn compute_decommitment_positions_and_witness_evals(
 
     let mut decommitment_positions = Vec::new();
     let mut fri_witness = Vec::new();
-    let mut value_map = HashMap::new();
+    let mut value_map = BTreeMap::new();
 
     for subset_queries in query_positions.chunk_by(|a, b| a >> fold_step == b >> fold_step) {
         let subset_start = (subset_queries[0] >> fold_step) << fold_step;

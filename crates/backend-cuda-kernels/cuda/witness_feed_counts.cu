@@ -73,6 +73,42 @@ __global__ void witness_feed_counts_kernel(
             continue;
         }
 
+        if (kind == 2u) {
+            // Dependent XOR tuple. The consumer table is indexed by (a,b),
+            // while the recorded tuple also carries c. Validate that c is the
+            // canonical AOT-produced xor result before using the exact
+            // input-to-row LUT; never fold all three words into a larger key.
+            uint32_t bits = e[2];
+            uint32_t mask = (1u << bits) - 1u;
+            uint32_t a = sub_words[(size_t)word_base * column_length + row];
+            uint32_t b = sub_words[(size_t)(word_base + 1u) * column_length + row];
+            uint32_t c = sub_words[(size_t)(word_base + 2u) * column_length + row];
+            if ((a | b | c) > mask || c != (a ^ b)) {
+                continue;
+            }
+            uint32_t key = (a << bits) | b;
+            uint32_t idx = luts[lut_index][key];
+            if (idx < table_size) {
+                atomicAdd(&counts[e[10]][(size_t)rel_index * table_size + idx], 1u);
+            }
+            continue;
+        }
+
+        if (kind == 3u) {
+            // xor12's AIR table is expanded: high two-bit limbs select one of
+            // 16 multiplicity columns, low ten-bit limbs select its row.
+            uint32_t a = sub_words[(size_t)word_base * column_length + row];
+            uint32_t b = sub_words[(size_t)(word_base + 1u) * column_length + row];
+            uint32_t c = sub_words[(size_t)(word_base + 2u) * column_length + row];
+            if ((a | b | c) >= (1u << 12) || c != (a ^ b)) {
+                continue;
+            }
+            uint32_t column = ((a >> 10) << 2) | (b >> 10);
+            uint32_t table_row = ((a & 0x3ffu) << 10) | (b & 0x3ffu);
+            atomicAdd(&counts[e[10]][(size_t)column * table_size + table_row], 1u);
+            continue;
+        }
+
         // FOLD (+ optional signed key offset e[12], e.g. addr - 1; + optional LUT).
         uint32_t key = 0;
         for (uint32_t i = 0; i < n_words; ++i) {
@@ -99,6 +135,29 @@ __global__ void witness_feed_counts_kernel(
 // Launch over every padded row (the host feeds padding rows too — mults_0 = 1
 // everywhere; truncating at the real count is an invalid-proof bug). All
 // pointer arrays are DEVICE arrays built by the caller. Returns 0 on success.
+static int witness_feed_counts_on(
+    const uint32_t *sub_words_dev,
+    uint32_t column_length,
+    const uint32_t *descs_dev,
+    uint32_t n_descs,
+    const uint32_t *const *luts_dev,
+    uint32_t *const *counts_dev,
+    cudaStream_t stream
+) {
+    if (n_descs == 0 || column_length == 0) {
+        return 0;
+    }
+    const uint32_t block = 256;
+    uint32_t grid = (column_length + block - 1) / block;
+    witness_feed_counts_kernel<<<grid, block, 0, stream>>>(
+        sub_words_dev, column_length, descs_dev, n_descs, luts_dev, counts_dev);
+    if (cudaGetLastError() != cudaSuccess) {
+        fprintf(stderr, "stwo_witness_feed_counts: launch failed\n");
+        return 1;
+    }
+    return 0;
+}
+
 extern "C" int stwo_witness_feed_counts(
     const uint32_t *sub_words_dev,
     uint32_t column_length,
@@ -107,15 +166,54 @@ extern "C" int stwo_witness_feed_counts(
     const uint32_t *const *luts_dev,
     uint32_t *const *counts_dev
 ) {
-    if (n_descs == 0 || column_length == 0) {
+    return witness_feed_counts_on(
+        sub_words_dev, column_length, descs_dev, n_descs, luts_dev, counts_dev,
+        (cudaStream_t)0);
+}
+
+extern "C" int stwo_witness_feed_counts_on(
+    const uint32_t *sub_words_dev,
+    uint32_t column_length,
+    const uint32_t *descs_dev,
+    uint32_t n_descs,
+    const uint32_t *const *luts_dev,
+    uint32_t *const *counts_dev,
+    void *stream
+) {
+    return witness_feed_counts_on(
+        sub_words_dev, column_length, descs_dev, n_descs, luts_dev, counts_dev,
+        (cudaStream_t)stream);
+}
+
+__global__ void witness_feed_clear_kernel(
+    uint32_t *const *destinations,
+    const uint32_t *lengths
+) {
+    uint32_t destination = blockIdx.y;
+    uint32_t word = blockIdx.x * blockDim.x + threadIdx.x;
+    if (word < lengths[destination]) {
+        destinations[destination][word] = 0;
+    }
+}
+
+// One capture-safe launch clears every shared fixed-table multiplicity slab.
+// Pointer/length tables are immutable arena data prepared before capture.
+extern "C" int stwo_witness_feed_clear_on(
+    uint32_t *const *destinations_dev,
+    const uint32_t *lengths_dev,
+    uint32_t n_destinations,
+    uint32_t max_words,
+    void *stream
+) {
+    if (n_destinations == 0 || max_words == 0) {
         return 0;
     }
     const uint32_t block = 256;
-    uint32_t grid = (column_length + block - 1) / block;
-    witness_feed_counts_kernel<<<grid, block>>>(
-        sub_words_dev, column_length, descs_dev, n_descs, luts_dev, counts_dev);
+    dim3 grid((max_words + block - 1) / block, n_destinations, 1);
+    witness_feed_clear_kernel<<<grid, block, 0, (cudaStream_t)stream>>>(
+        destinations_dev, lengths_dev);
     if (cudaGetLastError() != cudaSuccess) {
-        fprintf(stderr, "stwo_witness_feed_counts: launch failed\n");
+        fprintf(stderr, "stwo_witness_feed_clear: launch failed\n");
         return 1;
     }
     return 0;

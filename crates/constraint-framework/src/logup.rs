@@ -67,8 +67,10 @@ pub struct LookupElements<const N: usize> {
     pub alpha_powers: [SecureField; N],
 }
 impl<const N: usize> LookupElements<N> {
-    pub fn draw(channel: &mut impl Channel) -> Self {
-        let [z, alpha] = channel.draw_secure_felts(2).try_into().unwrap();
+    /// Construct lookup elements from the two Fiat-Shamir draws. This is the
+    /// deterministic expansion used by resident device planners as well as the
+    /// ordinary channel path.
+    pub fn from_z_alpha(z: SecureField, alpha: SecureField) -> Self {
         let mut cur = SecureField::one();
         let alpha_powers = array::from_fn(|_| {
             let res = cur;
@@ -80,6 +82,11 @@ impl<const N: usize> LookupElements<N> {
             alpha,
             alpha_powers,
         }
+    }
+
+    pub fn draw(channel: &mut impl Channel) -> Self {
+        let [z, alpha] = channel.draw_secure_felts(2).try_into().unwrap();
+        Self::from_z_alpha(z, alpha)
     }
     pub fn combine<F: Clone, EF>(&self, values: &[F]) -> EF
     where

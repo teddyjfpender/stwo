@@ -16,7 +16,7 @@ use stwo::prover::pcs::proof_driver::{PcsProofStage, PcsProofStageObserver};
 use stwo::prover::pcs::CommitmentSchemeProver;
 
 use super::backend::CudaBackend;
-use super::exec_context::DeviceArena;
+use super::exec_context::{CudaExecTelemetry, DeviceArena};
 
 /// Runtime architecture selected for this driver invocation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -120,6 +120,9 @@ pub struct CudaPcsDriverTelemetry {
     pub stage_finished: [u32; PcsProofStage::ALL.len()],
     /// The trace-tree stage routes through stwo's backend-batched sparse gather.
     pub batched_tree_decommit: bool,
+    /// Resident-context counters. Detached migration runs deliberately report
+    /// `None`; strict ArenaGraph admission requires this evidence.
+    pub exec: Option<CudaExecTelemetry>,
 }
 
 impl CudaPcsDriverTelemetry {
@@ -130,6 +133,18 @@ impl CudaPcsDriverTelemetry {
             stage_started: [0; PcsProofStage::ALL.len()],
             stage_finished: [0; PcsProofStage::ALL.len()],
             batched_tree_decommit: false,
+            exec: None,
+        }
+    }
+
+    pub fn completed_arena_graph(exec: CudaExecTelemetry) -> Self {
+        Self {
+            architecture: "cuda-typed-pcs-driver-v1",
+            runtime_mode: CudaPcsRuntimeMode::ArenaGraph,
+            stage_started: [1; PcsProofStage::ALL.len()],
+            stage_finished: [1; PcsProofStage::ALL.len()],
+            batched_tree_decommit: true,
+            exec: Some(exec),
         }
     }
 

@@ -8,15 +8,15 @@
 #include "batch_inverse.cuh"
 #include "fields.cuh"
 #include "prefix_sum.cuh"
+// Tuple/combine/multiplicity semantics and the geometry binary search are
+// shared with the fused lane (relation_fused.cu) through this header so the
+// two lanes cannot drift.
+#include "relation_fused.cuh"
 
 namespace {
 
-constexpr uint32_t BLOCK = 256;
-constexpr uint32_t DESC_WORDS = 16;
-constexpr uint32_t USE_WORDS = 7;
-constexpr uint32_t LARGE_MEMORY_VALUE_ID_BASE = 0x40000000u;
-constexpr uint32_t XOR12_LIMB_BITS = 10;
-constexpr uint32_t XOR12_EXPAND_BITS = 2;
+constexpr uint32_t BLOCK = RELATION_LAUNCH_BLOCK;
+constexpr uint32_t DESC_WORDS = RELATION_DESC_WORDS;
 
 // Expand the channel's exact LookupElements draw order `[z, alpha]` into the
 // persistent relation slots consumed by every generated relation instance.
@@ -38,84 +38,22 @@ __global__ void relation_expand_challenges_kernel(const qm31 *drawn,
   }
 }
 
-__device__ __forceinline__ m31 tuple_word(const uint32_t *const *sources,
-                                          uint32_t n_rows, uint32_t row,
-                                          uint32_t source_offset_rows,
-                                          const uint32_t *use, uint32_t word) {
-  uint32_t kind = use[0];
-  uint32_t arg = use[1];
-  if (word == 0) {
-    return use[3];
-  }
-  if (kind == 0u) { // LookupWords.
-    return sources[0][(arg + word) * n_rows + row];
-  }
-  if (kind == 1u) { // MemoryAddressChunk.
-    if (word == 1) {
-      return row + 1u + arg * n_rows;
-    }
-    return sources[arg * 2u][row];
-  }
-  if (kind == 2u || kind == 4u) { // Memory big/small limb pair.
-    return sources[arg + word - 1u][row];
-  }
-  if (kind == 3u) { // Full big memory value.
-    if (word == 1) {
-      return (row + source_offset_rows) | LARGE_MEMORY_VALUE_ID_BASE;
-    }
-    return sources[word - 2u][row];
-  }
-  if (kind == 5u) { // Full small memory value.
-    if (word == 1) {
-      return row + source_offset_rows;
-    }
-    return sources[word - 2u][row];
-  }
-  // BitwiseXor12: multiplicity-column index encodes high parts of a,b;
-  // row encodes their two low 10-bit limbs.
-  uint32_t ah = arg >> XOR12_EXPAND_BITS;
-  uint32_t bh = arg & ((1u << XOR12_EXPAND_BITS) - 1u);
-  uint32_t a = (ah << XOR12_LIMB_BITS) | (row >> XOR12_LIMB_BITS);
-  uint32_t b = (bh << XOR12_LIMB_BITS) | (row & ((1u << XOR12_LIMB_BITS) - 1u));
-  return word == 1 ? a : (word == 2 ? b : (a ^ b));
-}
-
-__device__ __forceinline__ qm31 combine_use(const uint32_t *const *sources,
-                                            uint32_t n_rows, uint32_t row,
-                                            uint32_t source_offset_rows,
-                                            const uint32_t *use,
-                                            const qm31 *alphas, qm31 z) {
-  qm31 zero = {{0, 0}, {0, 0}};
-  qm31 acc = sub(zero, z);
-  for (uint32_t word = 0; word < use[2]; ++word) {
-    acc =
-        add(acc,
-            mul(tuple_word(sources, n_rows, row, source_offset_rows, use, word),
-                alphas[word]));
-  }
-  return acc;
-}
-
-__device__ __forceinline__ m31 multiplicity(const uint32_t *const *sources,
-                                            uint32_t n_rows, uint32_t row,
-                                            uint32_t n_real,
-                                            const uint32_t *use) {
-  uint32_t kind = use[4];
-  uint32_t arg = use[5];
-  m31 value;
-  if (kind == 0u) {
-    value = 1u;
-  } else if (kind == 1u) {
-    value = row < n_real ? 1u : 0u;
-  } else if (kind == 2u) {
-    value = sources[0][arg * n_rows + row];
-  } else if (kind == 3u) {
-    value = sources[arg * 2u + 1u][row];
-  } else {
-    // Big/small multiplicity and XOR12 all carry their source-column index.
-    value = sources[arg][row];
-  }
-  return use[6] != 0u && value != 0u ? P - value : value;
+__device__ __forceinline__ void relation_pair_at(
+    const uint32_t *const *sources, uint32_t n_rows, uint32_t row,
+    uint32_t n_real, uint32_t source_offset_rows,
+    const uint32_t *descriptors, uint32_t column, const qm31 *alphas, qm31 z,
+    m31 *const *outputs, qm31 *denominators) {
+  qm31 numerator;
+  qm31 denominator;
+  relation_column_fraction(sources, n_rows, row, n_real, source_offset_rows,
+                           descriptors + column * DESC_WORDS, alphas, z,
+                           &numerator, &denominator);
+  uint32_t output_base = column * 4u;
+  outputs[output_base][row] = numerator.a.a;
+  outputs[output_base + 1u][row] = numerator.a.b;
+  outputs[output_base + 2u][row] = numerator.b.a;
+  outputs[output_base + 3u][row] = numerator.b.b;
+  denominators[column * n_rows + row] = denominator;
 }
 
 __global__ void relation_pairs_kernel(const uint32_t *const *sources,
@@ -129,54 +67,104 @@ __global__ void relation_pairs_kernel(const uint32_t *const *sources,
   if (row >= n_rows) {
     return;
   }
-  const uint32_t *descriptor = descriptors + column * DESC_WORDS;
-  const uint32_t *use_a = descriptor + 1;
-  qm31 z = z_ptr[0];
-  qm31 denominator_a =
-      combine_use(sources, n_rows, row, source_offset_rows, use_a, alphas, z);
-  m31 mult_a = multiplicity(sources, n_rows, row, n_real, use_a);
-  qm31 numerator;
-  qm31 denominator;
-  if (descriptor[0] == 2u) {
-    const uint32_t *use_b = descriptor + 1 + USE_WORDS;
-    qm31 denominator_b =
-        combine_use(sources, n_rows, row, source_offset_rows, use_b, alphas, z);
-    m31 mult_b = multiplicity(sources, n_rows, row, n_real, use_b);
-    numerator = add(mul(mult_b, denominator_a), mul(mult_a, denominator_b));
-    denominator = mul(denominator_a, denominator_b);
-  } else {
-    numerator = qm31{{mult_a, 0}, {0, 0}};
-    denominator = denominator_a;
-  }
-  uint32_t output_base = column * 4u;
-  outputs[output_base][row] = numerator.a.a;
-  outputs[output_base + 1u][row] = numerator.a.b;
-  outputs[output_base + 2u][row] = numerator.b.a;
-  outputs[output_base + 3u][row] = numerator.b.b;
-  denominators[column * n_rows + row] = denominator;
+  relation_pair_at(sources, n_rows, row, n_real, source_offset_rows,
+                   descriptors, column, alphas, z_ptr[0], outputs,
+                   denominators);
 }
 
-__global__ void fraction_chain_kernel(m31 *const *outputs, const qm31 *inverse,
-                                      uint32_t n_rows, uint32_t column) {
+__global__ void relation_pairs_global_kernel(
+    const uint32_t *const *const *source_tables,
+    const uint32_t *const *descriptors, m31 *const *const *output_tables,
+    qm31 *const *denominator_slabs, const uint32_t *geometry,
+    uint32_t n_instances, const qm31 *alphas, const qm31 *z_ptr) {
+  uint32_t local_block = 0u;
+  uint32_t instance = relation_instance_for_block(
+      geometry, n_instances, blockIdx.x, RELATION_PAIR_FIRST,
+      RELATION_PAIR_BLOCKS, &local_block);
+  if (instance == n_instances) {
+    return;
+  }
+  const uint32_t *g = geometry + instance * RELATION_GEOMETRY_WORDS;
+  uint32_t row_blocks = g[RELATION_ROW_BLOCKS];
+  uint32_t column = local_block / row_blocks;
+  uint32_t row_block = local_block - column * row_blocks;
+  uint32_t row = row_block * BLOCK + threadIdx.x;
+  if (row >= g[RELATION_ROWS]) {
+    return;
+  }
+  relation_pair_at(
+      source_tables[instance], g[RELATION_ROWS], row, g[RELATION_REAL_ROWS],
+      g[RELATION_SOURCE_OFFSET], descriptors[instance], column, alphas, z_ptr[0],
+      output_tables[instance], denominator_slabs[instance]);
+}
+
+__global__ void fraction_chain_batched_kernel(m31 *const *outputs,
+                                              const qm31 *inverses,
+                                              uint32_t n_rows,
+                                              uint32_t n_columns) {
   uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
   if (row >= n_rows) {
     return;
   }
-  uint32_t base = column * 4u;
-  qm31 numerator = {{outputs[base][row], outputs[base + 1u][row]},
-                    {outputs[base + 2u][row], outputs[base + 3u][row]}};
-  qm31 value = mul(numerator, inverse[row]);
-  if (column != 0u) {
-    uint32_t previous = base - 4u;
-    value =
-        add(value,
-            qm31{{outputs[previous][row], outputs[previous + 1u][row]},
-                 {outputs[previous + 2u][row], outputs[previous + 3u][row]}});
+  qm31 accumulated = {{0, 0}, {0, 0}};
+  for (uint32_t column = 0; column < n_columns; ++column) {
+    uint32_t base = column * 4u;
+    qm31 numerator = {{outputs[base][row], outputs[base + 1u][row]},
+                      {outputs[base + 2u][row], outputs[base + 3u][row]}};
+    accumulated = add(
+        accumulated,
+        mul(numerator, inverses[column * n_rows + row]));
+    outputs[base][row] = accumulated.a.a;
+    outputs[base + 1u][row] = accumulated.a.b;
+    outputs[base + 2u][row] = accumulated.b.a;
+    outputs[base + 3u][row] = accumulated.b.b;
   }
-  outputs[base][row] = value.a.a;
-  outputs[base + 1u][row] = value.a.b;
-  outputs[base + 2u][row] = value.b.a;
-  outputs[base + 3u][row] = value.b.b;
+}
+
+__global__ void fraction_chain_global_kernel(
+    m31 *const *const *output_tables, const qm31 *const *inverses,
+    const uint32_t *geometry, uint32_t n_instances) {
+  uint32_t global_block = blockIdx.x;
+  uint32_t lo = 0u;
+  uint32_t hi = n_instances;
+  while (lo < hi) {
+    uint32_t mid = lo + (hi - lo) / 2u;
+    if (geometry[mid * RELATION_GEOMETRY_WORDS + RELATION_ROW_FIRST] <=
+        global_block) {
+      lo = mid + 1u;
+    } else {
+      hi = mid;
+    }
+  }
+  if (lo == 0u) {
+    return;
+  }
+  uint32_t instance = lo - 1u;
+  const uint32_t *g = geometry + instance * RELATION_GEOMETRY_WORDS;
+  uint32_t local_block = global_block - g[RELATION_ROW_FIRST];
+  if (local_block >= g[RELATION_ROW_BLOCKS]) {
+    return;
+  }
+  uint32_t rows = g[RELATION_ROWS];
+  uint32_t columns = g[RELATION_COLUMNS];
+  uint32_t row = local_block * BLOCK + threadIdx.x;
+  if (row >= rows) {
+    return;
+  }
+  m31 *const *outputs = output_tables[instance];
+  const qm31 *inverse = inverses[instance];
+  qm31 accumulated = {{0, 0}, {0, 0}};
+  for (uint32_t column = 0; column < columns; ++column) {
+    uint32_t base = column * 4u;
+    qm31 numerator = {{outputs[base][row], outputs[base + 1u][row]},
+                      {outputs[base + 2u][row], outputs[base + 3u][row]}};
+    accumulated =
+        add(accumulated, mul(numerator, inverse[column * rows + row]));
+    outputs[base][row] = accumulated.a.a;
+    outputs[base + 1u][row] = accumulated.a.b;
+    outputs[base + 2u][row] = accumulated.b.a;
+    outputs[base + 3u][row] = accumulated.b.b;
+  }
 }
 
 __global__ void reduce_coordinates_kernel(const m31 *c0, const m31 *c1,
@@ -235,6 +223,227 @@ __global__ void shift_last_column_kernel(m31 *c0, m31 *c1, m31 *c2, m31 *c3,
   c3[row] = sub(c3[row], shift.b.b);
 }
 
+__global__ void reduce_coordinates_ragged_kernel(
+    m31 *const *const *output_tables, const uint32_t *geometry,
+    uint32_t n_instances, qm31 *partials) {
+  uint32_t local_block = 0u;
+  uint32_t instance = relation_instance_for_block(
+      geometry, n_instances, blockIdx.x, RELATION_ROW_FIRST,
+      RELATION_ROW_BLOCKS, &local_block);
+  if (instance == n_instances) {
+    return;
+  }
+  const uint32_t *g = geometry + instance * RELATION_GEOMETRY_WORDS;
+  m31 *const *outputs = output_tables[instance];
+  uint32_t last = (g[RELATION_COLUMNS] - 1u) * 4u;
+  uint32_t row = local_block * BLOCK + threadIdx.x;
+  extern __shared__ qm31 shared_qm31[];
+  shared_qm31[threadIdx.x] =
+      row < g[RELATION_ROWS]
+          ? qm31{{outputs[last][row], outputs[last + 1u][row]},
+                 {outputs[last + 2u][row], outputs[last + 3u][row]}}
+          : qm31{{0, 0}, {0, 0}};
+  __syncthreads();
+  for (uint32_t stride = BLOCK / 2u; stride != 0u; stride >>= 1u) {
+    if (threadIdx.x < stride) {
+      shared_qm31[threadIdx.x] =
+          add(shared_qm31[threadIdx.x], shared_qm31[threadIdx.x + stride]);
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0u) {
+    partials[g[RELATION_ROW_FIRST] + local_block] = shared_qm31[0];
+  }
+}
+
+__global__ void finalize_claimed_sums_ragged_kernel(
+    qm31 *const *claimed_sums, const uint32_t *geometry,
+    uint32_t n_instances, const qm31 *partials) {
+  uint32_t instance = blockIdx.x;
+  if (instance >= n_instances) {
+    return;
+  }
+  const uint32_t *g = geometry + instance * RELATION_GEOMETRY_WORDS;
+  uint32_t first = g[RELATION_ROW_FIRST];
+  uint32_t count = g[RELATION_ROW_BLOCKS];
+  qm31 accumulated = {{0, 0}, {0, 0}};
+  for (uint32_t index = threadIdx.x; index < count; index += BLOCK) {
+    accumulated = add(accumulated, partials[first + index]);
+  }
+  extern __shared__ qm31 shared_qm31[];
+  shared_qm31[threadIdx.x] = accumulated;
+  __syncthreads();
+  for (uint32_t stride = BLOCK / 2u; stride != 0u; stride >>= 1u) {
+    if (threadIdx.x < stride) {
+      shared_qm31[threadIdx.x] =
+          add(shared_qm31[threadIdx.x], shared_qm31[threadIdx.x + stride]);
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0u) {
+    claimed_sums[instance][0] = shared_qm31[0];
+  }
+}
+
+__device__ __forceinline__ uint32_t relation_scan_instance_for_block(
+    const uint32_t *geometry, uint32_t n_instances, uint32_t global_block,
+    uint32_t *local_block) {
+  uint32_t lo = 0u;
+  uint32_t hi = n_instances;
+  while (lo < hi) {
+    uint32_t mid = lo + (hi - lo) / 2u;
+    const uint32_t *g = geometry + mid * RELATION_GEOMETRY_WORDS;
+    if (g[RELATION_ROW_FIRST] * 4u <= global_block) {
+      lo = mid + 1u;
+    } else {
+      hi = mid;
+    }
+  }
+  if (lo == 0u) {
+    return n_instances;
+  }
+  uint32_t instance = lo - 1u;
+  const uint32_t *g = geometry + instance * RELATION_GEOMETRY_WORDS;
+  *local_block = global_block - g[RELATION_ROW_FIRST] * 4u;
+  return *local_block < g[RELATION_ROW_BLOCKS] * 4u ? instance : n_instances;
+}
+
+// `inclusive_prefix_sum_prepared_on` scans relation evaluations in coset order:
+// bit-reverse circle order, interleave the two circle-domain halves, scan, then
+// undo both permutations.  The resulting gather and scatter use this same
+// bijection, so disjoint scan tiles can update the output in place.
+__device__ __forceinline__ uint32_t relation_coset_scan_row(
+    uint32_t scan_index, uint32_t rows) {
+  uint32_t circle_index = (scan_index & 1u) == 0u
+                              ? scan_index / 2u
+                              : rows - 1u - scan_index / 2u;
+  uint32_t bits = 31u - __clz(rows);
+  return bits == 0u ? 0u : __brev(circle_index) >> (32u - bits);
+}
+
+__global__ void shift_scan_tiles_ragged_kernel(
+    m31 *const *const *output_tables, qm31 *const *claimed_sums,
+    const uint32_t *geometry, uint32_t n_instances, m31 *block_sums) {
+  uint32_t local_block = 0u;
+  uint32_t instance = relation_scan_instance_for_block(
+      geometry, n_instances, blockIdx.x, &local_block);
+  if (instance == n_instances) {
+    return;
+  }
+  const uint32_t *g = geometry + instance * RELATION_GEOMETRY_WORDS;
+  uint32_t row_blocks = g[RELATION_ROW_BLOCKS];
+  uint32_t coordinate = local_block / row_blocks;
+  uint32_t row_block = local_block - coordinate * row_blocks;
+  uint32_t scan_index = row_block * BLOCK + threadIdx.x;
+  m31 *output =
+      output_tables[instance][(g[RELATION_COLUMNS] - 1u) * 4u + coordinate];
+  qm31 sum = claimed_sums[instance][0];
+  m31 sum_coordinate = coordinate == 0u   ? sum.a.a
+                       : coordinate == 1u ? sum.a.b
+                       : coordinate == 2u ? sum.b.a
+                                          : sum.b.b;
+  m31 shift = mul(g[RELATION_INVERSE_ROWS], sum_coordinate);
+  extern __shared__ m31 shared_m31[];
+  shared_m31[threadIdx.x] =
+      scan_index < g[RELATION_ROWS]
+          ? sub(output[relation_coset_scan_row(scan_index, g[RELATION_ROWS])],
+                shift)
+          : 0u;
+  __syncthreads();
+  for (uint32_t offset = 1u; offset < BLOCK; offset <<= 1u) {
+    m31 value = shared_m31[threadIdx.x];
+    if (threadIdx.x >= offset) {
+      value = add(value, shared_m31[threadIdx.x - offset]);
+    }
+    __syncthreads();
+    shared_m31[threadIdx.x] = value;
+    __syncthreads();
+  }
+  if (scan_index < g[RELATION_ROWS]) {
+    output[relation_coset_scan_row(scan_index, g[RELATION_ROWS])] =
+        shared_m31[threadIdx.x];
+  }
+  uint32_t valid = g[RELATION_ROWS] - row_block * BLOCK;
+  valid = valid < BLOCK ? valid : BLOCK;
+  if (threadIdx.x + 1u == valid) {
+    block_sums[blockIdx.x] = shared_m31[threadIdx.x];
+  }
+}
+
+__global__ void scan_block_totals_ragged_kernel(
+    m31 *block_sums, const uint32_t *geometry, uint32_t n_instances) {
+  uint32_t segment = blockIdx.x;
+  uint32_t instance = segment / 4u;
+  uint32_t coordinate = segment % 4u;
+  if (instance >= n_instances) {
+    return;
+  }
+  const uint32_t *g = geometry + instance * RELATION_GEOMETRY_WORDS;
+  uint32_t count = g[RELATION_ROW_BLOCKS];
+  uint32_t first = g[RELATION_ROW_FIRST] * 4u + coordinate * count;
+  __shared__ m31 shared_m31[BLOCK];
+  __shared__ m31 carry;
+  if (threadIdx.x == 0u) {
+    carry = 0u;
+  }
+  __syncthreads();
+  for (uint32_t chunk = 0u; chunk < count; chunk += BLOCK) {
+    uint32_t remaining = count - chunk;
+    uint32_t valid = remaining < BLOCK ? remaining : BLOCK;
+    shared_m31[threadIdx.x] = threadIdx.x < valid
+                                   ? block_sums[first + chunk + threadIdx.x]
+                                   : 0u;
+    __syncthreads();
+    for (uint32_t offset = 1u; offset < BLOCK; offset <<= 1u) {
+      m31 value = shared_m31[threadIdx.x];
+      if (threadIdx.x >= offset) {
+        value = add(value, shared_m31[threadIdx.x - offset]);
+      }
+      __syncthreads();
+      shared_m31[threadIdx.x] = value;
+      __syncthreads();
+    }
+    m31 base = carry;
+    // Every warp snapshots the segment carry before the last valid thread may
+    // publish the next chunk's carry.
+    __syncthreads();
+    if (threadIdx.x < valid) {
+      m31 total = add(shared_m31[threadIdx.x], base);
+      block_sums[first + chunk + threadIdx.x] = total;
+      if (threadIdx.x + 1u == valid) {
+        carry = total;
+      }
+    }
+    __syncthreads();
+  }
+}
+
+__global__ void add_scan_offsets_ragged_kernel(
+    m31 *const *const *output_tables, const uint32_t *geometry,
+    uint32_t n_instances, const m31 *block_sums) {
+  uint32_t local_block = 0u;
+  uint32_t instance = relation_scan_instance_for_block(
+      geometry, n_instances, blockIdx.x, &local_block);
+  if (instance == n_instances) {
+    return;
+  }
+  const uint32_t *g = geometry + instance * RELATION_GEOMETRY_WORDS;
+  uint32_t row_blocks = g[RELATION_ROW_BLOCKS];
+  uint32_t coordinate = local_block / row_blocks;
+  uint32_t row_block = local_block - coordinate * row_blocks;
+  if (row_block == 0u) {
+    return;
+  }
+  uint32_t scan_index = row_block * BLOCK + threadIdx.x;
+  if (scan_index >= g[RELATION_ROWS]) {
+    return;
+  }
+  uint32_t row = relation_coset_scan_row(scan_index, g[RELATION_ROWS]);
+  m31 *output =
+      output_tables[instance][(g[RELATION_COLUMNS] - 1u) * 4u + coordinate];
+  output[row] = add(output[row], block_sums[blockIdx.x - 1u]);
+}
+
 } // namespace
 
 extern "C" int stwo_relation_expand_challenges_on(
@@ -273,34 +482,81 @@ extern "C" int stwo_relation_pairs_on(
   return (int)cudaGetLastError();
 }
 
+extern "C" int stwo_relation_pairs_global_on(
+    const uint32_t *const *const *source_tables,
+    const uint32_t *const *descriptors, uint32_t *const *const *output_tables,
+    uint32_t *const *denominator_slabs, const uint32_t *geometry,
+    uint32_t n_instances, uint32_t total_pair_blocks,
+    const uint32_t *alpha_powers, uint32_t n_alpha_powers, const uint32_t *z,
+    void *stream_raw) {
+  if (source_tables == nullptr || descriptors == nullptr ||
+      output_tables == nullptr || denominator_slabs == nullptr ||
+      geometry == nullptr || n_instances == 0u || total_pair_blocks == 0u ||
+      alpha_powers == nullptr || n_alpha_powers == 0u || z == nullptr ||
+      stream_raw == nullptr) {
+    return (int)cudaErrorInvalidValue;
+  }
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_raw);
+  relation_pairs_global_kernel<<<total_pair_blocks, BLOCK, 0, stream>>>(
+      source_tables, descriptors,
+      reinterpret_cast<m31 *const *const *>(output_tables),
+      reinterpret_cast<qm31 *const *>(denominator_slabs), geometry, n_instances,
+      reinterpret_cast<const qm31 *>(alpha_powers),
+      reinterpret_cast<const qm31 *>(z));
+  return (int)cudaGetLastError();
+}
+
 extern "C" int stwo_relation_fraction_chain_on(uint32_t *const *outputs,
-                                               const uint32_t *denominators,
+                                               uint32_t *denominators,
                                                uint32_t *inverse_scratch,
                                                uint32_t n_rows,
                                                uint32_t n_columns,
                                                void *stream_raw) {
-  if (n_rows == 0u || n_columns == 0u) {
+  if (outputs == nullptr || denominators == nullptr ||
+      inverse_scratch == nullptr || n_rows == 0u || n_columns == 0u ||
+      static_cast<uint64_t>(n_rows) * n_columns > 0x7fffffffu) {
     return (int)cudaErrorInvalidValue;
   }
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_raw);
-  qm31 *inverse = reinterpret_cast<qm31 *>(inverse_scratch);
-  const qm31 *denominator = reinterpret_cast<const qm31 *>(denominators);
-  uint32_t blocks = (n_rows + BLOCK - 1u) / BLOCK;
-  for (uint32_t column = 0; column < n_columns; ++column) {
-    cudaError_t error = batch_inverse_secure_field_on(
-        stream, const_cast<qm31 *>(denominator + column * n_rows), inverse,
-        (int)n_rows);
-    if (error != cudaSuccess) {
-      return (int)error;
-    }
-    fraction_chain_kernel<<<blocks, BLOCK, 0, stream>>>(
-        reinterpret_cast<m31 *const *>(outputs), inverse, n_rows, column);
-    error = cudaGetLastError();
-    if (error != cudaSuccess) {
-      return (int)error;
-    }
+  // The arena ABI still carries the old one-column scratch slot. Keep validating
+  // it until that public plan is revised, but invert the private denominator slab
+  // in place so every column can be submitted in one capture-safe launch.
+  (void)inverse_scratch;
+  qm31 *inverse = reinterpret_cast<qm31 *>(denominators);
+  cudaError_t error = batch_inverse_secure_field_columns_on(
+      stream, inverse, inverse, (int)n_rows, (int)n_columns);
+  if (error != cudaSuccess) {
+    return (int)error;
   }
-  return (int)cudaSuccess;
+  uint32_t blocks = (n_rows + BLOCK - 1u) / BLOCK;
+  fraction_chain_batched_kernel<<<blocks, BLOCK, 0, stream>>>(
+      reinterpret_cast<m31 *const *>(outputs), inverse, n_rows, n_columns);
+  return (int)cudaGetLastError();
+}
+
+extern "C" int stwo_relation_fraction_chain_global_on(
+    uint32_t *const *const *output_tables, uint32_t *const *denominator_slabs,
+    const uint32_t *geometry, uint32_t n_instances,
+    uint32_t total_inverse_blocks, uint32_t total_chain_blocks,
+    void *stream_raw) {
+  if (output_tables == nullptr || denominator_slabs == nullptr ||
+      geometry == nullptr || n_instances == 0u || total_inverse_blocks == 0u ||
+      total_chain_blocks == 0u || total_inverse_blocks > 0x7fffffffu ||
+      total_chain_blocks > 0x7fffffffu) {
+    return (int)cudaErrorInvalidValue;
+  }
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_raw);
+  cudaError_t error = batch_inverse_secure_field_ragged_on(
+      stream, reinterpret_cast<qm31 *const *>(denominator_slabs), geometry,
+      static_cast<int>(n_instances), static_cast<int>(total_inverse_blocks));
+  if (error != cudaSuccess) {
+    return (int)error;
+  }
+  fraction_chain_global_kernel<<<total_chain_blocks, BLOCK, 0, stream>>>(
+      reinterpret_cast<m31 *const *const *>(output_tables),
+      reinterpret_cast<const qm31 *const *>(denominator_slabs), geometry,
+      n_instances);
+  return (int)cudaGetLastError();
 }
 
 extern "C" int stwo_relation_reduce_shift_on(
@@ -357,4 +613,56 @@ extern "C" int stwo_relation_prefix_scan_on(uint32_t *output, uint32_t n_rows,
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_raw);
   return (int)inclusive_prefix_sum_prepared_on(
       stream, output, eval_scratch, scan_temp, scan_temp_bytes, n_rows);
+}
+
+extern "C" int stwo_relation_tail_global_on(
+    uint32_t *const *const *output_tables, uint32_t *const *claimed_sums,
+    const uint32_t *geometry, uint32_t n_instances,
+    uint32_t total_row_blocks, uint32_t *reduction_partials,
+    uint32_t reduction_capacity, uint32_t *scan_block_sums,
+    uint32_t scan_capacity, void *stream_raw) {
+  if (output_tables == nullptr || claimed_sums == nullptr ||
+      geometry == nullptr || n_instances == 0u || total_row_blocks == 0u ||
+      n_instances > 0xffffffffu / 4u ||
+      reduction_partials == nullptr || reduction_capacity < total_row_blocks ||
+      scan_block_sums == nullptr || total_row_blocks > 0xffffffffu / 4u ||
+      scan_capacity < total_row_blocks * 4u || stream_raw == nullptr) {
+    return (int)cudaErrorInvalidValue;
+  }
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_raw);
+  auto outputs = reinterpret_cast<m31 *const *const *>(output_tables);
+  auto sums = reinterpret_cast<qm31 *const *>(claimed_sums);
+  auto partials = reinterpret_cast<qm31 *>(reduction_partials);
+  uint32_t total_scan_blocks = total_row_blocks * 4u;
+
+  reduce_coordinates_ragged_kernel<<<total_row_blocks, BLOCK,
+                                     BLOCK * sizeof(qm31), stream>>>(
+      outputs, geometry, n_instances, partials);
+  cudaError_t error = cudaGetLastError();
+  if (error != cudaSuccess) {
+    return (int)error;
+  }
+  finalize_claimed_sums_ragged_kernel<<<n_instances, BLOCK,
+                                        BLOCK * sizeof(qm31), stream>>>(
+      sums, geometry, n_instances, partials);
+  error = cudaGetLastError();
+  if (error != cudaSuccess) {
+    return (int)error;
+  }
+  shift_scan_tiles_ragged_kernel<<<total_scan_blocks, BLOCK,
+                                   BLOCK * sizeof(m31), stream>>>(
+      outputs, sums, geometry, n_instances, scan_block_sums);
+  error = cudaGetLastError();
+  if (error != cudaSuccess) {
+    return (int)error;
+  }
+  scan_block_totals_ragged_kernel<<<n_instances * 4u, BLOCK, 0, stream>>>(
+      scan_block_sums, geometry, n_instances);
+  error = cudaGetLastError();
+  if (error != cudaSuccess) {
+    return (int)error;
+  }
+  add_scan_offsets_ragged_kernel<<<total_scan_blocks, BLOCK, 0, stream>>>(
+      outputs, geometry, n_instances, scan_block_sums);
+  return (int)cudaGetLastError();
 }

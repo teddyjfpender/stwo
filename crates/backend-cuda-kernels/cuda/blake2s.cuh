@@ -17,6 +17,14 @@ __device__ void stwo_blake2s_hash2_device(
     const uint8_t *second,
     size_t second_len,
     Blake2sHash *out);
+
+// Cross-translation-unit sink for the fused N2B→leaf kernel. `message` is one
+// exact 16-word block; `state` already contains the running h[8].
+__device__ void stwo_blake2s_compress_leaf_block_device(
+    Blake2sHash *state,
+    const uint32_t message[16],
+    uint32_t total_bytes,
+    uint32_t lastblock);
 #endif
 
 // Occupancy lever for the register-capped commit/leaf-hash kernels. The
@@ -73,6 +81,22 @@ extern "C"
 int stwo_blake2s_leaf_update_on(uint32_t size, uint32_t group_n_cols, uint32_t **columns, const uint32_t *column_log_sizes, uint32_t lifting_log_size, uint32_t cols_done, Blake2sHash *state, void *stream);
 extern "C"
 int stwo_blake2s_leaf_finalize_on(uint32_t size, uint32_t rem_cols, uint32_t **columns, const uint32_t *column_log_sizes, uint32_t lifting_log_size, uint32_t cols_done, Blake2sHash *result, void *stream);
+// Consume columns stopped immediately before their final circle butterfly.
+// Each 256-leaf block computes that last value and feeds it straight into the
+// running Blake2s state, so no completed LDE is written and reread.
+extern "C"
+int stwo_blake2s_leaf_group_from_lde_on(
+    uint32_t size,
+    uint32_t group_n_cols,
+    uint32_t **prefinal_columns,
+    const uint32_t *column_log_sizes,
+    uint32_t lifting_log_size,
+    uint32_t cols_done,
+    uint32_t is_final,
+    uint32_t *twiddles,
+    uint32_t twiddle_words,
+    Blake2sHash *state,
+    void *stream);
 extern "C"
 int stwo_blake2s_layer_on(const Blake2sHash *previous_layer, uint32_t output_size, Blake2sHash *result, void *stream);
 extern "C"
@@ -87,6 +111,24 @@ int stwo_blake2s_fri_leaf_on(uint32_t evaluation_size,
                              uint32_t log_rows_per_leaf,
                              Blake2sHash *result,
                              void *stream);
+
+// Sparse counterpart of the streaming lifted-leaf commit. `leaf_indices` and
+// `leaf_count` stay on device and are produced from transcript queries. A
+// non-final group must contain a multiple of 16 columns; the final group has
+// 1..=16. The word stream is identical to stream_leaf_{update,finalize}.
+extern "C"
+int stwo_blake2s_sparse_leaf_group_on(
+    const uint32_t *leaf_indices,
+    const uint32_t *leaf_count,
+    uint32_t max_leaf_count,
+    uint32_t group_n_cols,
+    uint32_t **columns,
+    const uint32_t *column_log_sizes,
+    uint32_t lifting_log_size,
+    uint32_t cols_done,
+    uint32_t is_final,
+    Blake2sHash *states,
+    void *stream);
 
 // Workstream D layer-pair fusion: hash two internal (column-free) tree levels per
 // launch. `size` = number of grandparent hashes; `previous_layer` holds 4*size.

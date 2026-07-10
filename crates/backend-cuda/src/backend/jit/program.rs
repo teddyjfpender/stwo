@@ -795,25 +795,24 @@ pub fn lower_framework_eval_to_v1_split<F: FrameworkEval>(
     // (claimed_sum / 2^log_size), and record-time const folds of either all land in
     // the bytecode as ext CONSTANTS, which would change the semantic hash — and
     // therefore force an NVRTC recompile — for every new statement. Hoist EVERY ext
-    // constant into a runtime parameter slot (deduplicated by value, slots assigned
-    // in encounter order, values returned to the dispatcher for the ext_params
-    // buffer). After this rewrite the bytecode is a pure function of the AIR's
-    // structure, so the kernel cache (in-memory and on-disk) hits across statements,
-    // inputs, and processes. The kernel reads ext_params[slot] instead of an
-    // immediate — identical values, identical arithmetic, byte-identical results.
+    // constant into its own runtime parameter slot. Slots are assigned by instruction
+    // occurrence, in encounter order, and values are returned to the dispatcher for
+    // the ext_params buffer. Do not deduplicate by value: equality between two
+    // statement values (most notably a zero claimed sum colliding with another zero
+    // constant) is statement-dependent and would otherwise change subsequent slot
+    // numbers, the bytecode, and the kernel semantic hash. After this rewrite the
+    // bytecode is a pure function of the AIR's structure, so the kernel cache
+    // (in-memory and on-disk) hits across statements, inputs, and processes. The
+    // kernel reads ext_params[slot] instead of an immediate — identical values,
+    // identical arithmetic, byte-identical results.
     let mut ext_param_values: Vec<SecureField> = Vec::new();
-    let mut slot_by_value: std::collections::HashMap<[u32; 4], u32> =
-        std::collections::HashMap::new();
     for inst in state.ext_insts.iter_mut() {
         if inst.op == MetalEvaluationProgramExtOpcodeV1::Const as u8 {
             let limbs = [inst.a, inst.b, inst.c, inst.d];
-            let slot = *slot_by_value.entry(limbs).or_insert_with(|| {
-                let slot = ext_param_values.len() as u32;
-                ext_param_values.push(SecureField::from_m31_array(
-                    limbs.map(stwo::core::fields::m31::BaseField::from_u32_unchecked),
-                ));
-                slot
-            });
+            let slot = ext_param_values.len() as u32;
+            ext_param_values.push(SecureField::from_m31_array(
+                limbs.map(stwo::core::fields::m31::BaseField::from_u32_unchecked),
+            ));
             inst.op = MetalEvaluationProgramExtOpcodeV1::Param as u8;
             inst.a = slot;
             inst.b = 0;
@@ -1117,11 +1116,103 @@ fn split_recording_state(
 mod tests {
     use num_traits::Zero;
     use stwo::core::fields::m31::BaseField;
+    use stwo::core::Fraction;
+    use stwo_constraint_framework::{EvalAtRow, FrameworkEval};
 
     use super::super::recording::RecordingState;
     use super::*;
 
     const P: u64 = (1 << 31) - 1;
+
+    #[derive(Clone, Copy)]
+    struct ExtParamCollisionEval {
+        first: SecureField,
+        second: SecureField,
+    }
+
+    impl FrameworkEval for ExtParamCollisionEval {
+        fn log_size(&self) -> u32 {
+            4
+        }
+
+        fn max_constraint_log_degree_bound(&self) -> u32 {
+            5
+        }
+
+        fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
+            let first_trace = eval.next_trace_mask();
+            eval.add_constraint(first_trace + self.first);
+            let second_trace = eval.next_trace_mask();
+            eval.add_constraint(second_trace + self.second);
+
+            let numerator = E::EF::from(eval.next_trace_mask());
+            let denominator = E::EF::from(eval.next_trace_mask());
+            eval.write_logup_frac(Fraction::new(numerator, denominator));
+            eval.finalize_logup();
+            eval
+        }
+    }
+
+    #[test]
+    fn ext_param_slots_are_occurrence_stable_across_value_collisions() {
+        let distinct_first = SecureField::from_u32_unchecked(17, 29, 43, 71);
+        let distinct_second = SecureField::from_u32_unchecked(101, 131, 173, 211);
+        let distinct_claimed_sum = SecureField::from_u32_unchecked(257, 263, 269, 271);
+        let zero_eval = ExtParamCollisionEval {
+            first: SecureField::zero(),
+            second: SecureField::zero(),
+        };
+        let distinct_eval = ExtParamCollisionEval {
+            first: distinct_first,
+            second: distinct_second,
+        };
+
+        let lower = |eval: &ExtParamCollisionEval, claimed_sum| {
+            lower_framework_eval_to_v1_split(
+                eval,
+                3,
+                0,
+                0,
+                claimed_sum,
+                eval.log_size(),
+                usize::MAX,
+            )
+            .unwrap()
+        };
+        let (zero_parts, zero_values) = lower(&zero_eval, SecureField::zero());
+        let (distinct_parts, distinct_values) = lower(&distinct_eval, distinct_claimed_sum);
+
+        assert_eq!(zero_parts.len(), 1);
+        assert_eq!(distinct_parts.len(), 1);
+        assert_eq!(zero_parts[0].program, distinct_parts[0].program);
+        assert_eq!(
+            zero_parts[0].program.header().semantic_hash,
+            distinct_parts[0].program.header().semantic_hash
+        );
+
+        let rows = BaseField::from_u32_unchecked(1 << distinct_eval.log_size());
+        assert_eq!(
+            zero_values,
+            vec![
+                SecureField::zero(),
+                SecureField::zero(),
+                SecureField::zero()
+            ]
+        );
+        assert_eq!(
+            distinct_values,
+            vec![distinct_first, distinct_second, distinct_claimed_sum / rows]
+        );
+        let slots = distinct_parts[0]
+            .program
+            .ext_insts()
+            .iter()
+            .filter(|inst| inst.op == MetalEvaluationProgramExtOpcodeV1::Param as u8)
+            .map(|inst| inst.a)
+            .collect::<Vec<_>>();
+        assert_eq!(slots, vec![0, 1, 2]);
+        assert_eq!(distinct_parts[0].program.header().n_ext_params, 3);
+    }
 
     /// Deterministic synthetic trace value for the reference interpreter.
     fn trace_value(interaction: u8, column: u32, offset: i32) -> BaseField {

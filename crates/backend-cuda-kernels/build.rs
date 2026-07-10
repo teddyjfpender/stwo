@@ -42,8 +42,9 @@ fn main() {
         .map(|output| output.status.success())
         .unwrap_or(false);
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR must be set"));
+    let aot_constraint_max_instrs = generated_aot_constraint_max_instrs();
     if !nvcc_available {
-        write_aot_pack(&out_dir, &[]);
+        write_aot_pack(&out_dir, &[], aot_constraint_max_instrs);
         println!("cargo:rustc-env=STWO_CUDA_BUILD_MODE=no-cuda");
         return;
     }
@@ -197,7 +198,13 @@ fn main() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    build_aot_pack(&nvcc, &archs, &extra_flags, &out_dir);
+    build_aot_pack(
+        &nvcc,
+        &archs,
+        &extra_flags,
+        &out_dir,
+        aot_constraint_max_instrs,
+    );
 
     println!("cargo:rustc-env=STWO_CUDA_BUILD_MODE=cuda");
     println!("cargo:rustc-cfg=stwo_cuda_link");
@@ -293,7 +300,13 @@ fn collect_dirs(dir: &std::path::Path, out: &mut Vec<String>) {
 /// Cubins are cached in OUT_DIR by (source mtime): an unchanged kernel never
 /// recompiles. SASS generation for the biggest fused kernels is the expensive
 /// step — paid per AIR revision at build time, never at prove time.
-fn build_aot_pack(nvcc: &str, archs: &[String], extra_flags: &[String], out_dir: &PathBuf) {
+fn build_aot_pack(
+    nvcc: &str,
+    archs: &[String],
+    extra_flags: &[String],
+    out_dir: &PathBuf,
+    constraint_max_instrs: usize,
+) {
     let gen_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap())
         .join("cuda")
         .join("generated");
@@ -382,13 +395,17 @@ fn build_aot_pack(nvcc: &str, archs: &[String], extra_flags: &[String], out_dir:
         .iter()
         .map(|(k, a, p)| (*k, *a, p.as_path()))
         .collect();
-    write_aot_pack(out_dir, &refs);
+    write_aot_pack(out_dir, &refs, constraint_max_instrs);
 }
 
 /// Concatenate cubins into `aot_pack.bin` + emit `aot_index.rs` (sorted by
 /// (cache_key, sm)). Always written — an empty pack keeps the stub build and
 /// include_bytes! happy.
-fn write_aot_pack(out_dir: &std::path::Path, entries: &[(u64, u32, &std::path::Path)]) {
+fn write_aot_pack(
+    out_dir: &std::path::Path,
+    entries: &[(u64, u32, &std::path::Path)],
+    constraint_max_instrs: usize,
+) {
     let mut pack: Vec<u8> = Vec::new();
     let mut index: Vec<(u64, u32, usize, usize)> = Vec::new();
     for (key, sm, path) in entries {
@@ -405,5 +422,29 @@ fn write_aot_pack(out_dir: &std::path::Path, entries: &[(u64, u32, &std::path::P
         rs.push_str(&format!("    (0x{key:016x}, {sm}, {off}, {len}),\n"));
     }
     rs.push_str("];\n");
+    rs.push_str(&format!(
+        "pub(crate) const AOT_CONSTRAINT_MAX_INSTRS: usize = {constraint_max_instrs};\n"
+    ));
     std::fs::write(out_dir.join("aot_index.rs"), rs).expect("write aot index");
+}
+
+fn generated_aot_constraint_max_instrs() -> usize {
+    let path = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap())
+        .join("cuda")
+        .join("generated")
+        .join("aot_constraint_max_instrs.txt");
+    let raw = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+        panic!(
+            "generated AOT constraint cap is missing at {}: {error}",
+            path.display()
+        )
+    });
+    let cap = raw.trim().parse::<usize>().unwrap_or_else(|error| {
+        panic!(
+            "invalid generated AOT constraint cap at {}: {error}",
+            path.display()
+        )
+    });
+    assert!(cap > 0, "generated AOT constraint cap must be non-zero");
+    cap
 }

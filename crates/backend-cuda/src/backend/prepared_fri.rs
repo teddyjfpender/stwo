@@ -52,6 +52,7 @@ pub struct FriMerkleLayerRequirements {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FriMerkleTreeRequirements {
     pub evaluation_log_size: u32,
+    pub evaluation_words: usize,
     pub outgoing_fold_step: u32,
     pub log_rows_per_leaf: u32,
     pub layers_bottom_up: Vec<FriMerkleLayerRequirements>,
@@ -103,6 +104,10 @@ pub struct FriWorkspaceSlots {
     pub input_coordinate_ptrs: ArenaSlotId,
     pub ping_coordinate_ptrs: ArenaSlotId,
     pub pong_coordinate_ptrs: ArenaSlotId,
+    /// Compact snapshots for committed inner trees. Tree zero aliases the
+    /// proof-wide quotient input and therefore has no snapshot slot.
+    pub retained_tree_evaluations: Vec<ArenaSlotId>,
+    pub retained_tree_coordinate_ptrs: Vec<ArenaSlotId>,
     /// One stable four-word SecureField slot per transcript-bounded fold round.
     pub folding_challenges: Vec<ArenaSlotId>,
     pub trees: Vec<FriMerkleTreeSlots>,
@@ -212,6 +217,24 @@ impl FriWorkspaceRequirements {
                 alignment_words: FRI_POINTER_ALIGNMENT_WORDS,
             },
         ];
+        output.extend(
+            slots
+                .retained_tree_evaluations
+                .iter()
+                .zip(self.trees.iter().skip(1))
+                .map(|(&id, tree)| FriArenaSlotRequirement {
+                    id,
+                    len_words: tree.evaluation_words,
+                    alignment_words: 1,
+                }),
+        );
+        output.extend(slots.retained_tree_coordinate_ptrs.iter().map(|&id| {
+            FriArenaSlotRequirement {
+                id,
+                len_words: self.coordinate_pointer_words,
+                alignment_words: FRI_POINTER_ALIGNMENT_WORDS,
+            }
+        }));
         output.extend(
             slots
                 .folding_challenges
@@ -354,6 +377,7 @@ fn tree_requirements(
         .collect::<Result<_, PreparedFriError>>()?;
     Ok(FriMerkleTreeRequirements {
         evaluation_log_size,
+        evaluation_words: secure_evaluation_words(evaluation_log_size)?,
         outgoing_fold_step,
         log_rows_per_leaf,
         layers_bottom_up,
@@ -387,6 +411,21 @@ fn validate_slot_shape(
             role: "folding challenges",
             expected: requirements.rounds.len(),
             actual: slots.folding_challenges.len(),
+        });
+    }
+    let retained_tree_count = requirements.trees.len().saturating_sub(1);
+    if slots.retained_tree_evaluations.len() != retained_tree_count {
+        return Err(PreparedFriError::SlotShapeMismatch {
+            role: "retained tree evaluations",
+            expected: retained_tree_count,
+            actual: slots.retained_tree_evaluations.len(),
+        });
+    }
+    if slots.retained_tree_coordinate_ptrs.len() != retained_tree_count {
+        return Err(PreparedFriError::SlotShapeMismatch {
+            role: "retained tree coordinate pointers",
+            expected: retained_tree_count,
+            actual: slots.retained_tree_coordinate_ptrs.len(),
         });
     }
     if slots.trees.len() != requirements.trees.len() {
@@ -580,6 +619,24 @@ impl<'a> PreparedFriGraph<'a> {
             requirements.coordinate_pointer_words,
             FRI_POINTER_ALIGNMENT_WORDS,
         )?;
+        let retained_values = slots
+            .retained_tree_evaluations
+            .iter()
+            .zip(requirements.trees.iter().skip(1))
+            .map(|(&id, tree)| bind_slot(arena, id, tree.evaluation_words, 1))
+            .collect::<Result<Vec<_>, _>>()?;
+        let retained_ptrs = slots
+            .retained_tree_coordinate_ptrs
+            .iter()
+            .map(|&id| {
+                bind_slot(
+                    arena,
+                    id,
+                    requirements.coordinate_pointer_words,
+                    FRI_POINTER_ALIGNMENT_WORDS,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let folding_challenges = slots
             .folding_challenges
             .iter()
@@ -602,8 +659,23 @@ impl<'a> PreparedFriGraph<'a> {
             coordinate_ptrs: pong_ptrs,
             coordinate_stride: line_stride,
         };
+        let retained = retained_values
+            .into_iter()
+            .zip(retained_ptrs)
+            .zip(requirements.trees.iter().skip(1))
+            .map(|((values, coordinate_ptrs), tree)| {
+                Ok(EvaluationBinding {
+                    values,
+                    coordinate_ptrs,
+                    coordinate_stride: pow2_words(tree.evaluation_log_size)?,
+                })
+            })
+            .collect::<Result<Vec<_>, PreparedFriError>>()?;
 
-        for binding in [input, ping, pong] {
+        for binding in [input, ping, pong]
+            .into_iter()
+            .chain(retained.iter().copied())
+        {
             let pointers: Vec<usize> = (0..SECURE_COORDINATES)
                 .map(|coordinate| unsafe {
                     binding
@@ -650,6 +722,7 @@ impl<'a> PreparedFriGraph<'a> {
                 .map(|layer| layer.log_size)
                 .collect(),
         }];
+        let mut retained = retained.into_iter();
         let mut rounds = Vec::with_capacity(requirements.rounds.len());
         for (round_index, round) in requirements.rounds.iter().enumerate() {
             let mut folds = Vec::with_capacity(round.fold_step as usize);
@@ -687,8 +760,11 @@ impl<'a> PreparedFriGraph<'a> {
             let output = binding(current);
             if let Some(tree_index) = round.output_tree {
                 let tree_requirement = &requirements.trees[tree_index];
+                let evaluation = retained
+                    .next()
+                    .expect("slot validation covers every committed inner FRI tree");
                 trees.push(PreparedTree {
-                    evaluation: output,
+                    evaluation,
                     evaluation_log_size: tree_requirement.evaluation_log_size,
                     log_rows_per_leaf: tree_requirement.log_rows_per_leaf,
                     layers_bottom_up: tree_layers[tree_index].clone(),
@@ -708,9 +784,10 @@ impl<'a> PreparedFriGraph<'a> {
             });
         }
         debug_assert_eq!(trees.len(), requirements.trees.len());
+        debug_assert!(retained.next().is_none());
 
         // Descriptor host storage may be released only after the explicit stream
-        // has consumed all three uploads. No launch method synchronizes.
+        // has consumed every coordinate-table upload. No launch method synchronizes.
         arena.context().sync()?;
 
         Ok(Self {
@@ -747,6 +824,25 @@ impl<'a> PreparedFriGraph<'a> {
             .ok_or(PreparedFriError::InvalidTreeIndex(tree_index))
     }
 
+    /// Stable evaluation backing one committed FRI tree. Tree zero aliases the
+    /// quotient input; inner trees use compact snapshots retained through
+    /// decommitment instead of the subsequently overwritten ping/pong buffers.
+    pub fn tree_evaluation(
+        &self,
+        tree_index: usize,
+    ) -> Result<PreparedFriEvaluation, PreparedFriError> {
+        let tree = self
+            .trees
+            .get(tree_index)
+            .ok_or(PreparedFriError::InvalidTreeIndex(tree_index))?;
+        Ok(PreparedFriEvaluation {
+            values: tree.evaluation.values,
+            coordinate_ptrs: tree.evaluation.coordinate_ptrs,
+            coordinate_stride: tree.evaluation.coordinate_stride,
+            log_size: tree.evaluation_log_size,
+        })
+    }
+
     /// Commit the original circle evaluation. Callers mix [`Self::read_tree_root`]
     /// into the transcript before drawing the first folding challenge.
     pub fn launch_first_tree(&self) -> Result<(), PreparedFriError> {
@@ -763,14 +859,15 @@ impl<'a> PreparedFriGraph<'a> {
             .get(round_index)
             .ok_or(PreparedFriError::InvalidRoundIndex(round_index))?;
         if let Some(tree_index) = round.output_tree {
+            self.preserve_tree_evaluation(tree_index, round.output)?;
             self.launch_tree(tree_index)?;
         }
         Ok(round.output_tree)
     }
 
-    /// Re-run only the folds for a round. After query sampling, callers can walk
-    /// rounds from zero and gather each output's witness values without retaining
-    /// all large evaluation layers or rehashing already retained Merkle trees.
+    /// Run only the folds for a round. Production commitment uses
+    /// [`Self::launch_round`] so committed inner outputs are retained for later
+    /// decommitment; this lower-level entry remains useful for focused kernels.
     pub fn launch_round_folds_only(&self, round_index: usize) -> Result<(), PreparedFriError> {
         let round = self
             .rounds
@@ -916,6 +1013,39 @@ impl<'a> PreparedFriGraph<'a> {
         Ok(())
     }
 
+    fn preserve_tree_evaluation(
+        &self,
+        tree_index: usize,
+        source: EvaluationBinding,
+    ) -> Result<(), PreparedFriError> {
+        let tree = self
+            .trees
+            .get(tree_index)
+            .ok_or(PreparedFriError::InvalidTreeIndex(tree_index))?;
+        let coordinate_words = pow2_words(tree.evaluation_log_size)?;
+        let coordinate_bytes = coordinate_words
+            .checked_mul(WORD_BYTES)
+            .ok_or(PreparedFriError::SizeOverflow)?;
+        for coordinate in 0..SECURE_COORDINATES {
+            unsafe {
+                self.arena.context().memcpy_d2d_async(
+                    tree.evaluation
+                        .values
+                        .as_u32_ptr()
+                        .add(coordinate * tree.evaluation.coordinate_stride)
+                        .cast(),
+                    source
+                        .values
+                        .as_u32_ptr()
+                        .add(coordinate * source.coordinate_stride)
+                        .cast(),
+                    coordinate_bytes,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     fn launch_tree(&self, tree_index: usize) -> Result<(), PreparedFriError> {
         let tree = self
             .trees
@@ -988,6 +1118,13 @@ mod tests {
             input_coordinate_ptrs: id(),
             ping_coordinate_ptrs: id(),
             pong_coordinate_ptrs: id(),
+            retained_tree_evaluations: requirements.trees.iter().skip(1).map(|_| id()).collect(),
+            retained_tree_coordinate_ptrs: requirements
+                .trees
+                .iter()
+                .skip(1)
+                .map(|_| id())
+                .collect(),
             folding_challenges: requirements.rounds.iter().map(|_| id()).collect(),
             trees: requirements
                 .trees
@@ -1045,6 +1182,15 @@ mod tests {
         assert_eq!(requirements.evaluation_ping_words, 4 * (1 << 7));
         assert_eq!(requirements.evaluation_pong_words, 4 * (1 << 7));
         assert_eq!(
+            requirements
+                .trees
+                .iter()
+                .skip(1)
+                .map(|tree| tree.evaluation_words)
+                .collect::<Vec<_>>(),
+            vec![4 * (1 << 6), 4 * (1 << 4)]
+        );
+        assert_eq!(
             requirements.coordinate_pointer_words,
             4 * core::mem::size_of::<usize>() / 4
         );
@@ -1064,7 +1210,8 @@ mod tests {
             .iter()
             .map(|tree| tree.layers_bottom_up.len())
             .sum::<usize>();
-        let expected = 5 + requirements.rounds.len() + tree_layers;
+        let retained_trees = requirements.trees.len() - 1;
+        let expected = 5 + 2 * retained_trees + requirements.rounds.len() + tree_layers;
         assert_eq!(arena_slots.len(), expected);
         assert_eq!(
             arena_slots
@@ -1149,6 +1296,16 @@ mod tests {
         assert!(matches!(
             requirements.arena_slot_requirements(&missing_tree_slots),
             Err(PreparedFriError::SlotShapeMismatch { role: "trees", .. })
+        ));
+
+        let mut missing_retained_evaluation = slots(&requirements);
+        missing_retained_evaluation.retained_tree_evaluations.pop();
+        assert!(matches!(
+            requirements.arena_slot_requirements(&missing_retained_evaluation),
+            Err(PreparedFriError::SlotShapeMismatch {
+                role: "retained tree evaluations",
+                ..
+            })
         ));
 
         let mut aliased_slots = slots(&requirements);

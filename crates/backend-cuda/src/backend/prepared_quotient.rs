@@ -507,6 +507,18 @@ impl<'a> PreparedQuotientGraph<'a> {
         &self.requirements
     }
 
+    /// Device destination for the canonical sample-point array. A prepared OODS
+    /// producer writes this slice on the arena stream before [`Self::launch`].
+    pub const fn sample_points_destination(&self) -> ArenaSlice {
+        self.sample_points
+    }
+
+    /// Device destination for the accumulated first line coefficients. A
+    /// prepared numerator producer writes this slice before [`Self::launch`].
+    pub const fn first_linear_terms_destination(&self) -> ArenaSlice {
+        self.first_linear_terms
+    }
+
     /// Update only transcript-derived constants between graph replays.
     pub fn upload_constants_at_transcript_boundary(
         &self,

@@ -25,7 +25,7 @@ use rand::{Rng, SeedableRng};
 use stwo::core::air::Component;
 use stwo::core::channel::{Channel, MerkleChannel};
 use stwo::core::circle::SECURE_FIELD_CIRCLE_GEN;
-use stwo::core::fields::m31::{BaseField, M31};
+use stwo::core::fields::m31::{BaseField, M31, P};
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::fields::FieldExpOps;
 use stwo::core::pcs::{CommitmentSchemeVerifier, PcsConfig};
@@ -320,6 +320,10 @@ where
         dec_b.decommitment.hash_witness, dec_cpu.decommitment.hash_witness,
         "hash witness"
     );
+    assert_eq!(
+        dec_b.aux.all_node_values, dec_cpu.aux.all_node_values,
+        "Merkle auxiliary node values"
+    );
 
     // Pruned commit must be observationally identical.
     let pruned_b =
@@ -330,6 +334,10 @@ where
     assert_eq!(
         dec_pruned.decommitment.hash_witness, dec_b.decommitment.hash_witness,
         "pruned hash witness"
+    );
+    assert_eq!(
+        dec_pruned.aux.all_node_values, dec_b.aux.all_node_values,
+        "pruned auxiliary node values"
     );
 
     // Column counts that are exact 16-word (64-byte) block multiples: the leaf hash
@@ -368,7 +376,50 @@ where
             dec_b.decommitment.hash_witness, dec_cpu.decommitment.hash_witness,
             "hash witness, n_columns={n_columns}"
         );
+        assert_eq!(
+            dec_b.aux.all_node_values, dec_cpu.aux.all_node_values,
+            "auxiliary node values, n_columns={n_columns}"
+        );
     }
+
+    // The sparse gather must preserve the raw `P` word for leaf rehashing while
+    // returning its canonical zero value to the verifier. This catches an
+    // accidental `BaseField::reduce` in the PCIe gather boundary.
+    let raw_p = BaseField::from_u32_unchecked(P);
+    let raw_columns_cpu = vec![
+        vec![
+            raw_p,
+            BaseField::from_u32_unchecked(1),
+            raw_p,
+            BaseField::from_u32_unchecked(3),
+        ],
+        (0..8)
+            .map(|i| BaseField::from_u32_unchecked(if i == 6 { P } else { i }))
+            .collect(),
+    ];
+    let raw_columns_b: Vec<Col<B, BaseField>> = raw_columns_cpu
+        .iter()
+        .map(|column| column.iter().copied().collect())
+        .collect();
+    let raw_tree_b =
+        MerkleProverLifted::<B, MC::H>::commit_pruned(raw_columns_b.iter().collect(), 4);
+    let raw_tree_cpu =
+        MerkleProverLifted::<CpuBackend, MC::H>::commit_pruned(raw_columns_cpu.iter().collect(), 4);
+    assert_eq!(raw_tree_b.root(), raw_tree_cpu.root(), "raw-P Merkle root");
+    let raw_queries = [0, 3, 7, 15];
+    let (raw_values_b, raw_dec_b) =
+        raw_tree_b.decommit(&raw_queries, raw_columns_b.iter().collect_vec());
+    let (raw_values_cpu, raw_dec_cpu) =
+        raw_tree_cpu.decommit(&raw_queries, raw_columns_cpu.iter().collect_vec());
+    assert_eq!(raw_values_b, raw_values_cpu, "raw-P queried values");
+    assert_eq!(
+        raw_dec_b.decommitment.hash_witness, raw_dec_cpu.decommitment.hash_witness,
+        "raw-P hash witness"
+    );
+    assert_eq!(
+        raw_dec_b.aux.all_node_values, raw_dec_cpu.aux.all_node_values,
+        "raw-P auxiliary node values"
+    );
 }
 
 /// Proof-of-work grinding must return the same nonce as the reference backend. (Any valid

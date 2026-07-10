@@ -554,6 +554,17 @@ bool compile_kernel(const char *source, const char *kernel_name, uint64_t semant
         return false;
     }
 
+    // A null source is the strict resident warm-path sentinel: callers that
+    // admitted an exact embedded entry do not materialize the huge CUDA TU.
+    // Reaching here means the entry was absent/unloadable while strict mode was
+    // not active, so fail rather than handing a null pointer to cache/NVRTC code.
+    if (source == nullptr) {
+        fprintf(stderr,
+                "stwo JIT: source-free AOT resolution missed kernel=%s key=%016llx\n",
+                kernel_name, (unsigned long long)semantic_hash);
+        return false;
+    }
+
     // Cubin fast path (skips ptxas at load). On any failure, fall through to PTX.
     if (jit_cubin_cache_enabled() &&
         [&]() {
@@ -941,6 +952,52 @@ extern "C" bool stwo_cuda_jit_eval_fused(
     if (cuLaunchKernel(function, grid, 1, 1, block, 1, 1, 0, nullptr, args, nullptr) !=
         CUDA_SUCCESS) {
         fprintf(stderr, "stwo JIT: cuLaunchKernel failed for %s\n", kernel_name);
+        return false;
+    }
+    return true;
+}
+
+// Resident explicit-stream form of the constraint launch. Setup has already
+// resolved every key against the embedded AOT pack before graph capture; this
+// call is allocation-free on a cache hit and never falls back to the default
+// stream. The ABI otherwise remains byte-identical to the legacy entry point.
+extern "C" bool stwo_cuda_jit_eval_fused_on(
+    const char *source,
+    const char *kernel_name,
+    uint64_t cache_key,
+    const uint32_t *trace_values,
+    const uint32_t *interaction_offsets,
+    const uint32_t *base_params,
+    const uint32_t *ext_params,
+    const uint32_t *random_coeff_powers,
+    const uint32_t *denom_inv,
+    uint32_t *coord_0,
+    uint32_t *coord_1,
+    uint32_t *coord_2,
+    uint32_t *coord_3,
+    uint32_t row_count,
+    uint32_t log_n_rows,
+    uint32_t rc_base,
+    bool relax_opt,
+    void *stream
+) {
+    CUfunction function = nullptr;
+    if (!get_or_compile(source, kernel_name, cache_key, relax_opt, &function)) {
+        return false;
+    }
+    void *args[] = {
+        (void *)&trace_values, (void *)&interaction_offsets, (void *)&base_params,
+        (void *)&ext_params,   (void *)&random_coeff_powers, (void *)&denom_inv,
+        (void *)&coord_0,      (void *)&coord_1,             (void *)&coord_2,
+        (void *)&coord_3,      (void *)&row_count,           (void *)&log_n_rows,
+        (void *)&rc_base,
+    };
+    const unsigned block = 128;
+    const unsigned grid = (row_count + block - 1) / block;
+    if (row_count == 0) return true;
+    if (cuLaunchKernel(function, grid, 1, 1, block, 1, 1, 0, (CUstream)stream, args,
+                       nullptr) != CUDA_SUCCESS) {
+        fprintf(stderr, "stwo resident AOT: cuLaunchKernel failed for %s\n", kernel_name);
         return false;
     }
     return true;

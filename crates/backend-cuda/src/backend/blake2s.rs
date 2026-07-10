@@ -40,13 +40,45 @@ fn merkle_span<T>(label: &str, n_cols: usize, log_size: u32, f: impl FnOnce() ->
     out
 }
 
+/// Keep the historical low-VRAM policy on CUDA by default. Set
+/// `STWO_CUDA_MERKLE_PRUNE_DEPTH=1` to experimentally retain the bottom three
+/// interior layers and trade additional VRAM for less host-side recomputation.
+fn cuda_merkle_prune_depth_from(raw: Option<&str>) -> u32 {
+    match raw.map(str::trim) {
+        None | Some("") | Some("4") => 4,
+        Some("1") => 1,
+        Some(value) => {
+            panic!("unsupported STWO_CUDA_MERKLE_PRUNE_DEPTH={value:?}; expected 1 or 4")
+        }
+    }
+}
+
 impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M31_OUTPUT>>
     for CudaBackend
 {
+    fn merkle_prune_depth() -> u32 {
+        cuda_merkle_prune_depth_from(
+            std::env::var("STWO_CUDA_MERKLE_PRUNE_DEPTH")
+                .ok()
+                .as_deref(),
+        )
+    }
+
     fn batch_gather_column_rows(
         columns: &[&BaseFieldVec],
         rows: &[Vec<usize>],
     ) -> Vec<Vec<stwo::core::fields::m31::BaseField>> {
+        // Migration-only same-binary rollback for the one live decommit-path
+        // override introduced by the resident work. `gather_unreduced` keeps
+        // raw device words (including P) exactly like the batched kernel.
+        if std::env::var("STWO_CUDA_DECOMMIT_GATHER_REFERENCE").as_deref() == Ok("1") {
+            assert_eq!(columns.len(), rows.len());
+            return columns
+                .iter()
+                .zip(rows)
+                .map(|(column, indices)| column.gather_unreduced(indices))
+                .collect();
+        }
         crate::backend::decommit_gather::gather_column_rows_host(columns, rows)
             .unwrap_or_else(|error| panic!("CUDA multi-column decommit gather failed: {error}"))
     }
@@ -246,6 +278,24 @@ impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M3
         drop(table);
         assert_eq!(rc, 0, "blake2s tail launch failed");
         levels
+    }
+}
+
+#[cfg(test)]
+mod prune_policy_tests {
+    use super::cuda_merkle_prune_depth_from;
+
+    #[test]
+    fn cuda_defaults_to_four_and_supports_depth_one_opt_in() {
+        assert_eq!(cuda_merkle_prune_depth_from(None), 4);
+        assert_eq!(cuda_merkle_prune_depth_from(Some("1")), 1);
+        assert_eq!(cuda_merkle_prune_depth_from(Some("4")), 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected 1 or 4")]
+    fn cuda_rejects_depth_zero() {
+        cuda_merkle_prune_depth_from(Some("0"));
     }
 }
 

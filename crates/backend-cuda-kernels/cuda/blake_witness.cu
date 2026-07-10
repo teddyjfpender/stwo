@@ -34,6 +34,32 @@ constexpr uint32_t BG_BLOCK = 256;
 constexpr int BG_N_TRACE = 53;
 constexpr int BG_N_AUX = 20;
 constexpr int BG_N_COLS = BG_N_TRACE + BG_N_AUX;  // 73
+constexpr int BG_N_SUB = 48;
+
+// Arena-native output ABI. Passing the pointers by value keeps the launch
+// allocation-free: the host wrapper copies the 53 arena addresses into this
+// kernel-argument struct, so no device pointer table is uploaded per proof.
+struct BlakeGResidentOutputs {
+    uint32_t *trace[BG_N_TRACE];
+    uint32_t *lookup;
+    uint32_t *sub;
+};
+
+__device__ __constant__ uint8_t BG_TUPLE_COLS[BG_N_SUB] = {
+    53, 55, 18, 14, 16, 19, 54, 56, 20, 15, 17, 21,
+    57, 59, 28, 24, 26, 29, 58, 60, 30, 25, 27, 31,
+    61, 63, 38, 34, 36, 39, 62, 64, 40, 35, 37, 41,
+    65, 67, 48, 44, 46, 49, 66, 68, 50, 45, 47, 51,
+};
+__device__ __constant__ uint32_t BG_TUPLE_RELATIONS[16] = {
+    112558620, 112558620, 521092554, 521092554,
+    648362599, 45448144, 648362599, 45448144,
+    112558620, 112558620, 521092554, 521092554,
+    62225763, 95781001, 62225763, 95781001,
+};
+__device__ __constant__ uint8_t BG_FINAL_COLS[20] = {
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 32, 33, 69, 70, 42, 43, 71, 72,
+};
 
 DEVICE_FORCEINLINE uint32_t lo16(uint32_t x) { return x & 0xFFFFu; }
 DEVICE_FORCEINLINE uint32_t hi16(uint32_t x) { return x >> 16; }
@@ -43,16 +69,37 @@ DEVICE_FORCEINLINE uint32_t hi16(uint32_t x) { return x >> 16; }
 // per row; padding rows already carry the host's replicated first input).
 __global__ void blake_g_write_trace_kernel(
     const uint32_t *inputs,
+    const uint32_t *producer_sub,
+    uint32_t producer_rows,
+    uint32_t producer_word_base,
     uint32_t n_rows,        // real (non-padding) rows; enabler = row < n_rows
     uint32_t column_length,
-    uint32_t *const *cols   // BG_N_COLS device pointers, column_length each
+    uint32_t *const *cols,  // legacy: BG_N_COLS device pointers
+    BlakeGResidentOutputs resident
 ) {
     uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= column_length) {
         return;
     }
-    const uint32_t *in = inputs + (size_t)row * 6;
-    uint32_t in0 = in[0], in1 = in[1], in2 = in[2], in3 = in[3], in4 = in[4], in5 = in[5];
+    uint32_t input_words[6];
+    if (producer_sub != nullptr) {
+        // blake_round -> blake_g edge: instance-major stacking. Padding rows
+        // replicate the first packed row's lanes, exactly like the host resize.
+        uint32_t src = row < n_rows ? row : (row & 15u);
+        uint32_t instance = src / producer_rows;
+        uint32_t producer_row = src % producer_rows;
+        for (uint32_t word = 0; word < 6; ++word) {
+            input_words[word] = producer_sub[
+                (size_t)(producer_word_base + instance * 6 + word) * producer_rows + producer_row];
+        }
+    } else {
+        const uint32_t *in = inputs + (size_t)row * 6;
+        for (uint32_t word = 0; word < 6; ++word) {
+            input_words[word] = in[word];
+        }
+    }
+    uint32_t in0 = input_words[0], in1 = input_words[1], in2 = input_words[2];
+    uint32_t in3 = input_words[3], in4 = input_words[4], in5 = input_words[5];
 
     uint32_t c[BG_N_COLS];
 
@@ -157,9 +204,33 @@ __global__ void blake_g_write_trace_kernel(
     c[65] = s71_0; c[66] = s73_0; c[67] = s75_0; c[68] = s77_0;
     c[69] = xr7_low; c[70] = xr7_high; c[71] = xr8_low; c[72] = xr8_high;
 
-    for (int j = 0; j < BG_N_COLS; ++j) {
-        cols[j][row] = c[j];
+    if (cols != nullptr) {
+        for (int j = 0; j < BG_N_COLS; ++j) {
+            cols[j][row] = c[j];
+        }
+        return;
     }
+
+    for (int j = 0; j < BG_N_TRACE; ++j) {
+        resident.trace[j][row] = c[j];
+    }
+
+    // Generated LookupData declaration order: sixteen xor tuples, the final
+    // blake_g tuple, then multiplicities (1, enabler).
+    for (int tuple = 0; tuple < 16; ++tuple) {
+        resident.lookup[(size_t)(4 * tuple) * column_length + row] = BG_TUPLE_RELATIONS[tuple];
+        for (int word = 0; word < 3; ++word) {
+            uint32_t value = c[BG_TUPLE_COLS[3 * tuple + word]];
+            resident.lookup[(size_t)(4 * tuple + 1 + word) * column_length + row] = value;
+            resident.sub[(size_t)(3 * tuple + word) * column_length + row] = value;
+        }
+    }
+    resident.lookup[(size_t)64 * column_length + row] = 1139985212;
+    for (int word = 0; word < 20; ++word) {
+        resident.lookup[(size_t)(65 + word) * column_length + row] = c[BG_FINAL_COLS[word]];
+    }
+    resident.lookup[(size_t)85 * column_length + row] = 1;
+    resident.lookup[(size_t)86 * column_length + row] = c[52];
 }
 
 // Generic xor multiplicity count feed. For each of `n_pairs` (a, b) column pairs,
@@ -294,10 +365,52 @@ extern "C" void blake_g_write_trace(
     const uint32_t *const *cols  // 73 device pointers (device-resident table)
 ) {
     uint32_t blocks = (column_length + BG_BLOCK - 1) / BG_BLOCK;
+    BlakeGResidentOutputs resident = {};
     blake_g_write_trace_kernel<<<blocks, BG_BLOCK>>>(
-        inputs, n_rows, column_length, const_cast<uint32_t *const *>(cols));
+        inputs, nullptr, 0, 0, n_rows, column_length,
+        const_cast<uint32_t *const *>(cols), resident);
     stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
+}
+
+extern "C" int blake_g_write_trace_into_on(
+    const uint32_t *inputs,
+    const uint32_t *producer_sub,
+    uint32_t producer_rows,
+    uint32_t producer_word_base,
+    uint32_t producer_instances,
+    uint32_t n_rows,
+    uint32_t column_length,
+    uint32_t *const *trace_cols_host,
+    uint32_t *lookup,
+    uint32_t *sub,
+    cudaStream_t stream
+) {
+    if (column_length == 0 || trace_cols_host == nullptr || lookup == nullptr || sub == nullptr) {
+        return static_cast<int>(cudaErrorInvalidValue);
+    }
+    if ((inputs == nullptr) == (producer_sub == nullptr)) {
+        return static_cast<int>(cudaErrorInvalidValue);
+    }
+    if (producer_sub != nullptr &&
+        (producer_rows == 0 || producer_instances == 0 ||
+         (size_t)producer_rows * producer_instances != n_rows)) {
+        return static_cast<int>(cudaErrorInvalidValue);
+    }
+    BlakeGResidentOutputs resident = {};
+    for (int column = 0; column < BG_N_TRACE; ++column) {
+        if (trace_cols_host[column] == nullptr) {
+            return static_cast<int>(cudaErrorInvalidDevicePointer);
+        }
+        resident.trace[column] = trace_cols_host[column];
+    }
+    resident.lookup = lookup;
+    resident.sub = sub;
+    uint32_t blocks = (column_length + BG_BLOCK - 1) / BG_BLOCK;
+    blake_g_write_trace_kernel<<<blocks, BG_BLOCK, 0, stream>>>(
+        inputs, producer_sub, producer_rows, producer_word_base,
+        n_rows, column_length, nullptr, resident);
+    return static_cast<int>(cudaGetLastError());
 }
 
 extern "C" void blake_g_xor_count(

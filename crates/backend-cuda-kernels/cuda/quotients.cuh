@@ -87,4 +87,58 @@ int stwo_combine_quotients_from_numerators_on(
         void *stream
 );
 
+// Prepared FRI-quotient numerator pipeline. All topology tables and scratch
+// buffers are caller-owned device memory; every launch stays on `stream`.
+extern "C"
+int stwo_prepare_quotient_numerator_terms_on(
+        const uint32_t *term_descriptors,
+        uint32_t term_count,
+        const secure_field_point *sample_points,
+        const qm31 *sample_values,
+        const qm31 *random_coefficient,
+        secure_field_point *term_points,
+        qm31 *line_coefficients,
+        void *stream
+);
+
+extern "C"
+int stwo_finalize_quotient_numerator_groups_on(
+        const uint32_t *group_offsets,
+        const uint32_t *group_term_indices,
+        uint32_t group_count,
+        const secure_field_point *term_points,
+        const qm31 *line_coefficients,
+        secure_field_point *sample_points,
+        qm31 *first_linear_terms,
+        void *stream
+);
+
+extern "C"
+int stwo_zero_quotient_numerator_outputs_on(
+        const uint32_t *group_log_sizes,
+        uint32_t group_count,
+        uint32_t max_output_size,
+        uint32_t *const *outputs_0,
+        uint32_t *const *outputs_1,
+        uint32_t *const *outputs_2,
+        uint32_t *const *outputs_3,
+        void *stream
+);
+
+extern "C"
+int stwo_accumulate_quotient_numerator_batch_on(
+        const uint32_t *group_offsets,
+        const uint32_t *term_descriptors,
+        uint32_t group_count,
+        uint32_t max_output_size,
+        const uint32_t *const *source_evaluations,
+        const qm31 *line_coefficients,
+        const uint32_t *group_log_sizes,
+        uint32_t *const *outputs_0,
+        uint32_t *const *outputs_1,
+        uint32_t *const *outputs_2,
+        uint32_t *const *outputs_3,
+        void *stream
+);
+
 #endif // QUOTIENTS_H

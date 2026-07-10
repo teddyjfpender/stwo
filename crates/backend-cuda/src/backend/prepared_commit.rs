@@ -11,10 +11,12 @@ use std::collections::BTreeSet;
 use stwo::core::vcs::blake2_hash::Blake2sHash;
 
 use super::commit_graph::{
-    CommitGraphError, CommitGraphPlan, CommitLaunchKind, CommitLdeBatch, CommitLeafGroup,
-    CommitTailPlan,
+    CommitGraphError, CommitGraphPlan, CommitHashFromTileTelemetry, CommitLaunchKind,
+    CommitLdeBatch, CommitLeafGroup, CommitTailPlan,
 };
-use super::exec_context::{ArenaError, ArenaSlice, ArenaSlotId, CudaRuntimeError, DeviceArena};
+use super::exec_context::{
+    check_cuda, ArenaError, ArenaSlice, ArenaSlotId, CudaRuntimeError, DeviceArena,
+};
 
 const WORD_BYTES: usize = core::mem::size_of::<u32>();
 const HASH_WORDS: usize = core::mem::size_of::<Blake2sHash>() / WORD_BYTES;
@@ -46,6 +48,15 @@ pub struct CommitCoefficientColumn {
 #[derive(Clone, Debug)]
 pub struct CommitCoefficientGroup {
     pub columns: Vec<CommitCoefficientColumn>,
+}
+
+/// Optional persistent LDE destinations for one canonical commitment group.
+/// When supplied, the commit writes and hashes these slices directly; they can
+/// remain live through query sampling and serve as decommit sources without a
+/// second full-domain LDE pass.
+#[derive(Clone, Debug)]
+pub struct CommitEvaluationGroup {
+    pub columns: Vec<ArenaSlice>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -264,6 +275,8 @@ pub enum PreparedCommitError {
     DuplicateSlot(ArenaSlotId),
     AliasedSourceSlot(ArenaSlotId),
     SourceAliasesWorkspace(ArenaSlotId),
+    OutputAliasesSource(ArenaSlotId),
+    OutputAliasesWorkspace(ArenaSlotId),
     ContextMismatch(ArenaSlotId),
     SlotTooSmall {
         slot: ArenaSlotId,
@@ -536,6 +549,7 @@ pub struct PreparedCommitGraph<'a> {
     arena: &'a DeviceArena,
     plan: CommitGraphPlan,
     retained_layers_bottom_up: Vec<ArenaSlice>,
+    retained_evaluations: Vec<Option<Vec<ArenaSlice>>>,
 }
 
 impl<'a> PreparedCommitGraph<'a> {
@@ -547,6 +561,31 @@ impl<'a> PreparedCommitGraph<'a> {
         groups: &[CommitCoefficientGroup],
         twiddles: ArenaSlice,
         slots: &CommitWorkspaceSlots,
+    ) -> Result<Self, PreparedCommitError> {
+        Self::prepare_inner(arena, config, groups, twiddles, slots, None)
+    }
+
+    /// Prepare a commitment with a deterministic per-group opening policy.
+    /// `Some(group)` keeps that group's LDE columns resident through decommit;
+    /// `None` uses the shared streaming tile and is recomputed if opened later.
+    pub fn prepare_with_retained_evaluations(
+        arena: &'a DeviceArena,
+        config: CommitWorkspaceConfig,
+        groups: &[CommitCoefficientGroup],
+        twiddles: ArenaSlice,
+        slots: &CommitWorkspaceSlots,
+        output_groups: &[Option<CommitEvaluationGroup>],
+    ) -> Result<Self, PreparedCommitError> {
+        Self::prepare_inner(arena, config, groups, twiddles, slots, Some(output_groups))
+    }
+
+    fn prepare_inner(
+        arena: &'a DeviceArena,
+        config: CommitWorkspaceConfig,
+        groups: &[CommitCoefficientGroup],
+        twiddles: ArenaSlice,
+        slots: &CommitWorkspaceSlots,
+        output_groups: Option<&[Option<CommitEvaluationGroup>]>,
     ) -> Result<Self, PreparedCommitError> {
         let grouped_logs: Vec<Vec<u32>> = groups
             .iter()
@@ -594,6 +633,62 @@ impl<'a> PreparedCommitGraph<'a> {
             return Err(PreparedCommitError::SourceAliasesWorkspace(*id));
         }
 
+        let retained_evaluations = match output_groups {
+            None => vec![None; groups.len()],
+            Some(outputs) => {
+                check_count("evaluation output groups", groups.len(), outputs.len())?;
+                let mut output_ids = BTreeSet::new();
+                let mut retained = Vec::with_capacity(outputs.len());
+                for (group_index, ((group, logs), output)) in
+                    groups.iter().zip(&grouped_logs).zip(outputs).enumerate()
+                {
+                    let Some(output) = output else {
+                        retained.push(None);
+                        continue;
+                    };
+                    check_count(
+                        "evaluation output columns",
+                        group.columns.len(),
+                        output.columns.len(),
+                    )?;
+                    let mut columns = Vec::with_capacity(output.columns.len());
+                    for (column_index, (&slice, &log_size)) in
+                        output.columns.iter().zip(logs).enumerate()
+                    {
+                        if slice.context_token() != context_token {
+                            return Err(PreparedCommitError::ContextMismatch(slice.id()));
+                        }
+                        let required_words = pow2_words(
+                            log_size
+                                .checked_add(config.log_blowup_factor)
+                                .ok_or(PreparedCommitError::SizeOverflow)?,
+                        )?;
+                        if slice.len_words() < required_words {
+                            return Err(PreparedCommitError::SlotTooSmall {
+                                slot: slice.id(),
+                                required_words,
+                                actual_words: slice.len_words(),
+                            });
+                        }
+                        if !output_ids.insert(slice.id()) {
+                            return Err(PreparedCommitError::DuplicateSlot(slice.id()));
+                        }
+                        if source_ids.contains(&slice.id()) {
+                            return Err(PreparedCommitError::OutputAliasesSource(slice.id()));
+                        }
+                        if workspace_set.contains(&slice.id()) {
+                            return Err(PreparedCommitError::OutputAliasesWorkspace(slice.id()));
+                        }
+                        debug_assert!(column_index < group.columns.len());
+                        debug_assert!(group_index < groups.len());
+                        columns.push(slice);
+                    }
+                    retained.push(Some(columns));
+                }
+                retained
+            }
+        };
+
         let lde_tile = bind_slot(arena, slots.lde_tile, requirements.lde_tile_words, 1)?;
         let leaf_state = bind_slot(
             arena,
@@ -628,11 +723,12 @@ impl<'a> PreparedCommitGraph<'a> {
         let mut uploads = Vec::new();
         let mut leaf_groups = Vec::with_capacity(groups.len());
         let mut first_column = 0u32;
-        for (((group, group_slots), group_requirement), logs) in groups
+        for ((((group, group_slots), group_requirement), logs), retained_group) in groups
             .iter()
             .zip(&slots.groups)
             .zip(&requirements.groups)
             .zip(&grouped_logs)
+            .zip(&retained_evaluations)
         {
             let column_ptrs = bind_slot(
                 arena,
@@ -647,14 +743,23 @@ impl<'a> PreparedCommitGraph<'a> {
                 1,
             )?;
 
-            let mut output_offset = 0usize;
-            let mut output_pointers = Vec::with_capacity(group.columns.len());
-            for &log_size in logs {
-                let evaluation_log_size = log_size + config.log_blowup_factor;
-                let pointer = unsafe { lde_tile.as_u32_ptr().add(output_offset) };
-                output_pointers.push(pointer as usize);
-                output_offset += pow2_words(evaluation_log_size)?;
-            }
+            let output_pointers = match retained_group {
+                Some(columns) => columns
+                    .iter()
+                    .map(|column| column.as_u32_ptr() as usize)
+                    .collect(),
+                None => {
+                    let mut output_offset = 0usize;
+                    let mut pointers = Vec::with_capacity(group.columns.len());
+                    for &log_size in logs {
+                        let evaluation_log_size = log_size + config.log_blowup_factor;
+                        let pointer = unsafe { lde_tile.as_u32_ptr().add(output_offset) };
+                        pointers.push(pointer as usize);
+                        output_offset += pow2_words(evaluation_log_size)?;
+                    }
+                    pointers
+                }
+            };
             uploads.push(PendingUpload {
                 destination: column_ptrs,
                 descriptor: HostDescriptor::Pointers(output_pointers.clone()),
@@ -736,6 +841,7 @@ impl<'a> PreparedCommitGraph<'a> {
                 column_ptrs,
                 column_log_sizes,
                 lde_batches,
+                retain_evaluations: retained_group.is_some(),
             });
             first_column = first_column
                 .checked_add(column_count)
@@ -787,6 +893,15 @@ impl<'a> PreparedCommitGraph<'a> {
             tail,
         )?;
 
+        // Dynamic shared-memory opt-in is a setup operation and therefore must
+        // happen before capture. Unsupported devices fail closed here; replay
+        // never performs runtime configuration.
+        for &log_n in plan.producer_fused_log_sizes() {
+            let code =
+                unsafe { stwo_backend_cuda_kernels::raw::stwo_lde_n2b_hash16_configure(log_n) };
+            check_cuda("commit_hash_from_tile_configure", code)?;
+        }
+
         // All host descriptor storage remains alive until this one setup drain.
         // No transfer or synchronization occurs in `launch` or during capture.
         let mut upload_result = Ok(());
@@ -816,6 +931,7 @@ impl<'a> PreparedCommitGraph<'a> {
             arena,
             plan,
             retained_layers_bottom_up,
+            retained_evaluations,
         })
     }
 
@@ -829,6 +945,10 @@ impl<'a> PreparedCommitGraph<'a> {
         self.plan.launch_sequence()
     }
 
+    pub fn hash_from_tile_telemetry(&self) -> CommitHashFromTileTelemetry {
+        self.plan.hash_from_tile_telemetry()
+    }
+
     pub fn root_slice(&self) -> ArenaSlice {
         self.plan.root()
     }
@@ -837,6 +957,12 @@ impl<'a> PreparedCommitGraph<'a> {
     /// deliberately absent; callers reproduce their queried nodes from sources.
     pub fn retained_layers_bottom_up(&self) -> &[ArenaSlice] {
         &self.retained_layers_bottom_up
+    }
+
+    /// Per-group persistent LDE columns selected by the proof plan. Streaming
+    /// groups are `None` and retain no evaluation storage after commitment.
+    pub fn retained_evaluations(&self) -> &[Option<Vec<ArenaSlice>>] {
+        &self.retained_evaluations
     }
 
     /// The sole commit-side D2H boundary: copy and synchronize the 32-byte root
