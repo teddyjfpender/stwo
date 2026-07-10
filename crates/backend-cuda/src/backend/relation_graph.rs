@@ -27,6 +27,13 @@ const INSTANCE_GEOMETRY_WORDS: usize = 11;
 const FRACTION_INVERSE_BLOCK_VALUES: usize = 1024;
 const M31_MODULUS: u64 = 0x7fff_ffff;
 const LARGE_MEMORY_VALUE_ID_BASE: u32 = 0x4000_0000;
+/// Mirror of `RELATION_SCAN_TICKET_WORDS` in `relation_scan.cuh`: the ticket
+/// counter (word 0) plus padding to keep the descriptor QM31 fields 16-byte
+/// aligned.
+const SCAN_TICKET_WORDS: usize = 4;
+/// Mirror of `RELATION_SCAN_DESC_STRIDE` in `relation_scan.cuh`: one
+/// partition descriptor = flag word (+3 pad) + aggregate QM31 + prefix QM31.
+const SCAN_DESC_STRIDE_WORDS: usize = 12;
 const XOR12_ROWS: u32 = 1 << 20;
 pub const RELATION_POINTER_ALIGNMENT_WORDS: usize =
     core::mem::align_of::<*const u32>() / WORD_BYTES;
@@ -63,6 +70,19 @@ pub enum RelationLaunchMode {
     Fused,
 }
 
+/// Selects which tail sequence follows the pipeline body. Both tails scan
+/// exactly the same element sequence (the last interaction column in coset
+/// scan order) and produce byte-identical committed columns and claimed sums;
+/// `Scan` is opt-in via `STWO_CUDA_RELATION_SCAN_TAIL=1`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RelationTailMode {
+    /// Segmented reduce + shift + 3-kernel block scan (default; 5 kernels).
+    Segmented,
+    /// Single-pass decoupled-lookback scan folding reduce/claimed-sum into
+    /// the same pass, plus a shift fixup (memset + 2 kernels).
+    Scan,
+}
+
 /// Static fused-lane eligibility of every instance of `batch`. Fail-closed:
 /// anything outside the audited envelope keeps the proven 3-stage path.
 pub fn relation_batch_fused_eligible(batch: &RelationBatchProgram) -> bool {
@@ -97,6 +117,15 @@ fn fused_eligibility_mask(eligible: &[bool]) -> Option<[u32; RELATION_FUSED_MASK
 fn fused_launch_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("STWO_CUDA_RELATION_FUSED").as_deref() == Ok("1"))
+}
+
+/// `STWO_CUDA_RELATION_SCAN_TAIL=1` opts every implicit-tail launch into the
+/// decoupled-lookback scan tail. Read once per process so eager runs, capture
+/// and replay all observe one mode. Default OFF: the segmented tail stays the
+/// proven fallback.
+fn scan_tail_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("STWO_CUDA_RELATION_SCAN_TAIL").as_deref() == Ok("1"))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -355,6 +384,9 @@ pub struct RelationGraphRequirements {
     pub scan_eval_words: usize,
     /// One-word compatibility sentinel; the proof-wide scan no longer uses CUB.
     pub scan_temp_words: usize,
+    /// Ticket counter + one partition descriptor per row block, consumed by
+    /// the decoupled-lookback scan tail (zeroed on-stream before each scan).
+    pub scan_descriptor_words: usize,
     pub fraction_pointer_words: usize,
     pub fraction_geometry_words: usize,
     pub pair_blocks: u32,
@@ -391,6 +423,9 @@ pub struct RelationGraphSlots {
     pub reduction_b: ArenaSlotId,
     pub scan_eval_scratch: ArenaSlotId,
     pub scan_temp_scratch: ArenaSlotId,
+    /// Partition descriptors (ticket + flag/aggregate/prefix per row block)
+    /// for the decoupled-lookback scan tail.
+    pub scan_descriptors: ArenaSlotId,
     /// Proof-wide dispatch pointer tables in source, descriptor, output,
     /// denominator and claimed-sum order, followed by immutable ragged geometry.
     pub fraction_pointers: ArenaSlotId,
@@ -423,6 +458,11 @@ impl RelationGraphRequirements {
             slot_requirement(slots.reduction_b, self.reduction_words, SECURE_FIELD_WORDS),
             slot_requirement(slots.scan_eval_scratch, self.scan_eval_words, 1),
             slot_requirement(slots.scan_temp_scratch, self.scan_temp_words, 1),
+            slot_requirement(
+                slots.scan_descriptors,
+                self.scan_descriptor_words,
+                SECURE_FIELD_WORDS,
+            ),
             slot_requirement(
                 slots.fraction_pointers,
                 self.fraction_pointer_words,
@@ -585,6 +625,7 @@ pub fn relation_graph_requirements(
         // Custom segmented scans reuse reduction_b for their tile totals.
         scan_eval_words: 1,
         scan_temp_words: 1,
+        scan_descriptor_words: scan_descriptor_words(fraction_chain_blocks as usize)?,
         fraction_pointer_words: instances
             .len()
             .checked_mul(INSTANCE_POINTER_TABLES)
@@ -600,6 +641,15 @@ pub fn relation_graph_requirements(
         fraction_chain_blocks,
         instances,
     })
+}
+
+/// Ticket counter plus one lookback partition descriptor per row block.
+/// Mirrors the buffer contract validated by `stwo_relation_scan_tail_on`.
+fn scan_descriptor_words(total_row_blocks: usize) -> Result<usize, RelationGraphError> {
+    total_row_blocks
+        .checked_mul(SCAN_DESC_STRIDE_WORDS)
+        .and_then(|words| words.checked_add(SCAN_TICKET_WORDS))
+        .ok_or(RelationGraphError::SizeOverflow)
 }
 
 fn validate_extent(
@@ -870,6 +920,7 @@ pub struct PreparedRelationGraph<'a> {
     inverse_scratch: ArenaSlice,
     reduction_a: ArenaSlice,
     reduction_b: ArenaSlice,
+    scan_descriptors: ArenaSlice,
     fraction_pointers: ArenaSlice,
     fraction_geometry: ArenaSlice,
     pair_blocks: u32,
@@ -951,6 +1002,12 @@ impl<'a> PreparedRelationGraph<'a> {
             slots.scan_temp_scratch,
             requirements.scan_temp_words,
             1,
+        )?;
+        let scan_descriptors = bind_slot(
+            arena,
+            slots.scan_descriptors,
+            requirements.scan_descriptor_words,
+            SECURE_FIELD_WORDS,
         )?;
         let fraction_pointers = bind_slot(
             arena,
@@ -1173,6 +1230,7 @@ impl<'a> PreparedRelationGraph<'a> {
             inverse_scratch,
             reduction_a,
             reduction_b,
+            scan_descriptors,
             fraction_pointers,
             fraction_geometry,
             pair_blocks: requirements.pair_blocks,
@@ -1185,7 +1243,8 @@ impl<'a> PreparedRelationGraph<'a> {
     /// Allocation/copy/sync/default-stream-free sequence shared by eager mode and
     /// graph capture. The pipeline defaults to the proven 3-stage lane;
     /// `STWO_CUDA_RELATION_FUSED=1` (read once per process) opts into the
-    /// fused lane. Both lanes produce byte-identical outputs.
+    /// fused lane and `STWO_CUDA_RELATION_SCAN_TAIL=1` into the lookback scan
+    /// tail. All combinations produce byte-identical outputs.
     pub fn launch(&self) -> Result<(), RelationGraphError> {
         let mode = if fused_launch_enabled() {
             RelationLaunchMode::Fused
@@ -1193,6 +1252,14 @@ impl<'a> PreparedRelationGraph<'a> {
             RelationLaunchMode::ThreeStage
         };
         self.launch_with_mode(mode)
+    }
+
+    fn tail_mode_from_env() -> RelationTailMode {
+        if scan_tail_enabled() {
+            RelationTailMode::Scan
+        } else {
+            RelationTailMode::Segmented
+        }
     }
 
     /// The fused lane: one kernel replaces pairs + ragged inverse + global
@@ -1205,8 +1272,18 @@ impl<'a> PreparedRelationGraph<'a> {
         self.launch_with_mode(RelationLaunchMode::Fused)
     }
 
-    /// Explicit-mode launch used by both lanes' parity tests.
+    /// Explicit-body-mode launch; the tail follows the process-wide env gate.
     pub fn launch_with_mode(&self, mode: RelationLaunchMode) -> Result<(), RelationGraphError> {
+        self.launch_with_modes(mode, Self::tail_mode_from_env())
+    }
+
+    /// Fully explicit launch used by the parity tests: any body lane may be
+    /// combined with any tail lane; all four combinations are byte-identical.
+    pub fn launch_with_modes(
+        &self,
+        mode: RelationLaunchMode,
+        tail: RelationTailMode,
+    ) -> Result<(), RelationGraphError> {
         if self.instances.is_empty() {
             return Ok(());
         }
@@ -1227,7 +1304,10 @@ impl<'a> PreparedRelationGraph<'a> {
             Some(mask) => self.launch_fused_body(&mask),
             None => self.launch_three_stage_body(),
         }?;
-        self.launch_tail()
+        match tail {
+            RelationTailMode::Segmented => self.launch_segmented_tail(),
+            RelationTailMode::Scan => self.launch_scan_tail(),
+        }
     }
 
     fn pointer_table(&self, index: usize) -> Result<*mut u32, RelationGraphError> {
@@ -1337,8 +1417,8 @@ impl<'a> PreparedRelationGraph<'a> {
     }
 
     /// Segmented reduction, claimed sums, shift and prefix scans — identical
-    /// in both lanes.
-    fn launch_tail(&self) -> Result<(), RelationGraphError> {
+    /// in both body lanes.
+    fn launch_segmented_tail(&self) -> Result<(), RelationGraphError> {
         let stream = self.arena.context().stream_raw().as_ptr();
         let geometry = self.fraction_geometry.as_u32_ptr().cast_const();
         check_cuda("relation_tail_global_on", unsafe {
@@ -1353,6 +1433,29 @@ impl<'a> PreparedRelationGraph<'a> {
                     .map_err(|_| RelationGraphError::SizeOverflow)?,
                 self.reduction_b.as_u32_ptr(),
                 u32::try_from(self.reduction_b.len_words())
+                    .map_err(|_| RelationGraphError::SizeOverflow)?,
+                stream,
+            )
+        })?;
+        Ok(())
+    }
+
+    /// Decoupled-lookback tail: one ragged single-pass scan over every
+    /// instance (claimed sums fold into the same pass) plus a shift fixup,
+    /// preceded by an on-stream memset of the partition descriptors. Byte
+    /// identical to the segmented tail and equally capture-safe.
+    fn launch_scan_tail(&self) -> Result<(), RelationGraphError> {
+        let stream = self.arena.context().stream_raw().as_ptr();
+        let geometry = self.fraction_geometry.as_u32_ptr().cast_const();
+        check_cuda("relation_scan_tail_on", unsafe {
+            stwo_backend_cuda_kernels::raw::stwo_relation_scan_tail_on(
+                self.pointer_table(2)?.cast(),
+                self.pointer_table(4)?.cast(),
+                geometry,
+                self.n_instances()?,
+                self.fraction_chain_blocks,
+                self.scan_descriptors.as_u32_ptr(),
+                u32::try_from(self.scan_descriptors.len_words())
                     .map_err(|_| RelationGraphError::SizeOverflow)?,
                 stream,
             )
@@ -1654,6 +1757,7 @@ mod tests {
             reduction_b: id(),
             scan_eval_scratch: id(),
             scan_temp_scratch: id(),
+            scan_descriptors: id(),
             fraction_pointers: id(),
             fraction_geometry: id(),
             instances: (0..2)
@@ -1678,6 +1782,10 @@ mod tests {
         assert_eq!(requirements.reduction_words, 2 * SECURE_FIELD_WORDS);
         assert_eq!(requirements.scan_eval_words, 1);
         assert_eq!(requirements.scan_temp_words, 1);
+        assert_eq!(
+            requirements.scan_descriptor_words,
+            SCAN_TICKET_WORDS + 2 * SCAN_DESC_STRIDE_WORDS
+        );
         assert_eq!(
             requirements.fraction_pointer_words,
             2 * INSTANCE_POINTER_TABLES * POINTER_WORDS
@@ -1707,9 +1815,9 @@ mod tests {
 
         let slots = sample_slots();
         let slot_requirements = requirements.arena_slot_requirements(&slots).unwrap();
-        assert_eq!(slot_requirements.len(), 10 + 2 * 8);
+        assert_eq!(slot_requirements.len(), 11 + 2 * 8);
         assert_eq!(
-            slot_requirements[10].alignment_words,
+            slot_requirements[11].alignment_words,
             RELATION_POINTER_ALIGNMENT_WORDS
         );
     }
@@ -1850,5 +1958,104 @@ mod tests {
             requirements.arena_slot_requirements(&slots),
             Err(RelationGraphError::DuplicateSlot(_))
         ));
+    }
+
+    #[test]
+    fn scan_partitions_cover_row_blocks_without_crossing_instances() {
+        let requirements = relation_graph_requirements(&sample_program()).unwrap();
+        // Instance row tiles are laid out contiguously: every instance's first
+        // tile index is the running row-block total, which is exactly where a
+        // lookback chain must restart with an identity prefix.
+        let mut row_first = 0u32;
+        for instance in &requirements.instances {
+            let row_blocks = instance.row_capacity.div_ceil(REDUCTION_BLOCK as u32);
+            assert!(row_blocks >= 1);
+            row_first = row_first.checked_add(row_blocks).unwrap();
+        }
+        assert_eq!(row_first, requirements.fraction_chain_blocks);
+        // One descriptor per tile plus the ticket words, matching the device
+        // buffer contract validated by `stwo_relation_scan_tail_on`.
+        assert_eq!(
+            requirements.scan_descriptor_words,
+            SCAN_TICKET_WORDS
+                + requirements.fraction_chain_blocks as usize * SCAN_DESC_STRIDE_WORDS
+        );
+        assert_eq!(
+            scan_descriptor_words(usize::MAX),
+            Err(RelationGraphError::SizeOverflow)
+        );
+    }
+
+    /// Host mirror of `relation_coset_scan_row` (relation_scan.cuh).
+    fn coset_scan_row(scan_index: u32, rows: u32) -> u32 {
+        let circle_index = if scan_index % 2 == 0 {
+            scan_index / 2
+        } else {
+            rows - 1 - scan_index / 2
+        };
+        let bits = 31 - rows.leading_zeros();
+        if bits == 0 {
+            0
+        } else {
+            circle_index.reverse_bits() >> (32 - bits)
+        }
+    }
+
+    #[test]
+    fn scan_order_matches_circle_domain_prefix_sum_reference() {
+        use num_traits::Zero;
+        use stwo::core::utils::{bit_reverse, coset_order_to_circle_domain_order};
+
+        // The oracle the parity tests compare against: bit-reverse circle
+        // order, interleave the two circle-domain halves, inclusive scan, and
+        // undo both permutations.
+        fn reference(mut values: Vec<SecureField>) -> Vec<SecureField> {
+            bit_reverse(&mut values);
+            let mut coset = Vec::with_capacity(values.len());
+            for index in 0..values.len() / 2 {
+                coset.extend([values[index], values[values.len() - 1 - index]]);
+            }
+            let mut sum = SecureField::zero();
+            for value in &mut coset {
+                sum += *value;
+                *value = sum;
+            }
+            let mut output = coset_order_to_circle_domain_order(&coset);
+            bit_reverse(&mut output);
+            output
+        }
+
+        for log_rows in 1..=9u32 {
+            let rows = 1u32 << log_rows;
+            let values = (0..rows)
+                .map(|row| {
+                    SecureField::from_u32_unchecked(
+                        (7 + 13 * row) % 1009,
+                        (3 + 29 * row) % 2027,
+                        (11 + 31 * row) % 4093,
+                        (5 + 37 * row) % 8191,
+                    )
+                })
+                .collect::<Vec<_>>();
+
+            // The device lanes walk scan positions through the storage-row
+            // bijection and update in place; both tails share this mapping.
+            let mut sequential = values.clone();
+            let mut positions_seen = vec![false; rows as usize];
+            let mut inclusive = SecureField::zero();
+            for scan_index in 0..rows {
+                let row = coset_scan_row(scan_index, rows) as usize;
+                assert!(!positions_seen[row], "scan order must be a bijection");
+                positions_seen[row] = true;
+                inclusive += values[row];
+                sequential[row] = inclusive;
+            }
+            assert_eq!(sequential, reference(values.clone()));
+
+            // The claimed sum is the final inclusive value — the same total
+            // the segmented reduce tree produces.
+            assert_eq!(inclusive, values.iter().copied().sum::<SecureField>());
+        }
+        assert_eq!(coset_scan_row(0, 1), 0);
     }
 }

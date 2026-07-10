@@ -1168,6 +1168,19 @@ pub unsafe extern "C" fn stream_leaf_update(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn stream_leaf_update_ilp2(
+    _size: u32,
+    _group_n_cols: u32,
+    _columns: *const *const u32,
+    _column_log_sizes: *const u32,
+    _lifting_log_size: u32,
+    _cols_done: u32,
+    _state: *mut Blake2sHash,
+) {
+    no_cuda_symbol("stream_leaf_update_ilp2")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stream_leaf_finalize(
     _size: u32,
     _rem_cols: u32,
@@ -1201,6 +1214,20 @@ pub unsafe extern "C" fn stwo_blake2s_leaf_update_on(
     _stream: *mut core::ffi::c_void,
 ) -> i32 {
     no_cuda_symbol("stwo_blake2s_leaf_update_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_blake2s_leaf_update_ilp2_on(
+    _size: u32,
+    _group_n_cols: u32,
+    _columns: *const *mut u32,
+    _column_log_sizes: *const u32,
+    _lifting_log_size: u32,
+    _cols_done: u32,
+    _state: *mut Blake2sHash,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_blake2s_leaf_update_ilp2_on")
 }
 
 #[unsafe(no_mangle)]
@@ -2706,4 +2733,18 @@ pub unsafe extern "C" fn stwo_decommit_assemble_fri_on(
     _stream: *mut c_void,
 ) -> i32 {
     no_cuda_symbol("stwo_decommit_assemble_fri_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_relation_scan_tail_on(
+    _output_tables: *const *const *mut u32,
+    _claimed_sums: *const *mut u32,
+    _geometry: *const u32,
+    _n_instances: u32,
+    _total_row_blocks: u32,
+    _partition_descriptors: *mut u32,
+    _descriptor_capacity_words: u32,
+    _stream: *mut c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_relation_scan_tail_on")
 }

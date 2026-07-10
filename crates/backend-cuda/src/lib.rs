@@ -155,9 +155,9 @@ pub use backend::relation_graph::{
     RelationColumnDescriptor, RelationGraphError, RelationGraphRequirements, RelationGraphSlots,
     RelationInstanceRequirement, RelationInstanceSlots, RelationInstanceSources,
     RelationKernelProgram, RelationLaunchMode, RelationMultiplicityKind, RelationRowExtent,
-    RelationSourceLayout, RelationTupleKind, RelationUseDescriptor, RELATION_FUSED_MASK_WORDS,
-    RELATION_FUSED_MAX_COLUMNS, RELATION_FUSED_MAX_INSTANCES, RELATION_FUSED_MAX_TUPLE_WORDS,
-    RELATION_POINTER_ALIGNMENT_WORDS,
+    RelationSourceLayout, RelationTailMode, RelationTupleKind, RelationUseDescriptor,
+    RELATION_FUSED_MASK_WORDS, RELATION_FUSED_MAX_COLUMNS, RELATION_FUSED_MAX_INSTANCES,
+    RELATION_FUSED_MAX_TUPLE_WORDS, RELATION_POINTER_ALIGNMENT_WORDS,
 };
 mod columns;
 

@@ -40,6 +40,35 @@ fn merkle_span<T>(label: &str, n_cols: usize, log_size: u32, f: impl FnOnce() ->
     out
 }
 
+/// `STWO_CUDA_BLAKE2S_LEAF_ILP=1`: opt-in ILP lane for the LEAF-hash update
+/// kernel (Step 3.2). Each CUDA thread hashes TWO adjacent leaf rows with the
+/// two blake2s G-function streams interleaved, doubling the independent
+/// instruction chains per thread — latency hiding through ILP instead of
+/// occupancy (occupancy hints measured FLAT on the 255-register kernels).
+/// Byte-identical digests either way; default OFF until the measured pod gate
+/// (>= 450 GB/s absorbed leaf bytes) passes. Read once per process, so eager
+/// launches and graph capture always pick the same kernel.
+pub(crate) fn blake2s_leaf_ilp2_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("STWO_CUDA_BLAKE2S_LEAF_ILP").as_deref() == Ok("1"))
+}
+
+/// Mirror of `BLOCK_SIZE` in `blake2s.cuh` (the leaf kernels' block width).
+pub(crate) const CUDA_BLAKE2S_BLOCK_SIZE: u32 = 256;
+
+/// ILP2 grid math, kept in LOCKSTEP with `number_of_ilp2_blocks_for` in
+/// `blake2s.cu`: one thread per ROW PAIR; an odd row count adds one final
+/// single-row thread (the kernel's scalar tail).
+pub(crate) fn leaf_ilp2_row_pairs(rows: u32) -> u32 {
+    rows / 2 + (rows & 1)
+}
+
+/// Blocks launched for the ILP2 leaf-update kernel: `ceil(ceil(rows/2) / 256)`
+/// — half the scalar kernel's grid (up to the odd-row thread).
+pub(crate) fn leaf_ilp2_grid_blocks(rows: u32) -> u32 {
+    leaf_ilp2_row_pairs(rows).div_ceil(CUDA_BLAKE2S_BLOCK_SIZE)
+}
+
 /// Keep the historical low-VRAM policy on CUDA by default. Set
 /// `STWO_CUDA_MERKLE_PRUNE_DEPTH=1` to experimentally retain the bottom three
 /// interior layers and trade additional VRAM for less host-side recomputation.
@@ -281,6 +310,71 @@ impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M3
     }
 }
 
+/// Pure-Rust gate for the ILP2 grid math (no device needed). The formulas are
+/// duplicated in `number_of_ilp2_blocks_for` in `blake2s.cu`; these tests lock
+/// the Rust mirror, and the native byte-identity tests lock the kernel that
+/// consumes the C++ copy.
+#[cfg(test)]
+mod leaf_ilp2_grid_tests {
+    use super::{leaf_ilp2_grid_blocks, leaf_ilp2_row_pairs, CUDA_BLAKE2S_BLOCK_SIZE};
+
+    #[test]
+    fn row_pairs_cover_every_row_with_at_most_one_unpaired() {
+        for rows in [
+            1u32,
+            2,
+            3,
+            255,
+            256,
+            257,
+            511,
+            512,
+            513,
+            (1 << 20) - 1,
+            1 << 20,
+            (1 << 20) + 1,
+            (1 << 25),
+        ] {
+            let pairs = leaf_ilp2_row_pairs(rows);
+            assert!(2 * pairs >= rows, "rows={rows}: pairs must cover all rows");
+            assert!(
+                2 * pairs - rows <= 1,
+                "rows={rows}: at most one single-row (odd-tail) thread"
+            );
+        }
+    }
+
+    #[test]
+    fn grid_blocks_are_tight_and_halve_the_scalar_grid() {
+        let scalar_blocks = |rows: u32| rows.div_ceil(CUDA_BLAKE2S_BLOCK_SIZE);
+        for rows in [1u32, 2, 3, 511, 512, 513, 1 << 13, (1 << 20) - 1, 1 << 20] {
+            let blocks = leaf_ilp2_grid_blocks(rows);
+            let pairs = leaf_ilp2_row_pairs(rows);
+            // Cover all pairs, with no fully idle trailing block.
+            assert!(blocks * CUDA_BLAKE2S_BLOCK_SIZE >= pairs, "rows={rows}");
+            assert!(
+                (blocks - 1) * CUDA_BLAKE2S_BLOCK_SIZE < pairs,
+                "rows={rows}: last block must not be empty"
+            );
+            assert!(blocks <= scalar_blocks(rows), "rows={rows}");
+        }
+        // Power-of-two production shapes (leaf counts) halve exactly.
+        for log in [13u32, 20, 24, 25] {
+            let rows = 1u32 << log;
+            assert_eq!(
+                leaf_ilp2_grid_blocks(rows),
+                scalar_blocks(rows) / 2,
+                "log={log}"
+            );
+        }
+        // Odd counts: the unpaired row still gets a thread.
+        assert_eq!(leaf_ilp2_row_pairs(33), 17);
+        assert_eq!(leaf_ilp2_grid_blocks(33), 1);
+        assert_eq!(leaf_ilp2_row_pairs(513), 257);
+        assert_eq!(leaf_ilp2_grid_blocks(513), 2);
+    }
+}
+
 #[cfg(test)]
 mod prune_policy_tests {
     use super::cuda_merkle_prune_depth_from;
@@ -422,6 +516,25 @@ impl CudaBackend {
         lifting_log_size: u32,
         group_cols: usize,
     ) -> Blake2sHashVec {
+        Self::stream_leaf_layer_impl(
+            columns,
+            column_log_sizes,
+            lifting_log_size,
+            group_cols,
+            blake2s_leaf_ilp2_enabled(),
+        )
+    }
+
+    /// [`Self::stream_leaf_layer`] with the ILP2 lane pinned explicitly, so the
+    /// byte-identity tests can exercise BOTH kernels in one process regardless
+    /// of the environment (the env switch is a process-global `OnceLock`).
+    pub(crate) fn stream_leaf_layer_impl(
+        columns: &[&BaseFieldVec],
+        column_log_sizes: &[u32],
+        lifting_log_size: u32,
+        group_cols: usize,
+        use_ilp2: bool,
+    ) -> Blake2sHashVec {
         let size = 1usize << lifting_log_size;
         let state = Blake2sHashVec::new_uninitialized(size);
         let n = columns.len();
@@ -447,15 +560,35 @@ impl CudaBackend {
             let table = UploadedDevicePointerVec::upload(&ptrs);
             let logs = UploadedUint32Vec::upload(&column_log_sizes[off..end]);
             unsafe {
-                bindings::stream_leaf_update(
-                    size as u32,
-                    g as u32,
-                    table.as_ptr(),
-                    logs.as_ptr(),
-                    lifting_log_size,
-                    off as u32,
-                    state.device_ptr.cast_mut(),
-                );
+                if use_ilp2 {
+                    // Halved grid, two rows per thread — every row still covered
+                    // (the .cu launcher implements exactly this formula).
+                    debug_assert!(
+                        u64::from(leaf_ilp2_grid_blocks(size as u32))
+                            * u64::from(CUDA_BLAKE2S_BLOCK_SIZE)
+                            * 2
+                            >= size as u64
+                    );
+                    bindings::stream_leaf_update_ilp2(
+                        size as u32,
+                        g as u32,
+                        table.as_ptr(),
+                        logs.as_ptr(),
+                        lifting_log_size,
+                        off as u32,
+                        state.device_ptr.cast_mut(),
+                    );
+                } else {
+                    bindings::stream_leaf_update(
+                        size as u32,
+                        g as u32,
+                        table.as_ptr(),
+                        logs.as_ptr(),
+                        lifting_log_size,
+                        off as u32,
+                        state.device_ptr.cast_mut(),
+                    );
+                }
             }
             drop((table, logs));
             off = end;
@@ -499,6 +632,26 @@ impl CudaBackend {
         lifting_log_size: u32,
         group_cols: usize,
     ) -> Blake2sHashVec {
+        Self::stream_commit_leaves_from_coeffs_impl(
+            coeffs,
+            log_blowup_factor,
+            twiddles,
+            lifting_log_size,
+            group_cols,
+            blake2s_leaf_ilp2_enabled(),
+        )
+    }
+
+    /// [`Self::stream_commit_leaves_from_coeffs`] with the ILP2 lane pinned
+    /// explicitly (see [`Self::stream_leaf_layer_impl`]).
+    pub(crate) fn stream_commit_leaves_from_coeffs_impl(
+        coeffs: &[&stwo::prover::poly::circle::CircleCoefficients<Self>],
+        log_blowup_factor: u32,
+        twiddles: &stwo::prover::poly::twiddles::TwiddleTree<Self>,
+        lifting_log_size: u32,
+        group_cols: usize,
+        use_ilp2: bool,
+    ) -> Blake2sHashVec {
         use stwo::core::poly::circle::CanonicCoset;
         let size = 1usize << lifting_log_size;
         let state = Blake2sHashVec::new_uninitialized(size);
@@ -531,15 +684,27 @@ impl CudaBackend {
             let table = UploadedDevicePointerVec::upload(&ptrs);
             let uploaded_logs = UploadedUint32Vec::upload(&logs);
             unsafe {
-                bindings::stream_leaf_update(
-                    size as u32,
-                    (end - off) as u32,
-                    table.as_ptr(),
-                    uploaded_logs.as_ptr(),
-                    lifting_log_size,
-                    off as u32,
-                    state.device_ptr.cast_mut(),
-                );
+                if use_ilp2 {
+                    bindings::stream_leaf_update_ilp2(
+                        size as u32,
+                        (end - off) as u32,
+                        table.as_ptr(),
+                        uploaded_logs.as_ptr(),
+                        lifting_log_size,
+                        off as u32,
+                        state.device_ptr.cast_mut(),
+                    );
+                } else {
+                    bindings::stream_leaf_update(
+                        size as u32,
+                        (end - off) as u32,
+                        table.as_ptr(),
+                        uploaded_logs.as_ptr(),
+                        lifting_log_size,
+                        off as u32,
+                        state.device_ptr.cast_mut(),
+                    );
+                }
             }
             drop((table, uploaded_logs, evals)); // free the group's LDE now
             off = end;
@@ -602,28 +767,100 @@ mod stream_leaf_tests {
         if !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
             return;
         }
-        for n_columns in [1usize, 15, 16, 17, 31, 32, 33, 64, 100] {
-            for group in [16usize, 32, 48] {
-                let cpu_cols = cols(n_columns);
-                let gpu_cols: Vec<BaseFieldVec> = cpu_cols
-                    .iter()
-                    .map(|c| BaseFieldVec::from_vec(c.clone()))
-                    .collect();
-                let refs: Vec<&BaseFieldVec> = gpu_cols.iter().collect();
-                let log_sizes: Vec<u32> = gpu_cols.iter().map(|c| c.len().ilog2()).collect();
-                let lifting = *log_sizes.last().unwrap();
+        // Both leaf-update kernels are gated here: the scalar reference lane
+        // and the opt-in ILP2 lane (two rows per thread, halved grid) must be
+        // BYTE-IDENTICAL to build_leaves. Pinned explicitly (not via env) so a
+        // single process covers both regardless of STWO_CUDA_BLAKE2S_LEAF_ILP.
+        for ilp2 in [false, true] {
+            for n_columns in [1usize, 15, 16, 17, 31, 32, 33, 64, 100] {
+                for group in [16usize, 32, 48] {
+                    let cpu_cols = cols(n_columns);
+                    let gpu_cols: Vec<BaseFieldVec> = cpu_cols
+                        .iter()
+                        .map(|c| BaseFieldVec::from_vec(c.clone()))
+                        .collect();
+                    let refs: Vec<&BaseFieldVec> = gpu_cols.iter().collect();
+                    let log_sizes: Vec<u32> = gpu_cols.iter().map(|c| c.len().ilog2()).collect();
+                    let lifting = *log_sizes.last().unwrap();
 
-                let reference = <CudaBackend as MerkleOpsLifted<
-                    Blake2sMerkleHasherGeneric<false>,
-                >>::build_leaves(&refs, lifting);
-                let streamed = CudaBackend::stream_leaf_layer(&refs, &log_sizes, lifting, group);
+                    let reference = <CudaBackend as MerkleOpsLifted<
+                        Blake2sMerkleHasherGeneric<false>,
+                    >>::build_leaves(&refs, lifting);
+                    let streamed = CudaBackend::stream_leaf_layer_impl(
+                        &refs, &log_sizes, lifting, group, ilp2,
+                    );
 
-                assert_eq!(
-                    streamed.to_cpu(),
-                    reference.to_cpu(),
-                    "n_columns={n_columns} group={group}"
-                );
+                    assert_eq!(
+                        streamed.to_cpu(),
+                        reference.to_cpu(),
+                        "n_columns={n_columns} group={group} ilp2={ilp2}"
+                    );
+                }
             }
+        }
+    }
+
+    // Odd-row tail gate for the ILP2 kernel: the leaf-state row count is a
+    // power of two in production, but the kernel guards odd counts (last
+    // unpaired row runs the scalar stream). Drive the raw bindings with an odd
+    // state count and require the ILP2 mid-stream states to match the scalar
+    // kernel's word-for-word.
+    #[test]
+    fn ilp2_update_matches_scalar_on_odd_row_counts() {
+        use crate::columns::bindings;
+        use crate::columns::blake_2s_hash_vec::Blake2sHashVec;
+
+        if !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
+            return;
+        }
+        const LIFTING: u32 = 6; // columns hold 64 rows; we hash the first `rows` states
+        for rows in [1u32, 3, 33, 63] {
+            let cpu_cols: Vec<Vec<M31>> = (0..16)
+                .map(|i| {
+                    (0..(1usize << LIFTING))
+                        .map(|j| M31::from((i * 11 + j * 3 + 1) as u32))
+                        .collect()
+                })
+                .collect();
+            let gpu_cols: Vec<BaseFieldVec> = cpu_cols
+                .iter()
+                .map(|c| BaseFieldVec::from_vec(c.clone()))
+                .collect();
+            let ptrs: Vec<*const u32> = gpu_cols.iter().map(|c| c.device_ptr).collect();
+            let logs: Vec<u32> = vec![LIFTING; 16];
+            let table = crate::backend::UploadedDevicePointerVec::upload(&ptrs);
+            let uploaded_logs = crate::backend::UploadedUint32Vec::upload(&logs);
+
+            let run = |ilp2: bool| -> Vec<_> {
+                let state = Blake2sHashVec::new_uninitialized(rows as usize);
+                unsafe {
+                    bindings::stream_leaf_init(rows, state.device_ptr.cast_mut());
+                    if ilp2 {
+                        bindings::stream_leaf_update_ilp2(
+                            rows,
+                            16,
+                            table.as_ptr(),
+                            uploaded_logs.as_ptr(),
+                            LIFTING,
+                            0,
+                            state.device_ptr.cast_mut(),
+                        );
+                    } else {
+                        bindings::stream_leaf_update(
+                            rows,
+                            16,
+                            table.as_ptr(),
+                            uploaded_logs.as_ptr(),
+                            LIFTING,
+                            0,
+                            state.device_ptr.cast_mut(),
+                        );
+                    }
+                }
+                state.to_cpu()
+            };
+
+            assert_eq!(run(true), run(false), "rows={rows}");
         }
     }
 
@@ -641,57 +878,60 @@ mod stream_leaf_tests {
             return;
         }
         const BLOWUP: u32 = 1;
-        for n_columns in [16usize, 17, 32, 48] {
-            // Mixed-size coefficient columns, sorted ascending by log_size.
-            let mut logs: Vec<u32> = (0..n_columns).map(|i| 4 + (i % 4) as u32).collect();
-            logs.sort_unstable();
-            let coeffs: Vec<CircleCoefficients<CudaBackend>> = logs
-                .iter()
-                .enumerate()
-                .map(|(i, &log)| {
-                    let vals: Vec<M31> = (0..(1usize << log))
-                        .map(|j| M31::from((i * 5 + j + 1) as u32))
-                        .collect();
-                    CircleCoefficients::new(BaseFieldVec::from_vec(vals))
-                })
-                .collect();
-            let lifting = logs.last().unwrap() + BLOWUP;
+        for ilp2 in [false, true] {
+            for n_columns in [16usize, 17, 32, 48] {
+                // Mixed-size coefficient columns, sorted ascending by log_size.
+                let mut logs: Vec<u32> = (0..n_columns).map(|i| 4 + (i % 4) as u32).collect();
+                logs.sort_unstable();
+                let coeffs: Vec<CircleCoefficients<CudaBackend>> = logs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &log)| {
+                        let vals: Vec<M31> = (0..(1usize << log))
+                            .map(|j| M31::from((i * 5 + j + 1) as u32))
+                            .collect();
+                        CircleCoefficients::new(BaseFieldVec::from_vec(vals))
+                    })
+                    .collect();
+                let lifting = logs.last().unwrap() + BLOWUP;
 
-            // Reference: bulk LDE all -> build_leaves (sorted refs).
-            let twiddles = CudaBackend::precompute_twiddles(
-                CanonicCoset::new(lifting).circle_domain().half_coset,
-            );
-            let pool = BaseColumnPool::<CudaBackend>::new();
-            let polys = <CudaBackend as PolyOps>::evaluate_polynomials(
-                coeffs.clone(),
-                BLOWUP,
-                &twiddles,
-                true,
-                &pool,
-            );
-            let mut eval_cols: Vec<&BaseFieldVec> = polys.iter().map(|p| &p.evals.values).collect();
-            eval_cols.sort_by_key(|c| c.len());
-            let ref_logs: Vec<u32> = eval_cols.iter().map(|c| c.len().ilog2()).collect();
-            let reference =
-                <CudaBackend as MerkleOpsLifted<Blake2sMerkleHasherGeneric<false>>>::build_leaves(
-                    &eval_cols, lifting,
+                // Reference: bulk LDE all -> build_leaves (sorted refs).
+                let twiddles = CudaBackend::precompute_twiddles(
+                    CanonicCoset::new(lifting).circle_domain().half_coset,
+                );
+                let pool = BaseColumnPool::<CudaBackend>::new();
+                let polys = <CudaBackend as PolyOps>::evaluate_polynomials(
+                    coeffs.clone(),
+                    BLOWUP,
+                    &twiddles,
+                    true,
+                    &pool,
+                );
+                let mut eval_cols: Vec<&BaseFieldVec> =
+                    polys.iter().map(|p| &p.evals.values).collect();
+                eval_cols.sort_by_key(|c| c.len());
+                let ref_logs: Vec<u32> = eval_cols.iter().map(|c| c.len().ilog2()).collect();
+                let reference = <CudaBackend as MerkleOpsLifted<
+                    Blake2sMerkleHasherGeneric<false>,
+                >>::build_leaves(&eval_cols, lifting);
+
+                let _ = ref_logs;
+                let coeff_refs: Vec<&CircleCoefficients<CudaBackend>> = coeffs.iter().collect();
+                let streamed = CudaBackend::stream_commit_leaves_from_coeffs_impl(
+                    &coeff_refs,
+                    BLOWUP,
+                    &twiddles,
+                    lifting,
+                    16,
+                    ilp2,
                 );
 
-            let _ = ref_logs;
-            let coeff_refs: Vec<&CircleCoefficients<CudaBackend>> = coeffs.iter().collect();
-            let streamed = CudaBackend::stream_commit_leaves_from_coeffs(
-                &coeff_refs,
-                BLOWUP,
-                &twiddles,
-                lifting,
-                16,
-            );
-
-            assert_eq!(
-                streamed.to_cpu(),
-                reference.to_cpu(),
-                "n_columns={n_columns}"
-            );
+                assert_eq!(
+                    streamed.to_cpu(),
+                    reference.to_cpu(),
+                    "n_columns={n_columns} ilp2={ilp2}"
+                );
+            }
         }
     }
 }

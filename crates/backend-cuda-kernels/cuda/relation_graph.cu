@@ -12,6 +12,9 @@
 // shared with the fused lane (relation_fused.cu) through this header so the
 // two lanes cannot drift.
 #include "relation_fused.cuh"
+// The coset scan-order bijection is shared with the decoupled-lookback tail
+// (relation_scan.cu) through this header for the same reason.
+#include "relation_scan.cuh"
 
 namespace {
 
@@ -308,18 +311,8 @@ __device__ __forceinline__ uint32_t relation_scan_instance_for_block(
   return *local_block < g[RELATION_ROW_BLOCKS] * 4u ? instance : n_instances;
 }
 
-// `inclusive_prefix_sum_prepared_on` scans relation evaluations in coset order:
-// bit-reverse circle order, interleave the two circle-domain halves, scan, then
-// undo both permutations.  The resulting gather and scatter use this same
-// bijection, so disjoint scan tiles can update the output in place.
-__device__ __forceinline__ uint32_t relation_coset_scan_row(
-    uint32_t scan_index, uint32_t rows) {
-  uint32_t circle_index = (scan_index & 1u) == 0u
-                              ? scan_index / 2u
-                              : rows - 1u - scan_index / 2u;
-  uint32_t bits = 31u - __clz(rows);
-  return bits == 0u ? 0u : __brev(circle_index) >> (32u - bits);
-}
+// The scan-order bijection `relation_coset_scan_row` lives in
+// relation_scan.cuh, shared with the decoupled-lookback tail.
 
 __global__ void shift_scan_tiles_ragged_kernel(
     m31 *const *const *output_tables, qm31 *const *claimed_sums,

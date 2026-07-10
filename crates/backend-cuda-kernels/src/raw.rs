@@ -462,6 +462,19 @@ extern "C" {
         cols_done: u32,
         state: *mut Blake2sHash,
     );
+    /// ILP2 leaf-update lane (Step 3.2, opt-in `STWO_CUDA_BLAKE2S_LEAF_ILP=1`):
+    /// one thread hashes TWO adjacent rows with interleaved G-function streams,
+    /// halving the grid. Byte-identical to `stream_leaf_update`; odd row counts
+    /// hash the final unpaired row through the scalar stream.
+    pub fn stream_leaf_update_ilp2(
+        size: u32,
+        group_n_cols: u32,
+        columns: *const *const u32,
+        column_log_sizes: *const u32,
+        lifting_log_size: u32,
+        cols_done: u32,
+        state: *mut Blake2sHash,
+    );
     pub fn stream_leaf_finalize(
         size: u32,
         rem_cols: u32,
@@ -480,6 +493,18 @@ extern "C" {
         stream: *mut core::ffi::c_void,
     ) -> i32;
     pub fn stwo_blake2s_leaf_update_on(
+        size: u32,
+        group_n_cols: u32,
+        columns: *const *mut u32,
+        column_log_sizes: *const u32,
+        lifting_log_size: u32,
+        cols_done: u32,
+        state: *mut Blake2sHash,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+    /// ILP2 explicit-stream twin of `stwo_blake2s_leaf_update_on` (same
+    /// contract; two rows per thread, halved grid, byte-identical digests).
+    pub fn stwo_blake2s_leaf_update_ilp2_on(
         size: u32,
         group_n_cols: u32,
         columns: *const *mut u32,
@@ -1984,6 +2009,16 @@ extern "C" {
         retained_layers_by_log: *const *const Blake2sHash,
         assembly: *mut u32,
         assembly_capacity_words: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    pub fn stwo_relation_scan_tail_on(
+        output_tables: *const *const *mut u32,
+        claimed_sums: *const *mut u32,
+        geometry: *const u32,
+        n_instances: u32,
+        total_row_blocks: u32,
+        partition_descriptors: *mut u32,
+        descriptor_capacity_words: u32,
         stream: *mut c_void,
     ) -> i32;
 }

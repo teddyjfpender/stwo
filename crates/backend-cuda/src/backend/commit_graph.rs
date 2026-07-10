@@ -741,6 +741,22 @@ impl CommitGraphPlan {
                                 state.as_u32_ptr().cast(),
                                 stream,
                             )
+                        } else if super::blake2s::blake2s_leaf_ilp2_enabled() {
+                            // Opt-in ILP lane (STWO_CUDA_BLAKE2S_LEAF_ILP=1):
+                            // two adjacent rows per thread, halved grid,
+                            // byte-identical digests. The env is a process
+                            // OnceLock, so capture and eager replay always
+                            // select the same kernel.
+                            raw::stwo_blake2s_leaf_update_ilp2_on(
+                                1u32 << lifting_log_size,
+                                columns,
+                                column_ptrs.as_u32_ptr().cast(),
+                                column_log_sizes.as_u32_ptr(),
+                                lifting_log_size,
+                                first_column,
+                                state.as_u32_ptr().cast(),
+                                stream,
+                            )
                         } else {
                             raw::stwo_blake2s_leaf_update_on(
                                 1u32 << lifting_log_size,

@@ -70,6 +70,12 @@ extern "C"
 void stream_leaf_init(uint32_t size, Blake2sHash *state);
 extern "C"
 void stream_leaf_update(uint32_t size, uint32_t group_n_cols, uint32_t **columns, const uint32_t *column_log_sizes, uint32_t lifting_log_size, uint32_t cols_done, Blake2sHash *state);
+// ILP2 leaf-update lane (Step 3.2, opt-in STWO_CUDA_BLAKE2S_LEAF_ILP=1): one
+// thread hashes TWO adjacent rows with interleaved G-function streams; grid
+// halves (one thread per row pair). Byte-identical to stream_leaf_update; odd
+// row counts hash the final unpaired row through the scalar stream.
+extern "C"
+void stream_leaf_update_ilp2(uint32_t size, uint32_t group_n_cols, uint32_t **columns, const uint32_t *column_log_sizes, uint32_t lifting_log_size, uint32_t cols_done, Blake2sHash *state);
 extern "C"
 void stream_leaf_finalize(uint32_t size, uint32_t rem_cols, uint32_t **columns, const uint32_t *column_log_sizes, uint32_t lifting_log_size, uint32_t cols_done, Blake2sHash *result);
 
@@ -79,6 +85,10 @@ extern "C"
 int stwo_blake2s_leaf_init_on(uint32_t size, Blake2sHash *state, void *stream);
 extern "C"
 int stwo_blake2s_leaf_update_on(uint32_t size, uint32_t group_n_cols, uint32_t **columns, const uint32_t *column_log_sizes, uint32_t lifting_log_size, uint32_t cols_done, Blake2sHash *state, void *stream);
+// ILP2 explicit-stream twin of stwo_blake2s_leaf_update_on (same contract,
+// two rows per thread, halved grid; byte-identical digests).
+extern "C"
+int stwo_blake2s_leaf_update_ilp2_on(uint32_t size, uint32_t group_n_cols, uint32_t **columns, const uint32_t *column_log_sizes, uint32_t lifting_log_size, uint32_t cols_done, Blake2sHash *state, void *stream);
 extern "C"
 int stwo_blake2s_leaf_finalize_on(uint32_t size, uint32_t rem_cols, uint32_t **columns, const uint32_t *column_log_sizes, uint32_t lifting_log_size, uint32_t cols_done, Blake2sHash *result, void *stream);
 // Consume columns stopped immediately before their final circle butterfly.

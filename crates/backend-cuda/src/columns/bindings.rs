@@ -372,6 +372,29 @@ pub unsafe fn stream_leaf_update(
     );
 }
 
+/// ILP2 leaf-update lane (Step 3.2, opt-in `STWO_CUDA_BLAKE2S_LEAF_ILP=1`):
+/// two adjacent rows per thread, interleaved compression streams, halved grid.
+/// Byte-identical to [`stream_leaf_update`].
+pub unsafe fn stream_leaf_update_ilp2(
+    size: u32,
+    group_n_cols: u32,
+    columns: *const *const u32,
+    column_log_sizes: *const u32,
+    lifting_log_size: u32,
+    cols_done: u32,
+    state: *mut Blake2sHash,
+) {
+    sys_raw::stream_leaf_update_ilp2(
+        size,
+        group_n_cols,
+        columns,
+        column_log_sizes,
+        lifting_log_size,
+        cols_done,
+        raw_blake2s_mut_ptr(state),
+    );
+}
+
 pub unsafe fn stream_leaf_finalize(
     size: u32,
     rem_cols: u32,

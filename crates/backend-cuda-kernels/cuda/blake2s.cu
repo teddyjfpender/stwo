@@ -205,6 +205,79 @@ __device__ __forceinline__ void blake2s_init_words(uint32_t h[8]) {
     h[0] ^= 0x01010020; // digest len = 32, fanout/depth 1 — same as blake2s_init
 }
 
+// ---------------------------------------------------------------------------
+// ILP2 compression (Step 3.2 leaf-hash ILP lane): TWO independent blake2s
+// streams interleaved instruction-by-instruction. Each G step's dependency
+// chain is ~6 sequential ops; interleaving stream a and stream b gives the
+// scheduler two independent chains so ALU latency is hidden by ILP instead of
+// occupancy (the kernels sit at 255 regs / 12.5% occupancy — occupancy hints
+// measured FLAT, see blake2s.cuh). Per-stream math is IDENTICAL to
+// blake2s_compress_words (same sigma table, same rotation amounts — rotates
+// spelled as __funnelshift_r, the SASS the ROTR32 macro also lowers to), so
+// digests are bit-identical by construction. Register budget: 2x16 v + 2x16 m
+// staging + 2x8 h ~= 80 u32 before scheduling.
+// ---------------------------------------------------------------------------
+
+#define ROTR32_FS(x, n) __funnelshift_r((x), (x), (n))
+
+#define G2(r,i,va,vb,ma,mb,A,B,C,D) \
+    do { \
+        va[A] = va[A] + va[B] + ma[blake2s_sigma[r][2*i+0]]; \
+        vb[A] = vb[A] + vb[B] + mb[blake2s_sigma[r][2*i+0]]; \
+        va[D] = ROTR32_FS(va[D] ^ va[A], 16); \
+        vb[D] = ROTR32_FS(vb[D] ^ vb[A], 16); \
+        va[C] = va[C] + va[D]; \
+        vb[C] = vb[C] + vb[D]; \
+        va[B] = ROTR32_FS(va[B] ^ va[C], 12); \
+        vb[B] = ROTR32_FS(vb[B] ^ vb[C], 12); \
+        va[A] = va[A] + va[B] + ma[blake2s_sigma[r][2*i+1]]; \
+        vb[A] = vb[A] + vb[B] + mb[blake2s_sigma[r][2*i+1]]; \
+        va[D] = ROTR32_FS(va[D] ^ va[A], 8); \
+        vb[D] = ROTR32_FS(vb[D] ^ vb[A], 8); \
+        va[C] = va[C] + va[D]; \
+        vb[C] = vb[C] + vb[D]; \
+        va[B] = ROTR32_FS(va[B] ^ va[C], 7); \
+        vb[B] = ROTR32_FS(vb[B] ^ vb[C], 7); \
+    } while (0)
+
+__device__ __forceinline__ void blake2s_compress_words_x2(
+    uint32_t ha[8],
+    uint32_t hb[8],
+    const uint32_t ma[16],
+    const uint32_t mb[16],
+    uint32_t t,         // total bytes so far (both streams share the column stream)
+    uint32_t lastblock  // 0 for normal, 0xFFFFFFFF for last block
+) {
+    uint32_t va[16], vb[16];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) { va[i] = ha[i]; vb[i] = hb[i]; }
+    #pragma unroll
+    for (int i = 0; i < 8; i++) { va[i+8] = blake2s_IV[i]; vb[i+8] = blake2s_IV[i]; }
+
+    va[12] ^= t;
+    vb[12] ^= t;
+    va[14] ^= lastblock;
+    vb[14] ^= lastblock;
+
+    #pragma unroll
+    for (int r = 0; r < 10; r++) {
+        G2(r,0,va,vb,ma,mb,0,4,8,12);
+        G2(r,1,va,vb,ma,mb,1,5,9,13);
+        G2(r,2,va,vb,ma,mb,2,6,10,14);
+        G2(r,3,va,vb,ma,mb,3,7,11,15);
+        G2(r,4,va,vb,ma,mb,0,5,10,15);
+        G2(r,5,va,vb,ma,mb,1,6,11,12);
+        G2(r,6,va,vb,ma,mb,2,7,8,13);
+        G2(r,7,va,vb,ma,mb,3,4,9,14);
+    }
+
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        ha[i] ^= va[i] ^ va[i+8];
+        hb[i] ^= vb[i] ^ vb[i+8];
+    }
+}
+
 __device__ void stwo_blake2s_compress_leaf_block_device(
     Blake2sHash *state,
     const uint32_t message[16],
@@ -383,6 +456,85 @@ __global__ void __launch_bounds__(BLOCK_SIZE, STWO_LEAF_MIN_BLOCKS) stream_leaf_
     }
     #pragma unroll
     for (int i = 0; i < 8; i++) state[index].s[i] = h[i];
+}
+
+// ILP2 leaf-update variant (opt-in: STWO_CUDA_BLAKE2S_LEAF_ILP=1 on the Rust
+// launch sites; default OFF). One thread owns TWO ADJACENT rows (2*tid,
+// 2*tid+1) and drives both blake2s streams through the interleaved
+// blake2s_compress_words_x2, doubling the independent instruction chains per
+// thread. The per-row word stream, block boundaries, and byte counts are
+// EXACTLY stream_leaf_update_in_gpu's — byte-identical digests. Grid HALVES:
+// blocks = ceil(ceil(size/2) / BLOCK_SIZE) (see number_of_ilp2_blocks_for; the
+// Rust mirror + unit tests live in backend-cuda/src/backend/blake2s.rs). Odd
+// row counts: the final unpaired row runs the scalar compress, byte-identical.
+// The adjacent rows' lifted indices are consecutive words of every column
+// (lifted_column_index maps 2p -> base, 2p+1 -> base+1), so the paired loads
+// stay contiguous.
+__global__ void __launch_bounds__(BLOCK_SIZE, STWO_LEAF_MIN_BLOCKS) stream_leaf_update_ilp2_in_gpu(
+    uint32_t size,
+    uint32_t group_n_cols,          // MULTIPLE OF 16 (whole blocks, last=0)
+    uint32_t **group_data,
+    const uint32_t *group_col_log_sizes,
+    uint32_t lifting_log_size,
+    uint32_t cols_done,             // columns compressed in prior groups
+    Blake2sHash *state
+) {
+    const uint32_t pair = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t row0 = 2 * pair;
+    if (row0 >= size) return;
+    const uint32_t row1 = row0 + 1;
+
+    if (row1 < size) {
+        uint32_t ha[8], hb[8];
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            ha[i] = state[row0].s[i];
+            hb[i] = state[row1].s[i];
+        }
+        uint32_t ma[16], mb[16];
+        uint32_t t = 4u * cols_done;    // bytes hashed so far (4 per M31 word)
+        uint32_t col = 0;
+        while (col + 16 <= group_n_cols) {
+            #pragma unroll
+            for (int k = 0; k < 16; k++) {
+                const uint32_t log_ratio =
+                    lifting_log_size - group_col_log_sizes[col + k];
+                const uint32_t *column = group_data[col + k];
+                ma[k] = column[lifted_column_index(row0, log_ratio)];
+                mb[k] = column[lifted_column_index(row1, log_ratio)];
+            }
+            t += 64;
+            blake2s_compress_words_x2(ha, hb, ma, mb, t, 0);
+            col += 16;
+        }
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            state[row0].s[i] = ha[i];
+            state[row1].s[i] = hb[i];
+        }
+    } else {
+        // Odd row-count tail: the single remaining row takes the scalar
+        // stream — the exact stream_leaf_update_in_gpu body for one index.
+        uint32_t h[8];
+        #pragma unroll
+        for (int i = 0; i < 8; i++) h[i] = state[row0].s[i];
+        uint32_t m[16];
+        uint32_t t = 4u * cols_done;
+        uint32_t col = 0;
+        while (col + 16 <= group_n_cols) {
+            #pragma unroll
+            for (int k = 0; k < 16; k++) {
+                const uint32_t log_ratio =
+                    lifting_log_size - group_col_log_sizes[col + k];
+                m[k] = group_data[col + k][lifted_column_index(row0, log_ratio)];
+            }
+            t += 64;
+            blake2s_compress_words(h, m, t, 0);
+            col += 16;
+        }
+        #pragma unroll
+        for (int i = 0; i < 8; i++) state[row0].s[i] = h[i];
+    }
 }
 
 __global__ void __launch_bounds__(BLOCK_SIZE) stream_leaf_finalize_in_gpu(
@@ -671,6 +823,14 @@ __global__ void __launch_bounds__(BLOCK_SIZE) commit_on_two_layers_using_previou
 uint32_t number_of_blocks_for(uint32_t size) {
     return (size + BLOCK_SIZE - 1) / BLOCK_SIZE;
 }
+
+// ILP2 grid: one thread per ROW PAIR; an odd row count adds one single-row
+// thread. Keep this formula in LOCKSTEP with `leaf_ilp2_grid_blocks` in
+// crates/backend-cuda/src/backend/blake2s.rs (pure-Rust mirror + unit tests).
+static uint32_t number_of_ilp2_blocks_for(uint32_t size) {
+    const uint32_t row_pairs = size / 2 + (size & 1);
+    return number_of_blocks_for(row_pairs);
+}
 void commit_on_first_layer(
     uint32_t size,
     uint32_t number_of_columns,
@@ -723,6 +883,8 @@ static void stwo_maybe_probe_commit_occupancy() {
     };
     const KernelInfo kernels[] = {
         {"stream_leaf_update", reinterpret_cast<const void *>(stream_leaf_update_in_gpu), BLOCK_SIZE},
+        {"stream_leaf_update_ilp2",
+         reinterpret_cast<const void *>(stream_leaf_update_ilp2_in_gpu), BLOCK_SIZE},
         {"stream_leaf_finalize", reinterpret_cast<const void *>(stream_leaf_finalize_in_gpu),
          BLOCK_SIZE},
         {"commit_on_first_layer_lifted",
@@ -768,6 +930,24 @@ void stream_leaf_update(
     Blake2sHash *state
 ) {
     stream_leaf_update_in_gpu<<<number_of_blocks_for(size), BLOCK_SIZE>>>(
+        size, group_n_cols, device_columns, column_log_sizes, lifting_log_size, cols_done, state);
+    ASSERT_CUDA_SUCCESS(cudaGetLastError());
+    stwo_maybe_debug_sync();
+    ASSERT_CUDA_SUCCESS(cudaGetLastError());
+}
+
+// ILP2 leaf-update lane (opt-in; see stream_leaf_update_ilp2_in_gpu).
+// Byte-identical to stream_leaf_update with half the grid.
+void stream_leaf_update_ilp2(
+    uint32_t size,
+    uint32_t group_n_cols,
+    uint32_t **device_columns,
+    const uint32_t *column_log_sizes,
+    uint32_t lifting_log_size,
+    uint32_t cols_done,
+    Blake2sHash *state
+) {
+    stream_leaf_update_ilp2_in_gpu<<<number_of_ilp2_blocks_for(size), BLOCK_SIZE>>>(
         size, group_n_cols, device_columns, column_log_sizes, lifting_log_size, cols_done, state);
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
     stwo_maybe_debug_sync();
@@ -823,6 +1003,32 @@ extern "C" int stwo_blake2s_leaf_update_on(
     }
     stream_leaf_update_in_gpu<<<number_of_blocks_for(size), BLOCK_SIZE, 0,
                                 reinterpret_cast<cudaStream_t>(stream)>>>(
+        size, group_n_cols, device_columns, column_log_sizes, lifting_log_size,
+        cols_done, state);
+    return cudaGetLastError();
+}
+
+// ILP2 explicit-stream leaf update (opt-in via STWO_CUDA_BLAKE2S_LEAF_ILP=1 at
+// the Rust launch sites). Same validation contract as
+// stwo_blake2s_leaf_update_on; only the grid (halved) and the kernel differ.
+extern "C" int stwo_blake2s_leaf_update_ilp2_on(
+    uint32_t size,
+    uint32_t group_n_cols,
+    uint32_t **device_columns,
+    const uint32_t *column_log_sizes,
+    uint32_t lifting_log_size,
+    uint32_t cols_done,
+    Blake2sHash *state,
+    void *stream
+) {
+    if (size == 0 || group_n_cols == 0 || (group_n_cols % 16) != 0 ||
+        device_columns == nullptr || column_log_sizes == nullptr ||
+        lifting_log_size >= 31 || size != (1u << lifting_log_size) ||
+        (cols_done % 16) != 0 || state == nullptr || stream == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    stream_leaf_update_ilp2_in_gpu<<<number_of_ilp2_blocks_for(size), BLOCK_SIZE, 0,
+                                     reinterpret_cast<cudaStream_t>(stream)>>>(
         size, group_n_cols, device_columns, column_log_sizes, lifting_log_size,
         cols_done, state);
     return cudaGetLastError();
