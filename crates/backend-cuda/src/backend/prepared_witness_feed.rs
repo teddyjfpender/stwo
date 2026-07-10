@@ -799,13 +799,13 @@ impl<'a> PreparedWitnessFeedClearGraph<'a> {
                 .collect::<Vec<_>>(),
         )?;
         requirements.arena_slot_requirements(slots)?;
-        let destination_pointers = bind_exact(
+        let destination_pointers = bind_min(
             arena,
             slots.destination_pointers,
             requirements.destination_pointer_words,
             WITNESS_FEED_POINTER_ALIGNMENT_WORDS,
         )?;
-        let destination_lengths = bind_exact(
+        let destination_lengths = bind_min(
             arena,
             slots.destination_lengths,
             requirements.destination_length_words,
@@ -820,7 +820,7 @@ impl<'a> PreparedWitnessFeedClearGraph<'a> {
         for (&destination, &expected_words) in
             destinations.iter().zip(&requirements.destination_words)
         {
-            bind_external_exact(arena, destination, expected_words)?;
+            bind_external_min(arena, destination, expected_words)?;
         }
         upload(arena, destination_pointers, &pointer_values(destinations))?;
         let lengths = requirements
@@ -897,11 +897,11 @@ impl<'a> PreparedWitnessFeedGraph<'a> {
             multiplicity_words,
         )?;
         requirements.arena_slot_requirements(slots)?;
-        bind_external_exact(arena, source, requirements.source_words)?;
+        bind_external_min(arena, source, requirements.source_words)?;
 
-        let descriptors = bind_exact(arena, slots.descriptors, requirements.descriptor_words, 1)?;
+        let descriptors = bind_min(arena, slots.descriptors, requirements.descriptor_words, 1)?;
         let lut_tables = bind_many_exact(arena, &slots.lut_tables, &requirements.lut_words, 1)?;
-        let lut_pointers = bind_exact(
+        let lut_pointers = bind_min(
             arena,
             slots.lut_pointers,
             requirements.lut_pointer_words,
@@ -913,7 +913,7 @@ impl<'a> PreparedWitnessFeedGraph<'a> {
             &requirements.multiplicity_words,
             1,
         )?;
-        let multiplicity_pointers = bind_exact(
+        let multiplicity_pointers = bind_min(
             arena,
             slots.multiplicity_pointers,
             requirements.multiplicity_pointer_words,
@@ -1012,7 +1012,7 @@ pub fn clear_witness_feed_destinations_once(
 ) -> Result<u64, PreparedWitnessFeedError> {
     let mut unique = BTreeMap::<ArenaSlotId, ArenaSlice>::new();
     for &destination in destinations {
-        bind_external_exact(arena, destination, destination.len_words())?;
+        bind_external_min(arena, destination, destination.len_words())?;
         if let Some(previous) = unique.insert(destination.id(), destination) {
             if previous.as_u32_ptr() != destination.as_u32_ptr()
                 || previous.len_words() != destination.len_words()
@@ -1050,7 +1050,7 @@ fn upload<T: Copy>(
     values: &[T],
 ) -> Result<(), PreparedWitnessFeedError> {
     let bytes = core::mem::size_of_val(values);
-    if bytes != destination.len_bytes() {
+    if bytes > destination.len_bytes() {
         return Err(PreparedWitnessFeedError::SlotSizeMismatch {
             slot: destination.id(),
             expected_words: bytes.div_ceil(WORD_BYTES),
@@ -1075,25 +1075,30 @@ fn bind_many_exact(
 ) -> Result<Vec<ArenaSlice>, PreparedWitnessFeedError> {
     ids.iter()
         .zip(lengths)
-        .map(|(&id, &words)| bind_exact(arena, id, words, alignment_words))
+        .map(|(&id, &words)| bind_min(arena, id, words, alignment_words))
         .collect()
 }
 
-fn bind_exact(
+fn bind_min(
     arena: &DeviceArena,
     id: ArenaSlotId,
     expected_words: usize,
     alignment_words: usize,
 ) -> Result<ArenaSlice, PreparedWitnessFeedError> {
     let slice = arena.bind(id)?;
-    bind_external_exact(arena, slice, expected_words)?;
+    bind_external_min(arena, slice, expected_words)?;
     if (slice.as_u32_ptr() as usize) % (alignment_words * WORD_BYTES) != 0 {
         return Err(PreparedWitnessFeedError::SlotMisaligned(id));
     }
     Ok(slice)
 }
 
-fn bind_external_exact(
+// Pooled arena slots are sized to the largest disjoint-lifetime sharer, so a
+// requirement is a lower bound: launches touch exactly the required words and
+// never the pooled surplus (same contract as prepared_witness_input's
+// bind_min; undersized, misaligned, or foreign-context slots still fail
+// closed).
+fn bind_external_min(
     arena: &DeviceArena,
     slice: ArenaSlice,
     expected_words: usize,
@@ -1101,7 +1106,7 @@ fn bind_external_exact(
     if slice.context_token() != arena.context().identity_token() {
         return Err(PreparedWitnessFeedError::ContextMismatch(slice.id()));
     }
-    if slice.len_words() != expected_words {
+    if slice.len_words() < expected_words {
         return Err(PreparedWitnessFeedError::SlotSizeMismatch {
             slot: slice.id(),
             expected_words,

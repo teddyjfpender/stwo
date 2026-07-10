@@ -517,7 +517,7 @@ impl<'a> PreparedFixedTableGraph<'a> {
         validate_inputs(arena, multiplicity_columns, requirements.row_count)?;
 
         let source_pointers = match slots.source_pointers {
-            Some(id) => Some(bind_exact(
+            Some(id) => Some(bind_min(
                 arena,
                 id,
                 requirements.source_pointer_words,
@@ -525,13 +525,13 @@ impl<'a> PreparedFixedTableGraph<'a> {
             )?),
             None => None,
         };
-        let multiplicity_pointers = bind_exact(
+        let multiplicity_pointers = bind_min(
             arena,
             slots.multiplicity_pointers,
             requirements.multiplicity_pointer_words,
             FIXED_TABLE_POINTER_ALIGNMENT_WORDS,
         )?;
-        let trace_multiplicity_columns = bind_exact(
+        let trace_multiplicity_columns = bind_min(
             arena,
             slots.trace_multiplicity_columns,
             requirements.trace_mapping_words,
@@ -539,13 +539,13 @@ impl<'a> PreparedFixedTableGraph<'a> {
         )?;
         let trace_outputs =
             bind_many_exact(arena, &slots.trace_outputs, requirements.row_count, 1)?;
-        let trace_output_pointers = bind_exact(
+        let trace_output_pointers = bind_min(
             arena,
             slots.trace_output_pointers,
             requirements.trace_pointer_words,
             FIXED_TABLE_POINTER_ALIGNMENT_WORDS,
         )?;
-        let lookup_descriptors = bind_exact(
+        let lookup_descriptors = bind_min(
             arena,
             slots.lookup_descriptors,
             requirements.lookup_descriptor_words,
@@ -553,7 +553,7 @@ impl<'a> PreparedFixedTableGraph<'a> {
         )?;
         let lookup_outputs =
             bind_many_exact(arena, &slots.lookup_outputs, requirements.row_count, 1)?;
-        let lookup_output_pointers = bind_exact(
+        let lookup_output_pointers = bind_min(
             arena,
             slots.lookup_output_pointers,
             requirements.lookup_pointer_words,
@@ -653,7 +653,7 @@ impl<'a> PreparedFixedTableGraph<'a> {
             .row_count
             .checked_mul(requirements.multiplicity_column_count)
             .ok_or(PreparedFixedTableError::LaunchGeometryOverflow)?;
-        if multiplicity_slab.len_words() != multiplicity_words {
+        if multiplicity_slab.len_words() < multiplicity_words {
             return Err(PreparedFixedTableError::SlotSizeMismatch {
                 slot: multiplicity_slab.id(),
                 expected_words: multiplicity_words,
@@ -662,7 +662,7 @@ impl<'a> PreparedFixedTableGraph<'a> {
         }
 
         let source_pointers = match slots.source_pointers {
-            Some(id) => Some(bind_exact(
+            Some(id) => Some(bind_min(
                 arena,
                 id,
                 requirements.source_pointer_words,
@@ -670,13 +670,13 @@ impl<'a> PreparedFixedTableGraph<'a> {
             )?),
             None => None,
         };
-        let multiplicity_pointers = bind_exact(
+        let multiplicity_pointers = bind_min(
             arena,
             slots.multiplicity_pointers,
             requirements.multiplicity_pointer_words,
             FIXED_TABLE_POINTER_ALIGNMENT_WORDS,
         )?;
-        let trace_multiplicity_columns = bind_exact(
+        let trace_multiplicity_columns = bind_min(
             arena,
             slots.trace_multiplicity_columns,
             requirements.trace_mapping_words,
@@ -684,13 +684,13 @@ impl<'a> PreparedFixedTableGraph<'a> {
         )?;
         let trace_outputs =
             bind_many_exact(arena, &slots.trace_outputs, requirements.row_count, 1)?;
-        let trace_output_pointers = bind_exact(
+        let trace_output_pointers = bind_min(
             arena,
             slots.trace_output_pointers,
             requirements.trace_pointer_words,
             FIXED_TABLE_POINTER_ALIGNMENT_WORDS,
         )?;
-        let lookup_descriptors = bind_exact(
+        let lookup_descriptors = bind_min(
             arena,
             slots.lookup_descriptors,
             requirements.lookup_descriptor_words,
@@ -700,8 +700,8 @@ impl<'a> PreparedFixedTableGraph<'a> {
             .row_count
             .checked_mul(requirements.lookup_output_count)
             .ok_or(PreparedFixedTableError::LaunchGeometryOverflow)?;
-        let lookup_output_slab = bind_exact(arena, slots.lookup_output, lookup_words, 1)?;
-        let lookup_output_pointers = bind_exact(
+        let lookup_output_slab = bind_min(arena, slots.lookup_output, lookup_words, 1)?;
+        let lookup_output_pointers = bind_min(
             arena,
             slots.lookup_output_pointers,
             requirements.lookup_pointer_words,
@@ -886,7 +886,7 @@ fn upload<T: Copy>(
     values: &[T],
 ) -> Result<(), PreparedFixedTableError> {
     let bytes = core::mem::size_of_val(values);
-    if bytes != destination.len_bytes() {
+    if bytes > destination.len_bytes() {
         return Err(PreparedFixedTableError::SlotSizeMismatch {
             slot: destination.id(),
             expected_words: bytes.div_ceil(WORD_BYTES),
@@ -910,11 +910,16 @@ fn bind_many_exact(
     alignment_words: usize,
 ) -> Result<Vec<ArenaSlice>, PreparedFixedTableError> {
     ids.iter()
-        .map(|&id| bind_exact(arena, id, expected_words, alignment_words))
+        .map(|&id| bind_min(arena, id, expected_words, alignment_words))
         .collect()
 }
 
-fn bind_exact(
+// Pooled arena slots are sized to the largest disjoint-lifetime sharer, so a
+// requirement is a lower bound: launches touch exactly the required words and
+// never the pooled surplus (same contract as prepared_witness_input's
+// bind_min; undersized, misaligned, or foreign-context slots still fail
+// closed).
+fn bind_min(
     arena: &DeviceArena,
     id: ArenaSlotId,
     expected_words: usize,
@@ -922,7 +927,7 @@ fn bind_exact(
 ) -> Result<ArenaSlice, PreparedFixedTableError> {
     let slice = arena.bind(id)?;
     require_context(arena, slice)?;
-    if slice.len_words() != expected_words {
+    if slice.len_words() < expected_words {
         return Err(PreparedFixedTableError::SlotSizeMismatch {
             slot: id,
             expected_words,

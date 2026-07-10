@@ -698,50 +698,50 @@ impl<'a> PreparedWitnessInputCompactGraph<'a> {
             }
         }
 
-        let source_pointers = bind_exact(
+        let source_pointers = bind_min(
             arena,
             slots.source_pointers,
             requirements.source_pointer_words,
             WITNESS_INPUT_GATHER_POINTER_ALIGNMENT_WORDS,
         )?;
-        let descriptors = bind_exact(arena, slots.descriptors, requirements.descriptor_words, 1)?;
-        let consumer_input_columns = bind_many_exact(
+        let descriptors = bind_min(arena, slots.descriptors, requirements.descriptor_words, 1)?;
+        let consumer_input_columns = bind_many_min(
             arena,
             &slots.consumer_input_columns,
             &requirements.consumer_input_column_words,
             1,
         )?;
-        let output_pointers = bind_exact(
+        let output_pointers = bind_min(
             arena,
             slots.output_pointers,
             requirements.output_pointer_words,
             WITNESS_INPUT_GATHER_POINTER_ALIGNMENT_WORDS,
         )?;
-        let tuple_scratch = bind_exact(
+        let tuple_scratch = bind_min(
             arena,
             slots.tuple_scratch,
             requirements.tuple_scratch_words,
             1,
         )?;
-        let sort_keys_a = bind_exact(arena, slots.sort_keys_a, requirements.sort_key_words, 1)?;
-        let sort_keys_b = bind_exact(arena, slots.sort_keys_b, requirements.sort_key_words, 1)?;
-        let sort_indices_a = bind_exact(
+        let sort_keys_a = bind_min(arena, slots.sort_keys_a, requirements.sort_key_words, 1)?;
+        let sort_keys_b = bind_min(arena, slots.sort_keys_b, requirements.sort_key_words, 1)?;
+        let sort_indices_a = bind_min(
             arena,
             slots.sort_indices_a,
             requirements.sort_index_words,
             1,
         )?;
-        let sort_indices_b = bind_exact(
+        let sort_indices_b = bind_min(
             arena,
             slots.sort_indices_b,
             requirements.sort_index_words,
             1,
         )?;
-        let run_heads = bind_exact(arena, slots.run_heads, requirements.run_words, 1)?;
-        let run_positions = bind_exact(arena, slots.run_positions, requirements.run_words, 1)?;
-        let n_unique = bind_exact(arena, slots.n_unique, 1, 1)?;
-        let sort_temp = bind_exact(arena, slots.sort_temp, requirements.sort_temp_words, 1)?;
-        let scan_temp = bind_exact(arena, slots.scan_temp, requirements.scan_temp_words, 1)?;
+        let run_heads = bind_min(arena, slots.run_heads, requirements.run_words, 1)?;
+        let run_positions = bind_min(arena, slots.run_positions, requirements.run_words, 1)?;
+        let n_unique = bind_min(arena, slots.n_unique, 1, 1)?;
+        let sort_temp = bind_min(arena, slots.sort_temp, requirements.sort_temp_words, 1)?;
+        let scan_temp = bind_min(arena, slots.scan_temp, requirements.scan_temp_words, 1)?;
         let workspace_ids = std::iter::once(source_pointers.id())
             .chain(std::iter::once(descriptors.id()))
             .chain(consumer_input_columns.iter().map(|slice| slice.id()))
@@ -967,20 +967,20 @@ impl<'a> PreparedWitnessInputGatherGraph<'a> {
             }
         }
 
-        let source_pointers = bind_exact(
+        let source_pointers = bind_min(
             arena,
             slots.source_pointers,
             requirements.source_pointer_words,
             WITNESS_INPUT_GATHER_POINTER_ALIGNMENT_WORDS,
         )?;
-        let descriptors = bind_exact(arena, slots.descriptors, requirements.descriptor_words, 1)?;
-        let consumer_input_columns = bind_many_exact(
+        let descriptors = bind_min(arena, slots.descriptors, requirements.descriptor_words, 1)?;
+        let consumer_input_columns = bind_many_min(
             arena,
             &slots.consumer_input_columns,
             &requirements.consumer_input_column_words,
             1,
         )?;
-        let output_pointers = bind_exact(
+        let output_pointers = bind_min(
             arena,
             slots.output_pointers,
             requirements.output_pointer_words,
@@ -1112,14 +1112,14 @@ impl<'a> PreparedWitnessInputSeedGraph<'a> {
             return Err(PreparedWitnessInputGatherError::SizeOverflow);
         }
         requirements.arena_slot_requirements(slots)?;
-        let scalar_values = bind_exact(arena, slots.scalar_values, requirements.scalar_words, 1)?;
-        let consumer_input_columns = bind_many_exact(
+        let scalar_values = bind_min(arena, slots.scalar_values, requirements.scalar_words, 1)?;
+        let consumer_input_columns = bind_many_min(
             arena,
             &slots.consumer_input_columns,
             &requirements.consumer_input_column_words,
             1,
         )?;
-        let output_pointers = bind_exact(
+        let output_pointers = bind_min(
             arena,
             slots.output_pointers,
             requirements.output_pointer_words,
@@ -1215,8 +1215,12 @@ fn upload<T: Copy>(
     destination: ArenaSlice,
     values: &[T],
 ) -> Result<(), PreparedWitnessInputGatherError> {
+    // Capacity contract (see `bind_min`): the destination is a whole arena
+    // slot that may be pooled larger than this payload. Exactly `values` is
+    // uploaded and exactly `values` is later read back by the kernels, so a
+    // larger backing slot is unobservable; a smaller one fails closed here.
     let bytes = core::mem::size_of_val(values);
-    if bytes != destination.len_bytes() {
+    if bytes > destination.len_bytes() {
         return Err(PreparedWitnessInputGatherError::SlotSizeMismatch {
             slot: destination.id(),
             expected_words: bytes.div_ceil(WORD_BYTES),
@@ -1233,7 +1237,7 @@ fn upload<T: Copy>(
     Ok(())
 }
 
-fn bind_many_exact(
+fn bind_many_min(
     arena: &DeviceArena,
     ids: &[ArenaSlotId],
     lengths: &[usize],
@@ -1241,22 +1245,32 @@ fn bind_many_exact(
 ) -> Result<Vec<ArenaSlice>, PreparedWitnessInputGatherError> {
     ids.iter()
         .zip(lengths)
-        .map(|(&id, &len_words)| bind_exact(arena, id, len_words, alignment_words))
+        .map(|(&id, &len_words)| bind_min(arena, id, len_words, alignment_words))
         .collect()
 }
 
-fn bind_exact(
+/// Bind one whole arena slot and require the kernel-ABI capacity.
+///
+/// `required_words` is a LOWER bound, not an exact length: the arena plan
+/// pools logical buffers with disjoint proof-epoch lifetimes into one physical
+/// slot sized to the largest sharer, and `DeviceArena::bind` always returns the
+/// whole slot. The witness-input kernels (`witness_edge_gather.cu`) touch
+/// exactly the required extent — `n_edges * 5` descriptor words, one pointer
+/// per table entry, destination rows `[0, consumer_rows)` — so extra backing
+/// capacity is unobservable, while an undersized or misaligned slot still
+/// fails closed before any launch.
+fn bind_min(
     arena: &DeviceArena,
     id: ArenaSlotId,
-    expected_words: usize,
+    required_words: usize,
     alignment_words: usize,
 ) -> Result<ArenaSlice, PreparedWitnessInputGatherError> {
     let slice = arena.bind(id)?;
     require_context(arena, slice)?;
-    if slice.len_words() != expected_words {
+    if slice.len_words() < required_words {
         return Err(PreparedWitnessInputGatherError::SlotSizeMismatch {
             slot: id,
-            expected_words,
+            expected_words: required_words,
             actual_words: slice.len_words(),
         });
     }
