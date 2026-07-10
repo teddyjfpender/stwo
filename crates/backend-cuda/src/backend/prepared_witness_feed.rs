@@ -20,6 +20,85 @@ pub const WITNESS_FEED_NO_LUT: u32 = u32::MAX;
 pub const WITNESS_FEED_POINTER_ALIGNMENT_WORDS: usize =
     core::mem::align_of::<*mut u32>() / WORD_BYTES;
 
+/// Static shared-memory budget of the privatized count kernel (see
+/// `WFC_PRIV_SHARED_BYTES` in witness_feed_counts.cu — the two constants must
+/// stay equal).
+pub const WITNESS_FEED_PRIVATIZED_SHARED_BYTES: usize = 48 * 1024;
+pub const WITNESS_FEED_PRIVATIZED_SHARED_WORDS: usize =
+    WITNESS_FEED_PRIVATIZED_SHARED_BYTES / WORD_BYTES;
+
+/// Selects which count-feed kernel [`PreparedWitnessFeedGraph::launch`]
+/// submits. Chosen once at [`PreparedWitnessFeedGraph::prepare`] (from the
+/// process-global `STWO_CUDA_FEED_PRIVATIZED` switch), so eager runs, capture
+/// and replay of one graph all observe one mode.
+///
+/// Byte-identity: every count is a u32 sum of `+1` increments merged with
+/// wrapping atomic adds. Privatization only reassociates that sum — per-block
+/// shared-memory partials, then one unconditional (branchless) atomicAdd per
+/// covered word into the same global slab — and wrapping u32 addition is
+/// commutative and associative, so both modes produce byte-identical count
+/// slabs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WitnessFeedLaunchMode {
+    /// Direct global atomicAdd scatter (default; the proven fallback).
+    GlobalAtomics,
+    /// Per-block shared-memory histograms for descriptors whose touched
+    /// counter footprint fits the 48KB static shared budget; oversized
+    /// families keep the global-atomic path inside the same launch. Opt-in
+    /// via `STWO_CUDA_FEED_PRIVATIZED=1`.
+    Privatized,
+}
+
+/// Touched counter words for one descriptor — the shared-memory words the
+/// privatized kernel must cover: table words per relation column times the
+/// number of relation columns the descriptor writes. Mirrors
+/// `wfc_privatized_footprint_words` in witness_feed_counts.cu exactly.
+pub fn witness_feed_privatized_footprint_words(
+    entry: &[u32; WITNESS_FEED_DESCRIPTOR_WORDS],
+) -> u64 {
+    let table_size = u64::from(entry[8]);
+    match entry[11] {
+        // MEM-ID DECODE writes one big relation column (table_size words) and
+        // one small relation column (entry[12] words).
+        1 => table_size + u64::from(entry[12]),
+        // xor12 addresses all sixteen expanded multiplicity columns.
+        3 => 16 * table_size,
+        // FOLD / dependent-XOR write one relation column of the table.
+        _ => table_size,
+    }
+}
+
+/// Per-descriptor privatization decision of the kernel: footprint x 4B must
+/// fit the 48KB static shared budget. Pure host math for unit tests and
+/// planning; the device kernel makes the identical decision per descriptor.
+pub fn witness_feed_descriptor_fits_shared(entry: &[u32; WITNESS_FEED_DESCRIPTOR_WORDS]) -> bool {
+    witness_feed_privatized_footprint_words(entry) <= WITNESS_FEED_PRIVATIZED_SHARED_WORDS as u64
+}
+
+/// Pure `STWO_CUDA_FEED_PRIVATIZED` parse, unit-testable without an
+/// environment: only the literal `"1"` opts into the privatized lane.
+fn feed_privatized_flag_from(raw: Option<&str>) -> bool {
+    raw == Some("1")
+}
+
+/// `STWO_CUDA_FEED_PRIVATIZED=1` opts newly prepared feed graphs into the
+/// privatized kernel. Read once per process (`OnceLock`). Default OFF: the
+/// global-atomic scatter stays the proven fallback.
+fn feed_privatized_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        feed_privatized_flag_from(std::env::var("STWO_CUDA_FEED_PRIVATIZED").ok().as_deref())
+    })
+}
+
+fn witness_feed_mode_from_env() -> WitnessFeedLaunchMode {
+    if feed_privatized_enabled() {
+        WitnessFeedLaunchMode::Privatized
+    } else {
+        WitnessFeedLaunchMode::GlobalAtomics
+    }
+}
+
 /// One slot request for merging a feed graph into the proof-wide arena.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WitnessFeedArenaSlotRequirement {
@@ -772,6 +851,8 @@ pub struct PreparedWitnessFeedGraph<'a> {
     lut_pointers: ArenaSlice,
     multiplicity_destinations: Vec<ArenaSlice>,
     multiplicity_pointers: ArenaSlice,
+    /// Kernel symbol selected at prepare; both symbols are always compiled.
+    mode: WitnessFeedLaunchMode,
 }
 
 /// One launch clears the complete union of arena-owned multiplicity slabs.
@@ -817,12 +898,14 @@ impl<'a> PreparedWitnessFeedClearGraph<'a> {
                 .map(|destination| destination.id())
                 .chain([destination_pointers.id(), destination_lengths.id()]),
         )?;
-        for (&destination, &expected_words) in
-            destinations.iter().zip(&requirements.destination_words)
-        {
-            bind_external_min(arena, destination, expected_words)?;
-        }
-        upload(arena, destination_pointers, &pointer_values(destinations))?;
+        let destinations = destinations
+            .iter()
+            .zip(&requirements.destination_words)
+            .map(|(&destination, &expected_words)| {
+                bind_external_min(arena, destination, expected_words)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        upload(arena, destination_pointers, &pointer_values(&destinations))?;
         let lengths = requirements
             .destination_words
             .iter()
@@ -833,7 +916,7 @@ impl<'a> PreparedWitnessFeedClearGraph<'a> {
         Ok(Self {
             arena,
             requirements,
-            destinations: destinations.to_vec(),
+            destinations,
             destination_pointers,
             destination_lengths,
         })
@@ -874,7 +957,8 @@ impl<'a> PreparedWitnessFeedClearGraph<'a> {
 
 impl<'a> PreparedWitnessFeedGraph<'a> {
     /// Bind exact geometry, upload immutable launch data once, and drain setup
-    /// before any graph capture begins.
+    /// before any graph capture begins. The kernel symbol is selected here
+    /// from `STWO_CUDA_FEED_PRIVATIZED` (default OFF: global atomics).
     #[allow(clippy::too_many_arguments)]
     pub fn prepare(
         arena: &'a DeviceArena,
@@ -885,6 +969,34 @@ impl<'a> PreparedWitnessFeedGraph<'a> {
         luts_host: &[Vec<u32>],
         multiplicity_words: &[usize],
         slots: &WitnessFeedWorkspaceSlots,
+    ) -> Result<Self, PreparedWitnessFeedError> {
+        Self::prepare_with_mode(
+            arena,
+            source,
+            row_count,
+            sub_words_per_row,
+            descriptors_host,
+            luts_host,
+            multiplicity_words,
+            slots,
+            witness_feed_mode_from_env(),
+        )
+    }
+
+    /// [`Self::prepare`] with an explicit kernel selection, bypassing the
+    /// process-global env switch — the parity seam letting one test process
+    /// compare both modes on identical inputs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_with_mode(
+        arena: &'a DeviceArena,
+        source: ArenaSlice,
+        row_count: usize,
+        sub_words_per_row: usize,
+        descriptors_host: &[u32],
+        luts_host: &[Vec<u32>],
+        multiplicity_words: &[usize],
+        slots: &WitnessFeedWorkspaceSlots,
+        mode: WitnessFeedLaunchMode,
     ) -> Result<Self, PreparedWitnessFeedError> {
         if !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
             return Err(PreparedWitnessFeedError::CudaUnavailable);
@@ -897,7 +1009,7 @@ impl<'a> PreparedWitnessFeedGraph<'a> {
             multiplicity_words,
         )?;
         requirements.arena_slot_requirements(slots)?;
-        bind_external_min(arena, source, requirements.source_words)?;
+        let source = bind_external_min(arena, source, requirements.source_words)?;
 
         let descriptors = bind_min(arena, slots.descriptors, requirements.descriptor_words, 1)?;
         let lut_tables = bind_many_exact(arena, &slots.lut_tables, &requirements.lut_words, 1)?;
@@ -951,10 +1063,11 @@ impl<'a> PreparedWitnessFeedGraph<'a> {
             lut_pointers,
             multiplicity_destinations,
             multiplicity_pointers,
+            mode,
         })
     }
 
-    /// Enqueue only the existing feed-count kernel on the proof stream.
+    /// Enqueue only the prepared feed-count kernel on the proof stream.
     pub fn launch(&self) -> Result<(), PreparedWitnessFeedError> {
         self.launch_on(self.arena.context().launch_context())
     }
@@ -964,21 +1077,41 @@ impl<'a> PreparedWitnessFeedGraph<'a> {
             return Err(CudaRuntimeError::ContextMismatch.into());
         }
         let code = unsafe {
-            stwo_backend_cuda_kernels::raw::stwo_witness_feed_counts_on(
-                self.source.as_u32_ptr().cast_const(),
-                self.requirements.row_count as u32,
-                self.descriptors.as_u32_ptr().cast_const(),
-                self.requirements.descriptor_count as u32,
-                self.lut_pointers.as_u32_ptr().cast(),
-                self.multiplicity_pointers.as_u32_ptr().cast(),
-                launch.stream_raw().as_ptr(),
-            )
+            match self.mode {
+                WitnessFeedLaunchMode::GlobalAtomics => {
+                    stwo_backend_cuda_kernels::raw::stwo_witness_feed_counts_on(
+                        self.source.as_u32_ptr().cast_const(),
+                        self.requirements.row_count as u32,
+                        self.descriptors.as_u32_ptr().cast_const(),
+                        self.requirements.descriptor_count as u32,
+                        self.lut_pointers.as_u32_ptr().cast(),
+                        self.multiplicity_pointers.as_u32_ptr().cast(),
+                        launch.stream_raw().as_ptr(),
+                    )
+                }
+                WitnessFeedLaunchMode::Privatized => {
+                    stwo_backend_cuda_kernels::raw::stwo_witness_feed_counts_privatized_on(
+                        self.source.as_u32_ptr().cast_const(),
+                        self.requirements.row_count as u32,
+                        self.descriptors.as_u32_ptr().cast_const(),
+                        self.requirements.descriptor_count as u32,
+                        self.lut_pointers.as_u32_ptr().cast(),
+                        self.multiplicity_pointers.as_u32_ptr().cast(),
+                        launch.stream_raw().as_ptr(),
+                    )
+                }
+            }
         };
         if code == 0 {
             Ok(())
         } else {
             Err(PreparedWitnessFeedError::KernelLaunchFailed)
         }
+    }
+
+    /// Kernel selection sealed at prepare.
+    pub fn launch_mode(&self) -> WitnessFeedLaunchMode {
+        self.mode
     }
 
     pub fn requirements(&self) -> &WitnessFeedWorkspaceRequirements {
@@ -1086,26 +1219,37 @@ fn bind_min(
     alignment_words: usize,
 ) -> Result<ArenaSlice, PreparedWitnessFeedError> {
     let slice = arena.bind(id)?;
-    bind_external_min(arena, slice, expected_words)?;
-    if (slice.as_u32_ptr() as usize) % (alignment_words * WORD_BYTES) != 0 {
+    let truncated = bind_external_min(arena, slice, expected_words)?;
+    if (truncated.as_u32_ptr() as usize) % (alignment_words * WORD_BYTES) != 0 {
         return Err(PreparedWitnessFeedError::SlotMisaligned(id));
     }
-    Ok(slice)
+    Ok(truncated)
 }
 
 // Pooled arena slots are sized to the largest disjoint-lifetime sharer, so a
-// requirement is a lower bound: launches touch exactly the required words and
-// never the pooled surplus (same contract as prepared_witness_input's
-// bind_min; undersized, misaligned, or foreign-context slots still fail
-// closed).
+// requirement is a lower bound on physical capacity. The returned slice is
+// truncated to exactly `expected_words`, making `len_words()` the logical
+// requirement everywhere downstream — clears and launches must never observe
+// the pooled surplus (same contract as prepared_witness_input's bind_min;
+// undersized, misaligned, or foreign-context slots still fail closed).
+// Callers must store and use the RETURNED slice, never the argument.
 fn bind_external_min(
     arena: &DeviceArena,
     slice: ArenaSlice,
     expected_words: usize,
-) -> Result<(), PreparedWitnessFeedError> {
+) -> Result<ArenaSlice, PreparedWitnessFeedError> {
     if slice.context_token() != arena.context().identity_token() {
         return Err(PreparedWitnessFeedError::ContextMismatch(slice.id()));
     }
+    truncate_bound_slot(slice, expected_words)
+}
+
+/// Validate one slice's capacity and truncate it to the logical requirement
+/// so `len_words()` never exposes the pooled surplus to clears or launches.
+fn truncate_bound_slot(
+    slice: ArenaSlice,
+    expected_words: usize,
+) -> Result<ArenaSlice, PreparedWitnessFeedError> {
     if slice.len_words() < expected_words {
         return Err(PreparedWitnessFeedError::SlotSizeMismatch {
             slot: slice.id(),
@@ -1113,7 +1257,7 @@ fn bind_external_min(
             actual_words: slice.len_words(),
         });
     }
-    Ok(())
+    Ok(slice.truncated(expected_words))
 }
 
 fn check_count(
@@ -1147,6 +1291,25 @@ fn ensure_distinct(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bound_slots_truncate_pooled_surplus_to_the_logical_requirement() {
+        // Pooled physical slots are sized to the LARGEST epoch-disjoint
+        // sharer; the multiplicity clear graph derives its per-destination
+        // clear extents from `len_words()`, so the binder must expose only
+        // the logical extent — clearing a whole pooled slot clobbers
+        // cohabitants of the other epoch.
+        let oversized = ArenaSlice::dangling_for_test(5, 1024);
+        let bound = truncate_bound_slot(oversized, 320).unwrap();
+        assert_eq!(bound.len_words(), 320);
+        assert_eq!(bound.id(), oversized.id());
+        assert_eq!(bound.as_u32_ptr(), oversized.as_u32_ptr());
+        // Undersized slots still fail closed.
+        assert!(matches!(
+            truncate_bound_slot(ArenaSlice::dangling_for_test(5, 64), 320),
+            Err(PreparedWitnessFeedError::SlotSizeMismatch { .. })
+        ));
+    }
 
     fn fold_descriptor(
         word_base: u32,
@@ -1296,6 +1459,82 @@ mod tests {
             requirements.arena_slot_requirements(&slots).unwrap_err(),
             PreparedWitnessFeedError::DuplicateSlot(duplicate)
         );
+    }
+
+    #[test]
+    fn privatized_footprint_counts_touched_relation_columns() {
+        // FOLD / dependent-XOR: one relation column of table_size words,
+        // regardless of the relation index or LUT.
+        let fold = fold_descriptor(0, &[2, 2], 3, 16, WITNESS_FEED_NO_LUT, 0);
+        assert_eq!(witness_feed_privatized_footprint_words(&fold), 16);
+        let mut xor4 = fold_descriptor(0, &[4, 4, 4], 0, 1 << 8, 0, 0);
+        xor4[11] = 2;
+        assert_eq!(witness_feed_privatized_footprint_words(&xor4), 1 << 8);
+
+        // MEM-ID DECODE: big column plus small column.
+        let memory = memory_descriptor();
+        assert_eq!(
+            witness_feed_privatized_footprint_words(&memory),
+            8 + 4,
+            "memory feeds cover the big and the small relation column"
+        );
+
+        // xor12 addresses all sixteen expanded multiplicity columns.
+        let mut xor12 = fold_descriptor(0, &[12, 12, 12], 0, 1 << 20, WITNESS_FEED_NO_LUT, 0);
+        xor12[11] = 3;
+        assert_eq!(
+            witness_feed_privatized_footprint_words(&xor12),
+            16 * (1 << 20)
+        );
+    }
+
+    #[test]
+    fn shared_budget_boundary_is_exact_at_48kb() {
+        assert_eq!(WITNESS_FEED_PRIVATIZED_SHARED_BYTES, 48 * 1024);
+        assert_eq!(WITNESS_FEED_PRIVATIZED_SHARED_WORDS, 12288);
+
+        // table_size * 4B == 48KB fits exactly; one more word does not.
+        let at_budget = fold_descriptor(0, &[14], 0, 12288, WITNESS_FEED_NO_LUT, 0);
+        assert!(witness_feed_descriptor_fits_shared(&at_budget));
+        let over_budget = fold_descriptor(0, &[14], 0, 12289, WITNESS_FEED_NO_LUT, 0);
+        assert!(!witness_feed_descriptor_fits_shared(&over_budget));
+
+        // The memory split counts BOTH columns against the budget.
+        let mut memory = memory_descriptor();
+        memory[8] = 12280;
+        memory[12] = 8;
+        assert!(witness_feed_descriptor_fits_shared(&memory));
+        memory[12] = 9;
+        assert!(!witness_feed_descriptor_fits_shared(&memory));
+
+        // xor12's validated 2^20 table can never privatize.
+        let mut xor12 = fold_descriptor(0, &[12, 12, 12], 0, 1 << 20, WITNESS_FEED_NO_LUT, 0);
+        xor12[11] = 3;
+        assert!(!witness_feed_descriptor_fits_shared(&xor12));
+
+        // Footprints larger than u32::MAX words must not wrap into "fits".
+        let mut huge = fold_descriptor(0, &[12, 12, 12], 0, u32::MAX, WITNESS_FEED_NO_LUT, 0);
+        huge[11] = 3;
+        assert_eq!(
+            witness_feed_privatized_footprint_words(&huge),
+            16 * u64::from(u32::MAX)
+        );
+        assert!(!witness_feed_descriptor_fits_shared(&huge));
+    }
+
+    #[test]
+    fn privatized_flag_requires_literal_one() {
+        assert!(feed_privatized_flag_from(Some("1")));
+        for raw in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("true"),
+            Some("2"),
+            Some("01"),
+        ] {
+            assert!(!feed_privatized_flag_from(raw), "{raw:?} must stay OFF");
+        }
     }
 
     #[test]

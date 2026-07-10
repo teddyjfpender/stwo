@@ -687,21 +687,32 @@ fn bind_slot(
     required_words: usize,
     alignment_words: usize,
 ) -> Result<ArenaSlice, PreparedQuotientError> {
-    let slice = arena.bind(id)?;
+    truncate_bound_slot(arena.bind(id)?, required_words, alignment_words)
+}
+
+/// Validate one bound slot's capacity and alignment, then truncate it to the
+/// logical requirement. Pooled slots may be larger than any single logical
+/// buffer; END-relative twiddle bases derive from `len_words()` and must
+/// never observe the pooled surplus.
+fn truncate_bound_slot(
+    slice: ArenaSlice,
+    required_words: usize,
+    alignment_words: usize,
+) -> Result<ArenaSlice, PreparedQuotientError> {
     if slice.len_words() < required_words {
         return Err(PreparedQuotientError::SlotTooSmall {
-            slot: id,
+            slot: slice.id(),
             required_words,
             actual_words: slice.len_words(),
         });
     }
     if (slice.as_u32_ptr() as usize) % (alignment_words * WORD_BYTES) != 0 {
         return Err(PreparedQuotientError::MisalignedSlot {
-            slot: id,
+            slot: slice.id(),
             alignment_words,
         });
     }
-    Ok(slice)
+    Ok(slice.truncated(required_words))
 }
 
 fn upload_and_sync(
@@ -723,6 +734,23 @@ fn upload_and_sync(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bound_slots_truncate_pooled_surplus_to_the_logical_requirement() {
+        // Pooled physical slots are sized to the LARGEST epoch-disjoint
+        // sharer; the binder must expose only the logical extent so
+        // END-relative twiddle bases never shift into the surplus.
+        let oversized = ArenaSlice::dangling_for_test(2, 4096);
+        let bound = truncate_bound_slot(oversized, 1024, 1).unwrap();
+        assert_eq!(bound.len_words(), 1024);
+        assert_eq!(bound.id(), oversized.id());
+        assert_eq!(bound.as_u32_ptr(), oversized.as_u32_ptr());
+        // Undersized slots still fail closed.
+        assert!(matches!(
+            truncate_bound_slot(ArenaSlice::dangling_for_test(2, 512), 1024, 1),
+            Err(PreparedQuotientError::SlotTooSmall { .. })
+        ));
+    }
 
     fn config() -> QuotientWorkspaceConfig {
         QuotientWorkspaceConfig {

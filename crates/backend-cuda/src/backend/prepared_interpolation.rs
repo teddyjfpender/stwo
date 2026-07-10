@@ -277,7 +277,9 @@ fn validate_batches(
                 batch.coefficient_pointers,
             ));
         }
-        pointer_tables.push(pointer_table);
+        // Pooled slots may be larger than the pointer table; keep only the
+        // logical extent so no consumer derives sizes from the surplus.
+        pointer_tables.push(pointer_table.truncated(pointer_words));
 
         for (column_index, column) in batch.columns.iter().enumerate() {
             if column.log_size != first.log_size {

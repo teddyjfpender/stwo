@@ -1863,6 +1863,29 @@ extern "C" {
         counts_dev: *const *mut u32,
         stream: *mut c_void,
     ) -> i32;
+    // Step 4.3 privatized variant of the count feed: per-block shared-memory
+    // histograms for descriptors whose touched table footprint fits 48KB
+    // static shared, block-local atomics, unconditional global merge;
+    // oversized families keep the global-atomic path inside the same launch.
+    // Byte-identical count slabs (wrapping u32 adds are commutative and
+    // associative). Same ABI as stwo_witness_feed_counts[_on].
+    pub fn stwo_witness_feed_counts_privatized(
+        sub_words_dev: *const u32,
+        column_length: u32,
+        descs_dev: *const u32,
+        n_descs: u32,
+        luts_dev: *const *const u32,
+        counts_dev: *const *mut u32,
+    ) -> i32;
+    pub fn stwo_witness_feed_counts_privatized_on(
+        sub_words_dev: *const u32,
+        column_length: u32,
+        descs_dev: *const u32,
+        n_descs: u32,
+        luts_dev: *const *const u32,
+        counts_dev: *const *mut u32,
+        stream: *mut c_void,
+    ) -> i32;
     pub fn stwo_witness_feed_clear_on(
         destinations_dev: *const *mut u32,
         lengths_dev: *const u32,

@@ -286,7 +286,9 @@ fn bind_slot(
             actual: slice.len_words(),
         });
     }
-    Ok(slice)
+    // Pooled slots may be larger than any single logical buffer; expose only
+    // the logical extent so no consumer derives sizes from the pooled surplus.
+    Ok(slice.truncated(requirement.len_words))
 }
 
 fn pow2(log_size: u32) -> Result<usize, PreparedFriFinalError> {

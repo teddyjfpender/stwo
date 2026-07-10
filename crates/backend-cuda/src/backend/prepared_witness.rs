@@ -895,18 +895,29 @@ fn bind_slot(
     required_words: usize,
     alignment_words: usize,
 ) -> Result<ArenaSlice, PreparedWitnessError> {
-    let slice = arena.bind(id)?;
+    truncate_bound_slot(arena.bind(id)?, required_words, alignment_words)
+}
+
+/// Validate one bound slot's capacity and alignment, then truncate it to the
+/// logical requirement. Pooled slots may be larger than any single logical
+/// buffer; `clear_multiplicities` memsets `len_bytes()` per column and must
+/// never clear a cohabitant's words in the pooled surplus.
+fn truncate_bound_slot(
+    slice: ArenaSlice,
+    required_words: usize,
+    alignment_words: usize,
+) -> Result<ArenaSlice, PreparedWitnessError> {
     if slice.len_words() < required_words {
         return Err(PreparedWitnessError::SlotTooSmall {
-            slot: id,
+            slot: slice.id(),
             required_words,
             actual_words: slice.len_words(),
         });
     }
     if (slice.as_u32_ptr() as usize) % (alignment_words * WORD_BYTES) != 0 {
-        return Err(PreparedWitnessError::SlotMisaligned(id));
+        return Err(PreparedWitnessError::SlotMisaligned(slice.id()));
     }
-    Ok(slice)
+    Ok(slice.truncated(required_words))
 }
 
 fn validate_slot_shape(
@@ -994,6 +1005,23 @@ fn ensure_distinct(ids: &[ArenaSlotId]) -> Result<(), PreparedWitnessError> {
 mod tests {
     use super::super::jit_witness::recording::WitnessRecorder;
     use super::*;
+
+    #[test]
+    fn bound_slots_truncate_pooled_surplus_to_the_logical_requirement() {
+        // Pooled physical slots are sized to the LARGEST epoch-disjoint
+        // sharer; multiplicity clears memset `len_bytes()` per column, so the
+        // binder must expose only the logical extent.
+        let oversized = ArenaSlice::dangling_for_test(8, 256);
+        let bound = truncate_bound_slot(oversized, 64, 1).unwrap();
+        assert_eq!(bound.len_words(), 64);
+        assert_eq!(bound.id(), oversized.id());
+        assert_eq!(bound.as_u32_ptr(), oversized.as_u32_ptr());
+        // Undersized slots still fail closed.
+        assert!(matches!(
+            truncate_bound_slot(ArenaSlice::dangling_for_test(8, 32), 64, 1),
+            Err(PreparedWitnessError::SlotTooSmall { .. })
+        ));
+    }
 
     fn program() -> WitnessProgram {
         let mut recorder = WitnessRecorder::new("prepared_witness_pure");

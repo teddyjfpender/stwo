@@ -6,11 +6,12 @@
 use core::ffi::c_void;
 
 use stwo_backend_cuda::{
-    witness_feed_clear_workspace_requirements, witness_feed_workspace_requirements, ArenaLayout,
-    ArenaSlice, ArenaSlotId, ArenaSlotSpec, CudaExecContext, DeviceArena,
-    PreparedWitnessFeedClearGraph, PreparedWitnessFeedGraph, WitnessFeedArenaSlotRequirement,
-    WitnessFeedClearWorkspaceSlots, WitnessFeedWorkspaceRequirements, WitnessFeedWorkspaceSlots,
-    WITNESS_FEED_DESCRIPTOR_WORDS, WITNESS_FEED_NO_LUT,
+    witness_feed_clear_workspace_requirements, witness_feed_descriptor_fits_shared,
+    witness_feed_workspace_requirements, ArenaLayout, ArenaSlice, ArenaSlotId, ArenaSlotSpec,
+    CudaExecContext, DeviceArena, PreparedWitnessFeedClearGraph, PreparedWitnessFeedGraph,
+    WitnessFeedArenaSlotRequirement, WitnessFeedClearWorkspaceSlots, WitnessFeedLaunchMode,
+    WitnessFeedWorkspaceRequirements, WitnessFeedWorkspaceSlots, WITNESS_FEED_DESCRIPTOR_WORDS,
+    WITNESS_FEED_NO_LUT,
 };
 
 const ROWS: usize = 32;
@@ -340,6 +341,88 @@ fn prepared_witness_feed_eager_capture_and_mutated_replay_match_host() {
     graph.launch(arena.context()).unwrap();
     assert_eq!(
         snapshot(&arena, &prepared),
+        host_reference(&mutated, &descriptors, &luts)
+    );
+}
+
+/// Step 4.3 parity gate: the privatized (shared-memory histogram) kernel and
+/// the global-atomic kernel produce byte-identical count slabs on identical
+/// inputs — counts are wrapping u32 sums of `+1`s, so the block-local
+/// reassociation plus unconditional merge cannot change them. The geometry
+/// deliberately mixes shared-fitting families (16-, 8/4-, 256-word tables)
+/// with the oversized xor12 slab (16 x 2^20 words), which keeps the
+/// global-atomic path inside the SAME privatized launch.
+#[test]
+fn prepared_witness_feed_privatized_matches_global_atomics_and_host() {
+    let (descriptors, luts) = feed_inputs();
+    // The mixed geometry must actually exercise both in-launch paths.
+    let per_descriptor_fits = descriptors
+        .chunks_exact(WITNESS_FEED_DESCRIPTOR_WORDS)
+        .map(|entry| witness_feed_descriptor_fits_shared(entry.try_into().unwrap()))
+        .collect::<Vec<_>>();
+    assert_eq!(per_descriptor_fits, [true, true, true, false, true]);
+
+    let requirements = witness_feed_workspace_requirements(
+        ROWS,
+        SUB_WORDS,
+        &descriptors,
+        &luts,
+        DESTINATION_WORDS,
+    )
+    .unwrap();
+    let slots = slots();
+    let arena = arena(&requirements, &slots);
+    let source_slot = arena.bind(ArenaSlotId(1)).unwrap();
+    let modes = [
+        WitnessFeedLaunchMode::GlobalAtomics,
+        WitnessFeedLaunchMode::Privatized,
+    ];
+    let graphs = modes.map(|mode| {
+        let prepared = PreparedWitnessFeedGraph::prepare_with_mode(
+            &arena,
+            source_slot,
+            ROWS,
+            SUB_WORDS,
+            &descriptors,
+            &luts,
+            DESTINATION_WORDS,
+            &slots,
+            mode,
+        )
+        .unwrap();
+        assert_eq!(prepared.launch_mode(), mode);
+        prepared
+    });
+    let clear = PreparedWitnessFeedClearGraph::prepare(
+        &arena,
+        graphs[0].multiplicity_destinations(),
+        clear_slots(),
+    )
+    .unwrap();
+
+    let initial = source(7);
+    upload(&arena, source_slot, &initial);
+    arena.context().sync().unwrap();
+    let expected = host_reference(&initial, &descriptors, &luts);
+    let eager = modes.map(|mode| {
+        let index = (mode == WitnessFeedLaunchMode::Privatized) as usize;
+        clear.launch().unwrap();
+        graphs[index].launch().unwrap();
+        snapshot(&arena, &graphs[index])
+    });
+    assert_eq!(eager[1], expected, "privatized eager counts match host");
+    assert_eq!(eager[0], eager[1], "byte-identical across kernel modes");
+
+    // The privatized kernel is capture-safe and replays over mutated sources.
+    let capture = arena.context().capture().unwrap();
+    clear.launch().unwrap();
+    graphs[1].launch().unwrap();
+    let graph = capture.finish().unwrap();
+    let mutated = source(11);
+    upload(&arena, source_slot, &mutated);
+    graph.launch(arena.context()).unwrap();
+    assert_eq!(
+        snapshot(&arena, &graphs[1]),
         host_reference(&mutated, &descriptors, &luts)
     );
 }

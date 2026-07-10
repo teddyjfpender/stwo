@@ -54,6 +54,8 @@
 #include "rfft.cuh"
 #include "utils.cuh"
 
+namespace {
+
 // Duplicate of rfft.cu's file-local shfl_xor_bf (the butterfly operand
 // exchange for the in-register final stages), under a unique name so the two
 // translation units cannot collide at device link. Kept in LOCKSTEP with
@@ -133,7 +135,7 @@ __global__ void n2b_final_warp_hash16_write_batch(
         #pragma unroll
         for (; stage <= log_n; ++stage) {
             const unsigned log_stride = log_n - stage;
-            shfl_xor_bf<LOG_VALS_PER_THREAD>(vals, log_stride, lane);
+            shfl_xor_bf_fused<LOG_VALS_PER_THREAD>(vals, log_stride, lane);
             #pragma unroll
             for (unsigned i = 0; i < (1 << (LOG_VALS_PER_THREAD - 1)); ++i) {
                 const unsigned inner_pair =
@@ -302,7 +304,7 @@ __global__ void n2b_final_block_warp_hash16_write_batch(
         #pragma unroll
         for (; stage <= log_n; ++stage) {
             const unsigned log_stride = log_n - stage;
-            shfl_xor_bf<LOG_VALS_PER_THREAD>(vals, log_stride, lane);
+            shfl_xor_bf_fused<LOG_VALS_PER_THREAD>(vals, log_stride, lane);
             #pragma unroll
             for (unsigned i = 0; i < (1 << (LOG_VALS_PER_THREAD - 1)); ++i) {
                 const unsigned inner_pair =

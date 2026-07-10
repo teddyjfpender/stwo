@@ -915,10 +915,11 @@ fn bind_many_exact(
 }
 
 // Pooled arena slots are sized to the largest disjoint-lifetime sharer, so a
-// requirement is a lower bound: launches touch exactly the required words and
-// never the pooled surplus (same contract as prepared_witness_input's
-// bind_min; undersized, misaligned, or foreign-context slots still fail
-// closed).
+// requirement is a lower bound on physical capacity. The returned slice is
+// truncated to exactly `expected_words`, making `len_words()` the logical
+// requirement everywhere downstream (same contract as
+// prepared_witness_input's bind_min; undersized, misaligned, or
+// foreign-context slots still fail closed).
 fn bind_min(
     arena: &DeviceArena,
     id: ArenaSlotId,
@@ -927,17 +928,27 @@ fn bind_min(
 ) -> Result<ArenaSlice, PreparedFixedTableError> {
     let slice = arena.bind(id)?;
     require_context(arena, slice)?;
+    truncate_bound_slot(slice, expected_words, alignment_words)
+}
+
+/// Validate one bound slot's capacity and alignment, then truncate it to the
+/// logical requirement so `len_words()` never exposes the pooled surplus.
+fn truncate_bound_slot(
+    slice: ArenaSlice,
+    expected_words: usize,
+    alignment_words: usize,
+) -> Result<ArenaSlice, PreparedFixedTableError> {
     if slice.len_words() < expected_words {
         return Err(PreparedFixedTableError::SlotSizeMismatch {
-            slot: id,
+            slot: slice.id(),
             expected_words,
             actual_words: slice.len_words(),
         });
     }
     if (slice.as_u32_ptr() as usize) % (alignment_words * WORD_BYTES) != 0 {
-        return Err(PreparedFixedTableError::SlotMisaligned(id));
+        return Err(PreparedFixedTableError::SlotMisaligned(slice.id()));
     }
-    Ok(slice)
+    Ok(slice.truncated(expected_words))
 }
 
 fn require_context(arena: &DeviceArena, slice: ArenaSlice) -> Result<(), PreparedFixedTableError> {
@@ -979,6 +990,23 @@ fn ensure_distinct(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bound_slots_truncate_pooled_surplus_to_the_logical_requirement() {
+        // Pooled physical slots are sized to the LARGEST epoch-disjoint
+        // sharer; the binder must expose only the logical extent so kernel
+        // extents derived from `len_words()` never see the surplus.
+        let oversized = ArenaSlice::dangling_for_test(4, 768);
+        let bound = truncate_bound_slot(oversized, 256, 1).unwrap();
+        assert_eq!(bound.len_words(), 256);
+        assert_eq!(bound.id(), oversized.id());
+        assert_eq!(bound.as_u32_ptr(), oversized.as_u32_ptr());
+        // Undersized slots still fail closed.
+        assert!(matches!(
+            truncate_bound_slot(ArenaSlice::dangling_for_test(4, 128), 256, 1),
+            Err(PreparedFixedTableError::SlotSizeMismatch { .. })
+        ));
+    }
 
     #[test]
     fn requirements_lower_all_source_kinds_to_the_stable_abi() {

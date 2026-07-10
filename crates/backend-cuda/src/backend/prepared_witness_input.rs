@@ -1249,16 +1249,16 @@ fn bind_many_min(
         .collect()
 }
 
-/// Bind one whole arena slot and require the kernel-ABI capacity.
+/// Bind one arena slot, require the kernel-ABI capacity, and return a slice
+/// truncated to exactly that requirement.
 ///
-/// `required_words` is a LOWER bound, not an exact length: the arena plan
+/// `required_words` is a LOWER bound on the physical capacity: the arena plan
 /// pools logical buffers with disjoint proof-epoch lifetimes into one physical
-/// slot sized to the largest sharer, and `DeviceArena::bind` always returns the
-/// whole slot. The witness-input kernels (`witness_edge_gather.cu`) touch
-/// exactly the required extent — `n_edges * 5` descriptor words, one pointer
-/// per table entry, destination rows `[0, consumer_rows)` — so extra backing
-/// capacity is unobservable, while an undersized or misaligned slot still
-/// fails closed before any launch.
+/// slot sized to the largest sharer, and `DeviceArena::bind` always returns
+/// the whole slot. The returned slice is truncated to `required_words`, so
+/// `len_words()` IS the logical requirement everywhere downstream and the
+/// pooled surplus is invisible; an undersized or misaligned slot still fails
+/// closed before any launch.
 fn bind_min(
     arena: &DeviceArena,
     id: ArenaSlotId,
@@ -1267,17 +1267,27 @@ fn bind_min(
 ) -> Result<ArenaSlice, PreparedWitnessInputGatherError> {
     let slice = arena.bind(id)?;
     require_context(arena, slice)?;
+    truncate_bound_slot(slice, required_words, alignment_words)
+}
+
+/// Validate one bound slot's capacity and alignment, then truncate it to the
+/// logical requirement so `len_words()` never exposes the pooled surplus.
+fn truncate_bound_slot(
+    slice: ArenaSlice,
+    required_words: usize,
+    alignment_words: usize,
+) -> Result<ArenaSlice, PreparedWitnessInputGatherError> {
     if slice.len_words() < required_words {
         return Err(PreparedWitnessInputGatherError::SlotSizeMismatch {
-            slot: id,
+            slot: slice.id(),
             expected_words: required_words,
             actual_words: slice.len_words(),
         });
     }
     if (slice.as_u32_ptr() as usize) % (alignment_words * WORD_BYTES) != 0 {
-        return Err(PreparedWitnessInputGatherError::SlotMisaligned(id));
+        return Err(PreparedWitnessInputGatherError::SlotMisaligned(slice.id()));
     }
-    Ok(slice)
+    Ok(slice.truncated(required_words))
 }
 
 fn require_context(
@@ -1322,6 +1332,23 @@ mod tests {
                 n_instances: 1,
             },
         ]
+    }
+
+    #[test]
+    fn bound_slots_truncate_pooled_surplus_to_the_logical_requirement() {
+        // Pooled physical slots are sized to the LARGEST epoch-disjoint
+        // sharer; the binder must expose only the logical extent so kernel
+        // extents derived from `len_words()` never see the surplus.
+        let oversized = ArenaSlice::dangling_for_test(9, 512);
+        let bound = truncate_bound_slot(oversized, 112, 1).unwrap();
+        assert_eq!(bound.len_words(), 112);
+        assert_eq!(bound.id(), oversized.id());
+        assert_eq!(bound.as_u32_ptr(), oversized.as_u32_ptr());
+        // Undersized slots still fail closed.
+        assert!(matches!(
+            truncate_bound_slot(ArenaSlice::dangling_for_test(9, 64), 112, 1),
+            Err(PreparedWitnessInputGatherError::SlotSizeMismatch { .. })
+        ));
     }
 
     #[test]

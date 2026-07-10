@@ -130,11 +130,13 @@ pub use backend::prepared_witness::{
 };
 pub use backend::prepared_witness_feed::{
     clear_witness_feed_destinations_once, witness_feed_clear_workspace_requirements,
+    witness_feed_descriptor_fits_shared, witness_feed_privatized_footprint_words,
     witness_feed_workspace_requirements, PreparedWitnessFeedClearGraph, PreparedWitnessFeedError,
     PreparedWitnessFeedGraph, WitnessFeedArenaSlotRequirement,
-    WitnessFeedClearWorkspaceRequirements, WitnessFeedClearWorkspaceSlots,
+    WitnessFeedClearWorkspaceRequirements, WitnessFeedClearWorkspaceSlots, WitnessFeedLaunchMode,
     WitnessFeedWorkspaceRequirements, WitnessFeedWorkspaceSlots, WITNESS_FEED_DESCRIPTOR_WORDS,
     WITNESS_FEED_MAX_TUPLE_WORDS, WITNESS_FEED_NO_LUT, WITNESS_FEED_POINTER_ALIGNMENT_WORDS,
+    WITNESS_FEED_PRIVATIZED_SHARED_BYTES, WITNESS_FEED_PRIVATIZED_SHARED_WORDS,
 };
 pub use backend::prepared_witness_input::{
     witness_input_compact_requirements, witness_input_gather_requirements,

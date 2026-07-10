@@ -1291,7 +1291,9 @@ fn bind_slot(
             alignment_words,
         });
     }
-    Ok(slice)
+    // Pooled slots may be larger than any single logical buffer; expose only
+    // the logical extent so no consumer derives sizes from the pooled surplus.
+    Ok(slice.truncated(required_words))
 }
 
 fn require_words(

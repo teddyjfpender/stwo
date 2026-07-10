@@ -483,7 +483,9 @@ fn bind_slot(
             actual_words: slice.len_words(),
         });
     }
-    Ok(slice)
+    // Pooled slots may be larger than any single logical buffer; expose only
+    // the logical extent so no consumer derives sizes from the pooled surplus.
+    Ok(slice.truncated(required_words))
 }
 
 fn validate_slot_shape(

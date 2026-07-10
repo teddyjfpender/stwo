@@ -19,7 +19,6 @@ use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 
-
 /// Content-addressed CUDA object cache (STWO_CUDA_OBJ_CACHE=<dir>): keyed by
 /// FNV-1a of the source bytes, every header in the include dirs, the compile
 /// flags and the nvcc version, so objects survive cargo fingerprint changes,
@@ -175,7 +174,10 @@ fn main() {
                 let key = fnv1a(&bytes, fnv1a(&headers.to_le_bytes(), *base));
                 dir.join(format!(
                     "{}-{key:016x}.o",
-                    source.file_stem().expect("kernel file stem").to_string_lossy()
+                    source
+                        .file_stem()
+                        .expect("kernel file stem")
+                        .to_string_lossy()
                 ))
             }),
             _ => None,

@@ -1671,23 +1671,54 @@ fn bind_slot(
     required_words: usize,
     alignment_words: usize,
 ) -> Result<ArenaSlice, RelationGraphError> {
-    let slice = arena.bind(id)?;
+    truncate_bound_slot(arena.bind(id)?, required_words, alignment_words)
+}
+
+/// Validate one bound slot's capacity and alignment, then truncate it to the
+/// logical requirement. Pooled slots may be larger than any single logical
+/// buffer; only the logical extent is exposed. Alpha-power counts,
+/// scan-descriptor counts, and reduction capacities are all derived from
+/// `len_words()` downstream and must never observe the pooled surplus.
+fn truncate_bound_slot(
+    slice: ArenaSlice,
+    required_words: usize,
+    alignment_words: usize,
+) -> Result<ArenaSlice, RelationGraphError> {
     if slice.len_words() < required_words.max(1) {
         return Err(RelationGraphError::SlotTooSmall {
-            slot: id,
+            slot: slice.id(),
             required_words: required_words.max(1),
             actual_words: slice.len_words(),
         });
     }
     if (slice.as_u32_ptr() as usize) % (alignment_words * WORD_BYTES) != 0 {
-        return Err(RelationGraphError::MisalignedSlot(id));
+        return Err(RelationGraphError::MisalignedSlot(slice.id()));
     }
-    Ok(slice)
+    Ok(slice.truncated(required_words.max(1)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bound_slots_truncate_pooled_surplus_to_the_logical_requirement() {
+        // Pooled physical slots are sized to the LARGEST epoch-disjoint
+        // sharer; the binder must expose only the logical extent so
+        // alpha-power and scan-descriptor counts never see the surplus.
+        let oversized = ArenaSlice::dangling_for_test(3, 512);
+        let bound = truncate_bound_slot(oversized, 96, 1).unwrap();
+        assert_eq!(bound.len_words(), 96);
+        assert_eq!(bound.id(), oversized.id());
+        assert_eq!(bound.as_u32_ptr(), oversized.as_u32_ptr());
+        // Zero-word requirements keep one addressable word (legacy scratch ABI).
+        assert_eq!(truncate_bound_slot(oversized, 0, 1).unwrap().len_words(), 1);
+        // Undersized slots still fail closed.
+        assert!(matches!(
+            truncate_bound_slot(ArenaSlice::dangling_for_test(3, 64), 96, 1),
+            Err(RelationGraphError::SlotTooSmall { .. })
+        ));
+    }
 
     fn lookup_use(tuple_arg: u32, tuple_words: u32) -> RelationUseDescriptor {
         RelationUseDescriptor {

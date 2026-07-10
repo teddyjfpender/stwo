@@ -589,7 +589,9 @@ fn bind_slot(
     if (slice.as_u32_ptr() as usize) % (alignment_words * WORD_BYTES) != 0 {
         return Err(PreparedExecutionTablesError::SlotMisaligned(id));
     }
-    Ok(slice)
+    // Pooled slots may be larger than any single logical buffer; expose only
+    // the logical extent so no consumer derives sizes from the pooled surplus.
+    Ok(slice.truncated(required_words))
 }
 
 fn upload<T: Copy>(

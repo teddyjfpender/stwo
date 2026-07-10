@@ -790,6 +790,31 @@ impl ArenaSlice {
         self.context_token
     }
 
+    /// View of the first `len_words` words: same slot id, base pointer, and
+    /// context token, shorter length.
+    ///
+    /// The arena colorer pools epoch-disjoint logical buffers into one
+    /// physical slot sized to the LARGEST sharer, so a whole-slot slice may be
+    /// longer than any single logical buffer. Every binder truncates the bound
+    /// slice to its logical requirement before returning it, which makes
+    /// `len_words()` the logical extent everywhere downstream — kernel
+    /// extents, memsets, and END-relative indexing must never observe the
+    /// pooled surplus.
+    ///
+    /// Panics if `len_words` exceeds the current length: growing a slice
+    /// would fabricate capacity that was never validated.
+    #[must_use]
+    pub fn truncated(self, len_words: usize) -> Self {
+        assert!(
+            len_words <= self.len_words,
+            "arena slice truncation cannot grow slot {:?}: {} > {}",
+            self.id,
+            len_words,
+            self.len_words,
+        );
+        Self { len_words, ..self }
+    }
+
     #[cfg(test)]
     pub(crate) fn dangling_for_test(id: u32, len_words: usize) -> Self {
         Self {
@@ -910,6 +935,26 @@ mod tests {
         assert_eq!(layout.total_words(), 64);
         assert_eq!(layout.slot(A).unwrap().len_words, 16);
         assert_eq!(layout.slot(B).unwrap().offset_words, 16);
+    }
+
+    #[test]
+    fn truncated_slice_keeps_identity_and_base_but_shrinks_length() {
+        let slice = ArenaSlice::dangling_for_test(7, 64);
+        let truncated = slice.truncated(24);
+        assert_eq!(truncated.id(), slice.id());
+        assert_eq!(truncated.as_u32_ptr(), slice.as_u32_ptr());
+        assert_eq!(truncated.context_token(), slice.context_token());
+        assert_eq!(truncated.len_words(), 24);
+        assert_eq!(truncated.len_bytes(), 24 * core::mem::size_of::<u32>());
+        // Idempotent at the same length; zero-length views stay addressable.
+        assert_eq!(truncated.truncated(24).len_words(), 24);
+        assert_eq!(truncated.truncated(0).len_words(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "arena slice truncation cannot grow")]
+    fn truncated_slice_rejects_growth() {
+        let _ = ArenaSlice::dangling_for_test(7, 16).truncated(17);
     }
 
     #[test]

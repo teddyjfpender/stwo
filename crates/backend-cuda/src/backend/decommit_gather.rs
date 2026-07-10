@@ -287,20 +287,25 @@ impl<'a> PreparedColumnRowGather<'a> {
             }
         }
 
-        let column_ptrs = arena.bind(slots.column_ptrs)?;
-        let row_offsets_device = arena.bind(slots.row_offsets)?;
-        let row_indices_device = arena.bind(slots.row_indices)?;
-        let output = arena.bind(slots.output)?;
+        // Pooled slots may be larger than any single logical buffer; keep only
+        // the logical extents so no consumer derives sizes from the surplus.
+        let column_ptrs = ensure_capacity(
+            arena.bind(slots.column_ptrs)?,
+            requirements.column_ptr_words,
+        )?;
+        let row_offsets_device = ensure_capacity(
+            arena.bind(slots.row_offsets)?,
+            requirements.row_offset_words,
+        )?;
+        let row_indices_device =
+            ensure_capacity(arena.bind(slots.row_indices)?, requirements.row_index_words)?;
+        let output = ensure_capacity(arena.bind(slots.output)?, requirements.output_words)?;
         let context_token = arena.context().identity_token();
         debug_assert!(
             [column_ptrs, row_offsets_device, row_indices_device, output,]
                 .iter()
                 .all(|slice| slice.context_token() == context_token)
         );
-        ensure_capacity(column_ptrs, requirements.column_ptr_words)?;
-        ensure_capacity(row_offsets_device, requirements.row_offset_words)?;
-        ensure_capacity(row_indices_device, requirements.row_index_words)?;
-        ensure_capacity(output, requirements.output_words)?;
 
         let pointer_alignment = core::mem::align_of::<*const u32>();
         if requirements.column_ptr_words != 0
@@ -457,7 +462,12 @@ fn ensure_distinct_slots(slots: ColumnRowGatherSlots) -> Result<(), ColumnRowGat
     Ok(())
 }
 
-fn ensure_capacity(slice: ArenaSlice, required_words: usize) -> Result<(), ColumnRowGatherError> {
+// Validates capacity and truncates the bound slot to the logical requirement
+// so `len_words()` never exposes the pooled surplus.
+fn ensure_capacity(
+    slice: ArenaSlice,
+    required_words: usize,
+) -> Result<ArenaSlice, ColumnRowGatherError> {
     if slice.len_words() < required_words {
         return Err(ColumnRowGatherError::SlotTooSmall {
             slot: slice.id(),
@@ -465,7 +475,7 @@ fn ensure_capacity(slice: ArenaSlice, required_words: usize) -> Result<(), Colum
             actual_words: slice.len_words(),
         });
     }
-    Ok(())
+    Ok(slice.truncated(required_words))
 }
 
 fn check_cuda(operation: &'static str, status: i32) -> Result<(), ColumnRowGatherError> {

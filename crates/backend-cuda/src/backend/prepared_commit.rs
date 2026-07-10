@@ -1135,26 +1135,54 @@ fn bind_slot(
     required_words: usize,
     alignment_words: usize,
 ) -> Result<ArenaSlice, PreparedCommitError> {
-    let slice = arena.bind(id)?;
+    truncate_bound_slot(arena.bind(id)?, required_words, alignment_words)
+}
+
+/// Validate one bound slot's capacity and alignment, then truncate it to the
+/// logical requirement. Pooled slots may be larger than any single logical
+/// buffer; END-relative twiddle bases and layer extents derive from
+/// `len_words()` and must never observe the pooled surplus.
+fn truncate_bound_slot(
+    slice: ArenaSlice,
+    required_words: usize,
+    alignment_words: usize,
+) -> Result<ArenaSlice, PreparedCommitError> {
     if slice.len_words() < required_words {
         return Err(PreparedCommitError::SlotTooSmall {
-            slot: id,
+            slot: slice.id(),
             required_words,
             actual_words: slice.len_words(),
         });
     }
     if (slice.as_u32_ptr() as usize) % (alignment_words * WORD_BYTES) != 0 {
         return Err(PreparedCommitError::MisalignedSlot {
-            slot: id,
+            slot: slice.id(),
             alignment_words,
         });
     }
-    Ok(slice)
+    Ok(slice.truncated(required_words))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bound_slots_truncate_pooled_surplus_to_the_logical_requirement() {
+        // Pooled physical slots are sized to the LARGEST epoch-disjoint
+        // sharer; the binder must expose only the logical extent so
+        // END-relative twiddle bases and layer extents never see the surplus.
+        let oversized = ArenaSlice::dangling_for_test(1, 1024);
+        let bound = truncate_bound_slot(oversized, 384, 1).unwrap();
+        assert_eq!(bound.len_words(), 384);
+        assert_eq!(bound.id(), oversized.id());
+        assert_eq!(bound.as_u32_ptr(), oversized.as_u32_ptr());
+        // Undersized slots still fail closed.
+        assert!(matches!(
+            truncate_bound_slot(ArenaSlice::dangling_for_test(1, 128), 384, 1),
+            Err(PreparedCommitError::SlotTooSmall { .. })
+        ));
+    }
 
     fn config(blowup: u32) -> CommitWorkspaceConfig {
         CommitWorkspaceConfig {

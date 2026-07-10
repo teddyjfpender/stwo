@@ -2546,6 +2546,31 @@ pub unsafe extern "C" fn stwo_witness_feed_counts_on(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_witness_feed_counts_privatized(
+    _sub_words_dev: *const u32,
+    _column_length: u32,
+    _descs_dev: *const u32,
+    _n_descs: u32,
+    _luts_dev: *const *const u32,
+    _counts_dev: *const *mut u32,
+) -> i32 {
+    no_cuda_symbol("stwo_witness_feed_counts_privatized")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_witness_feed_counts_privatized_on(
+    _sub_words_dev: *const u32,
+    _column_length: u32,
+    _descs_dev: *const u32,
+    _n_descs: u32,
+    _luts_dev: *const *const u32,
+    _counts_dev: *const *mut u32,
+    _stream: *mut c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_witness_feed_counts_privatized_on")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stwo_witness_feed_clear_on(
     _destinations_dev: *const *mut u32,
     _lengths_dev: *const u32,
