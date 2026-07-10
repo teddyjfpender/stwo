@@ -328,7 +328,8 @@ fn eager_and_capture_match() {
         let second_inner_root = prepared.read_tree_root(2).unwrap();
         assert_eq!(
             second_inner_root,
-            reference_first_tree_root(&second_inner, requirements.trees[2].evaluation_log_size)
+            reference_first_tree_root(&second_inner, requirements.trees[2].evaluation_log_size),
+            "mode {mode:?}: tree-2 root disagrees with the reference root of its OWN              (already equality-checked) evaluation"
         );
         let final_evaluation = read_evaluation(&arena, prepared.final_evaluation());
         assert_eq!(
