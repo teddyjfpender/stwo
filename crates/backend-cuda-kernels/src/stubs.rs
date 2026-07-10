@@ -1272,6 +1272,16 @@ pub unsafe extern "C" fn stwo_blake2s_layer_on(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_blake2s_interior4_on(
+    _previous_layer: *const Blake2sHash,
+    _output_size: u32,
+    _result: *mut Blake2sHash,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_blake2s_interior4_on")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stwo_blake2s_fri_leaf_on(
     _evaluation_size: u32,
     _coordinate_columns: *const *mut u32,
@@ -2747,4 +2757,43 @@ pub unsafe extern "C" fn stwo_relation_scan_tail_on(
     _stream: *mut c_void,
 ) -> i32 {
     no_cuda_symbol("stwo_relation_scan_tail_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_fri_fold_fused3_on(
+    _gpu_domain: *const u32,
+    _twiddle_offset_0: u32,
+    _twiddle_offset_1: u32,
+    _twiddle_offset_2: u32,
+    _n: u32,
+    _first_fold_is_circle: u32,
+    _eval_values: *const *mut u32,
+    _alpha: *const CudaSecureField,
+    _folded_values: *const *mut u32,
+    _stream: *mut c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_fri_fold_fused3_on")
+}
+
+// --- ntt_leaf_fused ---
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_ntt_leaf_fused_configure(_log_n: u32) -> i32 {
+    no_cuda_symbol("stwo_ntt_leaf_fused_configure")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_ntt_leaf_fused_on(
+    _coefficient_values: *const *const u32,
+    _coefficient_sizes: *const u32,
+    _device_values: *const *mut u32,
+    _log_n: u32,
+    _g_twiddles: *mut u32,
+    _twiddles_size: u32,
+    _eval_domain_size: u32,
+    _cols_done: u32,
+    _is_final: u32,
+    _states: *mut Blake2sHash,
+    _stream: *mut c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_ntt_leaf_fused_on")
 }

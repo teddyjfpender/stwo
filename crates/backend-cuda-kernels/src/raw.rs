@@ -546,6 +546,18 @@ extern "C" {
         result: *mut Blake2sHash,
         stream: *mut core::ffi::c_void,
     ) -> i32;
+    /// Four column-free interior Merkle levels in ONE launch (Step 3.2 fused
+    /// interior lane, opt-in via `STWO_CUDA_BLAKE2S_INTERIOR_FUSED=1`).
+    /// `previous_layer` holds `16 * output_size` child digests; `result[i]` is
+    /// the level-4 ancestor of children `16i..16i+16`. Intermediate levels stay
+    /// in shared memory and are never written to global. Byte-identical to four
+    /// sequential `stwo_blake2s_layer_on` launches; buffers must not alias.
+    pub fn stwo_blake2s_interior4_on(
+        previous_layer: *const Blake2sHash,
+        output_size: u32,
+        result: *mut Blake2sHash,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
     /// Hash four QM31 coordinate columns in the exact unpacked/packed FRI leaf
     /// byte order without materializing packed columns.
     pub fn stwo_blake2s_fri_leaf_on(
@@ -2019,6 +2031,48 @@ extern "C" {
         total_row_blocks: u32,
         partition_descriptors: *mut u32,
         descriptor_capacity_words: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    // Fused FRI triple fold (Step 3.4, `fri_fold_fused.cu`): one 8-to-1 kernel
+    // replacing the three per-fold launches of a full `fold_step == 3` round.
+    // Byte-identical to that sequence; see the kernel-file comment.
+    pub fn stwo_fri_fold_fused3_on(
+        gpu_domain: *const u32,
+        twiddle_offset_0: u32,
+        twiddle_offset_1: u32,
+        twiddle_offset_2: u32,
+        n: u32,
+        first_fold_is_circle: u32,
+        eval_values: *const *mut u32,
+        alpha: *const CudaSecureField,
+        folded_values: *const *mut u32,
+        stream: *mut c_void,
+    ) -> i32;
+}
+
+// --- ntt_leaf_fused ---
+#[cfg_attr(stwo_cuda_link, link(name = "stwo_cuda_kernels", kind = "static"))]
+extern "C" {
+    /// Setup-time dynamic-shared-memory admission for the retained
+    /// write+hash final N2B kernel selected by `log_n` (`ntt_leaf_fused.cu`).
+    pub fn stwo_ntt_leaf_fused_configure(log_n: u32) -> i32;
+
+    /// Retained twin of [`stwo_lde_n2b_hash16_on`]: stage and transform 16
+    /// same-log full-lifting columns, WRITE the completed evaluations into
+    /// `device_values` (kept resident for decommitment) AND absorb the same
+    /// final tile into the leaf states — zero evaluation re-read for hashing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stwo_ntt_leaf_fused_on(
+        coefficient_values: *const *const u32,
+        coefficient_sizes: *const u32,
+        device_values: *const *mut u32,
+        log_n: u32,
+        g_twiddles: *mut u32,
+        twiddles_size: u32,
+        eval_domain_size: u32,
+        cols_done: u32,
+        is_final: u32,
+        states: *mut Blake2sHash,
         stream: *mut c_void,
     ) -> i32;
 }

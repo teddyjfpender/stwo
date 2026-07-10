@@ -64,6 +64,14 @@
     "semantic_hash": "f53805dad6e749bb"
   },
   {
+    "cache_key": "19a10da57467ba9d",
+    "file": "constraint_bitwise_builtin_19a10da57467ba9d.cu",
+    "kernel_name": "stwo_jit_fused_4b561009970da257",
+    "kind": "constraint",
+    "label": "bitwise_builtin",
+    "semantic_hash": "4b561009970da257"
+  },
+  {
     "cache_key": "771e656763c988ae",
     "file": "constraint_bitwise_builtin_771e656763c988ae.cu",
     "kernel_name": "stwo_jit_fused_ea76bd5c18398a70",
@@ -160,6 +168,14 @@
     "semantic_hash": "236ecb1645901ac0"
   },
   {
+    "cache_key": "5a3417c81866daa3",
+    "file": "constraint_ec_op_builtin_5a3417c81866daa3.cu",
+    "kernel_name": "stwo_jit_fused_87d0117207915942",
+    "kind": "constraint",
+    "label": "ec_op_builtin",
+    "semantic_hash": "87d0117207915942"
+  },
+  {
     "cache_key": "95e6fd5319657332",
     "file": "constraint_ec_op_builtin_95e6fd5319657332.cu",
     "kernel_name": "stwo_jit_fused_890c638e65e67a2f",
@@ -174,6 +190,14 @@
     "kind": "constraint",
     "label": "ec_op_builtin",
     "semantic_hash": "834630a310a49f2a"
+  },
+  {
+    "cache_key": "ffaab9e210692a14",
+    "file": "constraint_ec_op_builtin_ffaab9e210692a14.cu",
+    "kernel_name": "stwo_jit_fused_df9c6a0cee30d01f",
+    "kind": "constraint",
+    "label": "ec_op_builtin",
+    "semantic_hash": "df9c6a0cee30d01f"
   },
   {
     "cache_key": "0945017b05951c65",
@@ -246,6 +270,14 @@
     "kind": "constraint",
     "label": "jump_opcode_rel_imm",
     "semantic_hash": "f22e7da0de2896b6"
+  },
+  {
+    "cache_key": "25be520aa9de408d",
+    "file": "constraint_memory_address_to_id_25be520aa9de408d.cu",
+    "kernel_name": "stwo_jit_fused_2935f225c67ee1d9",
+    "kind": "constraint",
+    "label": "memory_address_to_id",
+    "semantic_hash": "2935f225c67ee1d9"
   },
   {
     "cache_key": "530df25df37fe4bc",
@@ -576,6 +608,14 @@
     "semantic_hash": "1e38bd6ed2067594"
   },
   {
+    "cache_key": "896864742b9d7f54",
+    "file": "constraint_pedersen_builtin_896864742b9d7f54.cu",
+    "kernel_name": "stwo_jit_fused_6a28ac80d1faacad",
+    "kind": "constraint",
+    "label": "pedersen_builtin",
+    "semantic_hash": "6a28ac80d1faacad"
+  },
+  {
     "cache_key": "fc9f5ea723c57dda",
     "file": "constraint_pedersen_builtin_narrow_windows_fc9f5ea723c57dda.cu",
     "kernel_name": "stwo_jit_fused_712d95c40ff90b40",
@@ -630,6 +670,22 @@
     "kind": "constraint",
     "label": "poseidon_aggregator",
     "semantic_hash": "551eb18f22f5a3b6"
+  },
+  {
+    "cache_key": "6e825b570de4e032",
+    "file": "constraint_poseidon_builtin_6e825b570de4e032.cu",
+    "kernel_name": "stwo_jit_fused_be86d027dbdb6203",
+    "kind": "constraint",
+    "label": "poseidon_builtin",
+    "semantic_hash": "be86d027dbdb6203"
+  },
+  {
+    "cache_key": "8b917956b12ccddf",
+    "file": "constraint_poseidon_builtin_8b917956b12ccddf.cu",
+    "kernel_name": "stwo_jit_fused_82d7753e767b2a7e",
+    "kind": "constraint",
+    "label": "poseidon_builtin",
+    "semantic_hash": "82d7753e767b2a7e"
   },
   {
     "cache_key": "fe97609d7f261043",
@@ -750,6 +806,14 @@
     "kind": "constraint",
     "label": "range_check_builtin",
     "semantic_hash": "af9e2263fe20c1af"
+  },
+  {
+    "cache_key": "6c249ca7a2331b34",
+    "file": "constraint_range_check_builtin_6c249ca7a2331b34.cu",
+    "kernel_name": "stwo_jit_fused_a7d48d63680c85d8",
+    "kind": "constraint",
+    "label": "range_check_builtin",
+    "semantic_hash": "a7d48d63680c85d8"
   },
   {
     "cache_key": "d0ccc83517704466",

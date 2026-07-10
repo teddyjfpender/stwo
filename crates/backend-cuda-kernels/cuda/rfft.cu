@@ -1581,3 +1581,71 @@ extern "C" int stwo_lde_n2b_hash16_on(
         twiddle_words, eval_domain_size, cols_done, is_final, states,
         cuda_stream);
 }
+
+// --- ntt_leaf_fused support (Step 3.1) --------------------------------------
+// Additive export: staging + the NOFINAL prefix of the hash16 lane, so
+// cuda/ntt_leaf_fused.cu can attach its write+hash final-stage kernel. This
+// runs exactly the launches ntt_n2b_hash16_dispatch_on performs before its
+// final kernel (same static launchers, same LAUNCH_N2B_CONFIG rows, same
+// order), so the prefinal buffer state is byte-identical to both existing
+// lanes' intermediate state. No existing entry point changes behavior.
+extern "C" int stwo_lde_n2b_prefinal16_on(
+    const uint32_t *const *coefficient_values,
+    const uint32_t *coefficient_sizes,
+    uint32_t **device_values,
+    unsigned log_n,
+    uint32_t *twiddles,
+    unsigned twiddle_words,
+    unsigned eval_domain_size,
+    void *stream
+) {
+    if (coefficient_values == nullptr || coefficient_sizes == nullptr ||
+        device_values == nullptr || log_n < 13 || log_n > 30 ||
+        twiddles == nullptr || eval_domain_size != (1u << (log_n - 1)) ||
+        eval_domain_size > twiddle_words || stream == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+
+    cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    constexpr unsigned block_size = 256;
+    const unsigned output_size = 2 * eval_domain_size;
+    const unsigned grid_x = (output_size + block_size - 1) / block_size;
+    stage_lde_columns<<<dim3(grid_x, 16), block_size, 0, cuda_stream>>>(
+        coefficient_values, coefficient_sizes, device_values, eval_domain_size);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) return err;
+
+    m31 **values = reinterpret_cast<m31 **>(device_values);
+    auto nofinal = [&](unsigned stages, unsigned start_stage) -> cudaError_t {
+        switch (stages) {
+            case 6:
+                return ntt_n2b_nofinal_6_stage_batch_on(
+                    values, values, log_n, 16, start_stage, twiddles,
+                    twiddle_words, eval_domain_size, cuda_stream);
+            case 8:
+                return ntt_n2b_nofinal_8_stage_batch_on(
+                    values, values, log_n, 16, start_stage, twiddles,
+                    twiddle_words, eval_domain_size, cuda_stream);
+            default:
+                return cudaErrorInvalidConfiguration;
+        }
+    };
+
+    if (log_n <= 19) {
+        const auto &config = LAUNCH_N2B_CONFIG_13_19[log_n - 13];
+        return nofinal(config[0], 1);
+    }
+    if (log_n <= 27) {
+        const auto &config = LAUNCH_N2B_CONFIG_20_27[log_n - 20];
+        cudaError_t status = nofinal(config[0], 1);
+        return status == cudaSuccess ? nofinal(config[1], 1 + config[0]) : status;
+    }
+    const auto &config = LAUNCH_N2B_CONFIG_28_30[log_n - 28];
+    cudaError_t status = nofinal(config[0], 1);
+    if (status == cudaSuccess) {
+        status = nofinal(config[1], 1 + config[0]);
+    }
+    return status == cudaSuccess
+        ? nofinal(config[2], 1 + config[0] + config[1])
+        : status;
+}

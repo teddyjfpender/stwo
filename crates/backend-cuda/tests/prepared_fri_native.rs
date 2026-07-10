@@ -11,8 +11,9 @@ use stwo::core::vcs::blake2_hash::{Blake2sHash, Blake2sHasherGeneric};
 use stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
 use stwo_backend_cuda::{
     fri_workspace_requirements, ArenaLayout, ArenaSlotId, ArenaSlotSpec, CudaExecContext,
-    DeviceArena, FriArenaSlotRequirement, FriMerkleTreeSlots, FriWorkspaceConfig,
-    FriWorkspaceRequirements, FriWorkspaceSlots, PreparedFriEvaluation, PreparedFriGraph,
+    DeviceArena, FriArenaSlotRequirement, FriFoldLaunchMode, FriMerkleTreeSlots,
+    FriWorkspaceConfig, FriWorkspaceRequirements, FriWorkspaceSlots, PreparedFriEvaluation,
+    PreparedFriGraph,
 };
 
 const INPUT: ArenaSlotId = ArenaSlotId(50_000);
@@ -107,6 +108,7 @@ fn reference_fold_round(
     twiddles: &[u32],
     fold_step: u32,
     mut alpha: SecureField,
+    first_fold_is_circle: bool,
 ) -> Vec<u32> {
     let input_stride = 1usize << input_log_size;
     let mut values: Vec<SecureField> = (0..input_stride)
@@ -118,15 +120,16 @@ fn reference_fold_round(
         .collect();
     let twiddle_words = twiddles.len();
     for fold_index in 0..fold_step {
+        let circle_fold = first_fold_is_circle && fold_index == 0;
         let output_len = values.len() / 2;
-        let twiddle_offset = if fold_index == 0 {
+        let twiddle_offset = if circle_fold {
             twiddle_words - output_len
         } else {
             twiddle_words - values.len()
         };
         let next = (0..output_len)
             .map(|index| {
-                let x_inverse = if fold_index == 0 {
+                let x_inverse = if circle_fold {
                     let k = index >> 2;
                     match index & 3 {
                         0 => BaseField::from_u32_unchecked(twiddles[twiddle_offset + 2 * k + 1]),
@@ -244,64 +247,110 @@ fn eager_and_capture_match() {
     drop(tree_graph);
 
     let alpha = SecureField::from_u32_unchecked(1, 3, 5, 7);
-    prepared
-        .upload_round_challenge_at_transcript_boundary(0, alpha)
-        .unwrap();
-    arena.context().reset_telemetry();
-    prepared.launch_round(0).unwrap();
-    arena.context().sync().unwrap();
-    assert_eq!(
-        arena.context().telemetry().d2d_bytes,
-        (requirements.trees[1].evaluation_words * core::mem::size_of::<u32>()) as u64
-    );
-    let eager_inner = read_evaluation(&arena, prepared.tree_evaluation(1).unwrap());
-    assert_eq!(
-        eager_inner,
-        reference_fold_round(
-            &host_input,
-            config.circle_log_size,
-            &host_twiddles,
-            config.fri.fold_step,
-            alpha,
-        )
-    );
-    let eager_inner_root = prepared.read_tree_root(1).unwrap();
-    assert_eq!(
-        eager_inner_root,
-        reference_first_tree_root(&eager_inner, requirements.trees[1].evaluation_log_size)
-    );
-
-    arena.context().reset_telemetry();
-    let capture = arena.context().capture().unwrap();
-    prepared.launch_round(0).unwrap();
-    assert_eq!(
-        arena.context().telemetry().d2d_bytes,
-        (requirements.trees[1].evaluation_words * core::mem::size_of::<u32>()) as u64
-    );
-    let fold_graph = capture.finish().unwrap();
-    arena.context().reset_telemetry();
-    fold_graph.launch(arena.context()).unwrap();
-    let captured_inner = read_evaluation(&arena, prepared.tree_evaluation(1).unwrap());
-    assert_eq!(eager_inner, captured_inner);
-    assert_eq!(eager_inner_root, prepared.read_tree_root(1).unwrap());
-    let replay = arena.context().telemetry();
-    assert_eq!(replay.graph_launches, 1);
-    assert_eq!(
-        replay.kernel_launches,
-        u64::from(requirements.rounds[0].fold_step)
-            + requirements.trees[1].layers_bottom_up.len() as u64,
-        "retaining an inner codeword must add memcpy nodes, not kernel nodes"
-    );
-
-    for round_index in 1..prepared.round_count() {
+    for round_index in 0..prepared.round_count() {
         prepared
             .upload_round_challenge_at_transcript_boundary(round_index, alpha)
             .unwrap();
-        prepared.launch_round(round_index).unwrap();
+    }
+
+    // Host reference chain over every round: round 0 starts with the
+    // circle-to-line fold, later rounds are line folds only, and the final
+    // round is the partial `fold_step == 1` fold.
+    let mut reference_rounds: Vec<Vec<u32>> = Vec::new();
+    let mut reference_input = host_input.clone();
+    let mut reference_log_size = config.circle_log_size;
+    for (round_index, round) in requirements.rounds.iter().enumerate() {
+        reference_input = reference_fold_round(
+            &reference_input,
+            reference_log_size,
+            &host_twiddles,
+            round.fold_step,
+            alpha,
+            round_index == 0,
+        );
+        reference_log_size = round.output_log_size;
+        reference_rounds.push(reference_input.clone());
+    }
+
+    // Both fold lanes run in one invocation. `PerFold` is the proven baseline
+    // (three fold kernels per complete round); `FusedTriple` must produce
+    // byte-identical snapshots, roots and final evaluation with ONE 8-to-1
+    // kernel per complete round. The final partial round (fold_step == 1)
+    // exercises the fused lane's fail-closed fallback to the per-fold kernel.
+    let mut per_mode_results = Vec::new();
+    for (mode, fold_kernels_per_triple_round) in [
+        (FriFoldLaunchMode::PerFold, 3u64),
+        (FriFoldLaunchMode::FusedTriple, 1u64),
+    ] {
+        arena.context().reset_telemetry();
+        prepared.launch_round_with_mode(0, mode).unwrap();
+        arena.context().sync().unwrap();
+        assert_eq!(
+            arena.context().telemetry().d2d_bytes,
+            (requirements.trees[1].evaluation_words * core::mem::size_of::<u32>()) as u64
+        );
+        let eager_inner = read_evaluation(&arena, prepared.tree_evaluation(1).unwrap());
+        assert_eq!(eager_inner, reference_rounds[0], "mode {mode:?}");
+        let eager_inner_root = prepared.read_tree_root(1).unwrap();
+        assert_eq!(
+            eager_inner_root,
+            reference_first_tree_root(&eager_inner, requirements.trees[1].evaluation_log_size)
+        );
+
+        arena.context().reset_telemetry();
+        let capture = arena.context().capture().unwrap();
+        prepared.launch_round_with_mode(0, mode).unwrap();
+        assert_eq!(
+            arena.context().telemetry().d2d_bytes,
+            (requirements.trees[1].evaluation_words * core::mem::size_of::<u32>()) as u64
+        );
+        let fold_graph = capture.finish().unwrap();
+        arena.context().reset_telemetry();
+        fold_graph.launch(arena.context()).unwrap();
+        let captured_inner = read_evaluation(&arena, prepared.tree_evaluation(1).unwrap());
+        assert_eq!(eager_inner, captured_inner, "mode {mode:?}");
+        assert_eq!(eager_inner_root, prepared.read_tree_root(1).unwrap());
+        let replay = arena.context().telemetry();
+        assert_eq!(replay.graph_launches, 1);
+        assert_eq!(
+            replay.kernel_launches,
+            fold_kernels_per_triple_round + requirements.trees[1].layers_bottom_up.len() as u64,
+            "mode {mode:?}: retaining an inner codeword must add memcpy nodes, \
+             not kernel nodes, and the fused lane must fold as ONE kernel"
+        );
+        drop(fold_graph);
+
+        for round_index in 1..prepared.round_count() {
+            prepared.launch_round_with_mode(round_index, mode).unwrap();
+        }
+        let second_inner = read_evaluation(&arena, prepared.tree_evaluation(2).unwrap());
+        assert_eq!(second_inner, reference_rounds[1], "mode {mode:?}");
+        let second_inner_root = prepared.read_tree_root(2).unwrap();
+        assert_eq!(
+            second_inner_root,
+            reference_first_tree_root(&second_inner, requirements.trees[2].evaluation_log_size)
+        );
+        let final_evaluation = read_evaluation(&arena, prepared.final_evaluation());
+        assert_eq!(
+            final_evaluation,
+            *reference_rounds.last().unwrap(),
+            "mode {mode:?}: the partial final round must match the reference"
+        );
+        assert_eq!(
+            eager_inner,
+            read_evaluation(&arena, prepared.tree_evaluation(1).unwrap()),
+            "later ping/pong folds overwrote a committed FRI tree snapshot"
+        );
+        per_mode_results.push((
+            eager_inner,
+            eager_inner_root,
+            second_inner,
+            second_inner_root,
+            final_evaluation,
+        ));
     }
     assert_eq!(
-        eager_inner,
-        read_evaluation(&arena, prepared.tree_evaluation(1).unwrap()),
-        "later ping/pong folds overwrote a committed FRI tree snapshot"
+        per_mode_results[0], per_mode_results[1],
+        "fused triple folds must be byte-identical to the per-fold lane"
     );
 }

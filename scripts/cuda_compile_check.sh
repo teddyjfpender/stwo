@@ -20,14 +20,16 @@
 #   CUDA_IMAGE  container image (default nvidia/cuda:11.8.0-devel-ubuntu22.04,
 #               matching the H100 pod)
 #   CUDA_ARCH   -arch value for the fast mode (default sm_90)
-#   JOBS        parallel nvcc processes (default 4; emulation is CPU-bound)
+#   JOBS        parallel nvcc processes (default 2: emulated cicc segfaults
+#               spuriously under heavier parallelism — retry a FAIL solo before
+#               trusting it)
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 IMAGE="${CUDA_IMAGE:-nvidia/cuda:11.8.0-devel-ubuntu22.04}"
 ARCH="${CUDA_ARCH:-sm_90}"
-JOBS="${JOBS:-4}"
+JOBS="${JOBS:-2}"
 KERNELS_DIR="crates/backend-cuda-kernels"
 
 MODE="changed"

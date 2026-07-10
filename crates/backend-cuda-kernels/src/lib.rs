@@ -52,6 +52,12 @@ mod tests {
     }
 
     #[test]
+    fn ntt_leaf_fused_symbols_are_linked_in_cuda_and_stub_builds() {
+        assert_ne!(raw::stwo_ntt_leaf_fused_configure as usize, 0);
+        assert_ne!(raw::stwo_ntt_leaf_fused_on as usize, 0);
+    }
+
+    #[test]
     fn prepared_oods_symbols_are_linked_in_cuda_and_stub_builds() {
         assert_ne!(raw::stwo_oods_derive_points_on as usize, 0);
         assert_ne!(raw::stwo_oods_eval_first_on as usize, 0);

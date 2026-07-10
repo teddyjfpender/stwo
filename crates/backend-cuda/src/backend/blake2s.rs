@@ -69,6 +69,41 @@ pub(crate) fn leaf_ilp2_grid_blocks(rows: u32) -> u32 {
     leaf_ilp2_row_pairs(rows).div_ceil(CUDA_BLAKE2S_BLOCK_SIZE)
 }
 
+/// `STWO_CUDA_BLAKE2S_INTERIOR_FUSED=1`: opt-in FOUR-level interior Merkle
+/// fusion (Step 3.2 second half). Where four consecutive column-free interior
+/// levels have all three intermediate levels UNRETAINED (prune-depth scratch),
+/// one `stwo_blake2s_interior4_on` launch replaces four per-level launches;
+/// the intermediates live in shared memory and never round-trip HBM.
+/// Byte-identical output level by construction (same
+/// `blake2s_hash_children_device` routine, same parent[i] = H(child[2i],
+/// child[2i+1]) mapping per level — locked by `interior4_spec_tests` below).
+/// Default OFF until the pod gate (interior >= 400 GB/s, parity run) passes.
+/// Read once per process (OnceLock), so eager launches and graph capture
+/// always plan the same topology.
+///
+/// Consumed by `commit_graph.rs` planning (the prepared/resident commit
+/// island, which serves both eager and captured execution). The legacy trait
+/// path in this file (`build_next_layer`) is driven one level at a time by
+/// `tree_from_leaves` and must return every level to its caller, so it stays
+/// per-level regardless of the flag.
+pub(crate) fn blake2s_interior_fused_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("STWO_CUDA_BLAKE2S_INTERIOR_FUSED").as_deref() == Ok("1"))
+}
+
+/// Outputs produced per block by the interior4 kernel (256 threads / 8).
+/// Spec-lock mirror (test-only on the Rust side — the grid is computed in the
+/// .cu launcher); kept in LOCKSTEP with `STWO_INTERIOR4_OUT_PER_BLOCK`.
+#[cfg(test)]
+pub(crate) const CUDA_BLAKE2S_INTERIOR4_OUT_PER_BLOCK: u32 = CUDA_BLAKE2S_BLOCK_SIZE / 8;
+
+/// Interior4 grid math, kept in LOCKSTEP with `number_of_interior4_blocks_for`
+/// in `blake2s.cu`: one block per 32 output hashes.
+#[cfg(test)]
+pub(crate) fn interior4_grid_blocks(out_size: u32) -> u32 {
+    out_size.div_ceil(CUDA_BLAKE2S_INTERIOR4_OUT_PER_BLOCK)
+}
+
 /// Keep the historical low-VRAM policy on CUDA by default. Set
 /// `STWO_CUDA_MERKLE_PRUNE_DEPTH=1` to experimentally retain the bottom three
 /// interior layers and trade additional VRAM for less host-side recomputation.
@@ -1264,5 +1299,107 @@ mod layer_pair_spec_tests {
         let perturbed = layer_pair_fused(&prev);
         assert_ne!(base[0], perturbed[0], "out[0] must depend on child 3");
         assert_eq!(base[1], perturbed[1], "out[1] must not depend on child 3");
+    }
+}
+
+/// Host-only spec gate for the Step 3.2 FOUR-level interior fusion kernel
+/// (`blake2s_interior4_kernel` / `stwo_blake2s_interior4_on`): for output `i`
+/// the kernel computes the level-4 ancestor of children `16i..16i+16` with
+/// parent[j] = H(child[2j], child[2j+1]) at every local level. This proves the
+/// composition is **byte-identical to four sequential single-level passes**
+/// using the CPU reference hasher only (no device, runs anywhere). Also locks
+/// the Rust mirror of the kernel's grid math.
+#[cfg(test)]
+mod interior4_spec_tests {
+    use stwo::core::vcs::blake2_hash::Blake2sHash;
+    use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleHasherGeneric;
+    use stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
+
+    use super::{interior4_grid_blocks, CUDA_BLAKE2S_INTERIOR4_OUT_PER_BLOCK};
+
+    type H = Blake2sMerkleHasherGeneric<false>;
+
+    /// One reference tree level: `out[j] = hash_children(prev[2j], prev[2j+1])`.
+    fn single_layer(prev: &[Blake2sHash]) -> Vec<Blake2sHash> {
+        assert!(prev.len().is_multiple_of(2));
+        (0..prev.len() / 2)
+            .map(|j| H::hash_children((prev[2 * j], prev[2 * j + 1])))
+            .collect()
+    }
+
+    /// What the fused four-level kernel computes: the level-4 ancestor of each
+    /// aligned 16-child window, all intermediates local.
+    fn interior4_fused(prev: &[Blake2sHash]) -> Vec<Blake2sHash> {
+        assert!(prev.len().is_multiple_of(16));
+        (0..prev.len() / 16)
+            .map(|i| {
+                let window = &prev[16 * i..16 * i + 16];
+                let l1 = single_layer(window);
+                let l2 = single_layer(&l1);
+                let l3 = single_layer(&l2);
+                H::hash_children((l3[0], l3[1]))
+            })
+            .collect()
+    }
+
+    fn sample_hashes(n: usize) -> Vec<Blake2sHash> {
+        (0..n)
+            .map(|k| {
+                let mut bytes = [0u8; 32];
+                for (b, slot) in bytes.iter_mut().enumerate() {
+                    *slot = ((k * 37 + b * 11 + 3) % 251) as u8;
+                }
+                Blake2sHash(bytes)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn interior4_matches_four_single_layers() {
+        for &outputs in &[1usize, 2, 3, 32, 33, 64] {
+            let prev = sample_hashes(16 * outputs);
+            let fused = interior4_fused(&prev);
+            let four_pass = single_layer(&single_layer(&single_layer(&single_layer(&prev))));
+            assert_eq!(fused.len(), outputs, "output arity for {outputs} outputs");
+            assert_eq!(
+                fused, four_pass,
+                "interior4 fusion diverged from four single-level passes at \
+                 {outputs} outputs"
+            );
+        }
+    }
+
+    #[test]
+    fn output_consumes_its_sixteen_children_only() {
+        // Perturbing child 16i+15 must change out[i] and leave out[i+1]
+        // untouched — confirms the aligned 16-consecutive-children window
+        // mapping the kernel uses.
+        let mut prev = sample_hashes(32); // two outputs
+        let base = interior4_fused(&prev);
+        prev[15].0[0] ^= 0xFF; // perturb the last child of output 0
+        let perturbed = interior4_fused(&prev);
+        assert_ne!(base[0], perturbed[0], "out[0] must depend on child 15");
+        assert_eq!(base[1], perturbed[1], "out[1] must not depend on child 15");
+    }
+
+    #[test]
+    fn interior4_grid_blocks_are_tight() {
+        assert_eq!(CUDA_BLAKE2S_INTERIOR4_OUT_PER_BLOCK, 32);
+        for out_size in [1u32, 2, 31, 32, 33, 512, 1 << 20] {
+            let blocks = interior4_grid_blocks(out_size);
+            // Cover all outputs, with no fully idle trailing block.
+            assert!(
+                blocks * CUDA_BLAKE2S_INTERIOR4_OUT_PER_BLOCK >= out_size,
+                "out_size={out_size}"
+            );
+            assert!(
+                (blocks - 1) * CUDA_BLAKE2S_INTERIOR4_OUT_PER_BLOCK < out_size,
+                "out_size={out_size}: last block must not be empty"
+            );
+        }
+        // Power-of-two production shapes divide exactly.
+        for log in [5u32, 9, 21] {
+            assert_eq!(interior4_grid_blocks(1 << log), 1 << (log - 5), "log={log}");
+        }
     }
 }

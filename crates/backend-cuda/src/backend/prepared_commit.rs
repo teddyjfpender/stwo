@@ -12,7 +12,7 @@ use stwo::core::vcs::blake2_hash::Blake2sHash;
 
 use super::commit_graph::{
     CommitGraphError, CommitGraphPlan, CommitHashFromTileTelemetry, CommitLaunchKind,
-    CommitLdeBatch, CommitLeafGroup, CommitTailPlan,
+    CommitLdeBatch, CommitLeafGroup, CommitTailPlan, RetainedLdeHashMode,
 };
 use super::exec_context::{
     check_cuda, ArenaError, ArenaSlice, ArenaSlotId, CudaRuntimeError, DeviceArena,
@@ -562,7 +562,16 @@ impl<'a> PreparedCommitGraph<'a> {
         twiddles: ArenaSlice,
         slots: &CommitWorkspaceSlots,
     ) -> Result<Self, PreparedCommitError> {
-        Self::prepare_inner(arena, config, groups, twiddles, slots, None)
+        Self::prepare_inner(
+            arena,
+            config,
+            groups,
+            twiddles,
+            slots,
+            None,
+            super::blake2s::blake2s_interior_fused_enabled(),
+            RetainedLdeHashMode::from_env(),
+        )
     }
 
     /// Prepare a commitment with a deterministic per-group opening policy.
@@ -576,9 +585,74 @@ impl<'a> PreparedCommitGraph<'a> {
         slots: &CommitWorkspaceSlots,
         output_groups: &[Option<CommitEvaluationGroup>],
     ) -> Result<Self, PreparedCommitError> {
-        Self::prepare_inner(arena, config, groups, twiddles, slots, Some(output_groups))
+        Self::prepare_inner(
+            arena,
+            config,
+            groups,
+            twiddles,
+            slots,
+            Some(output_groups),
+            super::blake2s::blake2s_interior_fused_enabled(),
+            RetainedLdeHashMode::from_env(),
+        )
     }
 
+    /// [`Self::prepare_with_retained_evaluations`] with the Step 3.1 retained
+    /// LDE-write + leaf-absorb lane (`STWO_CUDA_NTT_LEAF_FUSED`) pinned
+    /// explicitly, so the native byte-identity test can exercise BOTH
+    /// retained commit topologies in one process (the env switch is a
+    /// process-global `OnceLock`). Workspace requirements and slot budgets
+    /// are identical in both modes; a fused-eligible retained group merely
+    /// swaps its `Lde` + leaf-hash launch pair for one `RetainedNttHash`
+    /// launch (see `CommitGraphPlan::new_pruned_with_modes`).
+    pub fn prepare_with_retained_evaluations_and_mode(
+        arena: &'a DeviceArena,
+        config: CommitWorkspaceConfig,
+        groups: &[CommitCoefficientGroup],
+        twiddles: ArenaSlice,
+        slots: &CommitWorkspaceSlots,
+        output_groups: &[Option<CommitEvaluationGroup>],
+        retained_lde_hash: RetainedLdeHashMode,
+    ) -> Result<Self, PreparedCommitError> {
+        Self::prepare_inner(
+            arena,
+            config,
+            groups,
+            twiddles,
+            slots,
+            Some(output_groups),
+            super::blake2s::blake2s_interior_fused_enabled(),
+            retained_lde_hash,
+        )
+    }
+
+    /// [`Self::prepare`] with the Step 3.2 interior four-level fusion lane
+    /// (`STWO_CUDA_BLAKE2S_INTERIOR_FUSED`) pinned explicitly, so the native
+    /// byte-identity test can exercise BOTH interior launch topologies in one
+    /// process (the env switch is a process-global `OnceLock`). Workspace
+    /// requirements and slot budgets are identical in both modes; only the
+    /// interior launch emission differs (see `CommitGraphPlan::new_pruned_impl`).
+    pub fn prepare_with_interior_mode(
+        arena: &'a DeviceArena,
+        config: CommitWorkspaceConfig,
+        groups: &[CommitCoefficientGroup],
+        twiddles: ArenaSlice,
+        slots: &CommitWorkspaceSlots,
+        interior_fused: bool,
+    ) -> Result<Self, PreparedCommitError> {
+        Self::prepare_inner(
+            arena,
+            config,
+            groups,
+            twiddles,
+            slots,
+            None,
+            interior_fused,
+            RetainedLdeHashMode::from_env(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn prepare_inner(
         arena: &'a DeviceArena,
         config: CommitWorkspaceConfig,
@@ -586,6 +660,8 @@ impl<'a> PreparedCommitGraph<'a> {
         twiddles: ArenaSlice,
         slots: &CommitWorkspaceSlots,
         output_groups: Option<&[Option<CommitEvaluationGroup>]>,
+        interior_fused: bool,
+        retained_lde_hash: RetainedLdeHashMode,
     ) -> Result<Self, PreparedCommitError> {
         let grouped_logs: Vec<Vec<u32>> = groups
             .iter()
@@ -884,13 +960,15 @@ impl<'a> PreparedCommitGraph<'a> {
             })
         };
 
-        let plan = CommitGraphPlan::new_pruned(
+        let plan = CommitGraphPlan::new_pruned_with_modes(
             config.lifting_log_size,
             config.unretained_bottom_layers,
             leaf_state,
             leaf_groups,
             interior_outputs,
             tail,
+            interior_fused,
+            retained_lde_hash,
         )?;
 
         // Dynamic shared-memory opt-in is a setup operation and therefore must
@@ -900,6 +978,11 @@ impl<'a> PreparedCommitGraph<'a> {
             let code =
                 unsafe { stwo_backend_cuda_kernels::raw::stwo_lde_n2b_hash16_configure(log_n) };
             check_cuda("commit_hash_from_tile_configure", code)?;
+        }
+        for &log_n in plan.retained_fused_log_sizes() {
+            let code =
+                unsafe { stwo_backend_cuda_kernels::raw::stwo_ntt_leaf_fused_configure(log_n) };
+            check_cuda("commit_ntt_leaf_fused_configure", code)?;
         }
 
         // All host descriptor storage remains alive until this one setup drain.

@@ -480,6 +480,46 @@ fn bind_slot(
     Ok(slice)
 }
 
+/// Selects which fold pipeline [`PreparedFriGraph::launch_round`] submits.
+/// Both modes produce byte-identical folded evaluations, retained snapshots
+/// and tree roots; `FusedTriple` is opt-in via `STWO_CUDA_FRI_FOLD_FUSED=1`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FriFoldLaunchMode {
+    /// One kernel per sub-fold plus the circle-fold destination memset
+    /// (default; the proven fallback).
+    PerFold,
+    /// One 8-to-1 kernel per complete `fold_step == 3` round: each thread
+    /// reads its eight source elements once and applies the three fold stages
+    /// in registers. Ineligible rounds — the final partial round whose
+    /// `fold_step < 3` — fail closed to the per-fold kernels.
+    FusedTriple,
+}
+
+/// Pure `STWO_CUDA_FRI_FOLD_FUSED` parse, unit-testable without an
+/// environment: only the literal `"1"` opts into the fused lane.
+fn fri_fold_fused_flag_from(raw: Option<&str>) -> bool {
+    raw == Some("1")
+}
+
+/// `STWO_CUDA_FRI_FOLD_FUSED=1` opts the default [`PreparedFriGraph::launch_round`]
+/// into the fused triple-fold lane. Read once per process so eager runs,
+/// capture and replay all observe one mode. Default OFF: the per-fold kernels
+/// stay the proven fallback.
+fn fri_fold_fused_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        fri_fold_fused_flag_from(std::env::var("STWO_CUDA_FRI_FOLD_FUSED").ok().as_deref())
+    })
+}
+
+fn fri_fold_mode_from_env() -> FriFoldLaunchMode {
+    if fri_fold_fused_enabled() {
+        FriFoldLaunchMode::FusedTriple
+    } else {
+        FriFoldLaunchMode::PerFold
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EvaluationBuffer {
     Input,
@@ -491,6 +531,25 @@ enum EvaluationBuffer {
 enum FoldKind {
     CircleToLine,
     Line,
+}
+
+/// Pure twiddle-offset math shared by the per-fold and fused launches: a line
+/// fold over `n` elements reads the `n/2` twiddles at `twiddle_words - n`; the
+/// circle fold reads its `n/2`-word tail directly at `twiddle_words - n/2`
+/// (its `get_circle_twiddle` indexing consumes the packed half-domain).
+fn fold_twiddle_offset(
+    twiddle_words: usize,
+    n: u32,
+    kind: FoldKind,
+) -> Result<u32, PreparedFriError> {
+    let consumed_words = match kind {
+        FoldKind::CircleToLine => (n >> 1) as usize,
+        FoldKind::Line => n as usize,
+    };
+    twiddle_words
+        .checked_sub(consumed_words)
+        .and_then(|offset| u32::try_from(offset).ok())
+        .ok_or(PreparedFriError::SizeOverflow)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -734,22 +793,15 @@ impl<'a> PreparedFriGraph<'a> {
                 };
                 let n = u32::try_from(pow2_words(log_size)?)
                     .map_err(|_| PreparedFriError::SizeOverflow)?;
-                let half_n = n >> 1;
-                let twiddle_offset = if round_index == 0 && fold_index == 0 {
-                    u32::try_from(requirements.twiddle_words - half_n as usize)
-                        .map_err(|_| PreparedFriError::SizeOverflow)?
+                let kind = if round_index == 0 && fold_index == 0 {
+                    FoldKind::CircleToLine
                 } else {
-                    u32::try_from(requirements.twiddle_words - n as usize)
-                        .map_err(|_| PreparedFriError::SizeOverflow)?
+                    FoldKind::Line
                 };
                 folds.push(FoldLaunch {
-                    kind: if round_index == 0 && fold_index == 0 {
-                        FoldKind::CircleToLine
-                    } else {
-                        FoldKind::Line
-                    },
+                    kind,
                     n,
-                    twiddle_offset,
+                    twiddle_offset: fold_twiddle_offset(requirements.twiddle_words, n, kind)?,
                     input: binding(current),
                     output: binding(next),
                     alpha_squarings: fold_index,
@@ -851,9 +903,26 @@ impl<'a> PreparedFriGraph<'a> {
 
     /// Execute exactly one challenge-bounded fold round from its stable device
     /// challenge slot and, unless it reached the final layer, commit its output
-    /// tree. No host value is captured into the graph executable.
+    /// tree. No host value is captured into the graph executable. The fold
+    /// pipeline defaults to the proven per-fold kernels;
+    /// `STWO_CUDA_FRI_FOLD_FUSED=1` (read once per process) opts into the fused
+    /// triple-fold lane. Both lanes produce byte-identical outputs.
     pub fn launch_round(&self, round_index: usize) -> Result<Option<usize>, PreparedFriError> {
-        self.launch_round_folds_only(round_index)?;
+        self.launch_round_with_mode(round_index, fri_fold_mode_from_env())
+    }
+
+    /// Explicit-mode variant of [`Self::launch_round`] used by the parity
+    /// tests to exercise both fold lanes in one process. The retained-snapshot
+    /// d2d and the tree commitment are identical in both modes: the fused lane
+    /// writes the round output to the same ping/pong destination the third
+    /// per-fold launch writes, so `preserve_tree_evaluation` snapshots the same
+    /// bytes — the value AFTER all three sub-folds of the round.
+    pub fn launch_round_with_mode(
+        &self,
+        round_index: usize,
+        mode: FriFoldLaunchMode,
+    ) -> Result<Option<usize>, PreparedFriError> {
+        self.launch_round_folds_only_with_mode(round_index, mode)?;
         let round = self
             .rounds
             .get(round_index)
@@ -869,10 +938,29 @@ impl<'a> PreparedFriGraph<'a> {
     /// [`Self::launch_round`] so committed inner outputs are retained for later
     /// decommitment; this lower-level entry remains useful for focused kernels.
     pub fn launch_round_folds_only(&self, round_index: usize) -> Result<(), PreparedFriError> {
+        self.launch_round_folds_only_with_mode(round_index, fri_fold_mode_from_env())
+    }
+
+    /// Explicit-mode variant of [`Self::launch_round_folds_only`]. In
+    /// [`FriFoldLaunchMode::FusedTriple`] a complete three-fold round runs as
+    /// one 8-to-1 kernel; any other geometry (the final partial round with
+    /// `fold_step < 3`) fails closed to the per-fold kernels.
+    pub fn launch_round_folds_only_with_mode(
+        &self,
+        round_index: usize,
+        mode: FriFoldLaunchMode,
+    ) -> Result<(), PreparedFriError> {
         let round = self
             .rounds
             .get(round_index)
             .ok_or(PreparedFriError::InvalidRoundIndex(round_index))?;
+        if mode == FriFoldLaunchMode::FusedTriple {
+            if let [first, second, third] = round.folds.as_slice() {
+                return self.launch_fused_triple(*first, *second, *third, round.folding_challenge);
+            }
+            // Fail closed: not a complete triple fold — run the exact
+            // per-fold sequence below.
+        }
         for launch in &round.folds {
             self.launch_fold(*launch, round.folding_challenge)?;
         }
@@ -1013,6 +1101,53 @@ impl<'a> PreparedFriGraph<'a> {
         Ok(())
     }
 
+    /// One 8-to-1 kernel replacing the three per-fold launches of a complete
+    /// `fold_step == 3` round (`fri_fold_fused.cu`). Byte identity with the
+    /// per-fold sequence is argued in the kernel file: per output element the
+    /// exact same field-op sequence runs on the same operands (the twiddle
+    /// offsets below are the three replaced launches' own values, and the
+    /// per-stage alphas are the identical repeated-squaring chain), and exact
+    /// modular arithmetic makes the regrouped evaluation bit-identical. The
+    /// per-fold lane's circle-fold destination memset is skipped: its only
+    /// effect is the zero accumulator input, which the kernel replicates in
+    /// registers, and no consumer reads the skipped scratch bytes (every
+    /// consumer reads exactly `2^log_size` live words per coordinate).
+    fn launch_fused_triple(
+        &self,
+        first: FoldLaunch,
+        second: FoldLaunch,
+        third: FoldLaunch,
+        folding_challenge: ArenaSlice,
+    ) -> Result<(), PreparedFriError> {
+        debug_assert_eq!(first.alpha_squarings, 0);
+        debug_assert_eq!(second.alpha_squarings, 1);
+        debug_assert_eq!(third.alpha_squarings, 2);
+        debug_assert_eq!(second.kind, FoldKind::Line);
+        debug_assert_eq!(third.kind, FoldKind::Line);
+        debug_assert_eq!(second.n, first.n >> 1);
+        debug_assert_eq!(third.n, first.n >> 2);
+        let alpha = folding_challenge
+            .as_u32_ptr()
+            .cast::<stwo_backend_cuda_kernels::raw::CudaSecureField>()
+            .cast_const();
+        let code = unsafe {
+            stwo_backend_cuda_kernels::raw::stwo_fri_fold_fused3_on(
+                self.twiddles.as_u32_ptr(),
+                first.twiddle_offset,
+                second.twiddle_offset,
+                third.twiddle_offset,
+                first.n,
+                u32::from(first.kind == FoldKind::CircleToLine),
+                first.input.coordinate_ptrs.as_u32_ptr().cast::<*mut u32>(),
+                alpha,
+                third.output.coordinate_ptrs.as_u32_ptr().cast::<*mut u32>(),
+                self.arena.context().stream_raw().as_ptr(),
+            )
+        };
+        check_cuda("prepared_fri_fold_fused3", code)?;
+        Ok(())
+    }
+
     fn preserve_tree_evaluation(
         &self,
         tree_index: usize,
@@ -1134,6 +1269,51 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn fused_flag_parses_only_literal_one() {
+        assert!(fri_fold_fused_flag_from(Some("1")));
+        assert!(!fri_fold_fused_flag_from(Some("0")));
+        assert!(!fri_fold_fused_flag_from(Some("true")));
+        assert!(!fri_fold_fused_flag_from(Some("")));
+        assert!(!fri_fold_fused_flag_from(None));
+    }
+
+    #[test]
+    fn fold_twiddle_offsets_match_per_stage_consumption() {
+        // Twiddle buffer of 2^8 words for a 2^9 circle domain. The circle fold
+        // consumes the packed n/2-word tail; a line fold over n elements reads
+        // its n/2 twiddles at `twiddle_words - n`.
+        assert_eq!(
+            fold_twiddle_offset(256, 512, FoldKind::CircleToLine).unwrap(),
+            0
+        );
+        assert_eq!(fold_twiddle_offset(256, 256, FoldKind::Line).unwrap(), 0);
+        assert_eq!(fold_twiddle_offset(256, 128, FoldKind::Line).unwrap(), 128);
+        assert_eq!(fold_twiddle_offset(256, 64, FoldKind::Line).unwrap(), 192);
+        // A domain larger than the twiddle buffer must fail closed instead of
+        // wrapping the offset.
+        assert_eq!(
+            fold_twiddle_offset(64, 256, FoldKind::Line).unwrap_err(),
+            PreparedFriError::SizeOverflow
+        );
+    }
+
+    #[test]
+    fn fused_eligibility_is_exactly_the_complete_triple_rounds() {
+        // fold_step = 3: 9 -> 6 -> 3 -> 2. The two complete rounds carry three
+        // sub-folds each (fused-eligible); the final partial round folds once
+        // and must fail closed to the per-fold kernels.
+        let requirements = fri_workspace_requirements(config(9, 3, 1)).unwrap();
+        assert_eq!(
+            requirements
+                .rounds
+                .iter()
+                .map(|round| round.fold_step)
+                .collect::<Vec<_>>(),
+            vec![3, 3, 1]
+        );
     }
 
     #[test]

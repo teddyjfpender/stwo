@@ -9,7 +9,7 @@ mod backend;
 pub use backend::aot;
 pub use backend::commit_graph::{
     CommitGraphError, CommitGraphPlan, CommitHashFromTileTelemetry, CommitLaunchKind,
-    CommitLdeBatch, CommitLeafGroup, CommitTailPlan,
+    CommitLdeBatch, CommitLeafGroup, CommitTailPlan, RetainedLdeHashMode,
 };
 pub use backend::decommit_gather::{
     column_row_gather_requirements, gather_column_rows_host, ColumnRowGatherError,
@@ -76,10 +76,11 @@ pub use backend::prepared_fixed_table::{
     FIXED_TABLE_POINTER_ALIGNMENT_WORDS,
 };
 pub use backend::prepared_fri::{
-    fri_workspace_requirements, FriArenaSlotRequirement, FriMerkleLayerRequirements,
-    FriMerkleTreeRequirements, FriMerkleTreeSlots, FriRoundRequirements, FriWorkspaceConfig,
-    FriWorkspaceRequirements, FriWorkspaceSlots, PreparedFriError, PreparedFriEvaluation,
-    PreparedFriGraph, FRI_CHALLENGE_WORDS, FRI_HASH_ALIGNMENT_WORDS, FRI_POINTER_ALIGNMENT_WORDS,
+    fri_workspace_requirements, FriArenaSlotRequirement, FriFoldLaunchMode,
+    FriMerkleLayerRequirements, FriMerkleTreeRequirements, FriMerkleTreeSlots,
+    FriRoundRequirements, FriWorkspaceConfig, FriWorkspaceRequirements, FriWorkspaceSlots,
+    PreparedFriError, PreparedFriEvaluation, PreparedFriGraph, FRI_CHALLENGE_WORDS,
+    FRI_HASH_ALIGNMENT_WORDS, FRI_POINTER_ALIGNMENT_WORDS,
 };
 pub use backend::prepared_fri_final::{
     fri_final_workspace_requirements, FriFinalArenaSlotRequirement, FriFinalWorkspaceRequirements,

@@ -1271,3 +1271,101 @@ extern "C" int stwo_blake2s_tail_on(
         first_dev, first_size, out_levels_dev, n_levels);
     return cudaGetLastError();
 }
+
+// ---------------------------------------------------------------------------
+// Interior FOUR-level fusion (Step 3.2 second half; opt-in via
+// STWO_CUDA_BLAKE2S_INTERIOR_FUSED=1 on the Rust planning side, default OFF).
+//
+// One launch builds FOUR column-free interior Merkle levels: for each output
+// index i it consumes the 16 consecutive child digests prev[16i .. 16i+16)
+// and produces the level-4 ancestor. The three intermediate levels live only
+// in SHARED memory — they are never written to (or reread from) HBM, so the
+// interior traffic for the window drops from (1/2 + 1/4 + 1/8 + 1/16) reads +
+// writes per child to one read of the children plus a 1/16th-size output
+// write. The Rust planner only selects this kernel for windows whose three
+// intermediate levels are UNRETAINED (prune-depth scratch); any window that
+// must materialize an intermediate retained layer falls back to the per-level
+// kernel (see commit_graph.rs).
+//
+// BYTE IDENTITY: every parent is blake2s_hash_children_device — the SAME
+// routine the per-level kernel (commit_on_layer_using_previous_in_gpu with
+// number_of_columns == 0), the layer-pair kernel, and the fused tail use —
+// and at each of the four local levels parent[j] = H(child[2j], child[2j+1]),
+// exactly the per-level index mapping. By induction over the four levels the
+// output level is bit-identical to four sequential stwo_blake2s_layer_on
+// launches; this is a scheduling/traffic change, not a new hash or ordering.
+// The pure-Rust spec test `interior4_spec_tests` in
+// crates/backend-cuda/src/backend/blake2s.rs locks this composition against
+// the CPU reference hasher.
+//
+// Geometry: 256 threads/block; each block produces 32 outputs from 512
+// children. Level 1 reads children straight from global (each thread hashes
+// one adjacent pair — no need to stage raw children in shared) and parks the
+// 256 parents in shared; levels 2..4 reduce within shared; level 4 writes the
+// 32 outputs to global. Shared footprint: (256 + 128 + 64) * 32 B = 14 KiB.
+// Keep the grid math in LOCKSTEP with `interior4_grid_blocks` in
+// crates/backend-cuda/src/backend/blake2s.rs (pure-Rust mirror + unit tests).
+#define STWO_INTERIOR4_BLOCK 256u
+#define STWO_INTERIOR4_OUT_PER_BLOCK (STWO_INTERIOR4_BLOCK / 8u)
+
+__global__ void __launch_bounds__(STWO_INTERIOR4_BLOCK) blake2s_interior4_kernel(
+    const Blake2sHash *prev,    // 16 * out_size child digests
+    uint32_t out_size,          // number of level-4 output hashes
+    Blake2sHash *out
+) {
+    __shared__ Blake2sHash l1[STWO_INTERIOR4_BLOCK];        // level-1 parents
+    __shared__ Blake2sHash l2[STWO_INTERIOR4_BLOCK / 2];    // level-2 parents
+    __shared__ Blake2sHash l3[STWO_INTERIOR4_BLOCK / 4];    // level-3 parents
+
+    const uint32_t out0 = blockIdx.x * STWO_INTERIOR4_OUT_PER_BLOCK;
+    // Outputs owned by this block. out_size is a power of two, so the window
+    // is only partial when out_size < 32 (then the grid is a single block).
+    const uint32_t window = min(out_size - out0, STWO_INTERIOR4_OUT_PER_BLOCK);
+    const uint32_t tid = threadIdx.x;
+    const Blake2sHash *children = prev + 16u * out0;
+
+    if (tid < 8u * window) {
+        l1[tid] = blake2s_hash_children_device(children[2u * tid], children[2u * tid + 1]);
+    }
+    __syncthreads();
+    if (tid < 4u * window) {
+        l2[tid] = blake2s_hash_children_device(l1[2u * tid], l1[2u * tid + 1]);
+    }
+    __syncthreads();
+    if (tid < 2u * window) {
+        l3[tid] = blake2s_hash_children_device(l2[2u * tid], l2[2u * tid + 1]);
+    }
+    __syncthreads();
+    if (tid < window) {
+        out[out0 + tid] = blake2s_hash_children_device(l3[2u * tid], l3[2u * tid + 1]);
+    }
+}
+
+// Grid: one block per 32 outputs. Mirror of `interior4_grid_blocks` (Rust).
+static uint32_t number_of_interior4_blocks_for(uint32_t out_size) {
+    return (out_size + STWO_INTERIOR4_OUT_PER_BLOCK - 1) / STWO_INTERIOR4_OUT_PER_BLOCK;
+}
+
+// Four column-free interior levels in one launch: result[i] is the level-4
+// ancestor of previous_layer[16i .. 16i+16). `previous_layer` must hold
+// 16 * output_size hashes. In-place operation is FORBIDDEN (blocks write
+// low output indices other blocks may still be reading as children), hence
+// the aliasing reject; the Rust planner additionally falls back to per-level
+// kernels for any window whose buffers alias.
+extern "C" int stwo_blake2s_interior4_on(
+    const Blake2sHash *previous_layer,
+    uint32_t output_size,
+    Blake2sHash *result,
+    void *stream
+) {
+    if (previous_layer == nullptr || output_size == 0 ||
+        (output_size & (output_size - 1)) != 0 || result == nullptr ||
+        previous_layer == result || stream == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    blake2s_interior4_kernel<<<number_of_interior4_blocks_for(output_size),
+                               STWO_INTERIOR4_BLOCK, 0,
+                               reinterpret_cast<cudaStream_t>(stream)>>>(
+        previous_layer, output_size, result);
+    return cudaGetLastError();
+}

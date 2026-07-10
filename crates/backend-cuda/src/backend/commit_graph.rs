@@ -16,6 +16,42 @@ use super::exec_context::{check_cuda, ArenaSlice, ArenaSlotId, CudaExecContext, 
 const HASH_WORDS: usize = core::mem::size_of::<Blake2sHash>() / core::mem::size_of::<u32>();
 const MAX_FUSED_TAIL_HASHES: u32 = 4096;
 
+/// Selects how a `retain_evaluations` group meeting the NttHash shape
+/// constraints (exactly 16 columns, one batch, `log_n == lifting_log_size`,
+/// `log_n >= 13`) is committed. Both modes produce byte-identical retained
+/// evaluations, leaf digests and roots; `Fused` is opt-in via
+/// `STWO_CUDA_NTT_LEAF_FUSED=1`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RetainedLdeHashMode {
+    /// The LDE writes the retained evaluations; a separate LeafUpdate pass
+    /// re-reads every evaluation word for hashing (default).
+    Separate,
+    /// `ntt_leaf_fused.cu`: the final NTT stage writes the retained
+    /// evaluations AND absorbs the same tile into the leaf states — one read
+    /// of coefficients, one write of evaluations, zero re-read for hashing.
+    Fused,
+}
+
+impl RetainedLdeHashMode {
+    /// Process-wide default. Read once via `OnceLock` so plan construction,
+    /// eager launches, capture and replay all observe one mode.
+    pub fn from_env() -> Self {
+        if ntt_leaf_fused_enabled() {
+            Self::Fused
+        } else {
+            Self::Separate
+        }
+    }
+}
+
+/// `STWO_CUDA_NTT_LEAF_FUSED=1` opts retained full-lifting 16-column groups
+/// into the LDE-write + leaf-absorb fused lane (Step 3.1). Default OFF until
+/// the pod byte-identity and bandwidth gates pass.
+fn ntt_leaf_fused_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("STWO_CUDA_NTT_LEAF_FUSED").as_deref() == Ok("1"))
+}
+
 /// One same-size LDE batch. Both pointer tables are DEVICE tables in the same
 /// canonical order. `coefficient_sizes` gives each source's exact length;
 /// outputs have `2 * eval_domain_size` words. One explicit-stream kernel stages
@@ -78,6 +114,15 @@ pub enum CommitLaunchKind {
         columns: u32,
         log_n: u32,
     },
+    /// Retained twin of `NttHash` (Step 3.1 `ntt_leaf_fused.cu` lane, opt-in
+    /// via `STWO_CUDA_NTT_LEAF_FUSED=1`): the final NTT stage WRITES the
+    /// group's retained evaluations and absorbs the same tile into the leaf
+    /// states, replacing the `Lde` + `LeafUpdate`/`LeafFinalize` pair.
+    RetainedNttHash {
+        group: u32,
+        columns: u32,
+        log_n: u32,
+    },
     LeafUpdate {
         group: u32,
         first_column: u32,
@@ -92,6 +137,15 @@ pub enum CommitLaunchKind {
         level: u32,
         output_hashes: u32,
     },
+    /// Four column-free interior levels in one launch (Step 3.2 fused interior
+    /// lane, opt-in via `STWO_CUDA_BLAKE2S_INTERIOR_FUSED=1`). `first_level` is
+    /// the first of the four fused levels; `output_hashes` counts the deepest
+    /// (level `first_level + 3`) output. The three intermediate levels stay in
+    /// shared memory and their planned buffers are never written.
+    FusedInterior4 {
+        first_level: u32,
+        output_hashes: u32,
+    },
     FusedTail {
         first_hashes: u32,
         levels: u32,
@@ -99,12 +153,16 @@ pub enum CommitLaunchKind {
 }
 
 /// Physical traffic removed by the native-final or producer-fused N2B→leaf
-/// lanes. `bytes_avoided` is exactly the eliminated completed-LDE write plus
-/// its leaf-hash reread; `unfused_groups` exposes every legacy full-LDE group.
+/// lanes. For `fused_groups` (unretained), `bytes_avoided` counts the
+/// eliminated completed-LDE write plus its leaf-hash reread; for
+/// `retained_fused_groups` (the RetainedNttHash lane) only the leaf-hash
+/// reread is eliminated — the evaluation write must remain for decommitment.
+/// `unfused_groups` exposes every legacy full-LDE group.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CommitHashFromTileTelemetry {
     pub fused_groups: u64,
     pub fused_columns: u64,
+    pub retained_fused_groups: u64,
     pub unfused_groups: u64,
     pub bytes_avoided: u64,
 }
@@ -199,6 +257,13 @@ enum CommitLaunch {
         params: CommitLdeBatch,
         state: ArenaSlice,
     },
+    RetainedNttHash {
+        group: u32,
+        first_column: u32,
+        is_final: bool,
+        params: CommitLdeBatch,
+        state: ArenaSlice,
+    },
     LeafUpdate {
         group: u32,
         first_column: u32,
@@ -225,6 +290,12 @@ enum CommitLaunch {
     },
     InteriorLayer {
         level: u32,
+        input: ArenaSlice,
+        output: ArenaSlice,
+        output_hashes: u32,
+    },
+    FusedInterior4 {
+        first_level: u32,
         input: ArenaSlice,
         output: ArenaSlice,
         output_hashes: u32,
@@ -257,6 +328,11 @@ impl CommitLaunch {
                 columns: params.column_count,
                 log_n: params.log_n,
             },
+            Self::RetainedNttHash { group, params, .. } => CommitLaunchKind::RetainedNttHash {
+                group,
+                columns: params.column_count,
+                log_n: params.log_n,
+            },
             Self::LeafUpdate {
                 group,
                 first_column,
@@ -285,6 +361,14 @@ impl CommitLaunch {
                 level,
                 output_hashes,
             },
+            Self::FusedInterior4 {
+                first_level,
+                output_hashes,
+                ..
+            } => CommitLaunchKind::FusedInterior4 {
+                first_level,
+                output_hashes,
+            },
             Self::FusedTail {
                 first_hashes,
                 levels,
@@ -305,6 +389,7 @@ pub struct CommitGraphPlan {
     root: ArenaSlice,
     hash_from_tile: CommitHashFromTileTelemetry,
     producer_fused_log_sizes: Vec<u32>,
+    retained_fused_log_sizes: Vec<u32>,
 }
 
 impl CommitGraphPlan {
@@ -335,6 +420,10 @@ impl CommitGraphPlan {
     /// layer) are scratch. Those bottom outputs may reuse two arena slots in
     /// strict producer/consumer order; every retained and fused-tail output stays
     /// uniquely addressable for later decommitment.
+    ///
+    /// Interior four-level fusion follows the process-wide
+    /// `STWO_CUDA_BLAKE2S_INTERIOR_FUSED` flag (default OFF); see
+    /// [`Self::new_pruned_impl`] for the explicit-mode variant the tests pin.
     pub fn new_pruned(
         lifting_log_size: u32,
         unretained_bottom_layers: u32,
@@ -342,6 +431,76 @@ impl CommitGraphPlan {
         leaf_groups: Vec<CommitLeafGroup>,
         interior_outputs: Vec<ArenaSlice>,
         tail: Option<CommitTailPlan>,
+    ) -> Result<Self, CommitGraphError> {
+        Self::new_pruned_impl(
+            lifting_log_size,
+            unretained_bottom_layers,
+            leaf_state,
+            leaf_groups,
+            interior_outputs,
+            tail,
+            super::blake2s::blake2s_interior_fused_enabled(),
+        )
+    }
+
+    /// [`Self::new_pruned`] with the Step 3.2 interior four-level fusion lane
+    /// pinned explicitly, so plan-shape and native byte-identity tests can
+    /// exercise BOTH launch topologies in one process regardless of the
+    /// environment (the env switch is a process-global `OnceLock`).
+    ///
+    /// When `interior_fused` is on, aligned windows of four consecutive
+    /// column-free interior levels collapse into one `FusedInterior4` launch
+    /// **iff** all three intermediate levels are unretained
+    /// ([`interior4_window_fusible`]) and the window's output buffer does not
+    /// alias its input. Retained-layer policy (the simpler correct option per
+    /// the plan): a window whose intermediates include a retained layer falls
+    /// back to per-level launches, so retained layers are always written to
+    /// their arena buffers by exactly the same kernel as today; the fused
+    /// window's own OUTPUT level is always written to its planned buffer and
+    /// may itself be retained. Validation, retention bookkeeping, and arena
+    /// slot budgets are identical in both modes — unwritten intermediate
+    /// ping-pong buffers stay allocated; only launch emission changes.
+    pub(crate) fn new_pruned_impl(
+        lifting_log_size: u32,
+        unretained_bottom_layers: u32,
+        leaf_state: ArenaSlice,
+        leaf_groups: Vec<CommitLeafGroup>,
+        interior_outputs: Vec<ArenaSlice>,
+        tail: Option<CommitTailPlan>,
+        interior_fused: bool,
+    ) -> Result<Self, CommitGraphError> {
+        Self::new_pruned_with_modes(
+            lifting_log_size,
+            unretained_bottom_layers,
+            leaf_state,
+            leaf_groups,
+            interior_outputs,
+            tail,
+            interior_fused,
+            RetainedLdeHashMode::from_env(),
+        )
+    }
+
+    /// [`Self::new_pruned_impl`] with the Step 3.1 retained LDE-write +
+    /// leaf-absorb lane (`STWO_CUDA_NTT_LEAF_FUSED`) additionally pinned, so
+    /// plan-shape and native byte-identity tests can exercise both retained
+    /// commit topologies in one process. Under [`RetainedLdeHashMode::Fused`],
+    /// a `retain_evaluations` group meeting the SAME shape constraints as the
+    /// NttHash lane (exactly 16 columns, one batch,
+    /// `log_n == lifting_log_size >= 13`) emits one `RetainedNttHash` launch
+    /// instead of the `Lde` + `LeafUpdate`/`LeafFinalize` pair; every other
+    /// group is planned exactly as before. Validation, retention bookkeeping,
+    /// and arena slot budgets are identical in both modes.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_pruned_with_modes(
+        lifting_log_size: u32,
+        unretained_bottom_layers: u32,
+        leaf_state: ArenaSlice,
+        leaf_groups: Vec<CommitLeafGroup>,
+        interior_outputs: Vec<ArenaSlice>,
+        tail: Option<CommitTailPlan>,
+        interior_fused: bool,
+        retained_lde_hash: RetainedLdeHashMode,
     ) -> Result<Self, CommitGraphError> {
         if lifting_log_size >= 31 {
             return Err(CommitGraphError::InvalidLiftingLogSize(lifting_log_size));
@@ -368,6 +527,7 @@ impl CommitGraphPlan {
         let mut launches = Vec::new();
         let mut hash_from_tile = CommitHashFromTileTelemetry::default();
         let mut producer_fused_log_sizes = BTreeSet::new();
+        let mut retained_fused_log_sizes = BTreeSet::new();
         launches.push(CommitLaunch::LeafInit {
             size: leaf_size,
             state: leaf_state,
@@ -456,11 +616,19 @@ impl CommitGraphPlan {
                 }
             }
 
-            let producer_fused = group.column_count == 16
+            // The NttHash shape constraints, shared verbatim by the retained
+            // lane: one full-lifting same-log 16-column batch. Under them the
+            // leaf row index IS the evaluation index (the lifting ratio is 1),
+            // so the fused kernels' absorb order coincides with the canonical
+            // committed column order by construction.
+            let hash16_shape = group.column_count == 16
                 && group.lde_batches.len() == 1
                 && group.lde_batches[0].log_n == lifting_log_size
-                && group.lde_batches[0].log_n >= 13
-                && !group.retain_evaluations;
+                && group.lde_batches[0].log_n >= 13;
+            let producer_fused = hash16_shape && !group.retain_evaluations;
+            let retained_fused = hash16_shape
+                && group.retain_evaluations
+                && retained_lde_hash == RetainedLdeHashMode::Fused;
             let prefix_fused =
                 !group.retain_evaluations && group.lde_batches.iter().all(|batch| batch.log_n < 13);
             if producer_fused || prefix_fused {
@@ -479,6 +647,22 @@ impl CommitGraphPlan {
                         )
                         .ok_or(CommitGraphError::SizeOverflow)?;
                 }
+            } else if retained_fused {
+                // Only the leaf-hash reread disappears; the evaluation write
+                // stays (the buffer is live through decommitment).
+                hash_from_tile.retained_fused_groups += 1;
+                let batch = group.lde_batches[0];
+                let evaluation_words = (1u64 << batch.log_n)
+                    .checked_mul(u64::from(batch.column_count))
+                    .ok_or(CommitGraphError::SizeOverflow)?;
+                hash_from_tile.bytes_avoided = hash_from_tile
+                    .bytes_avoided
+                    .checked_add(
+                        evaluation_words
+                            .checked_mul(core::mem::size_of::<u32>() as u64)
+                            .ok_or(CommitGraphError::SizeOverflow)?,
+                    )
+                    .ok_or(CommitGraphError::SizeOverflow)?;
             } else {
                 hash_from_tile.unfused_groups += 1;
             }
@@ -487,6 +671,16 @@ impl CommitGraphPlan {
                 let params = group.lde_batches[0];
                 producer_fused_log_sizes.insert(params.log_n);
                 launches.push(CommitLaunch::NttHash {
+                    group: group_index,
+                    first_column: cols_done,
+                    is_final,
+                    params,
+                    state: leaf_state,
+                });
+            } else if retained_fused {
+                let params = group.lde_batches[0];
+                retained_fused_log_sizes.insert(params.log_n);
+                launches.push(CommitLaunch::RetainedNttHash {
                     group: group_index,
                     first_column: cols_done,
                     is_final,
@@ -536,6 +730,10 @@ impl CommitGraphPlan {
                 .ok_or(CommitGraphError::TooManyColumns)?;
         }
 
+        // Validate every interior level exactly as the per-level plan always
+        // has — the fused lane below changes LAUNCH EMISSION only, never the
+        // validated geometry, aliasing, or retention invariants.
+        let mut interior_levels = Vec::with_capacity(interior_outputs.len());
         let mut current = leaf_state;
         let mut current_hashes = leaf_size;
         for (level, &output) in interior_outputs.iter().enumerate() {
@@ -552,7 +750,7 @@ impl CommitGraphPlan {
             hash_slots.insert(output.id());
             let output_hashes = current_hashes / 2;
             require_hash_capacity("interior_output", output, output_hashes)?;
-            launches.push(CommitLaunch::InteriorLayer {
+            interior_levels.push(CommitLaunch::InteriorLayer {
                 level: level as u32,
                 input: current,
                 output,
@@ -565,6 +763,42 @@ impl CommitGraphPlan {
             if (level as u32 + 1) >= unretained_bottom_layers {
                 retained_slots.insert(output.id());
             }
+        }
+        // Emission: with the fused lane on, an aligned window of four levels
+        // whose intermediates are all unretained becomes one FusedInterior4
+        // launch reading the window's input layer and writing only the
+        // 1/16th-size output level. The kernel forbids in-place operation, so
+        // an aliased window (possible when deep pruning ping-pongs the output
+        // back onto the input slot) falls back to per-level launches.
+        let mut level = 0usize;
+        while level < interior_levels.len() {
+            let CommitLaunch::InteriorLayer { input, .. } = interior_levels[level] else {
+                unreachable!("interior_levels holds only InteriorLayer records");
+            };
+            if interior_fused
+                && interior4_window_fusible(level, interior_levels.len(), unretained_bottom_layers)
+            {
+                let CommitLaunch::InteriorLayer {
+                    output,
+                    output_hashes,
+                    ..
+                } = interior_levels[level + 3]
+                else {
+                    unreachable!("interior_levels holds only InteriorLayer records");
+                };
+                if output.id() != input.id() {
+                    launches.push(CommitLaunch::FusedInterior4 {
+                        first_level: level as u32,
+                        input,
+                        output,
+                        output_hashes,
+                    });
+                    level += 4;
+                    continue;
+                }
+            }
+            launches.push(interior_levels[level]);
+            level += 1;
         }
 
         if let Some(tail) = tail {
@@ -626,6 +860,7 @@ impl CommitGraphPlan {
             root: current,
             hash_from_tile,
             producer_fused_log_sizes: producer_fused_log_sizes.into_iter().collect(),
+            retained_fused_log_sizes: retained_fused_log_sizes.into_iter().collect(),
         })
     }
 
@@ -645,6 +880,13 @@ impl CommitGraphPlan {
 
     pub fn producer_fused_log_sizes(&self) -> &[u32] {
         &self.producer_fused_log_sizes
+    }
+
+    /// Log sizes committed through the retained `RetainedNttHash` lane; each
+    /// needs `stwo_ntt_leaf_fused_configure` before capture (mirrors
+    /// [`Self::producer_fused_log_sizes`]).
+    pub fn retained_fused_log_sizes(&self) -> &[u32] {
+        &self.retained_fused_log_sizes
     }
 
     /// Enqueue the complete allocation-free commit sequence on `context`.
@@ -702,6 +944,28 @@ impl CommitGraphPlan {
                     } => (
                         "commit_lde_n2b_hash16",
                         raw::stwo_lde_n2b_hash16_on(
+                            params.coefficient_ptrs.as_u32_ptr().cast(),
+                            params.coefficient_sizes.as_u32_ptr(),
+                            params.column_ptrs.as_u32_ptr().cast(),
+                            params.log_n,
+                            params.twiddles.as_u32_ptr(),
+                            params.twiddles_size,
+                            params.eval_domain_size,
+                            first_column,
+                            u32::from(is_final),
+                            state.as_u32_ptr().cast(),
+                            stream,
+                        ),
+                    ),
+                    CommitLaunch::RetainedNttHash {
+                        first_column,
+                        is_final,
+                        params,
+                        state,
+                        ..
+                    } => (
+                        "commit_ntt_leaf_fused",
+                        raw::stwo_ntt_leaf_fused_on(
                             params.coefficient_ptrs.as_u32_ptr().cast(),
                             params.coefficient_sizes.as_u32_ptr(),
                             params.column_ptrs.as_u32_ptr().cast(),
@@ -825,6 +1089,20 @@ impl CommitGraphPlan {
                             stream,
                         ),
                     ),
+                    CommitLaunch::FusedInterior4 {
+                        input,
+                        output,
+                        output_hashes,
+                        ..
+                    } => (
+                        "commit_interior_fused4",
+                        raw::stwo_blake2s_interior4_on(
+                            input.as_u32_ptr().cast(),
+                            output_hashes,
+                            output.as_u32_ptr().cast(),
+                            stream,
+                        ),
+                    ),
                     CommitLaunch::FusedTail {
                         input,
                         first_hashes,
@@ -846,6 +1124,25 @@ impl CommitGraphPlan {
         }
         Ok(())
     }
+}
+
+/// Whether the four consecutive interior levels `[first_level, first_level+4)`
+/// may fuse into one `FusedInterior4` launch. Pure planning math (unit-tested
+/// below): the window must fit inside the ordinary interior levels (the fused
+/// tail handles everything after them), and its three INTERMEDIATE levels —
+/// `first_level..first_level+3`, whose distance above the leaves is
+/// `level + 1` — must all be unretained (`level + 1 < unretained_bottom_layers`),
+/// because the fused kernel keeps them in shared memory and never writes their
+/// buffers. The tightest intermediate is level `first_level + 2`, giving
+/// `first_level + 3 < unretained_bottom_layers`. The window's OUTPUT level
+/// (`first_level + 3`) is always written and may be retained or not.
+pub(crate) fn interior4_window_fusible(
+    first_level: usize,
+    n_interior_levels: usize,
+    unretained_bottom_layers: u32,
+) -> bool {
+    first_level + 4 <= n_interior_levels
+        && (first_level as u64) + 3 < u64::from(unretained_bottom_layers)
 }
 
 fn require_same_context(
@@ -1004,6 +1301,7 @@ mod tests {
             CommitHashFromTileTelemetry {
                 fused_groups: 2,
                 fused_columns: 19,
+                retained_fused_groups: 0,
                 unfused_groups: 0,
                 bytes_avoided: 64 * 19 * 8,
             }
@@ -1086,7 +1384,176 @@ mod tests {
             CommitHashFromTileTelemetry {
                 fused_groups: 1,
                 fused_columns: 16,
+                retained_fused_groups: 0,
                 unfused_groups: 0,
+                bytes_avoided: 16 * (1 << 13) * 8,
+            }
+        );
+    }
+
+    /// Both retained commit topologies in one process (the env switch is a
+    /// process-global OnceLock, so the mode is pinned via
+    /// `new_pruned_with_modes`): Separate keeps the Lde + leaf-hash pair and
+    /// its full evaluation reread; Fused replaces that pair with one
+    /// RetainedNttHash launch under exactly the NttHash shape constraints.
+    /// This is the plan-level node-budget gate: one fewer launch per fused
+    /// retained group.
+    #[test]
+    fn retained_full_lifting_group_fuses_only_in_fused_mode() {
+        let retained_group = || {
+            let mut group = groups().remove(0);
+            group.retain_evaluations = true;
+            group.lde_batches[0].log_n = 13;
+            group.lde_batches[0].eval_domain_size = 1 << 12;
+            group.lde_batches[0].twiddles = slice(23, 1 << 12);
+            group.lde_batches[0].twiddles_size = 1 << 12;
+            group
+        };
+        let interior_outputs = || {
+            (0..13)
+                .map(|level| slice(100 + level, (1usize << (12 - level)) * HASH_WORDS))
+                .collect::<Vec<_>>()
+        };
+        let plan = |mode: RetainedLdeHashMode| {
+            CommitGraphPlan::new_pruned_with_modes(
+                13,
+                0,
+                slice(1, (1 << 13) * HASH_WORDS),
+                vec![retained_group()],
+                interior_outputs(),
+                None,
+                false,
+                mode,
+            )
+            .unwrap()
+        };
+
+        let separate = plan(RetainedLdeHashMode::Separate);
+        assert_eq!(
+            separate.launch_sequence().take(3).collect::<Vec<_>>(),
+            vec![
+                CommitLaunchKind::LeafInit { hashes: 1 << 13 },
+                CommitLaunchKind::Lde {
+                    group: 0,
+                    batch: 0,
+                    columns: 16,
+                    log_n: 13,
+                },
+                CommitLaunchKind::LeafFinalize {
+                    group: 0,
+                    first_column: 0,
+                    columns: 16,
+                },
+            ]
+        );
+        assert!(separate.retained_fused_log_sizes().is_empty());
+        assert_eq!(
+            separate.hash_from_tile_telemetry(),
+            CommitHashFromTileTelemetry {
+                unfused_groups: 1,
+                ..Default::default()
+            }
+        );
+
+        let fused = plan(RetainedLdeHashMode::Fused);
+        assert_eq!(
+            fused.launch_sequence().take(2).collect::<Vec<_>>(),
+            vec![
+                CommitLaunchKind::LeafInit { hashes: 1 << 13 },
+                CommitLaunchKind::RetainedNttHash {
+                    group: 0,
+                    columns: 16,
+                    log_n: 13,
+                },
+            ]
+        );
+        assert_eq!(
+            fused.launch_sequence().len() + 1,
+            separate.launch_sequence().len()
+        );
+        assert!(fused.producer_fused_log_sizes().is_empty());
+        assert_eq!(fused.retained_fused_log_sizes(), &[13]);
+        assert_eq!(
+            fused.hash_from_tile_telemetry(),
+            CommitHashFromTileTelemetry {
+                retained_fused_groups: 1,
+                // Only the leaf-hash reread is avoided (the evaluation write
+                // stays): 16 columns x 2^13 rows x 4 bytes.
+                bytes_avoided: 16 * (1 << 13) * 4,
+                ..Default::default()
+            }
+        );
+        assert_eq!(separate.root().id(), fused.root().id());
+    }
+
+    /// Fused mode must not widen eligibility beyond the NttHash shape
+    /// constraints (here: a lifted `log_n != lifting_log_size` retained
+    /// group) and must not perturb the unretained producer-fused lane.
+    #[test]
+    fn retained_fusion_keeps_ineligible_and_unretained_groups_unchanged() {
+        let mut lifted_retained = groups().remove(0);
+        lifted_retained.retain_evaluations = true;
+        lifted_retained.lde_batches[0].log_n = 12;
+        lifted_retained.lde_batches[0].eval_domain_size = 1 << 11;
+        lifted_retained.lde_batches[0].twiddles = slice(23, 1 << 11);
+        lifted_retained.lde_batches[0].twiddles_size = 1 << 11;
+
+        let mut producer = groups().remove(0);
+        producer.first_column = 16;
+        producer.column_ptrs = slice(40, 32);
+        producer.column_log_sizes = slice(41, 16);
+        producer.lde_batches = vec![batch(50, 16)];
+        producer.lde_batches[0].log_n = 13;
+        producer.lde_batches[0].eval_domain_size = 1 << 12;
+        producer.lde_batches[0].twiddles = slice(53, 1 << 12);
+        producer.lde_batches[0].twiddles_size = 1 << 12;
+
+        let interior_outputs = (0..13)
+            .map(|level| slice(100 + level, (1usize << (12 - level)) * HASH_WORDS))
+            .collect::<Vec<_>>();
+        let plan = CommitGraphPlan::new_pruned_with_modes(
+            13,
+            0,
+            slice(1, (1 << 13) * HASH_WORDS),
+            vec![lifted_retained, producer],
+            interior_outputs,
+            None,
+            false,
+            RetainedLdeHashMode::Fused,
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan.launch_sequence().take(4).collect::<Vec<_>>(),
+            vec![
+                CommitLaunchKind::LeafInit { hashes: 1 << 13 },
+                CommitLaunchKind::Lde {
+                    group: 0,
+                    batch: 0,
+                    columns: 16,
+                    log_n: 12,
+                },
+                CommitLaunchKind::LeafUpdate {
+                    group: 0,
+                    first_column: 0,
+                    columns: 16,
+                },
+                CommitLaunchKind::NttHash {
+                    group: 1,
+                    columns: 16,
+                    log_n: 13,
+                },
+            ]
+        );
+        assert!(plan.retained_fused_log_sizes().is_empty());
+        assert_eq!(plan.producer_fused_log_sizes(), &[13]);
+        assert_eq!(
+            plan.hash_from_tile_telemetry(),
+            CommitHashFromTileTelemetry {
+                fused_groups: 1,
+                fused_columns: 16,
+                retained_fused_groups: 0,
+                unfused_groups: 1,
                 bytes_avoided: 16 * (1 << 13) * 8,
             }
         );
@@ -1139,6 +1606,137 @@ mod tests {
             CommitGraphPlan::new(6, slice(1, 64 * HASH_WORDS), bad_groups, vec![], None,),
             Err(CommitGraphError::InconsistentGroupTwiddles { .. })
         ));
+    }
+
+    /// Both interior emission modes in one process (the env switch is a
+    /// process-global OnceLock, so the mode is pinned via `new_pruned_impl`):
+    /// per-level emits one InteriorLayer per level; the fused lane collapses
+    /// the bottom window (whose three intermediates are unretained under
+    /// prune depth 4) into one FusedInterior4 and keeps every retained level
+    /// on the per-level kernel. This is the plan-level "node budget" gate:
+    /// 8 interior nodes per-level vs 5 fused.
+    #[test]
+    fn pruned_plan_interior_fusion_replaces_the_unretained_bottom_window_only() {
+        // lifting 8, prune depth 4: interior levels 0..8 (log 7..0), levels
+        // 0,1,2 unretained ping-pong, levels 3..7 retained. No tail.
+        let interior_outputs = vec![
+            slice(2, 128 * HASH_WORDS), // level 0, scratch pong
+            slice(1, 256 * HASH_WORDS), // level 1, leaf ping
+            slice(2, 128 * HASH_WORDS), // level 2, scratch pong
+            slice(4, 16 * HASH_WORDS),  // level 3, retained (window output)
+            slice(5, 8 * HASH_WORDS),
+            slice(6, 4 * HASH_WORDS),
+            slice(7, 2 * HASH_WORDS),
+            slice(8, HASH_WORDS),
+        ];
+        let plan = |fused: bool| {
+            CommitGraphPlan::new_pruned_impl(
+                8,
+                4,
+                slice(1, 256 * HASH_WORDS),
+                groups(),
+                interior_outputs.clone(),
+                None,
+                fused,
+            )
+            .unwrap()
+        };
+
+        let interior_kinds = |fused: bool| {
+            plan(fused)
+                .launch_sequence()
+                .filter(|kind| {
+                    matches!(
+                        kind,
+                        CommitLaunchKind::InteriorLayer { .. }
+                            | CommitLaunchKind::FusedInterior4 { .. }
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            interior_kinds(false),
+            (0..8)
+                .map(|level| CommitLaunchKind::InteriorLayer {
+                    level,
+                    output_hashes: 128 >> level,
+                })
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            interior_kinds(true),
+            [CommitLaunchKind::FusedInterior4 {
+                first_level: 0,
+                output_hashes: 16,
+            }]
+            .into_iter()
+            .chain((4..8).map(|level| CommitLaunchKind::InteriorLayer {
+                level,
+                output_hashes: 128 >> level,
+            }))
+            .collect::<Vec<_>>()
+        );
+        // Same root and identical validation outcome in both modes.
+        assert_eq!(plan(false).root().id(), plan(true).root().id());
+    }
+
+    /// The fused kernel forbids in-place operation, so a window whose output
+    /// slot ping-pongs back onto its input slot must fall back to per-level
+    /// launches even with the lane enabled.
+    #[test]
+    fn interior_fusion_falls_back_per_level_when_window_output_aliases_input() {
+        let interior_outputs = vec![
+            slice(2, 128 * HASH_WORDS), // level 0
+            slice(3, 64 * HASH_WORDS),  // level 1
+            slice(2, 128 * HASH_WORDS), // level 2
+            slice(1, 256 * HASH_WORDS), // level 3: output aliases the leaf input
+            slice(5, 8 * HASH_WORDS),
+            slice(6, 4 * HASH_WORDS),
+            slice(7, 2 * HASH_WORDS),
+            slice(8, HASH_WORDS),
+        ];
+        let plan = CommitGraphPlan::new_pruned_impl(
+            8,
+            4,
+            slice(1, 256 * HASH_WORDS),
+            groups(),
+            interior_outputs,
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            plan.launch_sequence()
+                .filter(|kind| matches!(kind, CommitLaunchKind::FusedInterior4 { .. }))
+                .count(),
+            0
+        );
+        assert_eq!(
+            plan.launch_sequence()
+                .filter(|kind| matches!(kind, CommitLaunchKind::InteriorLayer { .. }))
+                .count(),
+            8
+        );
+    }
+
+    #[test]
+    fn interior4_window_fusibility_requires_unretained_intermediates_and_room() {
+        // Prune depth 4: exactly the bottom window fuses.
+        assert!(interior4_window_fusible(0, 10, 4));
+        assert!(!interior4_window_fusible(1, 10, 4));
+        assert!(!interior4_window_fusible(4, 10, 4));
+        // The window must fit inside the ordinary interior levels.
+        assert!(interior4_window_fusible(0, 4, 4));
+        assert!(!interior4_window_fusible(0, 3, 4));
+        assert!(!interior4_window_fusible(1, 4, 8));
+        // Fully retained trees (no pruning) never fuse.
+        assert!(!interior4_window_fusible(0, 10, 0));
+        assert!(!interior4_window_fusible(0, 10, 3));
+        // Deeper pruning fuses successive aligned windows.
+        assert!(interior4_window_fusible(0, 10, 8));
+        assert!(interior4_window_fusible(4, 10, 8));
+        assert!(!interior4_window_fusible(5, 10, 8));
     }
 
     #[test]

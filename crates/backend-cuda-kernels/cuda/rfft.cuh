@@ -108,4 +108,23 @@ int stwo_lde_n2b_hash16_on(
     void *stream
 );
 
+// Staging plus the NOFINAL N2B prefix of the 16-column hash16 lane, exported
+// for cuda/ntt_leaf_fused.cu (Step 3.1 retained fusion). Runs exactly the
+// launches ntt_n2b_hash16_dispatch_on performs before its final-stage kernel
+// — same kernels, same LAUNCH_N2B_CONFIG rows, same order — and stops there,
+// leaving `device_values` in the canonical prefinal state every final-stage
+// kernel consumes. The caller attaches its own final-stage kernel covering
+// the last `LAUNCH_N2B_CONFIG_*[log_n - base][last]` stages.
+extern "C"
+int stwo_lde_n2b_prefinal16_on(
+    const uint32_t *const *coefficient_values,
+    const uint32_t *coefficient_sizes,
+    uint32_t **device_values,
+    unsigned log_n,
+    uint32_t *twiddles,
+    unsigned twiddle_words,
+    unsigned eval_domain_size,
+    void *stream
+);
+
 #endif // POLY_RFFT_H
