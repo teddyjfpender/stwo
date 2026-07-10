@@ -15,6 +15,12 @@
 #   scripts/cuda_compile_check.sh cuda/foo.cu ... # explicit files
 #   scripts/cuda_compile_check.sh --build         # exact: run build.rs via
 #                                                 # cargo in the container
+#   scripts/cuda_compile_check.sh --link          # build the real nvcc archive
+#                                                 # AND link every native test
+#                                                 # binary (catches stub-masked
+#                                                 # FFI/symbol drift; no GPU)
+#   scripts/cuda_compile_check.sh --resources F.. # -Xptxas -v register/spill
+#                                                 # table; FAILS on any spill
 #
 # Environment:
 #   CUDA_IMAGE  container image (default nvidia/cuda:11.8.0-devel-ubuntu22.04,
@@ -40,7 +46,10 @@ for arg in "$@"; do
     --all) MODE="all" ;;
     --generated) INCLUDE_GENERATED=1 ;;
     --build) MODE="build" ;;
-    *) MODE="explicit"; FILES+=("$arg") ;;
+    --link) MODE="link" ;;
+    --symbols) MODE="symbols" ;;
+    --resources) MODE="resources" ;;
+    *) [[ "$MODE" == "changed" ]] && MODE="explicit"; FILES+=("$arg") ;;
   esac
 done
 
@@ -48,6 +57,87 @@ docker_run() {
   docker run --rm --platform linux/amd64 \
     -v "$PWD:/workspace" -w /workspace "$IMAGE" bash -lc "$1"
 }
+
+if [[ "$MODE" == "symbols" ]]; then
+  # Instant symbol-coherence audit: every extern "C" declaration in raw.rs
+  # must have a definition in some .cu, and vice versa for stwo_-prefixed
+  # exports. Catches the class the macOS stubs mask (missing/renamed symbol
+  # discovered only at pod link time) without compiling anything.
+  python3 - "$KERNELS_DIR" <<'PY'
+import re, sys, glob
+kd = sys.argv[1]
+raw = open(f"{kd}/src/raw.rs").read()
+declared = set(re.findall(r'pub fn (stwo_[a-z_0-9]+)', raw))
+defined = set()
+for f in glob.glob(f"{kd}/cuda/**/*.cu", recursive=True):
+    defined |= set(re.findall(r'(?:extern "C"[^\n]*?|^)\b(stwo_[a-z_0-9]+)\s*\(', open(f).read(), re.M))
+stubs = set(re.findall(r'pub extern "C" fn (stwo_[a-z_0-9]+)|fn (stwo_[a-z_0-9]+)', open(f"{kd}/src/stubs.rs").read()))
+stubs = {x for pair in stubs for x in pair if x}
+missing_def = sorted(declared - defined)
+missing_stub = sorted(declared - stubs)
+ok = True
+if missing_def:
+    print(f"FAIL: declared in raw.rs but no .cu definition: {missing_def}"); ok = False
+if missing_stub:
+    print(f"FAIL: declared in raw.rs but no stub: {missing_stub}"); ok = False
+print(f"[cuda_compile_check] symbols: {len(declared)} declared, {len(defined)} defined, "
+      + ("PASS" if ok else "FAIL"))
+sys.exit(0 if ok else 1)
+PY
+  exit $?
+fi
+
+RUST_VOLUME="stwo-cuda-rustup"
+
+container_cargo() {
+  # Rust toolchain lives in a named volume so repeat runs skip the install.
+  docker run --rm --platform linux/amd64 \
+    -v "$PWD:/workspace" -v "${RUST_VOLUME}:/root/.rustup" \
+    -v "${RUST_VOLUME}-cargo:/root/.cargo" \
+    -e STWO_CUDA_OBJ_CACHE=/workspace/.docker_cuda_obj_cache \
+    -e STWO_CUDA_ARCH="${ARCH}" -e RUST_MIN_STACK=33554432 \
+    -w /workspace "$IMAGE" bash -lc "
+      set -e
+      export PATH=\$HOME/.cargo/bin:\$PATH
+      command -v cargo >/dev/null 2>&1 || {
+        apt-get update -qq >/dev/null && apt-get install -y -qq curl build-essential >/dev/null
+        curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none >/dev/null
+      }
+      $1
+    "
+}
+
+if [[ "$MODE" == "link" ]]; then
+  # The macOS stub build cannot catch FFI declarations whose symbol is missing
+  # from (or mismatched in) the real nvcc archive — only producing the archive
+  # and LINKING the cfg(stwo_cuda_link) test binaries proves symbol coherence.
+  # No GPU needed: linking resolves symbols without executing kernels.
+  container_cargo "cargo build -p stwo-backend-cuda-kernels && cargo test -p stwo-backend-cuda --no-run"
+  echo '[cuda_compile_check] link-mode PASS (archive built, all native test binaries linked)'
+  exit 0
+fi
+
+if [[ "$MODE" == "resources" ]]; then
+  # Per-kernel register/spill/shared-memory report via ptxas. Spills are the
+  # plan's hard failure criterion for the fused kernels.
+  [[ "${#FILES[@]}" -gt 0 ]] || { echo 'usage: --resources <file.cu>...'; exit 2; }
+  out=$(printf '%s\0' "${FILES[@]}" | docker run --rm -i --platform linux/amd64 \
+    -v "$PWD:/workspace" -w /workspace "$IMAGE" bash -lc "
+      xargs -0 -P ${JOBS} -I{} sh -c '
+        echo \"=== {} ===\";
+        nvcc -std=c++17 -arch=${ARCH} -dc --expt-relaxed-constexpr -Xptxas -v \
+          -I ${KERNELS_DIR}/cuda -I ${KERNELS_DIR}/cuda/generated \
+          -o /dev/null {} 2>&1 | grep -E \"Function|registers|spill|smem\"
+      '
+    ")
+  echo "$out"
+  if echo "$out" | grep -E '[1-9][0-9]* bytes spill (stores|loads)' >/dev/null; then
+    echo '[cuda_compile_check] resources FAIL: spills detected'
+    exit 1
+  fi
+  echo '[cuda_compile_check] resources PASS (zero spills)'
+  exit 0
+fi
 
 if [[ "$MODE" == "build" ]]; then
   # Authoritative: the crate's own build.rs drives nvcc exactly as on the pod.

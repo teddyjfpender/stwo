@@ -19,6 +19,48 @@ use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 
+
+/// Content-addressed CUDA object cache (STWO_CUDA_OBJ_CACHE=<dir>): keyed by
+/// FNV-1a of the source bytes, every header in the include dirs, the compile
+/// flags and the nvcc version, so objects survive cargo fingerprint changes,
+/// profile switches (debug/release share objects — cubins are profile-
+/// independent) and repo re-clones. Any cache anomaly falls through to a
+/// normal compile; the cache is purely an accelerator.
+fn fnv1a(bytes: &[u8], mut hash: u64) -> u64 {
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn headers_digest(include_dirs: &[String]) -> u64 {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for dir in include_dirs {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let is_header = path
+                    .extension()
+                    .map(|e| e == "cuh" || e == "h" || e == "hpp")
+                    .unwrap_or(false);
+                if is_header {
+                    paths.push(path);
+                }
+            }
+        }
+    }
+    paths.sort();
+    let mut hash = 0xcbf29ce484222325u64;
+    for path in paths {
+        hash = fnv1a(path.to_string_lossy().as_bytes(), hash);
+        if let Ok(bytes) = std::fs::read(&path) {
+            hash = fnv1a(&bytes, hash);
+        }
+    }
+    hash
+}
+
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(stwo_cuda_link)");
     println!("cargo:rerun-if-env-changed=STWO_CUDA_NVCC");
@@ -96,8 +138,23 @@ fn main() {
     // mtime cache vs the SOURCE file only — header edits still dirty the build
     // via cargo's rerun-if-changed on cuda/, which reruns this script into a
     // fresh OUT_DIR fingerprint. A build.rs edit likewise re-fingerprints.
+    let obj_cache: Option<PathBuf> = env::var("STWO_CUDA_OBJ_CACHE").ok().map(PathBuf::from);
+    let cache_base = obj_cache.as_ref().map(|dir| {
+        let _ = std::fs::create_dir_all(dir);
+        let nvcc_version = Command::new(&nvcc)
+            .arg("--version")
+            .output()
+            .map(|o| o.stdout)
+            .unwrap_or_default();
+        let mut base = 0xcbf29ce484222325u64;
+        base = fnv1a(&nvcc_version, base);
+        for flag in gencode_flags.iter().chain(extra_flags.iter()) {
+            base = fnv1a(flag.as_bytes(), base);
+        }
+        (headers_digest(&include_dirs), base)
+    });
     let mut objects: Vec<PathBuf> = Vec::with_capacity(sources.len() + 1);
-    let mut obj_jobs: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut obj_jobs: Vec<(PathBuf, PathBuf, Option<PathBuf>)> = Vec::new();
     for source in &sources {
         let object = out_dir.join(format!(
             "{}.o",
@@ -113,8 +170,24 @@ fn main() {
             (Ok(o), Ok(s)) => o >= s,
             _ => false,
         };
+        let cache_path = match (&obj_cache, &cache_base) {
+            (Some(dir), Some((headers, base))) => std::fs::read(source).ok().map(|bytes| {
+                let key = fnv1a(&bytes, fnv1a(&headers.to_le_bytes(), *base));
+                dir.join(format!(
+                    "{}-{key:016x}.o",
+                    source.file_stem().expect("kernel file stem").to_string_lossy()
+                ))
+            }),
+            _ => None,
+        };
         if !fresh {
-            obj_jobs.push((source.clone(), object.clone()));
+            let restored = cache_path
+                .as_ref()
+                .map(|cached| cached.is_file() && std::fs::copy(cached, &object).is_ok())
+                .unwrap_or(false);
+            if !restored {
+                obj_jobs.push((source.clone(), object.clone(), cache_path));
+            }
         }
         objects.push(object);
     }
@@ -135,7 +208,7 @@ fn main() {
             for _ in 0..workers {
                 scope.spawn(move || loop {
                     let i = next_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let Some((source, object)) = jobs_ref.get(i) else {
+                    let Some((source, object, cache_path)) = jobs_ref.get(i) else {
                         break;
                     };
                     let output = Command::new(nvcc_ref)
@@ -166,6 +239,12 @@ fn main() {
                         String::from_utf8_lossy(&output.stdout),
                         String::from_utf8_lossy(&output.stderr)
                     );
+                    if let Some(cached) = cache_path {
+                        let staging = cached.with_extension("o.tmp");
+                        if std::fs::copy(object, &staging).is_ok() {
+                            let _ = std::fs::rename(&staging, cached);
+                        }
+                    }
                 });
             }
         });
