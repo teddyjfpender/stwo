@@ -70,16 +70,22 @@ fn read_evaluation(arena: &DeviceArena, evaluation: PreparedFriEvaluation) -> Ve
     host
 }
 
-fn reference_first_tree_root(input: &[u32], log_size: u32) -> Blake2sHash {
+/// Host reference Merkle root over one committed FRI evaluation. The leaf
+/// geometry comes from the PLAN requirement `log_rows_per_leaf`, mirroring the
+/// core verifier's `pack_leaves` rule (core/fri.rs): a tree whose outgoing
+/// fold step exceeds one packs four adjacent QM31 rows per leaf, while the
+/// final partial-fold tree (outgoing step one) hashes a single row per leaf.
+fn reference_tree_root(input: &[u32], log_size: u32, log_rows_per_leaf: u32) -> Blake2sHash {
     let coordinate_stride = 1usize << log_size;
-    let mut layer: Vec<Blake2sHash> = (0..coordinate_stride / 4)
+    let rows_per_leaf = 1usize << log_rows_per_leaf;
+    let mut layer: Vec<Blake2sHash> = (0..coordinate_stride >> log_rows_per_leaf)
         .map(|leaf| {
             let mut hasher = Blake2sHasherGeneric::<false>::default();
-            let words: Vec<BaseField> = (0..4)
+            let words: Vec<BaseField> = (0..rows_per_leaf)
                 .flat_map(|offset| {
                     (0..SECURE_COORDINATES).map(move |coordinate| {
                         BaseField::from_u32_unchecked(
-                            input[coordinate * coordinate_stride + 4 * leaf + offset],
+                            input[coordinate * coordinate_stride + rows_per_leaf * leaf + offset],
                         )
                     })
                 })
@@ -170,6 +176,17 @@ fn eager_and_capture_match() {
         twiddle_log_size: 8,
     };
     let requirements = fri_workspace_requirements(config).unwrap();
+    // Pin the protocol packing profile (core verifier `pack_leaves` rule):
+    // trees 0 and 1 fold outward by three and pack four rows per leaf; tree 2
+    // folds outward by one and commits UNPACKED, one QM31 row per leaf.
+    assert_eq!(
+        requirements
+            .trees
+            .iter()
+            .map(|tree| (tree.outgoing_fold_step, tree.log_rows_per_leaf))
+            .collect::<Vec<_>>(),
+        vec![(3, 2), (3, 2), (1, 0)]
+    );
     let slots = workspace_slots(&requirements);
     let mut requested = requirements.arena_slot_requirements(&slots).unwrap();
     requested.extend([
@@ -236,7 +253,11 @@ fn eager_and_capture_match() {
     let eager_root = prepared.read_tree_root(0).unwrap();
     assert_eq!(
         eager_root,
-        reference_first_tree_root(&host_input, config.circle_log_size)
+        reference_tree_root(
+            &host_input,
+            config.circle_log_size,
+            requirements.trees[0].log_rows_per_leaf
+        )
     );
     let capture = arena.context().capture().unwrap();
     prepared.launch_first_tree().unwrap();
@@ -294,7 +315,11 @@ fn eager_and_capture_match() {
         let eager_inner_root = prepared.read_tree_root(1).unwrap();
         assert_eq!(
             eager_inner_root,
-            reference_first_tree_root(&eager_inner, requirements.trees[1].evaluation_log_size)
+            reference_tree_root(
+                &eager_inner,
+                requirements.trees[1].evaluation_log_size,
+                requirements.trees[1].log_rows_per_leaf
+            )
         );
 
         arena.context().reset_telemetry();
@@ -328,8 +353,13 @@ fn eager_and_capture_match() {
         let second_inner_root = prepared.read_tree_root(2).unwrap();
         assert_eq!(
             second_inner_root,
-            reference_first_tree_root(&second_inner, requirements.trees[2].evaluation_log_size),
-            "mode {mode:?}: tree-2 root disagrees with the reference root of its OWN              (already equality-checked) evaluation"
+            reference_tree_root(
+                &second_inner,
+                requirements.trees[2].evaluation_log_size,
+                requirements.trees[2].log_rows_per_leaf
+            ),
+            "mode {mode:?}: tree-2 root disagrees with the reference root of its OWN \
+             (already equality-checked) evaluation"
         );
         let final_evaluation = read_evaluation(&arena, prepared.final_evaluation());
         assert_eq!(
