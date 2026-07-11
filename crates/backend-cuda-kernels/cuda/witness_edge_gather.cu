@@ -332,6 +332,12 @@ __global__ void witness_input_compact_heads_kernel(
     // proof bytes.
     if (!same_tuple &&
         witness_key_equal(tuples, current, previous, tuple_words, key_words)) {
+        printf(
+            "stwo compact trap: key collision at sorted row %u (tuple %u vs %u): "
+            "same %u-word key, different %u-word tuple; key0=%u key1=%u\n",
+            row, current, previous, key_words, tuple_words,
+            tuples[(size_t)current * tuple_words],
+            key_words > 1 ? tuples[(size_t)current * tuple_words + 1] : 0u);
         asm("trap;");
     }
     heads[row] = same_tuple ? 0u : 1u;
@@ -393,6 +399,10 @@ __global__ void witness_input_compact_finalize_kernel(
         *n_unique = unique;
         uint32_t expected = unique < 16u ? 16u : 1u << (32u - __clz(unique - 1u));
         if (unique == 0u || unique > consumer_rows || expected != consumer_rows) {
+            printf(
+                "stwo compact trap: unique=%u consumer_rows=%u expected_pow2=%u "
+                "total_rows=%u\n",
+                unique, consumer_rows, expected, total_rows);
             asm("trap;");
         }
     }
