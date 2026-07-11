@@ -26,6 +26,10 @@ namespace {
 
 constexpr unsigned KIND_PARTIAL_EC_MUL_W18 = 2;
 constexpr unsigned KIND_PEDERSEN_POINTS_W18 = 3;
+constexpr unsigned KIND_FELT_ADD = 4;
+constexpr unsigned KIND_FELT_SUB = 5;
+constexpr unsigned KIND_FELT_MUL = 6;
+constexpr unsigned KIND_FELT_DIV = 7;
 constexpr unsigned KIND_POSEIDON_ROUND_KEYS = 8;
 constexpr unsigned KIND_CUBE_252 = 9;
 constexpr unsigned KIND_POSEIDON_FULL_ROUND_CHAIN = 10;
@@ -47,6 +51,25 @@ __global__ void oracle_pedersen_points_w18_kernel(
         return;
     }
     stwo_wit_deduce_pedersen_points_w18(in + idx, out + (size_t)idx * 56);
+}
+
+__global__ void oracle_felt_kernel(
+    const unsigned* in, unsigned* out, unsigned n_items, unsigned kind) {
+    unsigned idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_items) {
+        return;
+    }
+    const unsigned* item_in = in + (size_t)idx * 56;
+    unsigned* item_out = out + (size_t)idx * 28;
+    if (kind == KIND_FELT_ADD) {
+        stwo_wit_deduce_felt_add(item_in, item_out);
+    } else if (kind == KIND_FELT_SUB) {
+        stwo_wit_deduce_felt_sub(item_in, item_out);
+    } else if (kind == KIND_FELT_MUL) {
+        stwo_wit_deduce_felt_mul(item_in, item_out);
+    } else {
+        stwo_wit_deduce_felt_div(item_in, item_out);
+    }
 }
 
 __global__ void oracle_poseidon_round_keys_kernel(
@@ -117,7 +140,8 @@ bool fill_oracle_table_globals() {
 
 // Run `n_items` deduces of `kind` on device. `h_in`/`h_out` are host buffers of
 // n_items * (in words) / n_items * (out words) per the recorder shapes
-// (kind 2: 72 -> 72; kind 3: 1 -> 56). Returns 0 on success, nonzero on any
+// (kind 2: 72 -> 72; kind 3: 1 -> 56; kinds 4-7: 56 -> 28; kind 8: 1 -> 30;
+// kind 9: 10 -> 10; kind 10: 32 -> 32; kind 11: 42 -> 42). Returns 0 on success, nonzero on any
 // failure (unknown kind, table init failure, CUDA error) — callers must treat
 // nonzero as "no data", never as zeros.
 extern "C" int stwo_wit_deduce_oracle_run(
@@ -133,6 +157,9 @@ extern "C" int stwo_wit_deduce_oracle_run(
     } else if (kind == KIND_PEDERSEN_POINTS_W18) {
         in_words = 1;
         out_words = 56;
+    } else if (kind >= KIND_FELT_ADD && kind <= KIND_FELT_DIV) {
+        in_words = 56;
+        out_words = 28;
     } else if (kind == KIND_POSEIDON_ROUND_KEYS) {
         in_words = 1;
         out_words = 30;
@@ -175,6 +202,8 @@ extern "C" int stwo_wit_deduce_oracle_run(
             oracle_partial_ec_mul_w18_kernel<<<grid, block>>>(d_in, d_out, n_items);
         } else if (kind == KIND_PEDERSEN_POINTS_W18) {
             oracle_pedersen_points_w18_kernel<<<grid, block>>>(d_in, d_out, n_items);
+        } else if (kind >= KIND_FELT_ADD && kind <= KIND_FELT_DIV) {
+            oracle_felt_kernel<<<grid, block>>>(d_in, d_out, n_items, kind);
         } else if (kind == KIND_POSEIDON_ROUND_KEYS) {
             oracle_poseidon_round_keys_kernel<<<grid, block>>>(d_in, d_out, n_items);
         } else if (kind == KIND_CUBE_252) {

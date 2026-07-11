@@ -1710,13 +1710,15 @@ extern "C" {
         stream: *mut core::ffi::c_void,
     ) -> i32;
 
-    // Truth oracle for the witness-JIT computed EC deduces (ISA-V3 kinds 2/3):
+    // Truth oracle for the witness-JIT computed deduces (ISA-V3 kinds 2-11):
     // runs the exact `stwo_wit_deduce_*` device functions the JIT kernels embed
     // from a precompiled kernel (see `stwo_wit_deduce_oracle.cu`), so the pod
     // ladder can compare against the host `fast_deduction` before trusting any
-    // JIT kernel. Buffers are flat per the recorder shapes (kind 2: 72->72
-    // words per item; kind 3: 1->56). Returns 0 on success; nonzero means "no
-    // data" (unknown kind, table init failure, CUDA error) — never zeros.
+    // JIT kernel. Buffers are flat per the recorder shapes (kind 2: 72->72;
+    // kind 3: 1->56; kinds 4-7: 56->28; kind 8: 1->30; kind 9: 10->10;
+    // kind 10: 32->32; kind 11: 42->42 words per item). Returns 0 on success;
+    // nonzero means "no data" (unknown kind, table init failure, CUDA error) —
+    // never zeros.
     pub fn stwo_wit_deduce_oracle_run(
         kind: u32,
         h_in: *const u32,
