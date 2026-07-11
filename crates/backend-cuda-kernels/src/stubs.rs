@@ -514,6 +514,28 @@ pub unsafe extern "C" fn memory_rc99_count(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn memory_rc99_count_on(
+    limb_cols_host: *const *const u32,
+    n_pairs: u32,
+    column_length: u32,
+    input_to_row_lut: *const u32,
+    rc_table_size: u32,
+    counts: *mut u32,
+    stream: *mut c_void,
+) -> i32 {
+    let _ = (
+        limb_cols_host,
+        n_pairs,
+        column_length,
+        input_to_row_lut,
+        rc_table_size,
+        counts,
+        stream,
+    );
+    no_cuda_symbol("memory_rc99_count_on")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn memory_logup_inputs(
     limb_cols: *const *const u32,
     n_limbs: u32,

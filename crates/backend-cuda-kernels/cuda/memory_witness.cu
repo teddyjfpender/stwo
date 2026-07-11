@@ -191,6 +191,28 @@ __global__ void rc99_count_kernel(
     }
 }
 
+// Capture-safe counterpart: the fixed pointer set travels by value instead of
+// through a device pointer table allocated by the legacy wrapper.
+__global__ void rc99_count_on_kernel(
+    MemoryBaseTraceSources limb_cols,
+    uint32_t n_pairs,
+    uint32_t column_length,
+    const uint32_t *input_to_row_lut,
+    uint32_t rc_table_size,
+    uint32_t *counts
+) {
+    uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= column_length) {
+        return;
+    }
+    for (uint32_t j = 0; j < n_pairs; ++j) {
+        uint32_t v0 = limb_cols.columns[2 * j][row];
+        uint32_t v1 = limb_cols.columns[2 * j + 1][row];
+        uint32_t rc_row = input_to_row_lut[(v0 << FELT252_BITS_PER_WORD) | v1];
+        atomicAdd(&counts[(j % 8) * (size_t)rc_table_size + rc_row], 1u);
+    }
+}
+
 DEVICE_FORCEINLINE qm31 qm31_mul_m31(qm31 x, m31 s) {
     return qm31{cm31{mul(x.a.a, s), mul(x.a.b, s)}, cm31{mul(x.b.a, s), mul(x.b.b, s)}};
 }
@@ -481,6 +503,33 @@ extern "C" void memory_rc99_count(
         limb_cols, n_pairs, column_length, input_to_row_lut, rc_table_size, counts);
     stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
+}
+
+extern "C" int memory_rc99_count_on(
+    const uint32_t *const *limb_cols_host,
+    uint32_t n_pairs,
+    uint32_t column_length,
+    const uint32_t *input_to_row_lut,
+    uint32_t rc_table_size,
+    uint32_t *counts,
+    cudaStream_t stream
+) {
+    if (limb_cols_host == nullptr || input_to_row_lut == nullptr || counts == nullptr ||
+        stream == nullptr || n_pairs == 0 || n_pairs > MW_MAX_LIMBS / 2 ||
+        column_length == 0 || rc_table_size == 0) {
+        return static_cast<int>(cudaErrorInvalidValue);
+    }
+    MemoryBaseTraceSources limb_cols = {};
+    for (uint32_t limb = 0; limb < 2 * n_pairs; ++limb) {
+        if (limb_cols_host[limb] == nullptr) {
+            return static_cast<int>(cudaErrorInvalidDevicePointer);
+        }
+        limb_cols.columns[limb] = limb_cols_host[limb];
+    }
+    uint32_t blocks = (column_length + MW_BLOCK - 1) / MW_BLOCK;
+    rc99_count_on_kernel<<<blocks, MW_BLOCK, 0, stream>>>(
+        limb_cols, n_pairs, column_length, input_to_row_lut, rc_table_size, counts);
+    return static_cast<int>(cudaGetLastError());
 }
 
 extern "C" void memory_logup_inputs(

@@ -1122,6 +1122,20 @@ impl<'a> PreparedWitnessFeedGraph<'a> {
         self.source
     }
 
+    /// Upload the immutable word-major source before graph capture.
+    pub fn upload_source(&self, words: &[u32]) -> Result<(), PreparedWitnessFeedError> {
+        if words.len() != self.requirements.source_words {
+            return Err(PreparedWitnessFeedError::SlotSizeMismatch {
+                slot: self.source.id(),
+                expected_words: self.requirements.source_words,
+                actual_words: words.len(),
+            });
+        }
+        upload(self.arena, self.source, words)?;
+        self.arena.context().sync()?;
+        Ok(())
+    }
+
     pub fn multiplicity_destinations(&self) -> &[ArenaSlice] {
         &self.multiplicity_destinations
     }

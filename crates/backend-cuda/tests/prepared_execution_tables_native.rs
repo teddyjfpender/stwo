@@ -14,6 +14,7 @@ use stwo_backend_cuda::{
 const N_ADDRS: usize = 7;
 const N_BIG: usize = 3;
 const N_SMALL: usize = 5;
+const RC99_TABLE_SIZE: usize = 1 << 18;
 
 fn slots() -> ExecutionTablesWorkspaceSlots {
     let mut next = 1u32;
@@ -307,6 +308,8 @@ struct MemoryTraceSlots {
     address_outputs: Vec<ArenaSlotId>,
     big_outputs: Vec<Vec<ArenaSlotId>>,
     small_outputs: Vec<ArenaSlotId>,
+    rc99_lut: ArenaSlotId,
+    rc99_counts: ArenaSlotId,
 }
 
 fn memory_trace_slots() -> MemoryTraceSlots {
@@ -323,6 +326,8 @@ fn memory_trace_slots() -> MemoryTraceSlots {
         address_outputs: (0..32).map(|_| id()).collect(),
         big_outputs: (0..3).map(|_| (0..29).map(|_| id()).collect()).collect(),
         small_outputs: (0..9).map(|_| id()).collect(),
+        rc99_lut: id(),
+        rc99_counts: id(),
     }
 }
 
@@ -345,6 +350,10 @@ fn arena_with_memory(
     requests.extend(memory.address_outputs.iter().map(|&id| (id, 16, 1)));
     requests.extend(memory.big_outputs.iter().flatten().map(|&id| (id, 16, 1)));
     requests.extend(memory.small_outputs.iter().map(|&id| (id, 16, 1)));
+    requests.extend([
+        (memory.rc99_lut, RC99_TABLE_SIZE, 1),
+        (memory.rc99_counts, 8 * RC99_TABLE_SIZE, 1),
+    ]);
     let mut offset = 0usize;
     let specs = requests
         .into_iter()
@@ -440,6 +449,52 @@ fn assert_memory_trace(
     assert_eq!(read_slot(arena, slots.small_outputs[8]), small_counts);
 }
 
+fn expected_rc99_counts(
+    requirements: &ExecutionTablesWorkspaceRequirements,
+    tables: &OwnedTables,
+    big_rows: usize,
+) -> Vec<u32> {
+    let split = reference(requirements, tables);
+    let mut counts = vec![0u32; 8 * RC99_TABLE_SIZE];
+    for row in 0..big_rows {
+        for pair in 0..EXECUTION_TABLE_BIG_LIMBS / 2 {
+            let lo = split.big_limbs[2 * pair].get(row).copied().unwrap_or(0);
+            let hi = split.big_limbs[2 * pair + 1].get(row).copied().unwrap_or(0);
+            let key = (lo << 9) | hi;
+            counts[(pair % 8) * RC99_TABLE_SIZE + rc99_lut_value(key) as usize] += 1;
+        }
+    }
+    for row in 0..requirements.small_column_words {
+        for pair in 0..EXECUTION_TABLE_SMALL_LIMBS / 2 {
+            let key =
+                (split.small_limbs[2 * pair][row] << 9) | split.small_limbs[2 * pair + 1][row];
+            counts[pair * RC99_TABLE_SIZE + rc99_lut_value(key) as usize] += 1;
+        }
+    }
+    let relation_totals = counts
+        .chunks_exact(RC99_TABLE_SIZE)
+        .map(|relation| relation.iter().sum::<u32>())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        relation_totals,
+        [
+            (2 * big_rows + requirements.small_column_words) as u32,
+            (2 * big_rows + requirements.small_column_words) as u32,
+            (2 * big_rows + requirements.small_column_words) as u32,
+            (2 * big_rows + requirements.small_column_words) as u32,
+            (2 * big_rows) as u32,
+            (2 * big_rows) as u32,
+            big_rows as u32,
+            big_rows as u32,
+        ]
+    );
+    counts
+}
+
+fn rc99_lut_value(key: u32) -> u32 {
+    (key + 17) & (RC99_TABLE_SIZE as u32 - 1)
+}
+
 /// The final real big segment may be partial and followed by an explicit zero
 /// padding component. Padded id/source offsets remain stable across capture and
 /// replay, and every base column is byte-identical to the host layout.
@@ -471,6 +526,11 @@ fn prepared_memory_base_trace_handles_partial_final_and_padding_part() {
     upload_words(&arena, memory_slots.address_counts, &address_counts);
     upload_words(&arena, memory_slots.big_counts, &big_counts);
     upload_words(&arena, memory_slots.small_counts, &small_counts);
+    upload_words(
+        &arena,
+        memory_slots.rc99_counts,
+        &vec![0; 8 * RC99_TABLE_SIZE],
+    );
     arena.context().sync().unwrap();
 
     let address_outputs = memory_slots
@@ -519,9 +579,19 @@ fn prepared_memory_base_trace_handles_partial_final_and_padding_part() {
             row_count: 16,
             outputs: &small_outputs,
         },
+        arena.bind(memory_slots.rc99_lut).unwrap(),
+        RC99_TABLE_SIZE,
+        arena.bind(memory_slots.rc99_counts).unwrap(),
     )
     .unwrap();
-    assert_eq!(prepared.kernel_launches(), 5);
+    prepared
+        .upload_rc99_lut(
+            &(0..RC99_TABLE_SIZE as u32)
+                .map(rc99_lut_value)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    assert_eq!(prepared.kernel_launches(), 9);
 
     execution.launch().unwrap();
     prepared.launch().unwrap();
@@ -534,7 +604,17 @@ fn prepared_memory_base_trace_handles_partial_final_and_padding_part() {
         &big_counts,
         &small_counts,
     );
+    assert_eq!(
+        read_slot(&arena, memory_slots.rc99_counts),
+        expected_rc99_counts(&requirements, &first, big_counts.len())
+    );
 
+    upload_words(
+        &arena,
+        memory_slots.rc99_counts,
+        &vec![0; 8 * RC99_TABLE_SIZE],
+    );
+    arena.context().sync().unwrap();
     let capture = arena.context().capture().unwrap();
     execution.launch().unwrap();
     prepared.launch().unwrap();
@@ -548,5 +628,9 @@ fn prepared_memory_base_trace_handles_partial_final_and_padding_part() {
         &address_counts,
         &big_counts,
         &small_counts,
+    );
+    assert_eq!(
+        read_slot(&arena, memory_slots.rc99_counts),
+        expected_rc99_counts(&requirements, &first, big_counts.len())
     );
 }

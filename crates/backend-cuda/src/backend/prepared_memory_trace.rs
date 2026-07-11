@@ -61,6 +61,7 @@ struct PreparedValuePart {
     source_offset: u32,
     row_count: u32,
     output_pointers: Vec<*mut u32>,
+    rc99_limb_pointers: Vec<*const u32>,
 }
 
 pub struct PreparedMemoryBaseTraceGraph<'a> {
@@ -81,6 +82,9 @@ pub struct PreparedMemoryBaseTraceGraph<'a> {
     small_counts: ArenaSlice,
     small_count_words: u32,
     small_part: PreparedValuePart,
+    rc99_lut: ArenaSlice,
+    rc99_table_size: u32,
+    rc99_counts: ArenaSlice,
 }
 
 impl<'a> PreparedMemoryBaseTraceGraph<'a> {
@@ -98,6 +102,9 @@ impl<'a> PreparedMemoryBaseTraceGraph<'a> {
         small_counts: ArenaSlice,
         small_count_words: usize,
         small_part: MemoryBaseTracePart<'_>,
+        rc99_lut: ArenaSlice,
+        rc99_table_size: usize,
+        rc99_counts: ArenaSlice,
     ) -> Result<Self, PreparedMemoryBaseTraceError> {
         if !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
             return Err(PreparedMemoryBaseTraceError::CudaUnavailable);
@@ -163,6 +170,10 @@ impl<'a> PreparedMemoryBaseTraceGraph<'a> {
                 actual: small_count_words,
             });
         }
+        check_shape("rc9_9 table size", 1usize << 18, rc99_table_size)?;
+        let rc99_count_words = rc99_table_size
+            .checked_mul(8)
+            .ok_or(PreparedMemoryBaseTraceError::SizeOverflow)?;
 
         let token = arena.context().identity_token();
         let mut all = Vec::new();
@@ -179,6 +190,8 @@ impl<'a> PreparedMemoryBaseTraceGraph<'a> {
             ),
             ("big multiplicities", big_counts, big_count_words),
             ("small multiplicities", small_counts, small_count_words),
+            ("rc9_9 LUT", rc99_lut, 1usize << 18),
+            ("rc9_9 multiplicities", rc99_counts, rc99_count_words),
         ] {
             validate_slice(role, slice, words, token)?;
             all.push(slice.id());
@@ -231,6 +244,12 @@ impl<'a> PreparedMemoryBaseTraceGraph<'a> {
                     .iter()
                     .map(|slice| slice.as_u32_ptr())
                     .collect(),
+                rc99_limb_pointers: part
+                    .outputs
+                    .iter()
+                    .take(part.outputs.len() - 1)
+                    .map(|slice| slice.as_u32_ptr().cast_const())
+                    .collect(),
             })
         };
         Ok(Self {
@@ -272,11 +291,29 @@ impl<'a> PreparedMemoryBaseTraceGraph<'a> {
             small_count_words: u32::try_from(small_count_words)
                 .map_err(|_| PreparedMemoryBaseTraceError::SizeOverflow)?,
             small_part: prepared_part(&small_part)?,
+            rc99_lut,
+            rc99_table_size: u32::try_from(rc99_table_size)
+                .map_err(|_| PreparedMemoryBaseTraceError::SizeOverflow)?,
+            rc99_counts,
         })
     }
 
     pub fn launch(&self) -> Result<(), PreparedMemoryBaseTraceError> {
         self.launch_on(self.arena.context().launch_context())
+    }
+
+    /// Seed the plan-owned canonical rc9_9 lookup table before capture.
+    pub fn upload_rc99_lut(&self, words: &[u32]) -> Result<(), PreparedMemoryBaseTraceError> {
+        check_shape("rc9_9 LUT upload", self.rc99_lut.len_words(), words.len())?;
+        unsafe {
+            self.arena.context().memcpy_h2d_async(
+                self.rc99_lut.as_void_ptr(),
+                words.as_ptr().cast(),
+                core::mem::size_of_val(words),
+            )?;
+        }
+        self.arena.context().sync()?;
+        Ok(())
     }
 
     pub fn launch_on(&self, launch: CudaLaunchContext) -> Result<(), PreparedMemoryBaseTraceError> {
@@ -306,6 +343,7 @@ impl<'a> PreparedMemoryBaseTraceGraph<'a> {
                 part,
                 stream,
             )?;
+            self.launch_rc99(part, EXECUTION_TABLE_BIG_LIMBS / 2, stream)?;
         }
         self.launch_value_part(
             &self.small_source_pointers,
@@ -315,7 +353,8 @@ impl<'a> PreparedMemoryBaseTraceGraph<'a> {
             self.small_count_words,
             &self.small_part,
             stream,
-        )
+        )?;
+        self.launch_rc99(&self.small_part, EXECUTION_TABLE_SMALL_LIMBS / 2, stream)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -346,8 +385,41 @@ impl<'a> PreparedMemoryBaseTraceGraph<'a> {
         Ok(())
     }
 
+    fn launch_rc99(
+        &self,
+        part: &PreparedValuePart,
+        n_pairs: usize,
+        stream: *mut core::ffi::c_void,
+    ) -> Result<(), PreparedMemoryBaseTraceError> {
+        let code = unsafe {
+            stwo_backend_cuda_kernels::raw::memory_rc99_count_on(
+                part.rc99_limb_pointers.as_ptr(),
+                n_pairs as u32,
+                part.row_count,
+                self.rc99_lut.as_u32_ptr().cast_const(),
+                self.rc99_table_size,
+                self.rc99_counts.as_u32_ptr(),
+                stream,
+            )
+        };
+        check_cuda("memory_rc99_count_on", code)?;
+        Ok(())
+    }
+
     pub fn kernel_launches(&self) -> usize {
-        2 + self.big_parts.len()
+        3 + 2 * self.big_parts.len()
+    }
+
+    pub fn rc99_lut(&self) -> ArenaSlice {
+        self.rc99_lut
+    }
+
+    pub fn rc99_counts(&self) -> ArenaSlice {
+        self.rc99_counts
+    }
+
+    pub fn rc99_table_size(&self) -> usize {
+        self.rc99_table_size as usize
     }
 }
 
