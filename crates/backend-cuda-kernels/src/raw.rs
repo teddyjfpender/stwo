@@ -1909,8 +1909,12 @@ extern "C" {
         stream: *mut c_void,
     ) -> i32;
 
-    /// Persistent, globally minimal numeric-u64 Blake2s nonce search from the
-    /// current device transcript state.
+    /// Persistent Blake2s nonce search over the SIMD grind lattice
+    /// `{(hi << 32) | low : 0 <= low < 2^20}` from the current device
+    /// transcript state. Publishes the numerically smallest qualifying
+    /// lattice nonce, which is byte-identical to the SIMD reference grind
+    /// (its hi-ascending, low-ascending scan order equals numeric order on
+    /// the lattice).
     pub fn stwo_blake2s_pow_persistent_on(
         transcript_state: *const u32,
         pow_bits: u32,

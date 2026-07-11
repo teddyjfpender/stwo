@@ -1,8 +1,14 @@
 //! Prepared resident Blake2s proof-of-work.
 //!
 //! The persistent search kernel reads the current device transcript digest and
-//! publishes the globally lowest numeric `u64` satisfying the ordinary Blake2s
-//! channel check. Replay contains only stream memsets and that one kernel.
+//! publishes the numerically smallest nonce on the SIMD grind lattice
+//! `{(hi << 32) | low : 0 <= low < 2^POW_GRIND_LOW_BITS}` satisfying the
+//! ordinary Blake2s channel check. The SIMD reference
+//! (`stwo::prover::backend::simd::grind`) scans hi ascending, then low
+//! ascending within each hi; because `low < 2^20 < 2^32`, that scan order IS
+//! numeric order on the lattice, so the kernel's numeric minimum over mapped
+//! lattice nonces is byte-identical to `SimdBackend::grind`. Replay contains
+//! only stream memsets and that one kernel.
 
 use std::collections::BTreeSet;
 
@@ -14,6 +20,19 @@ use super::exec_context::{
 const WORD_BYTES: usize = core::mem::size_of::<u32>();
 pub const POW_NONCE_WORDS: usize = 2;
 pub const POW_U64_ALIGNMENT_WORDS: usize = core::mem::align_of::<u64>() / WORD_BYTES;
+/// Low-bit width of the SIMD grind lattice (GRIND_LOW_BITS in
+/// `stwo::prover::backend::simd::grind`).
+pub const POW_GRIND_LOW_BITS: u32 = 20;
+
+/// Host mirror of the kernel's monotone index -> nonce map
+/// (`pow_index_to_nonce` in `cuda/resident_pow.cu`): linear search index `i`
+/// covers exactly the SIMD lattice nonce `(hi << 32) | low` with
+/// `hi = i >> 20` and `low = i & 0xFFFFF`. Strictly increasing in `i` (nonce
+/// bits 20..31 are always zero), so numeric order on mapped nonces equals
+/// index order equals the SIMD (hi ascending, low ascending) scan order.
+pub const fn pow_index_to_nonce(index: u64) -> u64 {
+    ((index >> POW_GRIND_LOW_BITS) << 32) | (index & ((1 << POW_GRIND_LOW_BITS) - 1))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Blake2sPowWorkspaceRequirements {
@@ -217,6 +236,11 @@ impl<'a> PreparedBlake2sPowGraph<'a> {
     }
 }
 
+/// Mirrors the SIMD reference's `pow_bits <= 32` assertion. The lattice
+/// enumeration keeps this bound sound: `pow_bits = 32` needs ~2^32 attempts in
+/// expectation, i.e. ~2^12 hi blocks of 2^20 lows each, far below the kernel's
+/// `hi < 2^31 - 1` give-up limit (which itself mirrors the SIMD post-grind
+/// assertion that the found hi is reduced modulo the M31 prime).
 fn validate_pow_bits(pow_bits: u32) -> Result<(), PreparedBlake2sPowError> {
     if pow_bits > 32 {
         return Err(PreparedBlake2sPowError::InvalidPowBits(pow_bits));
@@ -246,7 +270,7 @@ mod tests {
     use stwo::core::channel::{Blake2sChannelGeneric, Channel};
     use stwo::core::proof_of_work::GrindOps;
     use stwo::core::vcs::blake2_hash::Blake2sHasherGeneric;
-    use stwo::prover::backend::CpuBackend;
+    use stwo::prover::backend::simd::SimdBackend;
 
     use super::*;
 
@@ -315,20 +339,97 @@ mod tests {
     }
 
     #[test]
-    fn numeric_global_minimum_matches_sequential_reference() {
+    fn index_to_nonce_mapping_pins_the_simd_lattice() {
+        // Identity below the first hi block.
+        assert_eq!(pow_index_to_nonce(0), 0);
+        assert_eq!(pow_index_to_nonce(1), 1);
+        assert_eq!(pow_index_to_nonce((1 << 20) - 1), (1 << 20) - 1);
+        // Crossing a low-block boundary increments hi and resets low.
+        assert_eq!(pow_index_to_nonce(1 << 20), 1 << 32);
+        assert_eq!(pow_index_to_nonce((1 << 20) + 1), (1 << 32) | 1);
+
+        // Equivalence with the lattice documented in grind_blake2s.cu and
+        // implemented by the SIMD grind: index (hi << 20) | low covers
+        // exactly the nonce (hi << 32) | low, 0 <= low < 2^20.
+        for hi in [0u64, 1, 2, 41, (1 << 31) - 2] {
+            for low in [0u64, 1, 0x12345, (1 << 20) - 1] {
+                assert_eq!(pow_index_to_nonce((hi << 20) | low), (hi << 32) | low);
+            }
+        }
+
+        // Strict monotonicity across block boundaries: numeric order on
+        // mapped nonces equals index order, which is the SIMD scan order.
+        let samples = [
+            0u64,
+            1,
+            (1 << 20) - 1,
+            1 << 20,
+            (1 << 20) + 1,
+            (5 << 20) + 7,
+            u64::from(u32::MAX),
+        ];
+        for pair in samples.windows(2) {
+            assert!(pow_index_to_nonce(pair[0]) < pow_index_to_nonce(pair[1]));
+        }
+    }
+
+    #[test]
+    fn mapped_strided_minimum_matches_simd_grind() {
         let mut channel = Blake2sChannelGeneric::<false>::default();
         channel.mix_u32s(&[42, 77, 99]);
-        let expected = CpuBackend::grind(&channel, 10);
+        let expected = SimdBackend::grind(&channel, 10);
+        // Invert the monotone map to bound the walk at the known answer.
+        let expected_index =
+            ((expected >> 32) << POW_GRIND_LOW_BITS) | (expected & ((1 << POW_GRIND_LOW_BITS) - 1));
+        assert_eq!(pow_index_to_nonce(expected_index), expected);
         let workers = 37u64;
         let strided = (0..workers)
             .filter_map(|worker| {
-                (worker..=expected)
+                (worker..=expected_index)
                     .step_by(workers as usize)
+                    .map(pow_index_to_nonce)
                     .find(|&nonce| reference_valid_pow(&channel, 10, nonce))
             })
             .min()
             .unwrap();
         assert_eq!(strided, expected);
+    }
+
+    #[test]
+    fn lattice_enumeration_skips_dense_nonces_outside_the_simd_search_space() {
+        // Synthetic qualifying set reproducing the divergence scenario: the
+        // dense-u64 minimum 0x30_0000 has low-32 bits >= 2^20, so the SIMD
+        // grind NEVER tests it; the reference answer is the lattice point.
+        let lattice_hit = (3u64 << 32) | 7;
+        let dense_only_hit = 0x30_0000u64;
+        let qualifies = |nonce: u64| nonce == dense_only_hit || nonce == lattice_hit;
+        assert!(dense_only_hit < lattice_hit, "dense minimum must differ");
+
+        // SIMD scan-order reference (hi ascending, low ascending) == index
+        // order under the monotone map.
+        let simd_answer = (0u64..)
+            .map(pow_index_to_nonce)
+            .find(|&nonce| qualifies(nonce))
+            .unwrap();
+        assert_eq!(simd_answer, lattice_hit);
+
+        // Kernel model: workers stride the index space, atomicMin over MAPPED
+        // nonces. Each worker's minimum is its first hit (map is monotone per
+        // residue class); the global minimum is the SIMD answer, and the
+        // dense-only nonce is never enumerated.
+        let workers = 5u64;
+        let limit = (3u64 << POW_GRIND_LOW_BITS) + 8;
+        let strided = (0..workers)
+            .filter_map(|worker| {
+                (worker..limit)
+                    .step_by(workers as usize)
+                    .map(pow_index_to_nonce)
+                    .inspect(|&nonce| assert_ne!(nonce, dense_only_hit))
+                    .find(|&nonce| qualifies(nonce))
+            })
+            .min()
+            .unwrap();
+        assert_eq!(strided, simd_answer);
     }
 
     #[test]

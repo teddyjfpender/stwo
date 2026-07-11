@@ -102,9 +102,9 @@ pub use backend::prepared_oods::{
     PreparedOodsGraph, OODS_PARAMETER_WORDS, OODS_POINTER_ALIGNMENT_WORDS,
 };
 pub use backend::prepared_pow::{
-    blake2s_pow_workspace_requirements, Blake2sPowArenaSlotRequirement,
+    blake2s_pow_workspace_requirements, pow_index_to_nonce, Blake2sPowArenaSlotRequirement,
     Blake2sPowWorkspaceRequirements, Blake2sPowWorkspaceSlots, PreparedBlake2sPowError,
-    PreparedBlake2sPowGraph, POW_NONCE_WORDS, POW_U64_ALIGNMENT_WORDS,
+    PreparedBlake2sPowGraph, POW_GRIND_LOW_BITS, POW_NONCE_WORDS, POW_U64_ALIGNMENT_WORDS,
 };
 pub use backend::prepared_quotient::{
     quotient_workspace_requirements, PreparedQuotientError, PreparedQuotientGraph,

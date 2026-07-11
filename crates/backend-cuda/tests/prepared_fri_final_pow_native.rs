@@ -13,7 +13,7 @@ use stwo::core::poly::line::{LineDomain, LinePoly};
 use stwo::core::proof_of_work::GrindOps;
 use stwo::core::utils::bit_reverse_index;
 use stwo::prover::backend::cpu::circle::slow_precompute_twiddles;
-use stwo::prover::backend::CpuBackend;
+use stwo::prover::backend::simd::SimdBackend;
 use stwo_backend_cuda::{
     blake2s_pow_workspace_requirements, fri_final_workspace_requirements, ArenaLayout, ArenaSlice,
     ArenaSlotId, ArenaSlotSpec, Blake2sPowArenaSlotRequirement, Blake2sPowWorkspaceSlots,
@@ -264,8 +264,14 @@ fn read_nonce(arena: &DeviceArena, nonce: ArenaSlice) -> u64 {
     u64::from(words[0]) | (u64::from(words[1]) << 32)
 }
 
+// The byte-identity contract is the SIMD grind: the smallest qualifying nonce
+// on the lattice {(hi << 32) | low : 0 <= low < 2^20}, whose (hi asc, low asc)
+// scan order equals numeric order on the lattice. At pow_bits = 10 the answer
+// lands in the first low block with overwhelming probability, but the pinned
+// reference must be SimdBackend::grind — a dense-scan (CpuBackend) reference
+// would diverge whenever the dense minimum has low-32 bits >= 2^20.
 #[test]
-fn persistent_pow_eager_and_capture_return_cpu_global_minimum() {
+fn persistent_pow_eager_and_capture_return_simd_lattice_minimum() {
     let requirements = blake2s_pow_workspace_requirements();
     let workspace_slots = Blake2sPowWorkspaceSlots {
         best_nonce: POW_BEST,
@@ -304,7 +310,7 @@ fn persistent_pow_eager_and_capture_return_cpu_global_minimum() {
     prepared.launch().unwrap();
     assert_eq!(
         read_nonce(&arena, prepared.nonce_destination()),
-        CpuBackend::grind(&first_channel, pow_bits)
+        SimdBackend::grind(&first_channel, pow_bits)
     );
 
     let capture = arena.context().capture().unwrap();
@@ -316,6 +322,6 @@ fn persistent_pow_eager_and_capture_return_cpu_global_minimum() {
     graph.launch(arena.context()).unwrap();
     assert_eq!(
         read_nonce(&arena, prepared.nonce_destination()),
-        CpuBackend::grind(&second_channel, pow_bits)
+        SimdBackend::grind(&second_channel, pow_bits)
     );
 }

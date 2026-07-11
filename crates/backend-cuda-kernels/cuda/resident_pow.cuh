@@ -3,10 +3,13 @@
 
 #include <cstdint>
 
-// Search the numeric u64 nonce space with one persistent kernel. The state is
-// the 16-word device Blake2s transcript state; its first eight words are the
-// current digest. `best_nonce` is initialized to UINT64_MAX and
-// `completed_blocks` to zero by the prepared caller.
+// Search the SIMD grind nonce lattice {(hi << 32) | low : 0 <= low < 2^20}
+// with one persistent kernel, publishing the numerically smallest qualifying
+// lattice nonce -- byte-identical to the SIMD reference grind, whose
+// (hi ascending, low ascending) scan order equals numeric order on the
+// lattice. The state is the 16-word device Blake2s transcript state; its
+// first eight words are the current digest. `best_nonce` is initialized to
+// UINT64_MAX and `completed_blocks` to zero by the prepared caller.
 extern "C" int stwo_blake2s_pow_persistent_on(
     const uint32_t *transcript_state,
     uint32_t pow_bits,

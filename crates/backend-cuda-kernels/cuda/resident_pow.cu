@@ -11,6 +11,35 @@ constexpr uint32_t POW_PREFIX = 0x12345678U;
 constexpr uint32_t POW_BLOCK_SIZE = 256U;
 constexpr uint32_t POW_GRID_SIZE = 1024U;
 
+// SIMD grind lattice (crates/stwo/src/prover/backend/simd/grind.rs). The
+// reference scans nonces of the form (hi << 32) | low with 0 <= low < 2^20,
+// hi ascending and low ascending within each hi, and returns the first hit.
+// Because low < 2^20 < 2^32, that (hi, low) scan order IS numeric order on
+// the lattice values, so the reference answer is exactly the numeric minimum
+// of the qualifying lattice nonces. This kernel therefore enumerates a linear
+// index i, maps it monotonically onto the lattice, and takes an atomicMin of
+// the MAPPED nonce: the published minimum is byte-identical to SIMD's result.
+constexpr uint32_t POW_GRIND_LOW_BITS = 20U;
+constexpr unsigned long long POW_GRIND_LOW_MASK =
+    (1ULL << POW_GRIND_LOW_BITS) - 1ULL;
+// SIMD asserts the found hi is < 2^31 - 1 (the M31 prime). Mirror that bound
+// as the give-up limit: indices span [0, P << 20) ~ 2^51, astronomically more
+// than any realistic grind (pow_bits <= 32 needs ~2^32 attempts). On
+// exhaustion best_nonce stays UINT64_MAX (not a lattice value, since lattice
+// values have zero bits 20..31) and the published nonce fails verification
+// downstream: fail-closed, never a silent wrap.
+constexpr unsigned long long POW_INDEX_LIMIT =
+    static_cast<unsigned long long>(0x7FFFFFFFU) << POW_GRIND_LOW_BITS;
+
+// Monotone index -> lattice nonce map: i -> ((i >> 20) << 32) | (i & 0xFFFFF).
+// Strictly increasing in i (the hi field takes the index's high bits, the low
+// field its low 20 bits, and nonce bits 20..31 are always zero), so numeric
+// comparisons on mapped nonces order exactly like the underlying indices.
+__device__ __forceinline__ unsigned long long pow_index_to_nonce(
+    unsigned long long index) {
+  return ((index >> POW_GRIND_LOW_BITS) << 32U) | (index & POW_GRIND_LOW_MASK);
+}
+
 // Fixed 40-byte Blake2s candidate block, shared semantically with the legacy
 // grind kernel but kept local so the persistent loop stays fully in registers.
 static __device__ __constant__ uint32_t POW_IV[8] = {
@@ -120,8 +149,16 @@ __global__ void persistent_pow_search(
       static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
   const unsigned long long stride =
       static_cast<unsigned long long>(gridDim.x) * blockDim.x;
-  unsigned long long candidate = worker;
-  for (;;) {
+  // Workers stride over the linear INDEX space; every hashed candidate is the
+  // mapped lattice nonce, and best_nonce always holds a mapped value (or the
+  // UINT64_MAX sentinel). Because the map is strictly monotone, comparing a
+  // mapped candidate against best is equivalent to comparing indices, so the
+  // early-exit reasoning below is unchanged from the pre-lattice kernel.
+  // index + stride cannot overflow: index < POW_INDEX_LIMIT ~ 2^51 and
+  // stride = gridDim.x * blockDim.x = 2^18.
+  unsigned long long index = worker;
+  while (index < POW_INDEX_LIMIT) {
+    const unsigned long long candidate = pow_index_to_nonce(index);
     // An atomic read prevents a worker from terminating on an out-of-date
     // larger bound. A stale smaller bound is impossible because best only falls.
     const unsigned long long best = atomicAdd(best_nonce, 0ULL);
@@ -134,15 +171,14 @@ __global__ void persistent_pow_search(
       atomicMin(best_nonce, candidate);
     }
 
-    if (candidate > ~0ULL - stride) {
-      break;
-    }
-    candidate += stride;
+    index += stride;
   }
 
-  // Every worker exhausts its residue class below the observed minimum. The
-  // last block to retire therefore knows all numeric candidates below the final
-  // atomic minimum were checked, and alone publishes the transcript nonce.
+  // Every worker exhausts its index residue class for all lattice nonces below
+  // the observed minimum. The last block to retire therefore knows every
+  // lattice candidate below the final atomic minimum was checked, and alone
+  // publishes the transcript nonce -- the numerically smallest qualifying
+  // lattice nonce, i.e. exactly the SIMD grind's answer.
   __syncthreads();
   if (threadIdx.x == 0U) {
     __threadfence();
