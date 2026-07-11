@@ -786,6 +786,11 @@ impl ArenaSlice {
         self.len_words * core::mem::size_of::<u32>()
     }
 
+    /// Whether this non-owning view belongs to `context`.
+    pub fn belongs_to(self, context: &CudaExecContext) -> bool {
+        self.context_token == context.identity_token()
+    }
+
     pub(crate) fn context_token(self) -> NonNull<c_void> {
         self.context_token
     }
