@@ -407,7 +407,7 @@ fn build_aot_pack(
     // are independent TUs and SASS -O3 on the big fp256 kernels takes minutes
     // each; serial nvcc dominated the first pod build.
     let mut entries: Vec<(u64, u32, PathBuf)> = Vec::new();
-    let mut jobs: Vec<(PathBuf, String, PathBuf)> = Vec::new();
+    let mut jobs: Vec<(PathBuf, String, PathBuf, bool)> = Vec::new();
     for source in &sources {
         let stem = source.file_stem().unwrap().to_string_lossy().to_string();
         let key = u64::from_str_radix(stem.rsplit('_').next().unwrap(), 16)
@@ -418,7 +418,10 @@ fn build_aot_pack(
                 .trim_start_matches("sm_")
                 .parse()
                 .expect("STWO_CUDA_ARCH entries look like sm_90");
-            let cubin = cubin_dir.join(format!("{stem}_{arch}.cubin"));
+            let ptxas_o0 =
+                arch == "sm_90" && stem.starts_with("witness_poseidon_3_partial_rounds_chain_");
+            let policy = if ptxas_o0 { "_ptxas_o0" } else { "" };
+            let cubin = cubin_dir.join(format!("{stem}_{arch}{policy}.cubin"));
             let fresh = match (
                 std::fs::metadata(&cubin).and_then(|m| m.modified()),
                 src_mtime,
@@ -427,7 +430,7 @@ fn build_aot_pack(
                 _ => false,
             };
             if !fresh {
-                jobs.push((source.clone(), arch.clone(), cubin.clone()));
+                jobs.push((source.clone(), arch.clone(), cubin.clone(), ptxas_o0));
             }
             entries.push((key, num, cubin));
         }
@@ -447,16 +450,25 @@ fn build_aot_pack(
             for _ in 0..workers {
                 scope.spawn(move || loop {
                     let i = next_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let Some((source, arch, cubin)) = jobs_ref.get(i) else {
+                    let Some((source, arch, cubin, ptxas_o0)) = jobs_ref.get(i) else {
                         break;
                     };
-                    let output = Command::new(nvcc_ref)
+                    let mut command = Command::new(nvcc_ref);
+                    command
                         .arg("-cubin")
                         .arg("-O3")
                         .arg("--std=c++17")
                         .arg("--expt-relaxed-constexpr")
                         .arg(format!("-arch={arch}"))
-                        .args(extra_ref.iter())
+                        .args(extra_ref.iter());
+                    // The fully fused Poseidon partial-round witness reaches the
+                    // CUDA 11.8 sm_90 miscompiles this fully fused TU at the H100
+                    // register ceiling. Keep its generated CUDA and fp256 math
+                    // unchanged while selecting a conservative ptxas schedule.
+                    if *ptxas_o0 {
+                        command.arg("-Xptxas=-O0");
+                    }
+                    let output = command
                         .arg(source)
                         .arg("-o")
                         .arg(cubin)
