@@ -558,7 +558,8 @@ fn assert_canonical(snapshot: &[InstanceSnapshot]) {
 fn run_eager_capture_and_mutated_replay(
     mode: RelationLaunchMode,
     tail: RelationTailMode,
-    expected_kernel_nodes: u64,
+    expected_kernel_nodes: &[u64],
+    implicit_launch: bool,
 ) {
     let program = cairo_program();
     assert_eq!(
@@ -586,7 +587,20 @@ fn run_eager_capture_and_mutated_replay(
         linear_scan,
         "512-row fixture must detect a linear row-order scan"
     );
-    let requirements = program.requirements().unwrap();
+    let requirements = program.requirements_for_mode(mode).unwrap();
+    for requirement in &requirements.instances {
+        let batch = &program.batches[requirement.batch_index];
+        let expected_denominator_words =
+            if mode == RelationLaunchMode::Fused && relation_batch_fused_eligible(batch) {
+                1
+            } else {
+                requirement.output_words
+            };
+        assert_eq!(
+            requirement.denominator_words, expected_denominator_words,
+            "denominator layout disagrees with {mode:?} eligibility"
+        );
+    }
     let mut next_id = 1u32;
     let mut id = || {
         let result = ArenaSlotId(next_id);
@@ -688,9 +702,10 @@ fn run_eager_capture_and_mutated_replay(
         program.max_alpha_powers as usize,
     );
     let first_z = SecureField::from_u32_unchecked(13, 17, 19, 23);
-    let prepared = PreparedRelationGraph::prepare(
+    let prepared = PreparedRelationGraph::prepare_with_mode(
         &arena,
         &program,
+        mode,
         &slots,
         &device_sources,
         RelationChallenges {
@@ -700,7 +715,24 @@ fn run_eager_capture_and_mutated_replay(
     )
     .unwrap();
 
-    prepared.launch_with_modes(mode, tail).unwrap();
+    if mode == RelationLaunchMode::Fused {
+        assert!(matches!(
+            prepared.launch_with_modes(RelationLaunchMode::ThreeStage, tail),
+            Err(
+                stwo_backend_cuda::RelationGraphError::CompactFusedLaunchModeMismatch {
+                    requested: RelationLaunchMode::ThreeStage,
+                }
+            )
+        ));
+    }
+    let launch = |prepared: &PreparedRelationGraph<'_>| {
+        if implicit_launch {
+            prepared.launch()
+        } else {
+            prepared.launch_with_modes(mode, tail)
+        }
+    };
+    launch(&prepared).unwrap();
     let eager = read_snapshot(&arena, &prepared);
     assert_canonical(&eager);
     assert_eq!(
@@ -728,12 +760,13 @@ fn run_eager_capture_and_mutated_replay(
     );
 
     let capture = arena.context().capture().unwrap();
-    prepared.launch_with_modes(mode, tail).unwrap();
+    launch(&prepared).unwrap();
     let graph = capture.finish().unwrap();
-    assert_eq!(
-        graph.kernel_nodes(),
-        expected_kernel_nodes,
-        "relation capture node budget changed for {mode:?}/{tail:?}"
+    assert!(
+        expected_kernel_nodes.contains(&graph.kernel_nodes()),
+        "relation capture node budget changed for {mode:?}/{tail:?}: expected one of \
+         {expected_kernel_nodes:?}, got {}",
+        graph.kernel_nodes()
     );
     arena.context().reset_telemetry();
     graph.launch(arena.context()).unwrap();
@@ -782,7 +815,8 @@ fn eager_capture_and_mutated_replay_match_cairo_reference() {
     run_eager_capture_and_mutated_replay(
         RelationLaunchMode::ThreeStage,
         RelationTailMode::Segmented,
-        8,
+        &[8],
+        false,
     );
 }
 
@@ -790,7 +824,12 @@ fn eager_capture_and_mutated_replay_match_cairo_reference() {
 fn fused_eager_capture_and_mutated_replay_match_cairo_reference() {
     // One fused node + three per-instance fallback nodes for the wide-tuple
     // batch (pairs, slab inverse, fraction chain) + five segmented tail nodes.
-    run_eager_capture_and_mutated_replay(RelationLaunchMode::Fused, RelationTailMode::Segmented, 9);
+    run_eager_capture_and_mutated_replay(
+        RelationLaunchMode::Fused,
+        RelationTailMode::Segmented,
+        &[9],
+        false,
+    );
 }
 
 #[test]
@@ -798,12 +837,35 @@ fn scan_tail_eager_capture_and_mutated_replay_match_cairo_reference() {
     // Three 3-stage body nodes + two scan-tail kernels (lookback scan, shift
     // fixup); the partition-descriptor clear captures as a memset node, which
     // the kernel-node budget deliberately excludes.
-    run_eager_capture_and_mutated_replay(RelationLaunchMode::ThreeStage, RelationTailMode::Scan, 5);
+    run_eager_capture_and_mutated_replay(
+        RelationLaunchMode::ThreeStage,
+        RelationTailMode::Scan,
+        &[5],
+        false,
+    );
 }
 
 #[test]
 fn fused_scan_tail_eager_capture_and_mutated_replay_match_cairo_reference() {
     // Four fused-body nodes (fused + wide-tuple fallback pairs/inverse/chain)
     // + two scan-tail kernels.
-    run_eager_capture_and_mutated_replay(RelationLaunchMode::Fused, RelationTailMode::Scan, 6);
+    run_eager_capture_and_mutated_replay(
+        RelationLaunchMode::Fused,
+        RelationTailMode::Scan,
+        &[6],
+        false,
+    );
+}
+
+#[test]
+fn compact_fused_implicit_launch_matches_cairo_reference() {
+    // `launch()` must honor the preparation's compact fused mode even when
+    // STWO_CUDA_RELATION_FUSED is unset. The process-wide tail may be either
+    // segmented (9 nodes) or scan (6); neither 3-stage topology is accepted.
+    run_eager_capture_and_mutated_replay(
+        RelationLaunchMode::Fused,
+        RelationTailMode::Segmented,
+        &[6, 9],
+        true,
+    );
 }

@@ -5,9 +5,9 @@
 // from the arena source columns via the shared helpers in relation_fused.cuh,
 // so the only global traffic is: source reads (twice), one staging write plus
 // one read/write of the committed output coordinates. The instance's
-// `denominators` slab slot and the proof-wide `inverse_scratch` slot stay
-// allocated but untouched (the arena ABI is unchanged in this step; deleting
-// the slab slot is a future saving once the fused lane is the default).
+// `denominators` binding is a one-word aligned sentinel in a mode-sealed fused
+// preparation, and the proof-wide `inverse_scratch` slot stays allocated but
+// untouched. Neither is passed to or dereferenced by this kernel.
 //
 // Per thread (= one row of one instance), with C = columns:
 //   1. Backward pass c = C-1..0: recompute (num_c, d_c); stage

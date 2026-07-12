@@ -60,7 +60,8 @@ pub const RELATION_FUSED_MAX_COLUMNS: usize = 1024;
 
 /// Selects which kernel pipeline [`PreparedRelationGraph::launch_with_mode`]
 /// submits. Both modes produce byte-identical committed columns and claimed
-/// sums; `Fused` is opt-in via `STWO_CUDA_RELATION_FUSED=1`.
+/// sums. `Fused` is selected either by a mode-sealed compact preparation or,
+/// for a full preparation, by `STWO_CUDA_RELATION_FUSED=1`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RelationLaunchMode {
     /// pairs -> ragged batch inverse -> global fraction chain (default).
@@ -126,6 +127,24 @@ fn fused_launch_enabled() -> bool {
 fn scan_tail_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("STWO_CUDA_RELATION_SCAN_TAIL").as_deref() == Ok("1"))
+}
+
+fn validate_prepared_launch_mode(
+    prepared: RelationLaunchMode,
+    requested: RelationLaunchMode,
+) -> Result<(), RelationGraphError> {
+    if prepared == RelationLaunchMode::Fused && requested != RelationLaunchMode::Fused {
+        return Err(RelationGraphError::CompactFusedLaunchModeMismatch { requested });
+    }
+    Ok(())
+}
+
+fn implicit_launch_mode(prepared: RelationLaunchMode) -> RelationLaunchMode {
+    if prepared == RelationLaunchMode::Fused || fused_launch_enabled() {
+        RelationLaunchMode::Fused
+    } else {
+        RelationLaunchMode::ThreeStage
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -348,6 +367,17 @@ impl RelationKernelProgram {
         relation_graph_requirements(self)
     }
 
+    /// Exact arena requirements for `mode`. The fused layout keeps full
+    /// denominator slabs only for instances that must use the 3-stage
+    /// fallback; eligible instances receive one aligned sentinel word because
+    /// the fused kernel never dereferences their denominator pointer.
+    pub fn requirements_for_mode(
+        &self,
+        mode: RelationLaunchMode,
+    ) -> Result<RelationGraphRequirements, RelationGraphError> {
+        relation_graph_requirements_for_mode(self, mode)
+    }
+
     fn descriptor_words(&self) -> Result<Vec<u32>, RelationGraphError> {
         let mut output = Vec::new();
         for batch in &self.batches {
@@ -370,6 +400,9 @@ pub struct RelationInstanceRequirement {
     pub output_coordinate_words: usize,
     /// Aggregate words across every output coordinate.
     pub output_words: usize,
+    /// Full QM31 slab in 3-stage mode and for fused fallbacks; one aligned,
+    /// intentionally untouched sentinel word for fused-eligible instances in
+    /// a fused-mode preparation.
     pub denominator_words: usize,
     pub claimed_sum_words: usize,
 }
@@ -531,7 +564,25 @@ fn slot_requirement(
 pub fn relation_graph_requirements(
     program: &RelationKernelProgram,
 ) -> Result<RelationGraphRequirements, RelationGraphError> {
+    relation_graph_requirements_for_mode(program, RelationLaunchMode::ThreeStage)
+}
+
+pub fn relation_graph_requirements_for_mode(
+    program: &RelationKernelProgram,
+    mode: RelationLaunchMode,
+) -> Result<RelationGraphRequirements, RelationGraphError> {
     program.validate()?;
+    let instance_count = program.batches.iter().try_fold(0usize, |count, batch| {
+        count
+            .checked_add(batch.instances.len())
+            .ok_or(RelationGraphError::SizeOverflow)
+    })?;
+    if mode == RelationLaunchMode::Fused && instance_count > RELATION_FUSED_MAX_INSTANCES {
+        return Err(RelationGraphError::FusedInstanceCapacityExceeded {
+            instances: instance_count,
+            max: RELATION_FUSED_MAX_INSTANCES,
+        });
+    }
     let descriptor_words = program
         .batches
         .iter()
@@ -596,7 +647,13 @@ pub fn relation_graph_requirements(
                     .ok_or(RelationGraphError::SizeOverflow)?,
                 output_coordinate_words: rows,
                 output_words: coordinate_words,
-                denominator_words: coordinate_words,
+                denominator_words: if mode == RelationLaunchMode::Fused
+                    && relation_batch_fused_eligible(batch)
+                {
+                    1
+                } else {
+                    coordinate_words
+                },
                 claimed_sum_words: SECURE_FIELD_WORDS,
             });
         }
@@ -852,6 +909,13 @@ pub enum RelationGraphError {
         rows: u32,
         columns: u32,
     },
+    FusedInstanceCapacityExceeded {
+        instances: usize,
+        max: usize,
+    },
+    CompactFusedLaunchModeMismatch {
+        requested: RelationLaunchMode,
+    },
 }
 
 impl core::fmt::Display for RelationGraphError {
@@ -926,6 +990,7 @@ pub struct PreparedRelationGraph<'a> {
     pair_blocks: u32,
     fraction_inverse_blocks: u32,
     fraction_chain_blocks: u32,
+    prepared_mode: RelationLaunchMode,
     instances: Vec<PreparedInstance>,
 }
 
@@ -940,8 +1005,29 @@ impl<'a> PreparedRelationGraph<'a> {
         sources: &[RelationInstanceSources],
         challenges: RelationChallenges<'_>,
     ) -> Result<Self, RelationGraphError> {
+        Self::prepare_with_mode(
+            arena,
+            program,
+            RelationLaunchMode::ThreeStage,
+            slots,
+            sources,
+            challenges,
+        )
+    }
+
+    /// Prepare a mode-sealed relation graph. `Fused` compacts eligible
+    /// denominator slabs to one-word sentinels, so that prepared layout may
+    /// never be launched through the proof-wide 3-stage body.
+    pub fn prepare_with_mode(
+        arena: &'a DeviceArena,
+        program: &RelationKernelProgram,
+        mode: RelationLaunchMode,
+        slots: &RelationGraphSlots,
+        sources: &[RelationInstanceSources],
+        challenges: RelationChallenges<'_>,
+    ) -> Result<Self, RelationGraphError> {
         program.validate()?;
-        let requirements = program.requirements()?;
+        let requirements = program.requirements_for_mode(mode)?;
         requirements.arena_slot_requirements(slots)?;
         if sources.len() != requirements.instances.len() {
             return Err(RelationGraphError::SourceCountMismatch {
@@ -1236,22 +1322,18 @@ impl<'a> PreparedRelationGraph<'a> {
             pair_blocks: requirements.pair_blocks,
             fraction_inverse_blocks: requirements.fraction_inverse_blocks,
             fraction_chain_blocks: requirements.fraction_chain_blocks,
+            prepared_mode: mode,
             instances: prepared,
         })
     }
 
     /// Allocation/copy/sync/default-stream-free sequence shared by eager mode and
-    /// graph capture. The pipeline defaults to the proven 3-stage lane;
-    /// `STWO_CUDA_RELATION_FUSED=1` (read once per process) opts into the
-    /// fused lane and `STWO_CUDA_RELATION_SCAN_TAIL=1` into the lookback scan
-    /// tail. All combinations produce byte-identical outputs.
+    /// graph capture. A compact fused preparation is permanently fused;
+    /// otherwise the pipeline defaults to the proven 3-stage lane and
+    /// `STWO_CUDA_RELATION_FUSED=1` opts into fused execution. The tail remains
+    /// independently selected by `STWO_CUDA_RELATION_SCAN_TAIL=1`.
     pub fn launch(&self) -> Result<(), RelationGraphError> {
-        let mode = if fused_launch_enabled() {
-            RelationLaunchMode::Fused
-        } else {
-            RelationLaunchMode::ThreeStage
-        };
-        self.launch_with_mode(mode)
+        self.launch_with_mode(implicit_launch_mode(self.prepared_mode))
     }
 
     fn tail_mode_from_env() -> RelationTailMode {
@@ -1263,11 +1345,11 @@ impl<'a> PreparedRelationGraph<'a> {
     }
 
     /// The fused lane: one kernel replaces pairs + ragged inverse + global
-    /// fraction chain and never touches the denominator slabs or
-    /// `inverse_scratch` for eligible instances (both stay allocated — the
-    /// arena ABI is unchanged; reclaiming them is a follow-up once the fused
-    /// lane is the default). Fused-ineligible instances run the existing
-    /// per-instance pairs + inverse + chain kernels.
+    /// fraction chain and never touches the denominator slots or
+    /// `inverse_scratch` for eligible instances. Mode-aware preparations bind
+    /// one-word denominator sentinels for those instances; fused-ineligible
+    /// instances retain full slabs and run the existing per-instance pairs +
+    /// inverse + chain kernels.
     pub fn launch_fused(&self) -> Result<(), RelationGraphError> {
         self.launch_with_mode(RelationLaunchMode::Fused)
     }
@@ -1284,6 +1366,7 @@ impl<'a> PreparedRelationGraph<'a> {
         mode: RelationLaunchMode,
         tail: RelationTailMode,
     ) -> Result<(), RelationGraphError> {
+        validate_prepared_launch_mode(self.prepared_mode, mode)?;
         if self.instances.is_empty() {
             return Ok(());
         }
@@ -1843,6 +1926,14 @@ mod tests {
             requirements.instances[1].source_pointer_words,
             5 * POINTER_WORDS
         );
+        assert_eq!(
+            requirements.instances[0].denominator_words,
+            8 * SECURE_FIELD_WORDS
+        );
+        assert_eq!(
+            requirements.instances[1].denominator_words,
+            8 * SECURE_FIELD_WORDS
+        );
 
         let slots = sample_slots();
         let slot_requirements = requirements.arena_slot_requirements(&slots).unwrap();
@@ -1850,6 +1941,92 @@ mod tests {
         assert_eq!(
             slot_requirements[11].alignment_words,
             RELATION_POINTER_ALIGNMENT_WORDS
+        );
+    }
+
+    #[test]
+    fn fused_requirements_compact_only_eligible_denominators() {
+        let mut program = sample_program();
+        program.max_alpha_powers = RELATION_FUSED_MAX_TUPLE_WORDS + 1;
+        program.batches[0].source_layout = RelationSourceLayout::LookupWords { words: 40 };
+        program.batches[0].columns[0].uses[0].tuple_words = RELATION_FUSED_MAX_TUPLE_WORDS + 1;
+        assert!(!relation_batch_fused_eligible(&program.batches[0]));
+        assert!(relation_batch_fused_eligible(&program.batches[1]));
+
+        let full = program.requirements().unwrap();
+        assert_eq!(
+            full,
+            program
+                .requirements_for_mode(RelationLaunchMode::ThreeStage)
+                .unwrap()
+        );
+        assert_eq!(full.instances[0].denominator_words, 8 * SECURE_FIELD_WORDS);
+        assert_eq!(full.instances[1].denominator_words, 8 * SECURE_FIELD_WORDS);
+
+        let fused = program
+            .requirements_for_mode(RelationLaunchMode::Fused)
+            .unwrap();
+        assert_eq!(fused.instances[0].denominator_words, 8 * SECURE_FIELD_WORDS);
+        assert_eq!(fused.instances[1].denominator_words, 1);
+        assert_eq!(
+            fused.instances[0].output_words,
+            full.instances[0].output_words
+        );
+        assert_eq!(
+            fused.instances[1].output_words,
+            full.instances[1].output_words
+        );
+
+        let slots = sample_slots();
+        let slot_requirements = fused.arena_slot_requirements(&slots).unwrap();
+        let compact = slot_requirements
+            .iter()
+            .find(|requirement| requirement.id == slots.instances[1].denominators)
+            .unwrap();
+        assert_eq!(compact.len_words, 1);
+        assert_eq!(compact.alignment_words, SECURE_FIELD_WORDS);
+    }
+
+    #[test]
+    fn compact_fused_requirements_and_launch_modes_fail_closed() {
+        let mut program = sample_program();
+        let extent = program.batches[0].instances[0];
+        program.batches[0].instances = vec![extent; RELATION_FUSED_MAX_INSTANCES + 1];
+        program.batches[1].instances.clear();
+        assert_eq!(
+            program.requirements_for_mode(RelationLaunchMode::Fused),
+            Err(RelationGraphError::FusedInstanceCapacityExceeded {
+                instances: RELATION_FUSED_MAX_INSTANCES + 1,
+                max: RELATION_FUSED_MAX_INSTANCES,
+            })
+        );
+        assert!(program
+            .requirements_for_mode(RelationLaunchMode::ThreeStage)
+            .is_ok());
+
+        assert_eq!(
+            validate_prepared_launch_mode(
+                RelationLaunchMode::Fused,
+                RelationLaunchMode::ThreeStage
+            ),
+            Err(RelationGraphError::CompactFusedLaunchModeMismatch {
+                requested: RelationLaunchMode::ThreeStage,
+            })
+        );
+        assert!(validate_prepared_launch_mode(
+            RelationLaunchMode::Fused,
+            RelationLaunchMode::Fused
+        )
+        .is_ok());
+        assert!(validate_prepared_launch_mode(
+            RelationLaunchMode::ThreeStage,
+            RelationLaunchMode::Fused
+        )
+        .is_ok());
+        assert_eq!(
+            implicit_launch_mode(RelationLaunchMode::Fused),
+            RelationLaunchMode::Fused,
+            "compact preparation must force implicit launch onto the fused body"
         );
     }
 
