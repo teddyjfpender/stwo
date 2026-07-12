@@ -8,6 +8,14 @@
 use stwo::core::vcs::blake2_hash::{Blake2sHash, Blake2sHasherGeneric};
 
 const LEAF_BLOCK_COLUMNS: usize = 16;
+/// Maximum number of scratch-backed same-domain columns materialized before
+/// their canonical leaf bytes are absorbed and the shared LDE scratch is
+/// reused. Retained destinations consume no shared scratch and therefore do
+/// not count against this bound.
+pub const PROGRESSIVE_LDE_BATCH_MAX_SCRATCH_COLUMNS: usize = LEAF_BLOCK_COLUMNS;
+/// Conservative bound on one device pointer table and its `u32` column count.
+const PROGRESSIVE_LDE_BATCH_MAX_TOTAL_COLUMNS: usize = 65_535;
+const PROGRESSIVE_LDE_BATCH_POLICY: &[u8] = b"canonical-same-log-max-scratch-and-total-columns";
 const FIELD_WORD_BYTES: usize = core::mem::size_of::<u32>();
 pub const BLAKE2S_BLOCK_BYTES: usize = 64;
 pub const PROGRESSIVE_BLAKE2S_H_OFFSET: usize = 0;
@@ -177,6 +185,7 @@ pub enum ProgressiveCommitError {
         previous: u32,
         current: u32,
     },
+    InvalidLdeBatchPlan,
     SizeOverflow,
     OracleColumnCountMismatch,
     OracleColumnLengthMismatch {
@@ -188,6 +197,18 @@ pub enum ProgressiveCommitError {
 }
 
 pub fn plan_progressive_commit(
+    mode: ProgressiveCommitMode,
+    geometry: ProgressiveCommitGeometry,
+) -> Result<ProgressiveCommitPlan, ProgressiveCommitError> {
+    let plan = canonical_progressive_commit_plan(mode, geometry)?;
+    validate_progressive_plan(&plan)?;
+    Ok(plan)
+}
+
+/// Build the one canonical representation without calling admission. Keeping
+/// derivation here lets public admission rebuild and compare the complete plan
+/// without recursing through [`plan_progressive_commit`].
+fn canonical_progressive_commit_plan(
     mode: ProgressiveCommitMode,
     geometry: ProgressiveCommitGeometry,
 ) -> Result<ProgressiveCommitPlan, ProgressiveCommitError> {
@@ -252,7 +273,17 @@ pub fn plan_progressive_commit(
     while start < columns.len() {
         let log_size = columns[start].evaluation_log_size;
         let mut end = start + 1;
-        while end < columns.len() && columns[end].evaluation_log_size == log_size {
+        let mut scratch_columns = usize::from(!columns[start].retained_evaluation);
+        while end < columns.len()
+            && end - start < PROGRESSIVE_LDE_BATCH_MAX_TOTAL_COLUMNS
+            && columns[end].evaluation_log_size == log_size
+        {
+            if !columns[end].retained_evaluation
+                && scratch_columns == PROGRESSIVE_LDE_BATCH_MAX_SCRATCH_COLUMNS
+            {
+                break;
+            }
+            scratch_columns += usize::from(!columns[end].retained_evaluation);
             end += 1;
         }
         let output_words = pow2(log_size)?
@@ -456,6 +487,7 @@ pub fn progressive_leaf_oracle(
     plan: &ProgressiveCommitPlan,
     evaluations: &[Vec<u32>],
 ) -> Result<Vec<Blake2sHash>, ProgressiveCommitError> {
+    validate_progressive_plan(plan)?;
     validate_oracle_columns(plan, evaluations)?;
     let first_log = plan.columns[0].evaluation_log_size;
     let mut states = vec![Blake2sHasherGeneric::<false>::default(); pow2(first_log)?];
@@ -481,6 +513,7 @@ pub fn full_lifting_leaf_oracle(
     plan: &ProgressiveCommitPlan,
     evaluations: &[Vec<u32>],
 ) -> Result<Vec<Blake2sHash>, ProgressiveCommitError> {
+    validate_progressive_plan(plan)?;
     validate_oracle_columns(plan, evaluations)?;
     let rows = pow2(plan.geometry.lifting_log_size)?;
     Ok((0..rows)
@@ -525,7 +558,10 @@ pub fn progressive_commit_cache_key(
             hash = hash.wrapping_mul(0x100000001b3);
         }
     };
-    feed(b"stwo-progressive-commit-plan-v1\0");
+    feed(b"stwo-progressive-commit-plan-v3\0");
+    feed(PROGRESSIVE_LDE_BATCH_POLICY);
+    feed(&(PROGRESSIVE_LDE_BATCH_MAX_SCRATCH_COLUMNS as u64).to_le_bytes());
+    feed(&(PROGRESSIVE_LDE_BATCH_MAX_TOTAL_COLUMNS as u64).to_le_bytes());
     feed(&[mode as u8]);
     feed(&geometry.lifting_log_size.to_le_bytes());
     feed(&geometry.log_blowup_factor.to_le_bytes());
@@ -538,6 +574,18 @@ pub fn progressive_commit_cache_key(
         }
     }
     hash
+}
+
+/// Rebuild and compare the complete canonical plan before any public oracle or
+/// address-bearing prepared graph trusts its geometry, sizes, or output map.
+pub fn validate_progressive_plan(
+    plan: &ProgressiveCommitPlan,
+) -> Result<(), ProgressiveCommitError> {
+    let canonical = canonical_progressive_commit_plan(plan.mode, plan.geometry.clone())?;
+    if *plan != canonical {
+        return Err(ProgressiveCommitError::InvalidLdeBatchPlan);
+    }
+    Ok(())
 }
 
 fn validate_oracle_columns(
@@ -860,6 +908,190 @@ mod tests {
             vec![None, Some((1, 0)), Some((1, 1))]
         );
         assert_eq!(plan.lde_batches[1].output_words, 3 << 5);
+    }
+
+    #[test]
+    fn same_log_scratch_chunks_are_canonical_bounded_and_oracle_identical() {
+        for column_count in [1usize, 15, 16, 17, 31, 32, 33, 63, 64, 65] {
+            let plan = plan_progressive_commit(
+                ProgressiveCommitMode::DomainProgressive,
+                geometry(&vec![3; column_count], 6),
+            )
+            .unwrap();
+            assert_eq!(
+                plan.lde_batches
+                    .iter()
+                    .map(|batch| batch.columns.len())
+                    .collect::<Vec<_>>(),
+                (0..column_count)
+                    .collect::<Vec<_>>()
+                    .chunks(PROGRESSIVE_LDE_BATCH_MAX_SCRATCH_COLUMNS)
+                    .map(<[usize]>::len)
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                plan.lde_batches
+                    .iter()
+                    .flat_map(|batch| batch.columns.iter().copied())
+                    .collect::<Vec<_>>(),
+                (0..column_count).collect::<Vec<_>>()
+            );
+            assert!(plan.lde_batches.iter().all(|batch| {
+                batch.evaluation_log_size == 4
+                    && batch.output_words == batch.columns.len() * (1 << 4)
+            }));
+            validate_progressive_plan(&plan).unwrap();
+
+            let values = evaluations(&plan, column_count as u32 ^ 0x6a09_e667);
+            let progressive = progressive_leaf_oracle(&plan, &values).unwrap();
+            let full = full_lifting_leaf_oracle(&plan, &values).unwrap();
+            assert_eq!(progressive, full, "column_count={column_count}");
+            assert_eq!(merkle_root(progressive), merkle_root(full));
+        }
+    }
+
+    #[test]
+    fn retained_columns_coalesce_without_raising_the_scratch_bound() {
+        let plan = plan_progressive_commit(
+            ProgressiveCommitMode::DomainProgressive,
+            ProgressiveCommitGeometry {
+                lifting_log_size: 6,
+                log_blowup_factor: 1,
+                groups: vec![
+                    ProgressiveCommitGroupGeometry {
+                        coefficient_log_sizes: vec![3; 8],
+                        retain_evaluations: false,
+                    },
+                    ProgressiveCommitGroupGeometry {
+                        coefficient_log_sizes: vec![3; 33],
+                        retain_evaluations: true,
+                    },
+                    ProgressiveCommitGroupGeometry {
+                        coefficient_log_sizes: vec![3; 8],
+                        retain_evaluations: false,
+                    },
+                ],
+            },
+        )
+        .unwrap();
+        assert_eq!(plan.lde_batches.len(), 1);
+        let batch = &plan.lde_batches[0];
+        assert_eq!(batch.columns, (0..49).collect::<Vec<_>>());
+        assert_eq!(
+            batch
+                .retained_columns
+                .iter()
+                .filter(|destination| destination.is_none())
+                .count(),
+            PROGRESSIVE_LDE_BATCH_MAX_SCRATCH_COLUMNS
+        );
+        assert_eq!(batch.output_words, 49 * (1 << 4));
+        validate_progressive_plan(&plan).unwrap();
+
+        let values = evaluations(&plan, 0x8bad_f00d);
+        let progressive = progressive_leaf_oracle(&plan, &values).unwrap();
+        let full = full_lifting_leaf_oracle(&plan, &values).unwrap();
+        assert_eq!(progressive, full);
+        assert_eq!(merkle_root(progressive), merkle_root(full));
+    }
+
+    #[test]
+    fn retained_batches_respect_the_total_pointer_table_bound() {
+        let column_count = PROGRESSIVE_LDE_BATCH_MAX_TOTAL_COLUMNS + 1;
+        let plan = plan_progressive_commit(
+            ProgressiveCommitMode::DomainProgressive,
+            ProgressiveCommitGeometry {
+                lifting_log_size: 4,
+                log_blowup_factor: 1,
+                groups: vec![ProgressiveCommitGroupGeometry {
+                    coefficient_log_sizes: vec![3; column_count],
+                    retain_evaluations: true,
+                }],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            plan.lde_batches
+                .iter()
+                .map(|batch| batch.columns.len())
+                .collect::<Vec<_>>(),
+            [PROGRESSIVE_LDE_BATCH_MAX_TOTAL_COLUMNS, 1]
+        );
+        assert!(plan
+            .lde_batches
+            .iter()
+            .all(|batch| batch.retained_columns.iter().all(Option::is_some)));
+        validate_progressive_plan(&plan).unwrap();
+    }
+
+    #[test]
+    fn malformed_chunk_topologies_fail_closed() {
+        let plan = plan_progressive_commit(
+            ProgressiveCommitMode::DomainProgressive,
+            geometry(&[3; 17], 6),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.lde_batches
+                .iter()
+                .map(|batch| batch.columns.len())
+                .collect::<Vec<_>>(),
+            [16, 1]
+        );
+
+        let rejects = |mutate: fn(&mut ProgressiveCommitPlan)| {
+            let mut malformed = plan.clone();
+            mutate(&mut malformed);
+            assert_eq!(
+                validate_progressive_plan(&malformed),
+                Err(ProgressiveCommitError::InvalidLdeBatchPlan)
+            );
+        };
+        rejects(|plan| plan.lde_batches[0].columns[0] = 1); // gap + duplicate.
+        rejects(|plan| plan.lde_batches[0].columns.swap(0, 1));
+        rejects(|plan| plan.lde_batches[0].evaluation_log_size += 1);
+        rejects(|plan| plan.lde_batches[0].retained_columns[0] = Some((0, 0)));
+        rejects(|plan| {
+            let column = plan.lde_batches[0].columns.pop().unwrap();
+            let retained = plan.lde_batches[0].retained_columns.pop().unwrap();
+            plan.lde_batches[0].output_words -= 1 << 4;
+            plan.lde_batches[1].columns.insert(0, column);
+            plan.lde_batches[1].retained_columns.insert(0, retained);
+            plan.lde_batches[1].output_words += 1 << 4;
+        });
+        rejects(|plan| {
+            plan.lde_batches[0].columns.push(16);
+            plan.lde_batches[0].retained_columns.push(None);
+            plan.lde_batches[0].output_words += 1 << 4;
+        });
+        rejects(|plan| plan.cache_key ^= 1);
+    }
+
+    #[test]
+    fn complete_admission_rejects_mutated_public_plans_before_oracle_indexing() {
+        let plan = plan_progressive_commit(
+            ProgressiveCommitMode::DomainProgressive,
+            geometry(&[3; 16].into_iter().chain([5]).collect::<Vec<_>>(), 6),
+        )
+        .unwrap();
+        assert!(!plan.leaf_blocks.is_empty());
+        assert!(!plan.state_expansions.is_empty());
+        let values = evaluations(&plan, 0x51a7_1e55);
+
+        let rejects = |mutate: fn(&mut ProgressiveCommitPlan)| {
+            let mut malformed = plan.clone();
+            mutate(&mut malformed);
+            assert!(validate_progressive_plan(&malformed).is_err());
+            assert!(progressive_leaf_oracle(&malformed, &values).is_err());
+            assert!(full_lifting_leaf_oracle(&malformed, &values).is_err());
+        };
+        rejects(|plan| plan.leaf_blocks.clear());
+        rejects(|plan| plan.state_expansions.clear());
+        rejects(|plan| plan.accounting.total_nodes += 1);
+        rejects(|plan| plan.geometry.log_blowup_factor = 0);
+        rejects(|plan| plan.geometry.groups.clear());
+        rejects(|plan| plan.columns.clear());
+        rejects(|plan| plan.lde_batches[0].columns[0] = usize::MAX);
     }
 
     #[test]

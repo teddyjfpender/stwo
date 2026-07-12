@@ -18,8 +18,9 @@ use super::prepared_commit::{
     PreparedMerkleFromLeaves,
 };
 use super::progressive_commit::{
-    plan_progressive_commit, ProgressiveCommitError, ProgressiveCommitGeometry,
-    ProgressiveCommitMode, ProgressiveCommitPlan, PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES,
+    plan_progressive_commit, validate_progressive_plan, ProgressiveCommitError,
+    ProgressiveCommitGeometry, ProgressiveCommitMode, ProgressiveCommitPlan,
+    PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES,
 };
 
 const WORD_BYTES: usize = core::mem::size_of::<u32>();
@@ -321,6 +322,21 @@ pub fn progressive_prepare_mode_admission(
     {
         return Err(PreparedProgressiveCommitError::Disabled);
     }
+    validate_progressive_requirements(requirements)?;
+    Ok(())
+}
+
+fn validate_progressive_requirements(
+    requirements: &ProgressiveLeafWorkspaceRequirements,
+) -> Result<(), PreparedProgressiveCommitError> {
+    validate_progressive_plan(&requirements.plan)?;
+    let expected = progressive_leaf_workspace_requirements_for_mode(
+        requirements.plan.mode,
+        requirements.plan.geometry.clone(),
+    )?;
+    if *requirements != expected {
+        return Err(PreparedProgressiveCommitError::InvalidSlotShape);
+    }
     Ok(())
 }
 
@@ -618,10 +634,18 @@ impl<'a> PreparedProgressiveLeaves<'a> {
                     (None, None) => {
                         let base =
                             scratch.ok_or(PreparedProgressiveCommitError::InvalidSlotShape)?;
-                        let pointer = unsafe { base.as_u32_ptr().add(scratch_offset) };
-                        scratch_offset = scratch_offset
+                        let next_offset = scratch_offset
                             .checked_add(evaluation_words)
                             .ok_or(PreparedProgressiveCommitError::SizeOverflow)?;
+                        if next_offset > base.len_words() {
+                            return Err(PreparedProgressiveCommitError::SlotTooSmall {
+                                slot: base.id(),
+                                required: next_offset,
+                                actual: base.len_words(),
+                            });
+                        }
+                        let pointer = unsafe { base.as_u32_ptr().add(scratch_offset) };
+                        scratch_offset = next_offset;
                         pointer
                     }
                 };
@@ -1060,6 +1084,62 @@ mod tests {
                 },
                 ProgressiveLeafLaunchKind::Finalize { log_size: 8 },
             ]
+        );
+    }
+
+    #[test]
+    fn width_sixteen_chunks_bound_shared_lde_scratch_and_launches() {
+        let requirements = progressive_leaf_workspace_requirements_for_mode(
+            ProgressiveCommitMode::DomainProgressive,
+            ProgressiveCommitGeometry {
+                lifting_log_size: 6,
+                log_blowup_factor: 1,
+                groups: vec![ProgressiveCommitGroupGeometry {
+                    coefficient_log_sizes: vec![3; 65],
+                    retain_evaluations: false,
+                }],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            requirements
+                .plan
+                .lde_batches
+                .iter()
+                .map(|batch| batch.columns.len())
+                .collect::<Vec<_>>(),
+            [16, 16, 16, 16, 1]
+        );
+        assert_eq!(requirements.lde_scratch_words, Some(16 * (1 << 4)));
+        assert_eq!(
+            requirements
+                .launch_sequence()
+                .iter()
+                .filter(|launch| matches!(launch, ProgressiveLeafLaunchKind::Lde { .. }))
+                .count(),
+            5
+        );
+        assert_eq!(
+            requirements
+                .launch_sequence()
+                .iter()
+                .filter(|launch| matches!(launch, ProgressiveLeafLaunchKind::Absorb { .. }))
+                .count(),
+            5
+        );
+        validate_progressive_requirements(&requirements).unwrap();
+
+        let mut undersized = requirements.clone();
+        undersized.lde_scratch_words = Some(16 * (1 << 4) - 1);
+        assert_eq!(
+            validate_progressive_requirements(&undersized),
+            Err(PreparedProgressiveCommitError::InvalidSlotShape)
+        );
+        let mut descriptor_drift = requirements.clone();
+        descriptor_drift.batches[0].output_pointer_words -= POINTER_WORDS;
+        assert_eq!(
+            validate_progressive_requirements(&descriptor_drift),
+            Err(PreparedProgressiveCommitError::InvalidSlotShape)
         );
     }
 

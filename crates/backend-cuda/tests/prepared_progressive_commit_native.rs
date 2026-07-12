@@ -15,8 +15,8 @@ use stwo_backend_cuda::{
     progressive_leaf_workspace_requirements_for_mode, ArenaLayout, ArenaSlice, ArenaSlotId,
     ArenaSlotSpec, CommitArenaSlotRequirement, CommitCoefficientColumn, CudaExecContext,
     DeviceArena, PreparedProgressiveLeaves, ProgressiveBatchSlots, ProgressiveCommitGeometry,
-    ProgressiveCommitGroupGeometry, ProgressiveCommitMode, ProgressiveLeafWorkspaceRequirements,
-    ProgressiveLeafWorkspaceSlots,
+    ProgressiveCommitGroupGeometry, ProgressiveCommitMode, ProgressiveLeafLaunchKind,
+    ProgressiveLeafWorkspaceRequirements, ProgressiveLeafWorkspaceSlots,
 };
 
 const TWIDDLES: ArenaSlotId = ArenaSlotId(50_000);
@@ -224,8 +224,15 @@ fn assert_outputs(
     actual
 }
 
-fn run_boundary_case(total_columns: usize, rise_after: Option<usize>) {
+fn run_boundary_case(
+    total_columns: usize,
+    rise_after: Option<usize>,
+    retained_columns: &[bool],
+    expected_batch_columns: &[usize],
+    expected_scratch_words: usize,
+) {
     assert!(total_columns >= 2);
+    assert_eq!(retained_columns.len(), total_columns);
     if let Some(rise_after) = rise_after {
         assert!(rise_after < total_columns);
     }
@@ -238,21 +245,26 @@ fn run_boundary_case(total_columns: usize, rise_after: Option<usize>) {
             }
         })
         .collect::<Vec<_>>();
+    let mut groups = Vec::new();
+    let mut group_start = 0usize;
+    while group_start < total_columns {
+        let retained = retained_columns[group_start];
+        let mut group_end = group_start + 1;
+        while group_end < total_columns && retained_columns[group_end] == retained {
+            group_end += 1;
+        }
+        groups.push(ProgressiveCommitGroupGeometry {
+            coefficient_log_sizes: logs[group_start..group_end].to_vec(),
+            retain_evaluations: retained,
+        });
+        group_start = group_end;
+    }
     let geometry = ProgressiveCommitGeometry {
         lifting_log_size: 6,
         log_blowup_factor: 1,
-        // The first same-log batch crosses the historical group edge: column
-        // zero is scratch-backed and all later columns are retained directly.
-        groups: vec![
-            ProgressiveCommitGroupGeometry {
-                coefficient_log_sizes: vec![logs[0]],
-                retain_evaluations: false,
-            },
-            ProgressiveCommitGroupGeometry {
-                coefficient_log_sizes: logs[1..].to_vec(),
-                retain_evaluations: true,
-            },
-        ],
+        // Same-log batches may cross retention-group edges while preserving
+        // canonical column order.
+        groups,
     };
     let requirements = progressive_leaf_workspace_requirements_for_mode(
         ProgressiveCommitMode::DomainProgressive,
@@ -321,15 +333,50 @@ fn run_boundary_case(total_columns: usize, rise_after: Option<usize>) {
         arena.bind(TWIDDLES).unwrap(),
     )
     .unwrap();
+    assert_eq!(requirements.lde_scratch_words, Some(expected_scratch_words));
+    assert_eq!(
+        requirements
+            .plan
+            .lde_batches
+            .iter()
+            .map(|batch| batch.columns.len())
+            .collect::<Vec<_>>(),
+        expected_batch_columns
+    );
+    assert_eq!(
+        prepared
+            .launch_sequence()
+            .filter(|launch| matches!(launch, ProgressiveLeafLaunchKind::Lde { .. }))
+            .count(),
+        expected_batch_columns.len()
+    );
+    assert!(requirements.plan.lde_batches.iter().all(|batch| {
+        batch
+            .retained_columns
+            .iter()
+            .filter(|destination| destination.is_none())
+            .count()
+            <= 16
+    }));
 
-    // Capture is deliberately outside prepare. Replays must reread the stable
-    // coefficient addresses, not bake input contents into the graph.
+    let first_evaluations = expected_evaluations(&requirements, &first_coefficients);
+    prepared.launch().unwrap();
+    let eager_leaves = assert_outputs(
+        &arena,
+        &prepared,
+        &requirements,
+        &retained,
+        &first_evaluations,
+    );
+
+    // Capture is deliberately outside prepare and after one eager differential.
+    // Replays must reread stable coefficient addresses, not bake input contents
+    // into the graph.
     let capture = arena.context().capture().unwrap();
     prepared.launch().unwrap();
     let graph = capture.finish().unwrap();
 
     graph.launch(arena.context()).unwrap();
-    let first_evaluations = expected_evaluations(&requirements, &first_coefficients);
     let first_leaves = assert_outputs(
         &arena,
         &prepared,
@@ -337,6 +384,7 @@ fn run_boundary_case(total_columns: usize, rise_after: Option<usize>) {
         &retained,
         &first_evaluations,
     );
+    assert_eq!(first_leaves, eager_leaves);
 
     let second_coefficients = coefficient_set(&requirements, 9_999_991);
     for (column, words) in requirements.plan.columns.iter().zip(&second_coefficients) {
@@ -383,6 +431,24 @@ fn progressive_lazy_block_boundaries_rises_retention_and_replay_match_cpu() {
         (32, None),
         (33, Some(32)),
     ] {
-        run_boundary_case(columns, rise_after);
+        let retained = (0..columns).map(|column| column != 0).collect::<Vec<_>>();
+        let expected_batches = match rise_after {
+            Some(rise) => vec![rise, columns - rise],
+            None => vec![columns],
+        };
+        run_boundary_case(columns, rise_after, &retained, &expected_batches, 1 << 4);
     }
+    // Three consecutive same-log chunks overwrite the one 16-column scratch
+    // slab only after each preceding absorb. Eager capture and mutated replay
+    // below prove that reuse preserves every leaf byte.
+    run_boundary_case(33, None, &[false; 33], &[16, 16, 1], 16 * (1 << 4));
+
+    // Sixteen scratch-backed columns separated by 33 retained destinations
+    // coalesce into one canonical batch. The native differential proves the
+    // larger absorb loop, mixed pointer table, capture and mutation all retain
+    // exact leaf bytes without growing shared scratch.
+    let retained = (0..49)
+        .map(|column| (8..41).contains(&column))
+        .collect::<Vec<_>>();
+    run_boundary_case(49, None, &retained, &[49], 16 * (1 << 4));
 }
