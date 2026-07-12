@@ -135,7 +135,7 @@ mod tests {
     use stwo::core::poly::circle::{CanonicCoset, CircleDomain};
     use stwo::core::poly::line::{LineDomain, LinePoly};
     use stwo::prover::backend::{Column, ColumnOps, CpuBackend};
-    use stwo::prover::fri::FriOps;
+    use stwo::prover::fri::{squared_alpha_powers, FriOps};
     use stwo::prover::line::LineEvaluation;
     use stwo::prover::poly::circle::{PolyOps, SecureEvaluation};
     use stwo::prover::poly::twiddles::TwiddleTree;
@@ -151,7 +151,7 @@ mod tests {
         twiddles: &TwiddleTree<CpuBackend>,
         fold_step: u32,
     ) -> LineEvaluation<CpuBackend> {
-        CpuBackend::fold_line(eval, alpha, twiddles, fold_step)
+        CpuBackend::fold_line(eval, &squared_alpha_powers(alpha, fold_step), twiddles)
     }
 
     fn gpu_fold_line(
@@ -160,7 +160,7 @@ mod tests {
         twiddles: &TwiddleTree<CudaBackend>,
         fold_step: u32,
     ) -> LineEvaluation<CudaBackend> {
-        CudaBackend::fold_line(eval, alpha, twiddles, fold_step)
+        CudaBackend::fold_line(eval, &squared_alpha_powers(alpha, fold_step), twiddles)
     }
 
     #[test]
@@ -216,11 +216,6 @@ mod tests {
         let alpha = SecureField::from_u32_unchecked(1, 3, 5, 7);
         let circle_domain = CanonicCoset::new(LOG_SIZE).circle_domain();
         let line_domain = LineDomain::new(circle_domain.half_coset);
-        let mut cpu_fold = LineEvaluation::new(
-            line_domain,
-            SecureColumnByCoords::zeros(1 << (LOG_SIZE - 1)),
-        );
-
         let mut vec: [Vec<BaseField>; 4] = [vec![], vec![], vec![], vec![]];
         values.iter().for_each(|a| {
             vec[0].push(BaseField::from_u32_unchecked(a.0 .0 .0));
@@ -234,8 +229,7 @@ mod tests {
             BaseFieldVec::from_vec(vec[2].clone()),
             BaseFieldVec::from_vec(vec[3].clone()),
         ];
-        CpuBackend::fold_circle_into_line(
-            &mut cpu_fold,
+        let cpu_fold = CpuBackend::fold_circle_into_line(
             &SecureEvaluation::new(
                 circle_domain,
                 SecureColumnByCoords {
@@ -246,12 +240,7 @@ mod tests {
             &CpuBackend::precompute_twiddles(line_domain.coset()),
         );
 
-        let mut cuda_fold = LineEvaluation::new(
-            line_domain,
-            SecureColumnByCoords::zeros(1 << (LOG_SIZE - 1)),
-        );
-        CudaBackend::fold_circle_into_line(
-            &mut cuda_fold,
+        let cuda_fold = CudaBackend::fold_circle_into_line(
             &SecureEvaluation::new(circle_domain, SecureColumnByCoords { columns: vecs }),
             alpha,
             &CudaBackend::precompute_twiddles(line_domain.coset()),
@@ -482,11 +471,6 @@ mod tests {
         let alpha = SecureField::from_u32_unchecked(1, 3, 5, 7);
         let circle_domain = CanonicCoset::new(LOG_SIZE).circle_domain();
         let line_domain = LineDomain::new(circle_domain.half_coset);
-        let mut cpu_fold = LineEvaluation::new(
-            line_domain,
-            SecureColumnByCoords::zeros(1 << (LOG_SIZE - 1)),
-        );
-
         let mut vec: [Vec<BaseField>; 4] = [vec![], vec![], vec![], vec![]];
         values.iter().for_each(|a| {
             vec[0].push(BaseField::from_u32_unchecked(a.0 .0 .0));
@@ -500,8 +484,7 @@ mod tests {
             BaseFieldVec::from_vec(vec[2].clone()),
             BaseFieldVec::from_vec(vec[3].clone()),
         ];
-        CpuBackend::fold_circle_into_line(
-            &mut cpu_fold,
+        let cpu_fold = CpuBackend::fold_circle_into_line(
             &SecureEvaluation::new(
                 circle_domain,
                 SecureColumnByCoords {
@@ -512,12 +495,7 @@ mod tests {
             &CpuBackend::precompute_twiddles(line_domain.coset()),
         );
 
-        let mut cuda_fold = LineEvaluation::new(
-            line_domain,
-            SecureColumnByCoords::zeros(1 << (LOG_SIZE - 1)),
-        );
-        CudaBackend::fold_circle_into_line(
-            &mut cuda_fold,
+        let cuda_fold = CudaBackend::fold_circle_into_line(
             &SecureEvaluation::new(circle_domain, SecureColumnByCoords { columns: vecs }),
             alpha,
             &CudaBackend::precompute_twiddles(line_domain.coset()),
@@ -1150,8 +1128,12 @@ mod tests {
             itwiddles: BaseFieldVec::from_vec(itwiddles),
         };
 
-        CpuBackend::fold_circle_into_line(&mut dst, &src, alpha, &twiddle_tree);
-        CudaBackend::fold_circle_into_line(&mut dst_cuda, &src_cuda, alpha, &twiddle_tree_cuda);
+        let cpu_fold = CpuBackend::fold_circle_into_line(&src, alpha, &twiddle_tree);
+        for i in 0..dst.len() {
+            dst.values
+                .set(i, dst.values.at(i) * alpha * alpha + cpu_fold.values.at(i));
+        }
+        super::fold_circle_into_line_cuda(&mut dst_cuda, &src_cuda, alpha, &twiddle_tree_cuda);
 
         for i in 0..4 {
             assert_eq!(dst_cuda.values.columns[i].to_cpu(), dst.values.columns[i]);

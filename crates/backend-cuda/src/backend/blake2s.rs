@@ -1119,8 +1119,7 @@ mod tests {
 #[cfg(all(test, stwo_cuda_link))]
 mod lifted_tests {
     use stwo::core::fields::m31::{BaseField, M31};
-    use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleHasherGeneric;
-    use stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
+    use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleHasher;
     use stwo::prover::backend::{Column, CpuBackend};
     use stwo::prover::vcs_lifted::ops::MerkleOpsLifted;
 

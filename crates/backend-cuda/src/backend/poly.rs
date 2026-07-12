@@ -709,7 +709,6 @@ mod tests {
     use stwo::prover::poly::circle::{CircleCoefficients as CirclePoly, CircleEvaluation, PolyOps};
     use stwo::prover::poly::twiddles::TwiddleTree;
     use stwo::prover::poly::BitReversedOrder;
-    use test_log::test;
 
     // use crate::backend::poly::evaluate_native;
     use crate::backend::CudaBackend;

@@ -805,8 +805,7 @@ fn mutable_pointer_is_present<T>(ptr: *mut T) -> bool {
 #[cfg(all(test, stwo_cuda_link))]
 mod tests {
     use stwo::core::utils::offset_bit_reversed_circle_domain_index;
-
-    use super::*;
+    use stwo_backend_cuda_kernels::raw::test_offset_bit_reversed_indices;
 
     #[test]
     fn test_cuda_offset_bit_reversed_indices_with_blowup() {
