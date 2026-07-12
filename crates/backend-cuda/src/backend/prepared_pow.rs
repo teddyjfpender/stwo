@@ -327,7 +327,7 @@ mod tests {
     fn pow_prefix_and_validity_match_blake2s_channel() {
         let mut channel = Blake2sChannelGeneric::<false>::default();
         channel.mix_u32s(&[1, 0x1122_3344, 0xaabb_ccdd, 9]);
-        for pow_bits in [0, 1, 7, 16, 31, 32] {
+        for pow_bits in [0, 1, 7, 16, 26, 31, 32] {
             for nonce in [0, 1, 17, 0x1122_3344_5566_7788] {
                 assert_eq!(
                     reference_valid_pow(&channel, pow_bits, nonce),
@@ -439,5 +439,6 @@ mod tests {
             Err(PreparedBlake2sPowError::InvalidPowBits(33))
         );
         assert_eq!(validate_pow_bits(32), Ok(()));
+        assert_eq!(validate_pow_bits(26), Ok(()));
     }
 }
