@@ -976,8 +976,8 @@ extern "C" {
         stream: *mut c_void,
     ) -> i32;
 
-    /// Allocation-free out-of-place B2N transform using immutable input and
-    /// mutable output device pointer tables on an explicit stream.
+    /// Allocation-free B2N transform using separate input/output pointer tables
+    /// on an explicit stream. Each input may exactly alias its paired output.
     pub fn stwo_ntt_b2n_columns_out_of_place_on(
         inputs: *const *const u32,
         outputs: *const *mut u32,

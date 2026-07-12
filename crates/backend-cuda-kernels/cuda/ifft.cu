@@ -88,7 +88,10 @@ DEVICE_FORCEINLINE void shfl_xor_bf(m31* vals, const unsigned log_stride,
                                     const unsigned lane_id) {
     const unsigned mask = 1 << log_stride;
     const unsigned num_pair_per_thread = 1 << (LOG_VALS_PER_THREAD - 1);
-    __syncwarp();
+    // All callers launch complete warps. In the B2N init kernels this full-mask
+    // fence follows every global tile load and precedes every global tile
+    // store, which makes an exact input/output tile alias race-free.
+    __syncwarp(0xffffffffu);
     #pragma unroll
     for (unsigned i = 0; i < num_pair_per_thread; i++) {
         m31* ptr = lane_id & mask ? vals + 2 * i : vals + 2 * i + 1;

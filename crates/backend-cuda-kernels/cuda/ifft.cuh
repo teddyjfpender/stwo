@@ -55,10 +55,11 @@ int stwo_ntt_b2n_columns_on(
         void *stream
 );
 
-// Allocation-free out-of-place inverse transform. The input pointer table and
-// every input column are immutable. Stage 1 (or the fused init interval) reads
-// `inputs` and writes `outputs`; every later interval runs in-place on
-// `outputs`. All launches use `stream`.
+// Allocation-free inverse transform with separate pointer tables. An input may
+// exactly alias its paired output: each init tile completes all reads before
+// its first write. Partial and cross-column aliases are forbidden by the Rust
+// binder. Every later interval runs in-place on `outputs`; all launches use
+// `stream`.
 extern "C"
 int stwo_ntt_b2n_columns_out_of_place_on(
         const uint32_t *const *inputs,

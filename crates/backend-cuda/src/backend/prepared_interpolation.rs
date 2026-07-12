@@ -1,10 +1,12 @@
 //! Allocation-free, explicit-stream interpolation from resident evaluations.
 //!
-//! Relation kernels must retain their canonical evaluation columns for AIR
+//! Relation kernels may retain their canonical evaluation columns for AIR
 //! consumers while PCS stages consume a distinct coefficient representation.
-//! Setup binds and uploads immutable input/output pointer tables once. Replay
-//! uses one sealed launch mode: the proven copy-then-in-place path, or the
-//! opt-in stage-fused out-of-place path. Both run on the proof-owned stream.
+//! Columns with no later evaluation consumer may instead alias that storage
+//! exactly in either launch mode. Setup binds and uploads immutable input/output
+//! pointer tables once. Replay uses one sealed launch mode: the proven
+//! copy-then-in-place path, or the opt-in stage-fused path. Both run on the
+//! proof-owned stream.
 
 use core::ffi::c_void;
 use std::collections::BTreeSet;
@@ -74,8 +76,9 @@ pub fn b2n_chunk_ranges(column_count: usize) -> Vec<core::ops::Range<usize>> {
         .collect()
 }
 
-/// One evaluation/coefficient pair.  The two slices are required to be
-/// different because both values remain live after interpolation.
+/// One evaluation/coefficient pair. The slices may alias exactly in either
+/// launch mode when the evaluation is dead after interpolation. Partial and
+/// cross-column aliases are rejected.
 #[derive(Clone, Copy, Debug)]
 pub struct InterpolationColumn {
     pub evaluations: ArenaSlice,
@@ -179,7 +182,7 @@ impl<'a> PreparedInterpolationGraph<'a> {
         inverse_twiddles: ArenaSlice,
         mode: InterpolationLaunchMode,
     ) -> Result<Self, PreparedInterpolationError> {
-        let pointer_tables = validate_batches(arena, batches, inverse_twiddles)?;
+        let pointer_tables = validate_batches(arena, batches, inverse_twiddles, mode)?;
 
         let mut prepared = Vec::with_capacity(batches.len());
         let mut pointer_uploads = Vec::with_capacity(batches.len());
@@ -229,8 +232,9 @@ impl<'a> PreparedInterpolationGraph<'a> {
         })
     }
 
-    /// Copy each canonical evaluation to its distinct coefficient slot and
-    /// interpolate the copies in same-log batches on the arena stream.
+    /// Copy each distinct canonical evaluation to its coefficient slot, then
+    /// interpolate all coefficient slots in same-log batches on the arena
+    /// stream. Exact in-place columns skip the identity copy.
     pub fn launch(&self) -> Result<(), PreparedInterpolationError> {
         let twiddle_words = u32::try_from(self.inverse_twiddles.len_words())
             .map_err(|_| PreparedInterpolationError::SizeOverflow)?;
@@ -243,6 +247,9 @@ impl<'a> PreparedInterpolationGraph<'a> {
                         .checked_mul(WORD_BYTES)
                         .ok_or(PreparedInterpolationError::SizeOverflow)?;
                     for column in &batch.columns {
+                        if is_exact_in_place(*column) {
+                            continue;
+                        }
                         unsafe {
                             self.arena.context().memcpy_d2d_async(
                                 column.coefficients.as_void_ptr(),
@@ -305,6 +312,7 @@ fn validate_batches(
     arena: &DeviceArena,
     batches: &[InterpolationBatch],
     inverse_twiddles: ArenaSlice,
+    mode: InterpolationLaunchMode,
 ) -> Result<Vec<(ArenaSlice, ArenaSlice)>, PreparedInterpolationError> {
     if batches.is_empty() {
         return Err(PreparedInterpolationError::EmptyBatches);
@@ -398,17 +406,17 @@ fn validate_batches(
                     });
                 }
             }
-            insert_value_identities(&mut evaluations, &mut coefficients, *column)?;
-            value_ranges.push((
-                column.evaluations.id(),
-                false,
-                address_range(column.evaluations, required_words)?,
-            ));
-            value_ranges.push((
-                column.coefficients.id(),
-                true,
-                address_range(column.coefficients, required_words)?,
-            ));
+            let in_place =
+                insert_value_identities(&mut evaluations, &mut coefficients, *column, mode)?;
+            let evaluation_range = address_range(column.evaluations, required_words)?;
+            value_ranges.push((column.evaluations.id(), in_place, evaluation_range));
+            if !in_place {
+                value_ranges.push((
+                    column.coefficients.id(),
+                    true,
+                    address_range(column.coefficients, required_words)?,
+                ));
+            }
         }
     }
 
@@ -513,10 +521,22 @@ fn insert_value_identities(
     evaluations: &mut BTreeSet<ArenaSlotId>,
     coefficients: &mut BTreeSet<ArenaSlotId>,
     column: InterpolationColumn,
-) -> Result<(), PreparedInterpolationError> {
+    _mode: InterpolationLaunchMode,
+) -> Result<bool, PreparedInterpolationError> {
     let evaluation = column.evaluations.id();
     let coefficient = column.coefficients.id();
-    if evaluation == coefficient || coefficients.contains(&evaluation) {
+    let in_place = is_exact_in_place(column);
+    if in_place {
+        if evaluations.contains(&evaluation) || coefficients.contains(&coefficient) {
+            return Err(PreparedInterpolationError::EvaluationAliasesCoefficient(
+                evaluation,
+            ));
+        }
+        evaluations.insert(evaluation);
+        coefficients.insert(coefficient);
+        return Ok(true);
+    }
+    if coefficients.contains(&evaluation) {
         return Err(PreparedInterpolationError::EvaluationAliasesCoefficient(
             evaluation,
         ));
@@ -534,7 +554,11 @@ fn insert_value_identities(
             coefficient,
         ));
     }
-    Ok(())
+    Ok(false)
+}
+
+fn is_exact_in_place(column: InterpolationColumn) -> bool {
+    column.evaluations.id() == column.coefficients.id()
 }
 
 fn pow2(log_size: u32) -> Result<usize, PreparedInterpolationError> {
@@ -556,22 +580,60 @@ mod tests {
     }
 
     #[test]
-    fn evaluation_and_coefficient_identity_sets_must_be_disjoint() {
+    fn stagewise_mode_allows_only_exact_per_column_aliases() {
         let mut evaluations = BTreeSet::new();
         let mut coefficients = BTreeSet::new();
-        insert_value_identities(&mut evaluations, &mut coefficients, column(1, 2, 5)).unwrap();
+        assert!(!insert_value_identities(
+            &mut evaluations,
+            &mut coefficients,
+            column(1, 2, 5),
+            InterpolationLaunchMode::StageWiseCopyThenInPlace,
+        )
+        .unwrap());
+        assert!(insert_value_identities(
+            &mut evaluations,
+            &mut coefficients,
+            column(4, 4, 5),
+            InterpolationLaunchMode::StageWiseCopyThenInPlace,
+        )
+        .unwrap());
         assert_eq!(
-            insert_value_identities(&mut evaluations, &mut coefficients, column(3, 1, 5)),
+            insert_value_identities(
+                &mut evaluations,
+                &mut coefficients,
+                column(3, 1, 5),
+                InterpolationLaunchMode::StageWiseCopyThenInPlace,
+            ),
             Err(PreparedInterpolationError::EvaluationAliasesCoefficient(
                 ArenaSlotId(1)
             ))
         );
         assert_eq!(
-            insert_value_identities(&mut BTreeSet::new(), &mut BTreeSet::new(), column(4, 4, 5),),
+            insert_value_identities(
+                &mut evaluations,
+                &mut coefficients,
+                column(5, 4, 5),
+                InterpolationLaunchMode::StageWiseCopyThenInPlace,
+            ),
             Err(PreparedInterpolationError::EvaluationAliasesCoefficient(
                 ArenaSlotId(4)
             ))
         );
+    }
+
+    #[test]
+    fn fused_mode_accepts_exact_alias_and_copy_predicate_matches_identity() {
+        let aliased = column(4, 4, 5);
+        let distinct = column(4, 5, 5);
+        assert!(is_exact_in_place(aliased));
+        assert!(!is_exact_in_place(distinct));
+        assert!(insert_value_identities(
+            &mut BTreeSet::new(),
+            &mut BTreeSet::new(),
+            aliased,
+            InterpolationLaunchMode::StageFusedOutOfPlace,
+        )
+        .unwrap());
     }
 
     #[test]
