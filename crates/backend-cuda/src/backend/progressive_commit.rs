@@ -733,6 +733,77 @@ mod tests {
     }
 
     #[test]
+    fn retained_outputs_match_progressive_leaves_root_and_cpu_decommit() {
+        use stwo::core::fields::m31::BaseField;
+        use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleHasher;
+        use stwo::core::vcs_lifted::verifier::MerkleVerifierLifted;
+        use stwo::prover::backend::CpuBackend;
+        use stwo::prover::vcs_lifted::prover::MerkleProverLifted;
+
+        let plan = plan_progressive_commit(
+            ProgressiveCommitMode::DomainProgressive,
+            ProgressiveCommitGeometry {
+                lifting_log_size: 6,
+                log_blowup_factor: 1,
+                groups: vec![
+                    ProgressiveCommitGroupGeometry {
+                        coefficient_log_sizes: vec![3, 4],
+                        retain_evaluations: true,
+                    },
+                    ProgressiveCommitGroupGeometry {
+                        coefficient_log_sizes: vec![5],
+                        retain_evaluations: false,
+                    },
+                ],
+            },
+        )
+        .unwrap();
+        let retained = evaluations(&plan, 0x5a17);
+        assert_eq!(
+            plan.lde_batches
+                .iter()
+                .flat_map(|batch| batch.retained_columns.iter().copied())
+                .collect::<Vec<_>>(),
+            [Some((0, 0)), Some((0, 1)), None]
+        );
+
+        let progressive_leaves = progressive_leaf_oracle(&plan, &retained).unwrap();
+        let full_lifting_leaves = full_lifting_leaf_oracle(&plan, &retained).unwrap();
+        assert_eq!(progressive_leaves, full_lifting_leaves);
+
+        let columns = retained
+            .iter()
+            .map(|column| {
+                column
+                    .iter()
+                    .copied()
+                    .map(BaseField::from_u32_unchecked)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let cpu = MerkleProverLifted::<CpuBackend, Blake2sMerkleHasher>::commit(
+            columns.iter().collect(),
+            plan.geometry.lifting_log_size,
+            0,
+        );
+        assert_eq!(cpu.root(), merkle_root(progressive_leaves));
+
+        let queries = [0usize, 5, 17, 63];
+        let (queried_values, decommitment) = cpu.decommit(&queries, columns.iter().collect());
+        let verifier = MerkleVerifierLifted::new(
+            cpu.root(),
+            plan.columns
+                .iter()
+                .map(|column| column.evaluation_log_size)
+                .collect(),
+            None,
+        );
+        verifier
+            .verify(&queries, queried_values, decommitment.decommitment)
+            .unwrap();
+    }
+
+    #[test]
     fn canonical_blocks_preserve_order_partial_bytes_and_mixed_log_segments() {
         let logs = (0..17)
             .map(|index| if index < 7 { 3 } else { 5 })

@@ -20,8 +20,10 @@ use super::program::{
 /// History: 1 = initial scratch-writing kernel; 2 = fused accumulate (the kernel adds
 /// into the accumulator coordinates in place); 3 = `rc_base` runtime kernel parameter
 /// (random-coeff power indices are now `rc_base + i`, enabling size-governed kernel
-/// splitting — old fused PTX and new split-aware PTX must never collide on disk).
-pub const CODEGEN_VERSION: u64 = 3;
+/// splitting — old fused PTX and new split-aware PTX must never collide on disk);
+/// 4 = shifted trace reads use the kernel's true `log_n_rows` instead of
+/// assuming that every evaluation domain is exactly one bit larger.
+pub const CODEGEN_VERSION: u64 = 4;
 
 /// Cache key for compiled kernels: the program's content semantic hash mixed (FNV-1a)
 /// with [`CODEGEN_VERSION`]. This is the key for both the in-process function cache
@@ -109,8 +111,8 @@ fn emit_instruction_body(program: &OwnedMetalEvaluationProgramV1, src: &mut Stri
                 let (interaction, column, offset) = (inst.interaction, inst.a, inst.imm);
                 src.push_str(&format!(
                     "    {decl}{dst_var} = stwo_trace_value(trace_cols, \
-                     interaction_offsets, row_count, {interaction}u, {column}u, row_index, \
-                     {offset});\n"
+                     interaction_offsets, row_count, log_n_rows, {interaction}u, {column}u, \
+                     row_index, {offset});\n"
                 ));
             }
             // The recorder routes preprocessed columns through TraceCol interaction 0;
@@ -338,7 +340,7 @@ __device__ __forceinline__ unsigned stwo_offset_bit_reversed_circle_domain_index
 
 __device__ __forceinline__ unsigned stwo_trace_value(
     const unsigned *const *trace_cols, const unsigned *interaction_offsets, unsigned row_count,
-    unsigned interaction, unsigned column, unsigned row_index, int offset
+    unsigned log_n_rows, unsigned interaction, unsigned column, unsigned row_index, int offset
 ) {
     unsigned target_row;
     if (offset == 0) {
@@ -347,9 +349,8 @@ __device__ __forceinline__ unsigned stwo_trace_value(
         unsigned eval_log_size = 0u;
         unsigned tmp = row_count;
         while (tmp > 1u) { tmp >>= 1u; eval_log_size++; }
-        unsigned domain_log_size = eval_log_size - 1u;
         target_row = stwo_offset_bit_reversed_circle_domain_index(
-            row_index, domain_log_size, eval_log_size, offset);
+            row_index, log_n_rows, eval_log_size, offset);
     }
     unsigned global_column = interaction_offsets[interaction] + column;
     return trace_cols[global_column][target_row];
@@ -357,4 +358,61 @@ __device__ __forceinline__ unsigned stwo_trace_value(
 
 ",
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use stwo::core::utils::offset_bit_reversed_circle_domain_index;
+
+    use super::*;
+    use crate::backend::jit::program::{
+        MetalEvaluationProgramBaseInstV1, MetalEvaluationProgramExtInstV1,
+        MetalEvaluationProgramHeaderV1,
+    };
+
+    #[test]
+    fn shifted_trace_codegen_threads_the_true_trace_log() {
+        let header = MetalEvaluationProgramHeaderV1::new(0, 0x1234, 0, 1, 0, 0, 1, 1, 1);
+        let program = OwnedMetalEvaluationProgramV1::from_parts(
+            header,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![MetalEvaluationProgramBaseInstV1::trace_col(0, 0, 0, -1)],
+            vec![MetalEvaluationProgramExtInstV1::secure_col(0, 0, 0, 0, 0)],
+            vec![0],
+        );
+        let source = compile_v1_to_cuda_source(&program).unwrap();
+        assert!(
+            source.contains("interaction_offsets, row_count, log_n_rows, 0u, 0u, row_index, -1);")
+        );
+        assert!(source.contains(
+            "unsigned log_n_rows, unsigned interaction, unsigned column, unsigned row_index"
+        ));
+        assert!(!source.contains("domain_log_size = eval_log_size - 1u"));
+    }
+
+    #[test]
+    fn two_bit_expansion_disproves_the_legacy_shifted_index() {
+        const TRACE_LOG_SIZE: u32 = 6;
+        const EVALUATION_LOG_SIZE: u32 = 8;
+        let first_difference = (0..1usize << EVALUATION_LOG_SIZE)
+            .find_map(|row| {
+                let expected = offset_bit_reversed_circle_domain_index(
+                    row,
+                    TRACE_LOG_SIZE,
+                    EVALUATION_LOG_SIZE,
+                    -1,
+                );
+                let legacy = offset_bit_reversed_circle_domain_index(
+                    row,
+                    EVALUATION_LOG_SIZE - 1,
+                    EVALUATION_LOG_SIZE,
+                    -1,
+                );
+                (expected != legacy).then_some((row, expected, legacy))
+            })
+            .expect("two-bit expansion must distinguish the true trace domain");
+        assert_eq!(first_difference, (0, 126, 254));
+    }
 }

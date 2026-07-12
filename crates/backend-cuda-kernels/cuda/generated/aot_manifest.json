@@ -1,855 +1,855 @@
 [
   {
-    "cache_key": "4fcf64dc366ed1e5",
-    "file": "constraint_add_ap_opcode_4fcf64dc366ed1e5.cu",
+    "cache_key": "f2df0fc115a0f382",
+    "file": "constraint_add_ap_opcode_f2df0fc115a0f382.cu",
     "kernel_name": "stwo_jit_fused_8b1229a89671563e",
     "kind": "constraint",
     "label": "add_ap_opcode",
     "semantic_hash": "8b1229a89671563e"
   },
   {
-    "cache_key": "1020e66929d4a824",
-    "file": "constraint_add_mod_builtin_1020e66929d4a824.cu",
-    "kernel_name": "stwo_jit_fused_4e153970e61f4d00",
-    "kind": "constraint",
-    "label": "add_mod_builtin",
-    "semantic_hash": "4e153970e61f4d00"
-  },
-  {
-    "cache_key": "1b982ffefd4b1e3a",
-    "file": "constraint_add_mod_builtin_1b982ffefd4b1e3a.cu",
+    "cache_key": "7888851a1e18fc9d",
+    "file": "constraint_add_mod_builtin_7888851a1e18fc9d.cu",
     "kernel_name": "stwo_jit_fused_b3cf511a78e2a3a8",
     "kind": "constraint",
     "label": "add_mod_builtin",
     "semantic_hash": "b3cf511a78e2a3a8"
   },
   {
-    "cache_key": "f750bddb5af13d7b",
-    "file": "constraint_add_opcode_f750bddb5af13d7b.cu",
+    "cache_key": "f1261f601ee55e03",
+    "file": "constraint_add_mod_builtin_f1261f601ee55e03.cu",
+    "kernel_name": "stwo_jit_fused_4e153970e61f4d00",
+    "kind": "constraint",
+    "label": "add_mod_builtin",
+    "semantic_hash": "4e153970e61f4d00"
+  },
+  {
+    "cache_key": "164b84e465e0879c",
+    "file": "constraint_add_opcode_164b84e465e0879c.cu",
     "kernel_name": "stwo_jit_fused_d8a31b0859c6943e",
     "kind": "constraint",
     "label": "add_opcode",
     "semantic_hash": "d8a31b0859c6943e"
   },
   {
-    "cache_key": "e79242490fb703e8",
-    "file": "constraint_add_opcode_small_e79242490fb703e8.cu",
+    "cache_key": "c06db3885c420acf",
+    "file": "constraint_add_opcode_small_c06db3885c420acf.cu",
     "kernel_name": "stwo_jit_fused_c404737783a8b93e",
     "kind": "constraint",
     "label": "add_opcode_small",
     "semantic_hash": "c404737783a8b93e"
   },
   {
-    "cache_key": "89f07725ea264191",
-    "file": "constraint_assert_eq_opcode_89f07725ea264191.cu",
+    "cache_key": "24d65a5320d2b436",
+    "file": "constraint_assert_eq_opcode_24d65a5320d2b436.cu",
     "kernel_name": "stwo_jit_fused_db623f0e10c81639",
     "kind": "constraint",
     "label": "assert_eq_opcode",
     "semantic_hash": "db623f0e10c81639"
   },
   {
-    "cache_key": "e3462b3b08b56d56",
-    "file": "constraint_assert_eq_opcode_double_deref_e3462b3b08b56d56.cu",
+    "cache_key": "4860480dd208fab1",
+    "file": "constraint_assert_eq_opcode_double_deref_4860480dd208fab1.cu",
     "kernel_name": "stwo_jit_fused_036dfb90ab7f0477",
     "kind": "constraint",
     "label": "assert_eq_opcode_double_deref",
     "semantic_hash": "036dfb90ab7f0477"
   },
   {
-    "cache_key": "6e50a44b40217a1d",
-    "file": "constraint_assert_eq_opcode_imm_6e50a44b40217a1d.cu",
+    "cache_key": "11604f301f539bba",
+    "file": "constraint_assert_eq_opcode_imm_11604f301f539bba.cu",
     "kernel_name": "stwo_jit_fused_f53805dad6e749bb",
     "kind": "constraint",
     "label": "assert_eq_opcode_imm",
     "semantic_hash": "f53805dad6e749bb"
   },
   {
-    "cache_key": "19a10da57467ba9d",
-    "file": "constraint_bitwise_builtin_19a10da57467ba9d.cu",
+    "cache_key": "bcb0b88a5399dc3a",
+    "file": "constraint_bitwise_builtin_bcb0b88a5399dc3a.cu",
     "kernel_name": "stwo_jit_fused_4b561009970da257",
     "kind": "constraint",
     "label": "bitwise_builtin",
     "semantic_hash": "4b561009970da257"
   },
   {
-    "cache_key": "771e656763c988ae",
-    "file": "constraint_bitwise_builtin_771e656763c988ae.cu",
+    "cache_key": "dc38823a2d1d1609",
+    "file": "constraint_bitwise_builtin_dc38823a2d1d1609.cu",
     "kernel_name": "stwo_jit_fused_ea76bd5c18398a70",
     "kind": "constraint",
     "label": "bitwise_builtin",
     "semantic_hash": "ea76bd5c18398a70"
   },
   {
-    "cache_key": "4dd043e009959423",
-    "file": "constraint_blake_compress_opcode_4dd043e009959423.cu",
+    "cache_key": "6ccb0ae91484de44",
+    "file": "constraint_blake_compress_opcode_6ccb0ae91484de44.cu",
     "kernel_name": "stwo_jit_fused_dbf6a6f2d8cfd5ee",
     "kind": "constraint",
     "label": "blake_compress_opcode",
     "semantic_hash": "dbf6a6f2d8cfd5ee"
   },
   {
-    "cache_key": "92373f80f58f0844",
-    "file": "constraint_blake_compress_opcode_92373f80f58f0844.cu",
+    "cache_key": "733c7877ea9fbe23",
+    "file": "constraint_blake_compress_opcode_733c7877ea9fbe23.cu",
     "kernel_name": "stwo_jit_fused_f8e6d75c823ef3b4",
     "kind": "constraint",
     "label": "blake_compress_opcode",
     "semantic_hash": "f8e6d75c823ef3b4"
   },
   {
-    "cache_key": "4a4a87de4b387b64",
-    "file": "constraint_blake_g_4a4a87de4b387b64.cu",
+    "cache_key": "2b4fc0d540493143",
+    "file": "constraint_blake_g_2b4fc0d540493143.cu",
     "kernel_name": "stwo_jit_fused_a48e2af8f89f2334",
     "kind": "constraint",
     "label": "blake_g",
     "semantic_hash": "a48e2af8f89f2334"
   },
   {
-    "cache_key": "27debe3f03915c96",
-    "file": "constraint_blake_round_27debe3f03915c96.cu",
+    "cache_key": "8cf8db11cce4e9f1",
+    "file": "constraint_blake_round_8cf8db11cce4e9f1.cu",
     "kernel_name": "stwo_jit_fused_ac3a2d11548fdea9",
     "kind": "constraint",
     "label": "blake_round",
     "semantic_hash": "ac3a2d11548fdea9"
   },
   {
-    "cache_key": "c6f32ef8a9b96254",
-    "file": "constraint_blake_round_c6f32ef8a9b96254.cu",
+    "cache_key": "a7f867ef9eca1833",
+    "file": "constraint_blake_round_a7f867ef9eca1833.cu",
     "kernel_name": "stwo_jit_fused_48721258a1905267",
     "kind": "constraint",
     "label": "blake_round",
     "semantic_hash": "48721258a1905267"
   },
   {
-    "cache_key": "35fe95ac7e0206d7",
-    "file": "constraint_blake_round_sigma_35fe95ac7e0206d7.cu",
+    "cache_key": "5d23246d3176fff0",
+    "file": "constraint_blake_round_sigma_5d23246d3176fff0.cu",
     "kernel_name": "stwo_jit_fused_dc512e9aef7f81c9",
     "kind": "constraint",
     "label": "blake_round_sigma",
     "semantic_hash": "dc512e9aef7f81c9"
   },
   {
-    "cache_key": "199b0e53aadd1fdc",
-    "file": "constraint_call_opcode_abs_199b0e53aadd1fdc.cu",
+    "cache_key": "faa0474a9fedd5bb",
+    "file": "constraint_call_opcode_abs_faa0474a9fedd5bb.cu",
     "kernel_name": "stwo_jit_fused_3aac0396ae78da3f",
     "kind": "constraint",
     "label": "call_opcode_abs",
     "semantic_hash": "3aac0396ae78da3f"
   },
   {
-    "cache_key": "547f0f9b9dbeae56",
-    "file": "constraint_call_opcode_rel_imm_547f0f9b9dbeae56.cu",
+    "cache_key": "b9992c6e67123bb1",
+    "file": "constraint_call_opcode_rel_imm_b9992c6e67123bb1.cu",
     "kernel_name": "stwo_jit_fused_b60c9c9c25015103",
     "kind": "constraint",
     "label": "call_opcode_rel_imm",
     "semantic_hash": "b60c9c9c25015103"
   },
   {
-    "cache_key": "2952e2f9e4d5ed3a",
-    "file": "constraint_cube_252_2952e2f9e4d5ed3a.cu",
-    "kernel_name": "stwo_jit_fused_6a1dcd04b35338e6",
-    "kind": "constraint",
-    "label": "cube_252",
-    "semantic_hash": "6a1dcd04b35338e6"
-  },
-  {
-    "cache_key": "2f59786637dcd05b",
-    "file": "constraint_cube_252_2f59786637dcd05b.cu",
+    "cache_key": "4e543f6f42cc1a7c",
+    "file": "constraint_cube_252_4e543f6f42cc1a7c.cu",
     "kernel_name": "stwo_jit_fused_5837b076ba757437",
     "kind": "constraint",
     "label": "cube_252",
     "semantic_hash": "5837b076ba757437"
   },
   {
-    "cache_key": "c687f168b5760e1f",
-    "file": "constraint_cube_252_c687f168b5760e1f.cu",
+    "cache_key": "8643381505a3cb9d",
+    "file": "constraint_cube_252_8643381505a3cb9d.cu",
+    "kernel_name": "stwo_jit_fused_6a1dcd04b35338e6",
+    "kind": "constraint",
+    "label": "cube_252",
+    "semantic_hash": "6a1dcd04b35338e6"
+  },
+  {
+    "cache_key": "edac802968eb0738",
+    "file": "constraint_cube_252_edac802968eb0738.cu",
     "kernel_name": "stwo_jit_fused_236ecb1645901ac0",
     "kind": "constraint",
     "label": "cube_252",
     "semantic_hash": "236ecb1645901ac0"
   },
   {
-    "cache_key": "5a3417c81866daa3",
-    "file": "constraint_ec_op_builtin_5a3417c81866daa3.cu",
-    "kernel_name": "stwo_jit_fused_87d0117207915942",
-    "kind": "constraint",
-    "label": "ec_op_builtin",
-    "semantic_hash": "87d0117207915942"
-  },
-  {
-    "cache_key": "95e6fd5319657332",
-    "file": "constraint_ec_op_builtin_95e6fd5319657332.cu",
-    "kernel_name": "stwo_jit_fused_890c638e65e67a2f",
-    "kind": "constraint",
-    "label": "ec_op_builtin",
-    "semantic_hash": "890c638e65e67a2f"
-  },
-  {
-    "cache_key": "c60718b89a8ad589",
-    "file": "constraint_ec_op_builtin_c60718b89a8ad589.cu",
+    "cache_key": "60ecfbe5d137482e",
+    "file": "constraint_ec_op_builtin_60ecfbe5d137482e.cu",
     "kernel_name": "stwo_jit_fused_834630a310a49f2a",
     "kind": "constraint",
     "label": "ec_op_builtin",
     "semantic_hash": "834630a310a49f2a"
   },
   {
-    "cache_key": "ffaab9e210692a14",
-    "file": "constraint_ec_op_builtin_ffaab9e210692a14.cu",
+    "cache_key": "792eded1235624c4",
+    "file": "constraint_ec_op_builtin_792eded1235624c4.cu",
+    "kernel_name": "stwo_jit_fused_87d0117207915942",
+    "kind": "constraint",
+    "label": "ec_op_builtin",
+    "semantic_hash": "87d0117207915942"
+  },
+  {
+    "cache_key": "e0aff2d90579dff3",
+    "file": "constraint_ec_op_builtin_e0aff2d90579dff3.cu",
     "kernel_name": "stwo_jit_fused_df9c6a0cee30d01f",
     "kind": "constraint",
     "label": "ec_op_builtin",
     "semantic_hash": "df9c6a0cee30d01f"
   },
   {
-    "cache_key": "0945017b05951c65",
-    "file": "constraint_generic_opcode_0945017b05951c65.cu",
-    "kernel_name": "stwo_jit_fused_82455873b45a069f",
+    "cache_key": "f2d7526e3a335195",
+    "file": "constraint_ec_op_builtin_f2d7526e3a335195.cu",
+    "kernel_name": "stwo_jit_fused_890c638e65e67a2f",
     "kind": "constraint",
-    "label": "generic_opcode",
-    "semantic_hash": "82455873b45a069f"
+    "label": "ec_op_builtin",
+    "semantic_hash": "890c638e65e67a2f"
   },
   {
-    "cache_key": "829adeb8fb20a5dc",
-    "file": "constraint_generic_opcode_829adeb8fb20a5dc.cu",
+    "cache_key": "63a017aff0315bbb",
+    "file": "constraint_generic_opcode_63a017aff0315bbb.cu",
     "kernel_name": "stwo_jit_fused_defa0a4132b0baa5",
     "kind": "constraint",
     "label": "generic_opcode",
     "semantic_hash": "defa0a4132b0baa5"
   },
   {
-    "cache_key": "ce99c886ca941ea9",
-    "file": "constraint_generic_opcode_ce99c886ca941ea9.cu",
+    "cache_key": "697fabb40140914e",
+    "file": "constraint_generic_opcode_697fabb40140914e.cu",
     "kernel_name": "stwo_jit_fused_784d49d84a3b4854",
     "kind": "constraint",
     "label": "generic_opcode",
     "semantic_hash": "784d49d84a3b4854"
   },
   {
-    "cache_key": "abfe396850620439",
-    "file": "constraint_jnz_opcode_non_taken_abfe396850620439.cu",
+    "cache_key": "ac54ac5fe4c73e02",
+    "file": "constraint_generic_opcode_ac54ac5fe4c73e02.cu",
+    "kernel_name": "stwo_jit_fused_82455873b45a069f",
+    "kind": "constraint",
+    "label": "generic_opcode",
+    "semantic_hash": "82455873b45a069f"
+  },
+  {
+    "cache_key": "46e41c95870e76de",
+    "file": "constraint_jnz_opcode_non_taken_46e41c95870e76de.cu",
     "kernel_name": "stwo_jit_fused_16d2ea9e41d7d7e6",
     "kind": "constraint",
     "label": "jnz_opcode_non_taken",
     "semantic_hash": "16d2ea9e41d7d7e6"
   },
   {
-    "cache_key": "e8c2123e86cdbc13",
-    "file": "constraint_jnz_opcode_taken_e8c2123e86cdbc13.cu",
+    "cache_key": "07bcd94791bd0634",
+    "file": "constraint_jnz_opcode_taken_07bcd94791bd0634.cu",
     "kernel_name": "stwo_jit_fused_c4424f733f4bd4ab",
     "kind": "constraint",
     "label": "jnz_opcode_taken",
     "semantic_hash": "c4424f733f4bd4ab"
   },
   {
-    "cache_key": "3209320e77ff6378",
-    "file": "constraint_jump_opcode_abs_3209320e77ff6378.cu",
+    "cache_key": "0ae4a34dc48a6a5f",
+    "file": "constraint_jump_opcode_abs_0ae4a34dc48a6a5f.cu",
     "kernel_name": "stwo_jit_fused_f0e353c20c6f2d6a",
     "kind": "constraint",
     "label": "jump_opcode_abs",
     "semantic_hash": "f0e353c20c6f2d6a"
   },
   {
-    "cache_key": "72bc43c11f879e4b",
-    "file": "constraint_jump_opcode_double_deref_72bc43c11f879e4b.cu",
+    "cache_key": "91b70aca2a76e86c",
+    "file": "constraint_jump_opcode_double_deref_91b70aca2a76e86c.cu",
     "kernel_name": "stwo_jit_fused_132b915f95d4fcfc",
     "kind": "constraint",
     "label": "jump_opcode_double_deref",
     "semantic_hash": "132b915f95d4fcfc"
   },
   {
-    "cache_key": "ca0cc46551685cd1",
-    "file": "constraint_jump_opcode_rel_ca0cc46551685cd1.cu",
+    "cache_key": "64f2a7928814cf76",
+    "file": "constraint_jump_opcode_rel_64f2a7928814cf76.cu",
     "kernel_name": "stwo_jit_fused_5c3c289918278350",
     "kind": "constraint",
     "label": "jump_opcode_rel",
     "semantic_hash": "5c3c289918278350"
   },
   {
-    "cache_key": "a6462fc6ed53968f",
-    "file": "constraint_jump_opcode_rel_imm_a6462fc6ed53968f.cu",
+    "cache_key": "cd6abe87a0c88fa8",
+    "file": "constraint_jump_opcode_rel_imm_cd6abe87a0c88fa8.cu",
     "kernel_name": "stwo_jit_fused_f22e7da0de2896b6",
     "kind": "constraint",
     "label": "jump_opcode_rel_imm",
     "semantic_hash": "f22e7da0de2896b6"
   },
   {
-    "cache_key": "25be520aa9de408d",
-    "file": "constraint_memory_address_to_id_25be520aa9de408d.cu",
-    "kernel_name": "stwo_jit_fused_2935f225c67ee1d9",
-    "kind": "constraint",
-    "label": "memory_address_to_id",
-    "semantic_hash": "2935f225c67ee1d9"
-  },
-  {
-    "cache_key": "530df25df37fe4bc",
-    "file": "constraint_memory_address_to_id_530df25df37fe4bc.cu",
+    "cache_key": "34132b54e8909a9b",
+    "file": "constraint_memory_address_to_id_34132b54e8909a9b.cu",
     "kernel_name": "stwo_jit_fused_2cba2391b8c04fc9",
     "kind": "constraint",
     "label": "memory_address_to_id",
     "semantic_hash": "2cba2391b8c04fc9"
   },
   {
-    "cache_key": "5c47b25f27d301eb",
-    "file": "constraint_memory_address_to_id_5c47b25f27d301eb.cu",
+    "cache_key": "7b42796832c24c0c",
+    "file": "constraint_memory_address_to_id_7b42796832c24c0c.cu",
     "kernel_name": "stwo_jit_fused_005cd6559bef7f51",
     "kind": "constraint",
     "label": "memory_address_to_id",
     "semantic_hash": "005cd6559bef7f51"
   },
   {
-    "cache_key": "8453e0412079cf42",
-    "file": "constraint_memory_address_to_id_8453e0412079cf42.cu",
+    "cache_key": "c8cdfcef8910622a",
+    "file": "constraint_memory_address_to_id_c8cdfcef8910622a.cu",
+    "kernel_name": "stwo_jit_fused_2935f225c67ee1d9",
+    "kind": "constraint",
+    "label": "memory_address_to_id",
+    "semantic_hash": "2935f225c67ee1d9"
+  },
+  {
+    "cache_key": "e144355c4147ada5",
+    "file": "constraint_memory_address_to_id_e144355c4147ada5.cu",
     "kernel_name": "stwo_jit_fused_3859c59e9248cd69",
     "kind": "constraint",
     "label": "memory_address_to_id",
     "semantic_hash": "3859c59e9248cd69"
   },
   {
-    "cache_key": "a6aa239ed1a25e9c",
-    "file": "constraint_memory_id_to_big_a6aa239ed1a25e9c.cu",
+    "cache_key": "87af5c95c6b3147b",
+    "file": "constraint_memory_id_to_big_87af5c95c6b3147b.cu",
     "kernel_name": "stwo_jit_fused_cb1ce2703d2db392",
     "kind": "constraint",
     "label": "memory_id_to_big",
     "semantic_hash": "cb1ce2703d2db392"
   },
   {
-    "cache_key": "d331505bba420355",
-    "file": "constraint_memory_id_to_small_d331505bba420355.cu",
+    "cache_key": "7640fb40997424f2",
+    "file": "constraint_memory_id_to_small_7640fb40997424f2.cu",
     "kernel_name": "stwo_jit_fused_5300354eae2fe0f2",
     "kind": "constraint",
     "label": "memory_id_to_small",
     "semantic_hash": "5300354eae2fe0f2"
   },
   {
-    "cache_key": "228feb8302d69918",
-    "file": "constraint_mul_mod_builtin_228feb8302d69918.cu",
-    "kernel_name": "stwo_jit_fused_59254d430db5a125",
-    "kind": "constraint",
-    "label": "mul_mod_builtin",
-    "semantic_hash": "59254d430db5a125"
-  },
-  {
-    "cache_key": "3bc6f8c1bc0a4337",
-    "file": "constraint_mul_mod_builtin_3bc6f8c1bc0a4337.cu",
-    "kernel_name": "stwo_jit_fused_9e910bc83ea733ff",
-    "kind": "constraint",
-    "label": "mul_mod_builtin",
-    "semantic_hash": "9e910bc83ea733ff"
-  },
-  {
-    "cache_key": "499402090c9adcb4",
-    "file": "constraint_mul_mod_builtin_499402090c9adcb4.cu",
+    "cache_key": "2a993b0001ab9293",
+    "file": "constraint_mul_mod_builtin_2a993b0001ab9293.cu",
     "kernel_name": "stwo_jit_fused_2433db9b69efeb22",
     "kind": "constraint",
     "label": "mul_mod_builtin",
     "semantic_hash": "2433db9b69efeb22"
   },
   {
-    "cache_key": "4f93ae4240ece252",
-    "file": "constraint_mul_mod_builtin_4f93ae4240ece252.cu",
-    "kernel_name": "stwo_jit_fused_0593815dce532aa5",
-    "kind": "constraint",
-    "label": "mul_mod_builtin",
-    "semantic_hash": "0593815dce532aa5"
-  },
-  {
-    "cache_key": "a80c1d0f1c0287f0",
-    "file": "constraint_mul_mod_builtin_a80c1d0f1c0287f0.cu",
-    "kernel_name": "stwo_jit_fused_f68c73f9e5c4d994",
-    "kind": "constraint",
-    "label": "mul_mod_builtin",
-    "semantic_hash": "f68c73f9e5c4d994"
-  },
-  {
-    "cache_key": "c405b2bbe89c8514",
-    "file": "constraint_mul_mod_builtin_c405b2bbe89c8514.cu",
-    "kernel_name": "stwo_jit_fused_3da04688e1532528",
-    "kind": "constraint",
-    "label": "mul_mod_builtin",
-    "semantic_hash": "3da04688e1532528"
-  },
-  {
-    "cache_key": "dff683742560f150",
-    "file": "constraint_mul_mod_builtin_dff683742560f150.cu",
-    "kernel_name": "stwo_jit_fused_f2db41f49ee16e71",
-    "kind": "constraint",
-    "label": "mul_mod_builtin",
-    "semantic_hash": "f2db41f49ee16e71"
-  },
-  {
-    "cache_key": "efdbb17ac101cf56",
-    "file": "constraint_mul_mod_builtin_efdbb17ac101cf56.cu",
+    "cache_key": "54f5ce4d8a555cb1",
+    "file": "constraint_mul_mod_builtin_54f5ce4d8a555cb1.cu",
     "kernel_name": "stwo_jit_fused_c8883599230b812b",
     "kind": "constraint",
     "label": "mul_mod_builtin",
     "semantic_hash": "c8883599230b812b"
   },
   {
-    "cache_key": "274ba2ab3cf364c2",
-    "file": "constraint_mul_opcode_274ba2ab3cf364c2.cu",
+    "cache_key": "62eb87826f7f3c50",
+    "file": "constraint_mul_mod_builtin_62eb87826f7f3c50.cu",
+    "kernel_name": "stwo_jit_fused_9e910bc83ea733ff",
+    "kind": "constraint",
+    "label": "mul_mod_builtin",
+    "semantic_hash": "9e910bc83ea733ff"
+  },
+  {
+    "cache_key": "80e78e4e688d8ed7",
+    "file": "constraint_mul_mod_builtin_80e78e4e688d8ed7.cu",
+    "kernel_name": "stwo_jit_fused_f68c73f9e5c4d994",
+    "kind": "constraint",
+    "label": "mul_mod_builtin",
+    "semantic_hash": "f68c73f9e5c4d994"
+  },
+  {
+    "cache_key": "a50aebb2ddad3af3",
+    "file": "constraint_mul_mod_builtin_a50aebb2ddad3af3.cu",
+    "kernel_name": "stwo_jit_fused_3da04688e1532528",
+    "kind": "constraint",
+    "label": "mul_mod_builtin",
+    "semantic_hash": "3da04688e1532528"
+  },
+  {
+    "cache_key": "ac84035d61bac0b5",
+    "file": "constraint_mul_mod_builtin_ac84035d61bac0b5.cu",
+    "kernel_name": "stwo_jit_fused_0593815dce532aa5",
+    "kind": "constraint",
+    "label": "mul_mod_builtin",
+    "semantic_hash": "0593815dce532aa5"
+  },
+  {
+    "cache_key": "b8d1f4b371ebf837",
+    "file": "constraint_mul_mod_builtin_b8d1f4b371ebf837.cu",
+    "kernel_name": "stwo_jit_fused_f2db41f49ee16e71",
+    "kind": "constraint",
+    "label": "mul_mod_builtin",
+    "semantic_hash": "f2db41f49ee16e71"
+  },
+  {
+    "cache_key": "fb6b5cc24f619fff",
+    "file": "constraint_mul_mod_builtin_fb6b5cc24f619fff.cu",
+    "kernel_name": "stwo_jit_fused_59254d430db5a125",
+    "kind": "constraint",
+    "label": "mul_mod_builtin",
+    "semantic_hash": "59254d430db5a125"
+  },
+  {
+    "cache_key": "843bf7c65dc14325",
+    "file": "constraint_mul_opcode_843bf7c65dc14325.cu",
     "kernel_name": "stwo_jit_fused_a8dbf546374b1f35",
     "kind": "constraint",
     "label": "mul_opcode",
     "semantic_hash": "a8dbf546374b1f35"
   },
   {
-    "cache_key": "54663f1d28e63a51",
-    "file": "constraint_mul_opcode_54663f1d28e63a51.cu",
+    "cache_key": "ef4c224a5f92acf6",
+    "file": "constraint_mul_opcode_ef4c224a5f92acf6.cu",
     "kernel_name": "stwo_jit_fused_20a959b4f35bd2cd",
     "kind": "constraint",
     "label": "mul_opcode",
     "semantic_hash": "20a959b4f35bd2cd"
   },
   {
-    "cache_key": "f81dceab6cd9bf12",
-    "file": "constraint_mul_opcode_small_f81dceab6cd9bf12.cu",
+    "cache_key": "550e23c68da79d75",
+    "file": "constraint_mul_opcode_small_550e23c68da79d75.cu",
     "kernel_name": "stwo_jit_fused_bc74e68e54ebf0f3",
     "kind": "constraint",
     "label": "mul_opcode_small",
     "semantic_hash": "bc74e68e54ebf0f3"
   },
   {
-    "cache_key": "00f8a89b9d11ef90",
-    "file": "constraint_partial_ec_mul_generic_00f8a89b9d11ef90.cu",
-    "kernel_name": "stwo_jit_fused_fd5f6abc639c7ad3",
-    "kind": "constraint",
-    "label": "partial_ec_mul_generic",
-    "semantic_hash": "fd5f6abc639c7ad3"
-  },
-  {
-    "cache_key": "05f9c53174f0aaab",
-    "file": "constraint_partial_ec_mul_generic_05f9c53174f0aaab.cu",
-    "kernel_name": "stwo_jit_fused_4503468882eeb245",
-    "kind": "constraint",
-    "label": "partial_ec_mul_generic",
-    "semantic_hash": "4503468882eeb245"
-  },
-  {
-    "cache_key": "0d85e62852e65bf1",
-    "file": "constraint_partial_ec_mul_generic_0d85e62852e65bf1.cu",
-    "kernel_name": "stwo_jit_fused_a5a22a904ae7719a",
-    "kind": "constraint",
-    "label": "partial_ec_mul_generic",
-    "semantic_hash": "a5a22a904ae7719a"
-  },
-  {
-    "cache_key": "1c5835b3a5fef139",
-    "file": "constraint_partial_ec_mul_generic_1c5835b3a5fef139.cu",
-    "kernel_name": "stwo_jit_fused_eec4da0738322101",
-    "kind": "constraint",
-    "label": "partial_ec_mul_generic",
-    "semantic_hash": "eec4da0738322101"
-  },
-  {
-    "cache_key": "5c68aa540bd25c9e",
-    "file": "constraint_partial_ec_mul_generic_5c68aa540bd25c9e.cu",
-    "kernel_name": "stwo_jit_fused_9caf184ede0cedd8",
-    "kind": "constraint",
-    "label": "partial_ec_mul_generic",
-    "semantic_hash": "9caf184ede0cedd8"
-  },
-  {
-    "cache_key": "938d4c6c79c6c68e",
-    "file": "constraint_partial_ec_mul_generic_938d4c6c79c6c68e.cu",
-    "kernel_name": "stwo_jit_fused_a825a049ba6a952f",
-    "kind": "constraint",
-    "label": "partial_ec_mul_generic",
-    "semantic_hash": "a825a049ba6a952f"
-  },
-  {
-    "cache_key": "95cbc777b66614e4",
-    "file": "constraint_partial_ec_mul_generic_95cbc777b66614e4.cu",
-    "kernel_name": "stwo_jit_fused_3a940a524062d0a6",
-    "kind": "constraint",
-    "label": "partial_ec_mul_generic",
-    "semantic_hash": "3a940a524062d0a6"
-  },
-  {
-    "cache_key": "b52eac7ce08c782d",
-    "file": "constraint_partial_ec_mul_generic_b52eac7ce08c782d.cu",
-    "kernel_name": "stwo_jit_fused_9927162c86fc449f",
-    "kind": "constraint",
-    "label": "partial_ec_mul_generic",
-    "semantic_hash": "9927162c86fc449f"
-  },
-  {
-    "cache_key": "c0f1039453865a30",
-    "file": "constraint_partial_ec_mul_generic_c0f1039453865a30.cu",
-    "kernel_name": "stwo_jit_fused_633fe71fc869665d",
-    "kind": "constraint",
-    "label": "partial_ec_mul_generic",
-    "semantic_hash": "633fe71fc869665d"
-  },
-  {
-    "cache_key": "cc28bdf0b8c53698",
-    "file": "constraint_partial_ec_mul_generic_cc28bdf0b8c53698.cu",
-    "kernel_name": "stwo_jit_fused_04d089b7c5ed2771",
-    "kind": "constraint",
-    "label": "partial_ec_mul_generic",
-    "semantic_hash": "04d089b7c5ed2771"
-  },
-  {
-    "cache_key": "ef130c4b88f1d0bf",
-    "file": "constraint_partial_ec_mul_generic_ef130c4b88f1d0bf.cu",
+    "cache_key": "16379b0c3c66c9d8",
+    "file": "constraint_partial_ec_mul_generic_16379b0c3c66c9d8.cu",
     "kernel_name": "stwo_jit_fused_49565bc27a55d074",
     "kind": "constraint",
     "label": "partial_ec_mul_generic",
     "semantic_hash": "49565bc27a55d074"
   },
   {
-    "cache_key": "1ab049f2a1c4ff32",
-    "file": "constraint_partial_ec_mul_window_bits_18_1ab049f2a1c4ff32.cu",
-    "kernel_name": "stwo_jit_fused_86a901b804923a10",
+    "cache_key": "24f48c3a7fdff4cc",
+    "file": "constraint_partial_ec_mul_generic_24f48c3a7fdff4cc.cu",
+    "kernel_name": "stwo_jit_fused_4503468882eeb245",
     "kind": "constraint",
-    "label": "partial_ec_mul_window_bits_18",
-    "semantic_hash": "86a901b804923a10"
+    "label": "partial_ec_mul_generic",
+    "semantic_hash": "4503468882eeb245"
   },
   {
-    "cache_key": "5dc55cbb1ce6c19d",
-    "file": "constraint_partial_ec_mul_window_bits_18_5dc55cbb1ce6c19d.cu",
+    "cache_key": "583e5761bfbe99ca",
+    "file": "constraint_partial_ec_mul_generic_583e5761bfbe99ca.cu",
+    "kernel_name": "stwo_jit_fused_9927162c86fc449f",
+    "kind": "constraint",
+    "label": "partial_ec_mul_generic",
+    "semantic_hash": "9927162c86fc449f"
+  },
+  {
+    "cache_key": "76d1006eab76cac3",
+    "file": "constraint_partial_ec_mul_generic_76d1006eab76cac3.cu",
+    "kernel_name": "stwo_jit_fused_3a940a524062d0a6",
+    "kind": "constraint",
+    "label": "partial_ec_mul_generic",
+    "semantic_hash": "3a940a524062d0a6"
+  },
+  {
+    "cache_key": "99cc74d3a0116117",
+    "file": "constraint_partial_ec_mul_generic_99cc74d3a0116117.cu",
+    "kernel_name": "stwo_jit_fused_633fe71fc869665d",
+    "kind": "constraint",
+    "label": "partial_ec_mul_generic",
+    "semantic_hash": "633fe71fc869665d"
+  },
+  {
+    "cache_key": "a5042f3005503d7f",
+    "file": "constraint_partial_ec_mul_generic_a5042f3005503d7f.cu",
+    "kernel_name": "stwo_jit_fused_04d089b7c5ed2771",
+    "kind": "constraint",
+    "label": "partial_ec_mul_generic",
+    "semantic_hash": "04d089b7c5ed2771"
+  },
+  {
+    "cache_key": "a86bc9558992ce96",
+    "file": "constraint_partial_ec_mul_generic_a86bc9558992ce96.cu",
+    "kernel_name": "stwo_jit_fused_a5a22a904ae7719a",
+    "kind": "constraint",
+    "label": "partial_ec_mul_generic",
+    "semantic_hash": "a5a22a904ae7719a"
+  },
+  {
+    "cache_key": "b73e18e0dcab63de",
+    "file": "constraint_partial_ec_mul_generic_b73e18e0dcab63de.cu",
+    "kernel_name": "stwo_jit_fused_eec4da0738322101",
+    "kind": "constraint",
+    "label": "partial_ec_mul_generic",
+    "semantic_hash": "eec4da0738322101"
+  },
+  {
+    "cache_key": "c182c726d525e9f9",
+    "file": "constraint_partial_ec_mul_generic_c182c726d525e9f9.cu",
+    "kernel_name": "stwo_jit_fused_9caf184ede0cedd8",
+    "kind": "constraint",
+    "label": "partial_ec_mul_generic",
+    "semantic_hash": "9caf184ede0cedd8"
+  },
+  {
+    "cache_key": "d9d419dae99cf677",
+    "file": "constraint_partial_ec_mul_generic_d9d419dae99cf677.cu",
+    "kernel_name": "stwo_jit_fused_fd5f6abc639c7ad3",
+    "kind": "constraint",
+    "label": "partial_ec_mul_generic",
+    "semantic_hash": "fd5f6abc639c7ad3"
+  },
+  {
+    "cache_key": "f8a7693f431a53e9",
+    "file": "constraint_partial_ec_mul_generic_f8a7693f431a53e9.cu",
+    "kernel_name": "stwo_jit_fused_a825a049ba6a952f",
+    "kind": "constraint",
+    "label": "partial_ec_mul_generic",
+    "semantic_hash": "a825a049ba6a952f"
+  },
+  {
+    "cache_key": "00d5079ffc18e33a",
+    "file": "constraint_partial_ec_mul_window_bits_18_00d5079ffc18e33a.cu",
     "kernel_name": "stwo_jit_fused_0500d6a23bdae342",
     "kind": "constraint",
     "label": "partial_ec_mul_window_bits_18",
     "semantic_hash": "0500d6a23bdae342"
   },
   {
-    "cache_key": "983c2c769fa70013",
-    "file": "constraint_partial_ec_mul_window_bits_18_983c2c769fa70013.cu",
-    "kernel_name": "stwo_jit_fused_69d8461df4d70472",
-    "kind": "constraint",
-    "label": "partial_ec_mul_window_bits_18",
-    "semantic_hash": "69d8461df4d70472"
-  },
-  {
-    "cache_key": "bdfea75f60bf42ca",
-    "file": "constraint_partial_ec_mul_window_bits_18_bdfea75f60bf42ca.cu",
+    "cache_key": "1aeefc7a818d212d",
+    "file": "constraint_partial_ec_mul_window_bits_18_1aeefc7a818d212d.cu",
     "kernel_name": "stwo_jit_fused_88abad321f9b225e",
     "kind": "constraint",
     "label": "partial_ec_mul_window_bits_18",
     "semantic_hash": "88abad321f9b225e"
   },
   {
-    "cache_key": "feb3d54f64d37c87",
-    "file": "constraint_partial_ec_mul_window_bits_18_feb3d54f64d37c87.cu",
+    "cache_key": "25d86410184875a0",
+    "file": "constraint_partial_ec_mul_window_bits_18_25d86410184875a0.cu",
     "kernel_name": "stwo_jit_fused_17292106903a36d4",
     "kind": "constraint",
     "label": "partial_ec_mul_window_bits_18",
     "semantic_hash": "17292106903a36d4"
   },
   {
-    "cache_key": "0e4976504553e7fe",
-    "file": "constraint_partial_ec_mul_window_bits_9_0e4976504553e7fe.cu",
-    "kernel_name": "stwo_jit_fused_30a500fc8fd73bde",
+    "cache_key": "77a09f0dc292dd95",
+    "file": "constraint_partial_ec_mul_window_bits_18_77a09f0dc292dd95.cu",
+    "kernel_name": "stwo_jit_fused_86a901b804923a10",
     "kind": "constraint",
-    "label": "partial_ec_mul_window_bits_9",
-    "semantic_hash": "30a500fc8fd73bde"
+    "label": "partial_ec_mul_window_bits_18",
+    "semantic_hash": "86a901b804923a10"
   },
   {
-    "cache_key": "0f6bc5608d7895d4",
-    "file": "constraint_partial_ec_mul_window_bits_9_0f6bc5608d7895d4.cu",
-    "kernel_name": "stwo_jit_fused_2c2090172d1fabd8",
+    "cache_key": "b736f37faa964a34",
+    "file": "constraint_partial_ec_mul_window_bits_18_b736f37faa964a34.cu",
+    "kernel_name": "stwo_jit_fused_69d8461df4d70472",
     "kind": "constraint",
-    "label": "partial_ec_mul_window_bits_9",
-    "semantic_hash": "2c2090172d1fabd8"
+    "label": "partial_ec_mul_window_bits_18",
+    "semantic_hash": "69d8461df4d70472"
   },
   {
-    "cache_key": "1e65d020adc4322c",
-    "file": "constraint_partial_ec_mul_window_bits_9_1e65d020adc4322c.cu",
-    "kernel_name": "stwo_jit_fused_b0d36ae912d02153",
-    "kind": "constraint",
-    "label": "partial_ec_mul_window_bits_9",
-    "semantic_hash": "b0d36ae912d02153"
-  },
-  {
-    "cache_key": "238fd975f305229c",
-    "file": "constraint_partial_ec_mul_window_bits_9_238fd975f305229c.cu",
+    "cache_key": "0495126ce815d87b",
+    "file": "constraint_partial_ec_mul_window_bits_9_0495126ce815d87b.cu",
     "kernel_name": "stwo_jit_fused_76a09ab677452db3",
     "kind": "constraint",
     "label": "partial_ec_mul_window_bits_9",
     "semantic_hash": "76a09ab677452db3"
   },
   {
-    "cache_key": "a3cfa53874ac1518",
-    "file": "constraint_partial_ec_mul_window_bits_9_a3cfa53874ac1518.cu",
+    "cache_key": "736393230ea77559",
+    "file": "constraint_partial_ec_mul_window_bits_9_736393230ea77559.cu",
+    "kernel_name": "stwo_jit_fused_30a500fc8fd73bde",
+    "kind": "constraint",
+    "label": "partial_ec_mul_window_bits_9",
+    "semantic_hash": "30a500fc8fd73bde"
+  },
+  {
+    "cache_key": "7cab1677c1371bff",
+    "file": "constraint_partial_ec_mul_window_bits_9_7cab1677c1371bff.cu",
     "kernel_name": "stwo_jit_fused_83a0b4c9c0589648",
     "kind": "constraint",
     "label": "partial_ec_mul_window_bits_9",
     "semantic_hash": "83a0b4c9c0589648"
   },
   {
-    "cache_key": "3952448476f93180",
-    "file": "constraint_pedersen_aggregator_window_bits_18_3952448476f93180.cu",
+    "cache_key": "f070fe5782894bb3",
+    "file": "constraint_partial_ec_mul_window_bits_9_f070fe5782894bb3.cu",
+    "kernel_name": "stwo_jit_fused_2c2090172d1fabd8",
+    "kind": "constraint",
+    "label": "partial_ec_mul_window_bits_9",
+    "semantic_hash": "2c2090172d1fabd8"
+  },
+  {
+    "cache_key": "ff6b0917a2d4e80b",
+    "file": "constraint_partial_ec_mul_window_bits_9_ff6b0917a2d4e80b.cu",
+    "kernel_name": "stwo_jit_fused_b0d36ae912d02153",
+    "kind": "constraint",
+    "label": "partial_ec_mul_window_bits_9",
+    "semantic_hash": "b0d36ae912d02153"
+  },
+  {
+    "cache_key": "122db5c3c3843867",
+    "file": "constraint_pedersen_aggregator_window_bits_18_122db5c3c3843867.cu",
     "kernel_name": "stwo_jit_fused_d147c801aa6abdcc",
     "kind": "constraint",
     "label": "pedersen_aggregator_window_bits_18",
     "semantic_hash": "d147c801aa6abdcc"
   },
   {
-    "cache_key": "3b8ca6c6a2f6e790",
-    "file": "constraint_pedersen_aggregator_window_bits_9_3b8ca6c6a2f6e790.cu",
+    "cache_key": "14681805ef81ee77",
+    "file": "constraint_pedersen_aggregator_window_bits_9_14681805ef81ee77.cu",
     "kernel_name": "stwo_jit_fused_1ea15c37ad502f70",
     "kind": "constraint",
     "label": "pedersen_aggregator_window_bits_9",
     "semantic_hash": "1ea15c37ad502f70"
   },
   {
-    "cache_key": "4865ef571c104d03",
-    "file": "constraint_pedersen_aggregator_window_bits_9_4865ef571c104d03.cu",
+    "cache_key": "6760b66026ff9724",
+    "file": "constraint_pedersen_aggregator_window_bits_9_6760b66026ff9724.cu",
     "kernel_name": "stwo_jit_fused_ab92d6c8a372ccef",
     "kind": "constraint",
     "label": "pedersen_aggregator_window_bits_9",
     "semantic_hash": "ab92d6c8a372ccef"
   },
   {
-    "cache_key": "51208e69e10ebe1e",
-    "file": "constraint_pedersen_builtin_51208e69e10ebe1e.cu",
-    "kernel_name": "stwo_jit_fused_1e38bd6ed2067594",
-    "kind": "constraint",
-    "label": "pedersen_builtin",
-    "semantic_hash": "1e38bd6ed2067594"
-  },
-  {
-    "cache_key": "896864742b9d7f54",
-    "file": "constraint_pedersen_builtin_896864742b9d7f54.cu",
+    "cache_key": "6a6d9d6b20ae3533",
+    "file": "constraint_pedersen_builtin_6a6d9d6b20ae3533.cu",
     "kernel_name": "stwo_jit_fused_6a28ac80d1faacad",
     "kind": "constraint",
     "label": "pedersen_builtin",
     "semantic_hash": "6a28ac80d1faacad"
   },
   {
-    "cache_key": "fc9f5ea723c57dda",
-    "file": "constraint_pedersen_builtin_narrow_windows_fc9f5ea723c57dda.cu",
+    "cache_key": "b63aab3caa624b79",
+    "file": "constraint_pedersen_builtin_b63aab3caa624b79.cu",
+    "kernel_name": "stwo_jit_fused_1e38bd6ed2067594",
+    "kind": "constraint",
+    "label": "pedersen_builtin",
+    "semantic_hash": "1e38bd6ed2067594"
+  },
+  {
+    "cache_key": "598fb3c244935c3d",
+    "file": "constraint_pedersen_builtin_narrow_windows_598fb3c244935c3d.cu",
     "kernel_name": "stwo_jit_fused_712d95c40ff90b40",
     "kind": "constraint",
     "label": "pedersen_builtin_narrow_windows",
     "semantic_hash": "712d95c40ff90b40"
   },
   {
-    "cache_key": "2e3eccbf87dcd53e",
-    "file": "constraint_pedersen_points_table_window_bits_18_2e3eccbf87dcd53e.cu",
+    "cache_key": "9358e99251306299",
+    "file": "constraint_pedersen_points_table_window_bits_18_9358e99251306299.cu",
     "kernel_name": "stwo_jit_fused_6d15c44abe421789",
     "kind": "constraint",
     "label": "pedersen_points_table_window_bits_18",
     "semantic_hash": "6d15c44abe421789"
   },
   {
-    "cache_key": "b9e5e23780fc4fff",
-    "file": "constraint_poseidon_3_partial_rounds_chain_b9e5e23780fc4fff.cu",
-    "kernel_name": "stwo_jit_fused_b3298f3d64db6945",
-    "kind": "constraint",
-    "label": "poseidon_3_partial_rounds_chain",
-    "semantic_hash": "b3298f3d64db6945"
-  },
-  {
-    "cache_key": "bf683868cc5044f1",
-    "file": "constraint_poseidon_3_partial_rounds_chain_bf683868cc5044f1.cu",
+    "cache_key": "5a4e1b9602fcb796",
+    "file": "constraint_poseidon_3_partial_rounds_chain_5a4e1b9602fcb796.cu",
     "kernel_name": "stwo_jit_fused_d547dbd1baf953e1",
     "kind": "constraint",
     "label": "poseidon_3_partial_rounds_chain",
     "semantic_hash": "d547dbd1baf953e1"
   },
   {
-    "cache_key": "1a43361d170e86a6",
-    "file": "constraint_poseidon_aggregator_1a43361d170e86a6.cu",
-    "kernel_name": "stwo_jit_fused_488673d56eb5384d",
+    "cache_key": "e10a70f834714918",
+    "file": "constraint_poseidon_3_partial_rounds_chain_e10a70f834714918.cu",
+    "kernel_name": "stwo_jit_fused_b3298f3d64db6945",
     "kind": "constraint",
-    "label": "poseidon_aggregator",
-    "semantic_hash": "488673d56eb5384d"
+    "label": "poseidon_3_partial_rounds_chain",
+    "semantic_hash": "b3298f3d64db6945"
   },
   {
-    "cache_key": "467f5312ce40c230",
-    "file": "constraint_poseidon_aggregator_467f5312ce40c230.cu",
-    "kernel_name": "stwo_jit_fused_119c78399329b29a",
-    "kind": "constraint",
-    "label": "poseidon_aggregator",
-    "semantic_hash": "119c78399329b29a"
-  },
-  {
-    "cache_key": "e91530cd9f486993",
-    "file": "constraint_poseidon_aggregator_e91530cd9f486993.cu",
+    "cache_key": "080ff7d6aa37b3b4",
+    "file": "constraint_poseidon_aggregator_080ff7d6aa37b3b4.cu",
     "kernel_name": "stwo_jit_fused_551eb18f22f5a3b6",
     "kind": "constraint",
     "label": "poseidon_aggregator",
     "semantic_hash": "551eb18f22f5a3b6"
   },
   {
-    "cache_key": "6e825b570de4e032",
-    "file": "constraint_poseidon_builtin_6e825b570de4e032.cu",
-    "kernel_name": "stwo_jit_fused_be86d027dbdb6203",
+    "cache_key": "1f5ac4521acbc917",
+    "file": "constraint_poseidon_aggregator_1f5ac4521acbc917.cu",
+    "kernel_name": "stwo_jit_fused_119c78399329b29a",
     "kind": "constraint",
-    "label": "poseidon_builtin",
-    "semantic_hash": "be86d027dbdb6203"
+    "label": "poseidon_aggregator",
+    "semantic_hash": "119c78399329b29a"
   },
   {
-    "cache_key": "8b917956b12ccddf",
-    "file": "constraint_poseidon_builtin_8b917956b12ccddf.cu",
-    "kernel_name": "stwo_jit_fused_82d7753e767b2a7e",
+    "cache_key": "7f5d52efe0621401",
+    "file": "constraint_poseidon_aggregator_7f5d52efe0621401.cu",
+    "kernel_name": "stwo_jit_fused_488673d56eb5384d",
     "kind": "constraint",
-    "label": "poseidon_builtin",
-    "semantic_hash": "82d7753e767b2a7e"
+    "label": "poseidon_aggregator",
+    "semantic_hash": "488673d56eb5384d"
   },
   {
-    "cache_key": "fe97609d7f261043",
-    "file": "constraint_poseidon_builtin_fe97609d7f261043.cu",
+    "cache_key": "1d9227a68a155a64",
+    "file": "constraint_poseidon_builtin_1d9227a68a155a64.cu",
     "kernel_name": "stwo_jit_fused_676723043250d6c2",
     "kind": "constraint",
     "label": "poseidon_builtin",
     "semantic_hash": "676723043250d6c2"
   },
   {
-    "cache_key": "908d029611e1f887",
-    "file": "constraint_poseidon_full_round_chain_908d029611e1f887.cu",
+    "cache_key": "b2b6081764a1c6f8",
+    "file": "constraint_poseidon_builtin_b2b6081764a1c6f8.cu",
+    "kernel_name": "stwo_jit_fused_82d7753e767b2a7e",
+    "kind": "constraint",
+    "label": "poseidon_builtin",
+    "semantic_hash": "82d7753e767b2a7e"
+  },
+  {
+    "cache_key": "cb72b0722eb2be95",
+    "file": "constraint_poseidon_builtin_cb72b0722eb2be95.cu",
+    "kernel_name": "stwo_jit_fused_be86d027dbdb6203",
+    "kind": "constraint",
+    "label": "poseidon_builtin",
+    "semantic_hash": "be86d027dbdb6203"
+  },
+  {
+    "cache_key": "b7b19156c556f1a0",
+    "file": "constraint_poseidon_full_round_chain_b7b19156c556f1a0.cu",
     "kernel_name": "stwo_jit_fused_b6d974c335a15d00",
     "kind": "constraint",
     "label": "poseidon_full_round_chain",
     "semantic_hash": "b6d974c335a15d00"
   },
   {
-    "cache_key": "72234bdb224e728d",
-    "file": "constraint_poseidon_round_keys_72234bdb224e728d.cu",
+    "cache_key": "1532f6c00180942a",
+    "file": "constraint_poseidon_round_keys_1532f6c00180942a.cu",
     "kernel_name": "stwo_jit_fused_6eec0240134c359d",
     "kind": "constraint",
     "label": "poseidon_round_keys",
     "semantic_hash": "6eec0240134c359d"
   },
   {
-    "cache_key": "1886b26dc73957f8",
-    "file": "constraint_qm_31_add_mul_opcode_1886b26dc73957f8.cu",
+    "cache_key": "f16223ad13c45edf",
+    "file": "constraint_qm_31_add_mul_opcode_f16223ad13c45edf.cu",
     "kernel_name": "stwo_jit_fused_b19cad10f520123f",
     "kind": "constraint",
     "label": "qm_31_add_mul_opcode",
     "semantic_hash": "b19cad10f520123f"
   },
   {
-    "cache_key": "f7fb13a34b337c21",
-    "file": "constraint_range_check96_builtin_f7fb13a34b337c21.cu",
+    "cache_key": "92e0f6d081dfeec6",
+    "file": "constraint_range_check96_builtin_92e0f6d081dfeec6.cu",
     "kernel_name": "stwo_jit_fused_4dca901b42102712",
     "kind": "constraint",
     "label": "range_check96_builtin",
     "semantic_hash": "4dca901b42102712"
   },
   {
-    "cache_key": "e205ab564ba682ee",
-    "file": "constraint_range_check_18_e205ab564ba682ee.cu",
+    "cache_key": "471fc82914fa1049",
+    "file": "constraint_range_check_18_471fc82914fa1049.cu",
     "kernel_name": "stwo_jit_fused_c97d0e3125403a90",
     "kind": "constraint",
     "label": "range_check_18",
     "semantic_hash": "c97d0e3125403a90"
   },
   {
-    "cache_key": "915b9c6c996bd323",
-    "file": "constraint_range_check_20_915b9c6c996bd323.cu",
+    "cache_key": "b0566375a45b1d44",
+    "file": "constraint_range_check_20_b0566375a45b1d44.cu",
     "kernel_name": "stwo_jit_fused_441cd9c7fd53458a",
     "kind": "constraint",
     "label": "range_check_20",
     "semantic_hash": "441cd9c7fd53458a"
   },
   {
-    "cache_key": "1df0014b5a0f5a54",
-    "file": "constraint_range_check_252_width_27_1df0014b5a0f5a54.cu",
+    "cache_key": "fef53a424f201033",
+    "file": "constraint_range_check_252_width_27_fef53a424f201033.cu",
     "kernel_name": "stwo_jit_fused_a7ddf49888aeec68",
     "kind": "constraint",
     "label": "range_check_252_width_27",
     "semantic_hash": "a7ddf49888aeec68"
   },
   {
-    "cache_key": "08e5448d4cd611c0",
-    "file": "constraint_range_check_3_3_3_3_3_08e5448d4cd611c0.cu",
+    "cache_key": "e1c0b5cc996118a7",
+    "file": "constraint_range_check_3_3_3_3_3_e1c0b5cc996118a7.cu",
     "kernel_name": "stwo_jit_fused_264153f324dfa389",
     "kind": "constraint",
     "label": "range_check_3_3_3_3_3",
     "semantic_hash": "264153f324dfa389"
   },
   {
-    "cache_key": "7427d3ae2749288a",
-    "file": "constraint_range_check_3_6_6_3_7427d3ae2749288a.cu",
+    "cache_key": "d11828c9481706ed",
+    "file": "constraint_range_check_3_6_6_3_d11828c9481706ed.cu",
     "kernel_name": "stwo_jit_fused_8bfe46e1447d7e33",
     "kind": "constraint",
     "label": "range_check_3_6_6_3",
     "semantic_hash": "8bfe46e1447d7e33"
   },
   {
-    "cache_key": "785f1d2fda1ea922",
-    "file": "constraint_range_check_4_3_785f1d2fda1ea922.cu",
+    "cache_key": "d54f724afaec8785",
+    "file": "constraint_range_check_4_3_d54f724afaec8785.cu",
     "kernel_name": "stwo_jit_fused_bfbf5a8a40591289",
     "kind": "constraint",
     "label": "range_check_4_3",
     "semantic_hash": "bfbf5a8a40591289"
   },
   {
-    "cache_key": "5754f8a873a52740",
-    "file": "constraint_range_check_6_5754f8a873a52740.cu",
+    "cache_key": "303069e7c0302e27",
+    "file": "constraint_range_check_6_303069e7c0302e27.cu",
     "kernel_name": "stwo_jit_fused_b455671faf7e7149",
     "kind": "constraint",
     "label": "range_check_6",
     "semantic_hash": "b455671faf7e7149"
   },
   {
-    "cache_key": "7e0b6c8348014c9a",
-    "file": "constraint_range_check_7_2_5_7e0b6c8348014c9a.cu",
+    "cache_key": "dafbc19e68cf2afd",
+    "file": "constraint_range_check_7_2_5_dafbc19e68cf2afd.cu",
     "kernel_name": "stwo_jit_fused_b6da13dc52c21465",
     "kind": "constraint",
     "label": "range_check_7_2_5",
     "semantic_hash": "b6da13dc52c21465"
   },
   {
-    "cache_key": "8a40cc3240faf63d",
-    "file": "constraint_range_check_9_9_8a40cc3240faf63d.cu",
+    "cache_key": "2d507717202d17da",
+    "file": "constraint_range_check_9_9_2d507717202d17da.cu",
     "kernel_name": "stwo_jit_fused_239c495915d1b092",
     "kind": "constraint",
     "label": "range_check_9_9",
     "semantic_hash": "239c495915d1b092"
   },
   {
-    "cache_key": "699c879f7800f88e",
-    "file": "constraint_range_check_builtin_699c879f7800f88e.cu",
-    "kernel_name": "stwo_jit_fused_af9e2263fe20c1af",
-    "kind": "constraint",
-    "label": "range_check_builtin",
-    "semantic_hash": "af9e2263fe20c1af"
-  },
-  {
-    "cache_key": "6c249ca7a2331b34",
-    "file": "constraint_range_check_builtin_6c249ca7a2331b34.cu",
+    "cache_key": "4d29d59e9743d113",
+    "file": "constraint_range_check_builtin_4d29d59e9743d113.cu",
     "kernel_name": "stwo_jit_fused_a7d48d63680c85d8",
     "kind": "constraint",
     "label": "range_check_builtin",
     "semantic_hash": "a7d48d63680c85d8"
   },
   {
-    "cache_key": "d0ccc83517704466",
-    "file": "constraint_ret_opcode_d0ccc83517704466.cu",
+    "cache_key": "ceb6a472415485e9",
+    "file": "constraint_range_check_builtin_ceb6a472415485e9.cu",
+    "kernel_name": "stwo_jit_fused_af9e2263fe20c1af",
+    "kind": "constraint",
+    "label": "range_check_builtin",
+    "semantic_hash": "af9e2263fe20c1af"
+  },
+  {
+    "cache_key": "35e6e507e0c3d1c1",
+    "file": "constraint_ret_opcode_35e6e507e0c3d1c1.cu",
     "kernel_name": "stwo_jit_fused_39781b15a0897e90",
     "kind": "constraint",
     "label": "ret_opcode",
     "semantic_hash": "39781b15a0897e90"
   },
   {
-    "cache_key": "b6ddef7ed0dd6c1a",
-    "file": "constraint_triple_xor_32_b6ddef7ed0dd6c1a.cu",
+    "cache_key": "13ce4499f1ab4a7d",
+    "file": "constraint_triple_xor_32_13ce4499f1ab4a7d.cu",
     "kernel_name": "stwo_jit_fused_6f57d620eb0eb4a3",
     "kind": "constraint",
     "label": "triple_xor_32",
     "semantic_hash": "6f57d620eb0eb4a3"
   },
   {
-    "cache_key": "b9d58d17d96c29a9",
-    "file": "constraint_verify_bitwise_xor_12_b9d58d17d96c29a9.cu",
+    "cache_key": "54bb704510189c4e",
+    "file": "constraint_verify_bitwise_xor_12_54bb704510189c4e.cu",
     "kernel_name": "stwo_jit_fused_f1fce1a97a4f75dc",
     "kind": "constraint",
     "label": "verify_bitwise_xor_12",
     "semantic_hash": "f1fce1a97a4f75dc"
   },
   {
-    "cache_key": "5d8214b451babf5c",
-    "file": "constraint_verify_bitwise_xor_8_5d8214b451babf5c.cu",
+    "cache_key": "3e874dab46cb753b",
+    "file": "constraint_verify_bitwise_xor_8_3e874dab46cb753b.cu",
     "kernel_name": "stwo_jit_fused_870b93acf1caf2fe",
     "kind": "constraint",
     "label": "verify_bitwise_xor_8",
     "semantic_hash": "870b93acf1caf2fe"
   },
   {
-    "cache_key": "7a173a4409a94d3c",
-    "file": "constraint_verify_instruction_7a173a4409a94d3c.cu",
+    "cache_key": "5b1c733afeba031b",
+    "file": "constraint_verify_instruction_5b1c733afeba031b.cu",
     "kernel_name": "stwo_jit_fused_d1f6a2534aa0a301",
     "kind": "constraint",
     "label": "verify_instruction",
