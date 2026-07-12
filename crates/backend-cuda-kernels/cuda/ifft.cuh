@@ -15,11 +15,11 @@ __device__ __forceinline__ void exchg_dif(m31 &a, m31 &b, const m31 &twiddle) {
 #define LOG_THREADS_PER_WARP 5
 
 
-static const size_t LAUNCH_B2N_CONFIG_13_18[6][2] = {
+static constexpr size_t LAUNCH_B2N_CONFIG_13_18[6][2] = {
     {7, 6}, {8, 6}, {7, 8}, {8, 8}, {9, 8}, {10, 8}
 };
 
-static const size_t LAUNCH_B2N_CONFIG_19_24[6][3] = {
+static constexpr size_t LAUNCH_B2N_CONFIG_19_24[6][3] = {
     {7, 6, 6}, // 19
     {8, 6, 6}, // 20
     {7, 6, 8}, // 21
@@ -28,7 +28,7 @@ static const size_t LAUNCH_B2N_CONFIG_19_24[6][3] = {
     {8, 8, 8}, // 24
 };
 
-static const size_t LAUNCH_B2N_CONFIG_25_29[5][4] = {
+static constexpr size_t LAUNCH_B2N_CONFIG_25_29[5][4] = {
     {7, 6, 6, 6}, // 25
     {8, 6, 6, 6}, // 26
     {7, 8, 6, 6}, //27
@@ -50,6 +50,22 @@ int stwo_ntt_b2n_columns_on(
         uint32_t log_n,
         uint32_t num_poly,
         uint32_t *g_twiddles,
+        uint32_t twiddles_size,
+        uint32_t eval_domain_size,
+        void *stream
+);
+
+// Allocation-free out-of-place inverse transform. The input pointer table and
+// every input column are immutable. Stage 1 (or the fused init interval) reads
+// `inputs` and writes `outputs`; every later interval runs in-place on
+// `outputs`. All launches use `stream`.
+extern "C"
+int stwo_ntt_b2n_columns_out_of_place_on(
+        const uint32_t *const *inputs,
+        uint32_t *const *outputs,
+        uint32_t log_n,
+        uint32_t num_poly,
+        const uint32_t *g_twiddles,
         uint32_t twiddles_size,
         uint32_t eval_domain_size,
         void *stream

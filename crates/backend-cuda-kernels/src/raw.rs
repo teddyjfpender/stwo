@@ -932,6 +932,19 @@ extern "C" {
         stream: *mut c_void,
     ) -> i32;
 
+    /// Allocation-free out-of-place B2N transform using immutable input and
+    /// mutable output device pointer tables on an explicit stream.
+    pub fn stwo_ntt_b2n_columns_out_of_place_on(
+        inputs: *const *const u32,
+        outputs: *const *mut u32,
+        log_n: u32,
+        num_poly: u32,
+        g_twiddles: *const u32,
+        twiddles_size: u32,
+        eval_domain_size: u32,
+        stream: *mut c_void,
+    ) -> i32;
+
     pub fn ntt_n2b_columns(
         values_columns: *mut *mut u32,
         log_n: u32,

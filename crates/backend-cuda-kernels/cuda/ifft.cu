@@ -923,6 +923,206 @@ extern "C" int stwo_ntt_b2n_columns_on(
     return cudaSuccess;
 }
 
+namespace {
+
+constexpr bool b2n_partition_is_exact(const size_t *parts, size_t count,
+                                      unsigned log_n) {
+    unsigned covered = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (parts[i] == 0 || covered + parts[i] > log_n) return false;
+        covered += static_cast<unsigned>(parts[i]);
+    }
+    return covered == log_n;
+}
+
+constexpr bool b2n_init_interval_is_supported(size_t stages) {
+    return stages == 7 || stages == 8 || stages == 9 || stages == 10;
+}
+
+constexpr bool b2n_tables_partition_exactly() {
+    for (unsigned i = 0; i < 6; ++i) {
+        if (!b2n_init_interval_is_supported(LAUNCH_B2N_CONFIG_13_18[i][0]) ||
+            !b2n_partition_is_exact(LAUNCH_B2N_CONFIG_13_18[i], 2, 13 + i) ||
+            !b2n_init_interval_is_supported(LAUNCH_B2N_CONFIG_19_24[i][0]) ||
+            !b2n_partition_is_exact(LAUNCH_B2N_CONFIG_19_24[i], 3, 19 + i))
+            return false;
+    }
+    for (unsigned i = 0; i < 5; ++i)
+        if (!b2n_init_interval_is_supported(LAUNCH_B2N_CONFIG_25_29[i][0]) ||
+            !b2n_partition_is_exact(LAUNCH_B2N_CONFIG_25_29[i], 4, 25 + i))
+            return false;
+    return true;
+}
+
+static_assert(b2n_tables_partition_exactly(),
+              "fused B2N stage tables must cover exactly 1..=log_n");
+
+template <unsigned LOG_VALUES_PER_THREAD>
+cudaError_t b2n_init_interval_on(m31 **input, m31 **output, unsigned log_n,
+                                unsigned num_poly, unsigned stages,
+                                m31 *twiddles, cudaStream_t stream) {
+    constexpr unsigned expected = LOG_VALUES_PER_THREAD + LOG_THREADS_PER_WARP;
+    if (stages != expected) return cudaErrorInvalidConfiguration;
+    dim3 block{32, 1, 1};
+    const unsigned warps =
+        1u << (log_n - LOG_THREADS_PER_WARP - LOG_VALUES_PER_THREAD);
+    block.y = min(warps, 4u);
+    dim3 grid{warps / block.y, num_poly, 1};
+    b2n_init_warp_batch<LOG_VALUES_PER_THREAD><<<grid, block, 0, stream>>>(
+        input, output, log_n, num_poly, 1, stages, twiddles);
+    return cudaGetLastError();
+}
+
+template <unsigned LOG_WARPS_PER_BLOCK>
+cudaError_t b2n_init_block_interval_on(m31 **input, m31 **output,
+                                      unsigned log_n, unsigned num_poly,
+                                      unsigned stages, m31 *twiddles,
+                                      cudaStream_t stream) {
+    constexpr unsigned expected =
+        3 + LOG_THREADS_PER_WARP + LOG_WARPS_PER_BLOCK;
+    if (stages != expected || log_n < expected)
+        return cudaErrorInvalidConfiguration;
+    dim3 block{1u << LOG_THREADS_PER_WARP, 1u << LOG_WARPS_PER_BLOCK, 1};
+    dim3 grid{
+        1u << (log_n - LOG_THREADS_PER_WARP - 3 - LOG_WARPS_PER_BLOCK),
+        1,
+        num_poly,
+    };
+    // b2n_init_block_warp_batch uses an exclusive upper stage bound.
+    b2n_init_block_warp_batch<LOG_WARPS_PER_BLOCK>
+        <<<grid, block, 0, stream>>>(input, output, log_n, num_poly, 1,
+                                    1 + stages, twiddles);
+    return cudaGetLastError();
+}
+
+cudaError_t b2n_dispatch_init_interval_on(
+    m31 **input, m31 **output, unsigned log_n, unsigned num_poly,
+    unsigned stages, m31 *twiddles, cudaStream_t stream) {
+    switch (stages) {
+    case 7:
+        return b2n_init_interval_on<2>(input, output, log_n, num_poly, stages,
+                                       twiddles, stream);
+    case 8:
+        return b2n_init_interval_on<3>(input, output, log_n, num_poly, stages,
+                                       twiddles, stream);
+    case 9:
+        return b2n_init_block_interval_on<1>(
+            input, output, log_n, num_poly, stages, twiddles, stream);
+    case 10:
+        return b2n_init_block_interval_on<2>(
+            input, output, log_n, num_poly, stages, twiddles, stream);
+    default:
+        return cudaErrorInvalidConfiguration;
+    }
+}
+
+template <unsigned LOG_VALUES_PER_THREAD>
+cudaError_t b2n_noinit_interval_on(m31 **values, unsigned log_n,
+                                  unsigned num_poly, unsigned start_stage,
+                                  unsigned stages, m31 *twiddles,
+                                  cudaStream_t stream) {
+    constexpr unsigned expected = 2 * LOG_VALUES_PER_THREAD;
+    if (stages != expected || start_stage == 0 ||
+        start_stage + stages - 1 > log_n)
+        return cudaErrorInvalidConfiguration;
+    constexpr unsigned warp = 32;
+    dim3 block{warp, 1u << LOG_VALUES_PER_THREAD, 1};
+    const unsigned end_stage = start_stage + stages - 1;
+    const unsigned min_stride = 1u << (start_stage - 1);
+    dim3 grid{min_stride / warp, (1u << log_n) / (1u << end_stage), num_poly};
+    const m31 rescale_factor = inv(pow(m31{2}, log_n));
+    b2n_noinit_block_batch<LOG_VALUES_PER_THREAD><<<grid, block, 0, stream>>>(
+        values, values, log_n, num_poly, start_stage, end_stage, twiddles,
+        rescale_factor);
+    return cudaGetLastError();
+}
+
+cudaError_t b2n_stagewise_out_of_place_on(m31 **input, m31 **output,
+                                          unsigned log_n, unsigned num_poly,
+                                          m31 *twiddles,
+                                          cudaStream_t stream) {
+    dim3 block{};
+    block.x = log_n <= 8 ? 1u << (log_n - 1) : 128;
+    dim3 grid{};
+    grid.y = num_poly;
+    grid.x = log_n <= 8 ? 1 : 1u << (log_n - 8);
+    const m31 rescale_factor = inv(pow(m31{2}, log_n));
+    unsigned layer_size = (1u << log_n) >> 1;
+    unsigned layer_offset = 0;
+    ntt_b2n_stage_batch<<<grid, block, 0, stream>>>(
+        input, output, log_n, 1, twiddles, rescale_factor);
+    cudaError_t error = cudaGetLastError();
+    for (unsigned stage = 2; error == cudaSuccess && stage <= log_n; ++stage) {
+        ntt_b2n_stage_batch<<<grid, block, 0, stream>>>(
+            output, output, log_n, stage, &twiddles[layer_offset],
+            rescale_factor);
+        error = cudaGetLastError();
+        layer_size >>= 1;
+        layer_offset += layer_size;
+    }
+    return error;
+}
+
+cudaError_t b2n_fused_out_of_place_on(m31 **input, m31 **output,
+                                      unsigned log_n, unsigned num_poly,
+                                      m31 *twiddles, cudaStream_t stream) {
+    const size_t *parts = nullptr;
+    size_t count = 0;
+    if (log_n >= 13 && log_n <= 18) {
+        parts = LAUNCH_B2N_CONFIG_13_18[log_n - 13]; count = 2;
+    } else if (log_n >= 19 && log_n <= 24) {
+        parts = LAUNCH_B2N_CONFIG_19_24[log_n - 19]; count = 3;
+    } else if (log_n >= 25 && log_n <= 29) {
+        parts = LAUNCH_B2N_CONFIG_25_29[log_n - 25]; count = 4;
+    } else {
+        return b2n_stagewise_out_of_place_on(input, output, log_n, num_poly,
+                                             twiddles, stream);
+    }
+    if (!b2n_partition_is_exact(parts, count, log_n))
+        return cudaErrorInvalidConfiguration;
+    cudaError_t error = b2n_dispatch_init_interval_on(
+        input, output, log_n, num_poly, static_cast<unsigned>(parts[0]),
+        twiddles, stream);
+    unsigned start = 1u + static_cast<unsigned>(parts[0]);
+    for (size_t i = 1; error == cudaSuccess && i < count; ++i) {
+        const unsigned stages = static_cast<unsigned>(parts[i]);
+        switch (stages) {
+        case 4: error = b2n_noinit_interval_on<2>(output, log_n, num_poly, start, stages, twiddles, stream); break;
+        case 6: error = b2n_noinit_interval_on<3>(output, log_n, num_poly, start, stages, twiddles, stream); break;
+        case 8: error = b2n_noinit_interval_on<4>(output, log_n, num_poly, start, stages, twiddles, stream); break;
+        default: return cudaErrorInvalidConfiguration;
+        }
+        start += stages;
+    }
+    return error;
+}
+
+} // namespace
+
+extern "C" int stwo_ntt_b2n_columns_out_of_place_on(
+    const uint32_t *const *inputs, uint32_t *const *outputs, uint32_t log_n,
+    uint32_t num_poly, const uint32_t *g_twiddles, uint32_t twiddles_size,
+    uint32_t eval_domain_size, void *stream_raw) {
+    if (inputs == nullptr || outputs == nullptr || g_twiddles == nullptr ||
+        stream_raw == nullptr || log_n == 0 || log_n > 30 || num_poly == 0 ||
+        eval_domain_size != (1u << (log_n - 1)) ||
+        eval_domain_size > twiddles_size)
+        return (int)cudaErrorInvalidValue;
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_raw);
+    m31 *twiddles = reinterpret_cast<m31 *>(
+        const_cast<uint32_t *>(g_twiddles + twiddles_size - eval_domain_size));
+    for (uint32_t base = 0; base < num_poly; base += MAX_NTT_BATCH_COLUMNS) {
+        const uint32_t chunk = min(num_poly - base, MAX_NTT_BATCH_COLUMNS);
+        auto input = reinterpret_cast<m31 **>(const_cast<uint32_t **>(inputs + base));
+        auto output = reinterpret_cast<m31 **>(
+            const_cast<uint32_t **>(outputs + base));
+        cudaError_t error = b2n_fused_out_of_place_on(
+            input, output, log_n, chunk, twiddles, stream);
+        if (error != cudaSuccess) return (int)error;
+    }
+    return (int)cudaSuccess;
+}
+
 
 EXTERN void ntt_b2n_native_batch(m31** input, m31** output,
                            unsigned log_n, unsigned num_poly,
