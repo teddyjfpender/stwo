@@ -69,23 +69,59 @@ impl OodsMaskTopology<'_> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OodsColumnTopology<'a> {
+    /// Source buffer size. For coefficient sources this is the polynomial's
+    /// coefficient log; for evaluation sources it is the evaluation-domain log.
     pub log_size: u32,
+    /// Domain log used by the canonical PCS point fold before evaluation.
+    pub evaluation_log_size: u32,
     pub masks: OodsMaskTopology<'a>,
     pub source_kind: OodsSourceKind,
 }
 
 impl<'a> OodsColumnTopology<'a> {
+    /// Coefficient source whose source and evaluation domains have the same log size.
+    /// PCS callers with a nonzero blowup must use [`Self::coefficient_signed_offsets`].
     pub const fn signed_offsets(log_size: u32, offsets: &'a [isize]) -> Self {
         Self {
             log_size,
+            evaluation_log_size: log_size,
             masks: OodsMaskTopology::SignedOffsets(offsets),
             source_kind: OodsSourceKind::Coefficients,
         }
     }
 
+    pub const fn coefficient_signed_offsets(
+        coefficient_log_size: u32,
+        evaluation_log_size: u32,
+        offsets: &'a [isize],
+    ) -> Self {
+        Self {
+            log_size: coefficient_log_size,
+            evaluation_log_size,
+            masks: OodsMaskTopology::SignedOffsets(offsets),
+            source_kind: OodsSourceKind::Coefficients,
+        }
+    }
+
+    /// Coefficient source whose source and evaluation domains have the same log size.
+    /// PCS callers with a nonzero blowup must use [`Self::coefficient_offset_points`].
     pub const fn offset_points(log_size: u32, points: &'a [CirclePoint<BaseField>]) -> Self {
         Self {
             log_size,
+            evaluation_log_size: log_size,
+            masks: OodsMaskTopology::OffsetPoints(points),
+            source_kind: OodsSourceKind::Coefficients,
+        }
+    }
+
+    pub const fn coefficient_offset_points(
+        coefficient_log_size: u32,
+        evaluation_log_size: u32,
+        points: &'a [CirclePoint<BaseField>],
+    ) -> Self {
+        Self {
+            log_size: coefficient_log_size,
+            evaluation_log_size,
             masks: OodsMaskTopology::OffsetPoints(points),
             source_kind: OodsSourceKind::Coefficients,
         }
@@ -94,6 +130,7 @@ impl<'a> OodsColumnTopology<'a> {
     pub const fn evaluation_signed_offsets(log_size: u32, offsets: &'a [isize]) -> Self {
         Self {
             log_size,
+            evaluation_log_size: log_size,
             masks: OodsMaskTopology::SignedOffsets(offsets),
             source_kind: OodsSourceKind::Evaluations,
         }
@@ -105,6 +142,7 @@ impl<'a> OodsColumnTopology<'a> {
     ) -> Self {
         Self {
             log_size,
+            evaluation_log_size: log_size,
             masks: OodsMaskTopology::OffsetPoints(points),
             source_kind: OodsSourceKind::Evaluations,
         }
@@ -166,6 +204,7 @@ pub struct OodsPolynomialColumn<'a> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OodsColumnSampleRange {
     pub source_log_size: u32,
+    pub evaluation_log_size: u32,
     pub first_sample: usize,
     pub sample_count: usize,
 }
@@ -251,6 +290,12 @@ pub enum PreparedOodsError {
         log_size: u32,
         lifting_log_size: u32,
     },
+    InvalidEvaluationLogSize {
+        column: usize,
+        source_log_size: u32,
+        evaluation_log_size: u32,
+        lifting_log_size: u32,
+    },
     InvalidOffsetPoint {
         column: usize,
         mask: usize,
@@ -332,8 +377,22 @@ pub fn oods_workspace_requirements(
                 lifting_log_size: config.lifting_log_size,
             });
         }
+        if !topology.masks.is_empty()
+            && (topology.evaluation_log_size < topology.log_size
+                || topology.evaluation_log_size > config.lifting_log_size
+                || (topology.source_kind == OodsSourceKind::Evaluations
+                    && topology.evaluation_log_size != topology.log_size))
+        {
+            return Err(PreparedOodsError::InvalidEvaluationLogSize {
+                column,
+                source_log_size: topology.log_size,
+                evaluation_log_size: topology.evaluation_log_size,
+                lifting_log_size: config.lifting_log_size,
+            });
+        }
         column_ranges.push(OodsColumnSampleRange {
             source_log_size: topology.log_size,
+            evaluation_log_size: topology.evaluation_log_size,
             first_sample: sample_count,
             sample_count: topology.masks.len(),
         });
@@ -733,13 +792,14 @@ impl<'a> PreparedOodsGraph<'a> {
                 canonical_samples.push((
                     source.topology.source_kind,
                     source.topology.log_size,
+                    source.topology.evaluation_log_size,
                     source.source.slice().as_u32_ptr() as usize,
                     source.topology.offset_point(mask_step, mask),
                     first_sample + mask,
                 ));
             }
         }
-        canonical_samples.sort_unstable_by_key(|&(kind, log, _, point, output)| match kind {
+        canonical_samples.sort_unstable_by_key(|&(kind, log, _, _, point, output)| match kind {
             OodsSourceKind::Coefficients => (0, log, 0, 0, output),
             OodsSourceKind::Evaluations => (1, log, point.x.0, point.y.0, output),
         });
@@ -748,13 +808,13 @@ impl<'a> PreparedOodsGraph<'a> {
         let mut offsets = Vec::with_capacity(requirements.sample_count);
         let mut folds = Vec::with_capacity(requirements.sample_count);
         let mut indices = Vec::with_capacity(requirements.sample_count);
-        for &(_, log_size, pointer, offset_point, output) in &canonical_samples {
+        for &(_, _, evaluation_log_size, pointer, offset_point, output) in &canonical_samples {
             pointers.push(pointer);
             offsets.push(cuda_raw::CirclePointBaseField {
                 x: offset_point.x.0,
                 y: offset_point.y.0,
             });
-            folds.push(config.lifting_log_size - log_size);
+            folds.push(config.lifting_log_size - evaluation_log_size);
             indices.push(u32::try_from(output).map_err(|_| PreparedOodsError::SizeOverflow)?);
         }
         upload_and_sync(
@@ -1225,21 +1285,25 @@ mod tests {
             vec![
                 OodsColumnSampleRange {
                     source_log_size: 18,
+                    evaluation_log_size: 18,
                     first_sample: 0,
                     sample_count: 3,
                 },
                 OodsColumnSampleRange {
                     source_log_size: 20,
+                    evaluation_log_size: 20,
                     first_sample: 3,
                     sample_count: 1,
                 },
                 OodsColumnSampleRange {
                     source_log_size: 18,
+                    evaluation_log_size: 18,
                     first_sample: 4,
                     sample_count: 2,
                 },
                 OodsColumnSampleRange {
                     source_log_size: 25,
+                    evaluation_log_size: 25,
                     first_sample: 6,
                     sample_count: 0,
                 },
@@ -1350,5 +1414,38 @@ mod tests {
             ),
             Err(PreparedOodsError::InvalidOffsetPoint { column: 0, mask: 0 })
         );
+    }
+
+    #[test]
+    fn coefficient_and_evaluation_logs_are_distinct_and_validated() {
+        let offsets = [0];
+        let topology = [OodsColumnTopology::coefficient_signed_offsets(
+            4, 5, &offsets,
+        )];
+        let requirements = oods_workspace_requirements(
+            OodsWorkspaceConfig {
+                lifting_log_size: 24,
+                mask_log_size: 9,
+            },
+            &topology,
+        )
+        .unwrap();
+        assert_eq!(requirements.groups[0].log_size, 4);
+        assert_eq!(requirements.column_ranges[0].source_log_size, 4);
+        assert_eq!(requirements.column_ranges[0].evaluation_log_size, 5);
+
+        let invalid = [OodsColumnTopology::coefficient_signed_offsets(
+            5, 4, &offsets,
+        )];
+        assert!(matches!(
+            oods_workspace_requirements(
+                OodsWorkspaceConfig {
+                    lifting_log_size: 24,
+                    mask_log_size: 9,
+                },
+                &invalid,
+            ),
+            Err(PreparedOodsError::InvalidEvaluationLogSize { .. })
+        ));
     }
 }

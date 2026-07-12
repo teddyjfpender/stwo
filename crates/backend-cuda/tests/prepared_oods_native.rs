@@ -20,6 +20,7 @@ const PARAMETER: ArenaSlotId = ArenaSlotId(50_000);
 const COLUMN_A: ArenaSlotId = ArenaSlotId(50_001);
 const COLUMN_B: ArenaSlotId = ArenaSlotId(50_002);
 const COLUMN_C: ArenaSlotId = ArenaSlotId(50_003);
+const COLUMN_D: ArenaSlotId = ArenaSlotId(50_004);
 
 fn workspace_slots() -> OodsWorkspaceSlots {
     OodsWorkspaceSlots {
@@ -61,6 +62,11 @@ fn arena(requirements: &OodsWorkspaceRequirements, slots: &OodsWorkspaceSlots) -
         OodsArenaSlotRequirement {
             id: COLUMN_C,
             len_words: 1 << 8,
+            alignment_words: 1,
+        },
+        OodsArenaSlotRequirement {
+            id: COLUMN_D,
+            len_words: 1 << 4,
             alignment_words: 1,
         },
     ]);
@@ -148,14 +154,17 @@ fn random_circle_point(parameter: SecureField) -> CirclePoint<SecureField> {
 
 fn expected(
     config: OodsWorkspaceConfig,
+    log_blowup_factor: u32,
     parameter: SecureField,
-    columns: &[(&[u32], u32, &[isize])],
+    columns: &[(&[u32], u32, &[isize], bool)],
 ) -> (Vec<CirclePoint<SecureField>>, Vec<SecureField>) {
     let base = random_circle_point(parameter);
     let step = CanonicCoset::new(config.mask_log_size).step();
     let mut points = Vec::new();
     let mut values = Vec::new();
-    for &(words, log_size, offsets) in columns {
+    for &(words, log_size, offsets, is_evaluation_source) in columns {
+        // Coefficient sources use CircleCoefficients' FFT basis in bit-reversed
+        // order; they are neither monomial coefficients nor domain evaluations.
         let poly = CpuCirclePoly::new(
             words
                 .iter()
@@ -165,32 +174,39 @@ fn expected(
         );
         for &offset in offsets {
             let point = base + step.mul_signed(offset).into_ef();
+            let evaluation_log_size =
+                log_size + u32::from(!is_evaluation_source) * log_blowup_factor;
             points.push(point);
-            values.push(
-                poly.eval_at_point(point.repeated_double(config.lifting_log_size - log_size)),
-            );
+            values.push(poly.eval_at_point(
+                point.repeated_double(config.lifting_log_size - evaluation_log_size),
+            ));
         }
     }
     (points, values)
 }
 
 #[test]
-fn exact_points_values_and_capture_replay() {
+fn exact_points_values_log4_lifting24_and_capture_replay() {
+    const LOG_BLOWUP_FACTOR: u32 = 1;
+
     let config = OodsWorkspaceConfig {
-        lifting_log_size: 11,
+        lifting_log_size: 24,
         mask_log_size: 9,
     };
+    let offsets_d = [0];
     let offsets_a = [-1, 0, 2];
     let offsets_b = [0, 5];
     let offsets_c = [-2, 0, 3];
     let topology = [
-        OodsColumnTopology::signed_offsets(6, &offsets_a),
-        OodsColumnTopology::signed_offsets(11, &offsets_b),
+        OodsColumnTopology::coefficient_signed_offsets(4, 5, &offsets_d),
+        OodsColumnTopology::coefficient_signed_offsets(6, 7, &offsets_a),
+        OodsColumnTopology::coefficient_signed_offsets(11, 12, &offsets_b),
         OodsColumnTopology::evaluation_signed_offsets(8, &offsets_c),
     ];
     let requirements = oods_workspace_requirements(config, &topology).unwrap();
     let slots = workspace_slots();
     let arena = arena(&requirements, &slots);
+    let host_d: Vec<u32> = (0..1 << 4).map(|i| (13 * i + 7) & 0x7fff_ffff).collect();
     let host_a: Vec<u32> = (0..1 << 6).map(|i| (17 * i + 3) & 0x7fff_ffff).collect();
     let host_b: Vec<u32> = (0..1 << 11)
         .map(|i| (7919 * i + 11) & 0x7fff_ffff)
@@ -210,6 +226,7 @@ fn exact_points_values_and_capture_replay() {
     .into_iter()
     .map(|value| value.0)
     .collect();
+    upload_words(&arena, COLUMN_D, &host_d);
     upload_words(&arena, COLUMN_A, &host_a);
     upload_words(&arena, COLUMN_B, &host_b);
     upload_words(&arena, COLUMN_C, &host_c_evaluations);
@@ -220,16 +237,20 @@ fn exact_points_values_and_capture_replay() {
         config,
         &[
             OodsPolynomialColumn {
-                source: OodsColumnSource::Coefficients(arena.bind(COLUMN_A).unwrap()),
+                source: OodsColumnSource::Coefficients(arena.bind(COLUMN_D).unwrap()),
                 topology: topology[0],
             },
             OodsPolynomialColumn {
-                source: OodsColumnSource::Coefficients(arena.bind(COLUMN_B).unwrap()),
+                source: OodsColumnSource::Coefficients(arena.bind(COLUMN_A).unwrap()),
                 topology: topology[1],
             },
             OodsPolynomialColumn {
-                source: OodsColumnSource::Evaluations(arena.bind(COLUMN_C).unwrap()),
+                source: OodsColumnSource::Coefficients(arena.bind(COLUMN_B).unwrap()),
                 topology: topology[2],
+            },
+            OodsPolynomialColumn {
+                source: OodsColumnSource::Evaluations(arena.bind(COLUMN_C).unwrap()),
+                topology: topology[3],
             },
         ],
         arena.bind(PARAMETER).unwrap(),
@@ -242,11 +263,13 @@ fn exact_points_values_and_capture_replay() {
     prepared.launch().unwrap();
     let (first_points, first_values) = expected(
         config,
+        LOG_BLOWUP_FACTOR,
         first_parameter,
         &[
-            (&host_a, 6, &offsets_a),
-            (&host_b, 11, &offsets_b),
-            (&host_c_coefficients, 8, &offsets_c),
+            (&host_d, 4, &offsets_d, false),
+            (&host_a, 6, &offsets_a, false),
+            (&host_b, 11, &offsets_b, false),
+            (&host_c_coefficients, 8, &offsets_c, true),
         ],
     );
     assert_eq!(
@@ -266,11 +289,13 @@ fn exact_points_values_and_capture_replay() {
     graph.launch(arena.context()).unwrap();
     let (second_points, second_values) = expected(
         config,
+        LOG_BLOWUP_FACTOR,
         second_parameter,
         &[
-            (&host_a, 6, &offsets_a),
-            (&host_b, 11, &offsets_b),
-            (&host_c_coefficients, 8, &offsets_c),
+            (&host_d, 4, &offsets_d, false),
+            (&host_a, 6, &offsets_a, false),
+            (&host_b, 11, &offsets_b, false),
+            (&host_c_coefficients, 8, &offsets_c, true),
         ],
     );
     assert_eq!(
