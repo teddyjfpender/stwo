@@ -3,12 +3,14 @@ use core::ops::Deref;
 
 use serde::{Deserialize, Serialize};
 use std_shims::Vec;
+use thiserror::Error;
 
 use crate::core::circle::CirclePoint;
 use crate::core::fields::m31::BaseField;
 use crate::core::fields::qm31::{SecureField, SECURE_EXTENSION_DEGREE};
 use crate::core::fri::{FriLayerProof, FriProof};
 use crate::core::pcs::quotients::{CommitmentSchemeProof, CommitmentSchemeProofAux};
+use crate::core::pcs::TreeVec;
 use crate::core::vcs::hash::Hash;
 use crate::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
 use crate::core::vcs_lifted::verifier::MerkleDecommitmentLifted;
@@ -23,39 +25,6 @@ pub struct ExtendedStarkProof<H: MerkleHasherLifted> {
 }
 
 impl<H: MerkleHasherLifted> StarkProof<H> {
-    /// Extracts the composition trace Out-Of-Domain-Sample evaluation from the mask.
-    pub(crate) fn extract_composition_oods_eval(
-        &self,
-        oods_point: CirclePoint<SecureField>,
-        max_log_degree_bound: u32,
-    ) -> Option<SecureField> {
-        // TODO(andrew): `[.., composition_mask, _quotients_mask]` when add quotients
-        // commitment.
-        let [.., left_and_right_composition_mask] = &**self.sampled_values else {
-            return None;
-        };
-        let left_and_right_coordinate_evals: [SecureField; 2 * SECURE_EXTENSION_DEGREE] =
-            left_and_right_composition_mask
-                .iter()
-                .map(|columns| {
-                    let &[eval] = &columns[..] else {
-                        return None;
-                    };
-                    Some(eval)
-                })
-                .collect::<Option<Vec<_>>>()?
-                .try_into()
-                .ok()?;
-
-        let (left_coordinate_evals, right_coordinate_evals) =
-            left_and_right_coordinate_evals.split_at(SECURE_EXTENSION_DEGREE);
-
-        let left_eval = SecureField::from_partial_evals(left_coordinate_evals.try_into().ok()?);
-        let right_eval = SecureField::from_partial_evals(right_coordinate_evals.try_into().ok()?);
-        let value = left_eval + oods_point.repeated_double(max_log_degree_bound - 1).x * right_eval;
-        Some(value)
-    }
-
     /// Returns the estimate size (in bytes) of the proof.
     pub fn size_estimate(&self) -> usize {
         SizeEstimate::size_estimate(self)
@@ -105,6 +74,109 @@ impl<H: MerkleHasherLifted> StarkProof<H> {
                 + first_layer.commitment.size_estimate(),
             trace_decommitments: commitments.size_estimate() + decommitments.size_estimate(),
         }
+    }
+}
+
+/// Reconstructs the split composition opening and compares it with the
+/// composition value evaluated from trace openings. Malformed masks fail closed.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum CompositionOodsValidationError {
+    #[error("malformed composition OODS opening")]
+    InvalidStructure,
+    #[error("composition OODS opening does not match trace evaluation")]
+    Mismatch,
+}
+
+pub fn validate_composition_oods(
+    sampled_values: &TreeVec<Vec<Vec<SecureField>>>,
+    oods_point: CirclePoint<SecureField>,
+    max_log_degree_bound: u32,
+    evaluate_from_trace: impl FnOnce() -> SecureField,
+) -> Result<(), CompositionOodsValidationError> {
+    let Some(composition_mask) = sampled_values.last() else {
+        return Err(CompositionOodsValidationError::InvalidStructure);
+    };
+    let Some(coordinates): Option<[SecureField; 2 * SECURE_EXTENSION_DEGREE]> = composition_mask
+        .iter()
+        .map(|column| {
+            let &[eval] = column.as_slice() else {
+                return None;
+            };
+            Some(eval)
+        })
+        .collect::<Option<Vec<_>>>()
+        .and_then(|values| values.try_into().ok())
+    else {
+        return Err(CompositionOodsValidationError::InvalidStructure);
+    };
+    let (left, right) = coordinates.split_at(SECURE_EXTENSION_DEGREE);
+    let Some(left) = left.try_into().ok().map(SecureField::from_partial_evals) else {
+        return Err(CompositionOodsValidationError::InvalidStructure);
+    };
+    let Some(right) = right.try_into().ok().map(SecureField::from_partial_evals) else {
+        return Err(CompositionOodsValidationError::InvalidStructure);
+    };
+    let Some(split_log_degree_bound) = max_log_degree_bound.checked_sub(1) else {
+        return Err(CompositionOodsValidationError::InvalidStructure);
+    };
+    if left + oods_point.repeated_double(split_log_degree_bound).x * right != evaluate_from_trace()
+    {
+        return Err(CompositionOodsValidationError::Mismatch);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod composition_oods_tests {
+    use super::*;
+
+    #[test]
+    fn composition_oods_matches_fails_closed_on_corruption_or_shape_drift() {
+        let zero = SecureField::default();
+        let one = SecureField::from(1u32);
+        let point = CirclePoint { x: one, y: zero };
+        let assert_invalid_without_evaluation =
+            |sampled_values: &TreeVec<Vec<Vec<SecureField>>>, max_log_degree_bound| {
+                assert_eq!(
+                    validate_composition_oods(
+                        sampled_values,
+                        point,
+                        max_log_degree_bound,
+                        || panic!("invalid structure must be rejected before trace evaluation"),
+                    ),
+                    Err(CompositionOodsValidationError::InvalidStructure)
+                );
+            };
+        let mut sampled_values = TreeVec(vec![
+            vec![vec![zero]],
+            vec![vec![zero]; 2 * SECURE_EXTENSION_DEGREE],
+        ]);
+        assert_eq!(
+            validate_composition_oods(&sampled_values, point, 2, || zero),
+            Ok(())
+        );
+        assert_eq!(
+            validate_composition_oods(&sampled_values, point, 2, || one),
+            Err(CompositionOodsValidationError::Mismatch)
+        );
+
+        sampled_values[1][0][0] = one;
+        assert_eq!(
+            validate_composition_oods(&sampled_values, point, 2, || zero),
+            Err(CompositionOodsValidationError::Mismatch)
+        );
+        assert_invalid_without_evaluation(&sampled_values, 0);
+        assert_invalid_without_evaluation(&TreeVec(vec![]), 2);
+
+        let mut empty_column = sampled_values.clone();
+        empty_column[1][0].clear();
+        assert_invalid_without_evaluation(&empty_column, 2);
+        let mut double_sample = sampled_values.clone();
+        double_sample[1][0].push(zero);
+        assert_invalid_without_evaluation(&double_sample, 2);
+
+        sampled_values[1].pop();
+        assert_invalid_without_evaluation(&sampled_values, 2);
     }
 }
 

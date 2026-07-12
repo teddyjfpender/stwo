@@ -102,21 +102,28 @@ pub fn verify_ex<MC: MerkleChannel>(
         sample_points_by_column.into_iter().flatten().count()
     );
 
-    let composition_oods_eval = proof
-        .extract_composition_oods_eval(oods_point, max_log_degree_bound)
-        .ok_or(VerificationError::InvalidStructure(
-            std_shims::ToString::to_string(&"Unexpected sampled_values structure"),
-        ))?;
-
-    if composition_oods_eval
-        != components.eval_composition_polynomial_at_point(
-            oods_point,
-            &proof.sampled_values,
-            random_coeff,
-            max_log_degree_bound,
-        )
-    {
-        return Err(VerificationError::OodsNotMatching);
+    match crate::core::proof::validate_composition_oods(
+        &proof.sampled_values,
+        oods_point,
+        max_log_degree_bound,
+        || {
+            components.eval_composition_polynomial_at_point(
+                oods_point,
+                &proof.sampled_values,
+                random_coeff,
+                max_log_degree_bound,
+            )
+        },
+    ) {
+        Ok(()) => {}
+        Err(crate::core::proof::CompositionOodsValidationError::InvalidStructure) => {
+            return Err(VerificationError::InvalidStructure(
+                std_shims::ToString::to_string(&"Unexpected sampled_values structure"),
+            ));
+        }
+        Err(crate::core::proof::CompositionOodsValidationError::Mismatch) => {
+            return Err(VerificationError::OodsNotMatching);
+        }
     }
     commitment_scheme.verify_values(sample_points, proof.0, channel)
 }

@@ -175,19 +175,28 @@ where
 
     // Evaluate composition polynomial at OODS point and check that it matches the trace OODS
     // values. This is a sanity check.
-    if proof
-        .extract_composition_oods_eval(oods_point, max_log_degree_bound)
-        .unwrap()
-        != component_provers
-            .components()
-            .eval_composition_polynomial_at_point(
-                oods_point,
-                &proof.sampled_values,
-                random_coeff,
-                max_log_degree_bound,
-            )
-    {
-        return Err(ProvingError::ConstraintsNotSatisfied.into());
+    match crate::core::proof::validate_composition_oods(
+        &proof.sampled_values,
+        oods_point,
+        max_log_degree_bound,
+        || {
+            component_provers
+                .components()
+                .eval_composition_polynomial_at_point(
+                    oods_point,
+                    &proof.sampled_values,
+                    random_coeff,
+                    max_log_degree_bound,
+                )
+        },
+    ) {
+        Ok(()) => {}
+        Err(crate::core::proof::CompositionOodsValidationError::InvalidStructure) => {
+            return Err(ProvingError::InvalidCompositionOodsStructure.into());
+        }
+        Err(crate::core::proof::CompositionOodsValidationError::Mismatch) => {
+            return Err(ProvingError::ConstraintsNotSatisfied.into());
+        }
     }
 
     Ok((
@@ -211,6 +220,8 @@ pub enum ProveExWithPcsDriverError<E> {
 pub enum ProvingError {
     #[error("Constraints not satisfied.")]
     ConstraintsNotSatisfied,
+    #[error("Malformed composition OODS opening.")]
+    InvalidCompositionOodsStructure,
     #[error(transparent)]
     InvalidLiftingLogSize(#[from] crate::core::pcs::utils::InvalidLiftingLogSizeError),
     #[error(transparent)]
