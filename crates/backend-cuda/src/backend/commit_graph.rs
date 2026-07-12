@@ -517,11 +517,6 @@ impl CommitGraphPlan {
         let leaf_size = 1u32 << lifting_log_size;
         require_hash_capacity("leaf_state", leaf_state, leaf_size)?;
         let context_token = leaf_state.context_token();
-        let mut hash_slots = BTreeSet::from([leaf_state.id()]);
-        let mut retained_slots = BTreeSet::new();
-        if unretained_bottom_layers == 0 {
-            retained_slots.insert(leaf_state.id());
-        }
         let mut input_slots = BTreeSet::new();
 
         let mut launches = Vec::new();
@@ -730,137 +725,72 @@ impl CommitGraphPlan {
                 .ok_or(CommitGraphError::TooManyColumns)?;
         }
 
-        // Validate every interior level exactly as the per-level plan always
-        // has — the fused lane below changes LAUNCH EMISSION only, never the
-        // validated geometry, aliasing, or retention invariants.
-        let mut interior_levels = Vec::with_capacity(interior_outputs.len());
-        let mut current = leaf_state;
-        let mut current_hashes = leaf_size;
-        for (level, &output) in interior_outputs.iter().enumerate() {
-            require_same_context(context_token, output)?;
-            if current_hashes < 2 {
-                return Err(CommitGraphError::InteriorPastRoot(level as u32));
-            }
-            if output.id() == current.id() {
-                return Err(CommitGraphError::InPlaceInteriorLayer(output.id()));
-            }
-            if retained_slots.contains(&output.id()) {
-                return Err(CommitGraphError::PrematureArenaSlotReuse(output.id()));
-            }
-            hash_slots.insert(output.id());
-            let output_hashes = current_hashes / 2;
-            require_hash_capacity("interior_output", output, output_hashes)?;
-            interior_levels.push(CommitLaunch::InteriorLayer {
-                level: level as u32,
-                input: current,
-                output,
-                output_hashes,
-            });
-            current = output;
-            current_hashes = output_hashes;
-            // `level + 1` is this output's distance above the leaves. Outputs
-            // beyond the pruned prefix must remain live through decommitment.
-            if (level as u32 + 1) >= unretained_bottom_layers {
-                retained_slots.insert(output.id());
-            }
-        }
-        // Emission: with the fused lane on, an aligned window of four levels
-        // whose intermediates are all unretained becomes one FusedInterior4
-        // launch reading the window's input layer and writing only the
-        // 1/16th-size output level. The kernel forbids in-place operation, so
-        // an aliased window (possible when deep pruning ping-pongs the output
-        // back onto the input slot) falls back to per-level launches.
-        let mut level = 0usize;
-        while level < interior_levels.len() {
-            let CommitLaunch::InteriorLayer { input, .. } = interior_levels[level] else {
-                unreachable!("interior_levels holds only InteriorLayer records");
-            };
-            if interior_fused
-                && interior4_window_fusible(level, interior_levels.len(), unretained_bottom_layers)
-            {
-                let CommitLaunch::InteriorLayer {
-                    output,
-                    output_hashes,
-                    ..
-                } = interior_levels[level + 3]
-                else {
-                    unreachable!("interior_levels holds only InteriorLayer records");
-                };
-                if output.id() != input.id() {
-                    launches.push(CommitLaunch::FusedInterior4 {
-                        first_level: level as u32,
-                        input,
-                        output,
-                        output_hashes,
-                    });
-                    level += 4;
-                    continue;
-                }
-            }
-            launches.push(interior_levels[level]);
-            level += 1;
-        }
-
-        if let Some(tail) = tail {
-            if tail.level_outputs.is_empty() {
-                return Err(CommitGraphError::EmptyTail);
-            }
-            if current_hashes > MAX_FUSED_TAIL_HASHES {
-                return Err(CommitGraphError::TailTooWide(current_hashes));
-            }
-            if tail.level_outputs.len() >= 32 {
-                return Err(CommitGraphError::TooManyTailLevels(
-                    tail.level_outputs.len(),
-                ));
-            }
-            require_same_context(context_token, tail.level_ptrs)?;
-            input_slots.insert(tail.level_ptrs.id());
-            require_pointer_table(
-                "tail_level_ptrs",
-                tail.level_ptrs,
-                tail.level_outputs.len() as u32,
-            )?;
-            let first_hashes = current_hashes;
-            let tail_input = current;
-            for &output in &tail.level_outputs {
-                require_same_context(context_token, output)?;
-                if current_hashes < 2 {
-                    return Err(CommitGraphError::InteriorPastRoot(launches.len() as u32));
-                }
-                if output.id() == current.id() {
-                    return Err(CommitGraphError::InPlaceInteriorLayer(output.id()));
-                }
-                if retained_slots.contains(&output.id()) {
-                    return Err(CommitGraphError::PrematureArenaSlotReuse(output.id()));
-                }
-                hash_slots.insert(output.id());
-                retained_slots.insert(output.id());
-                current_hashes /= 2;
-                require_hash_capacity("tail_output", output, current_hashes)?;
-                current = output;
-            }
-            launches.push(CommitLaunch::FusedTail {
-                input: tail_input,
-                first_hashes,
-                level_ptrs: tail.level_ptrs,
-                levels: tail.level_outputs.len() as u32,
-            });
-        }
-
-        if let Some(id) = hash_slots.intersection(&input_slots).next() {
-            return Err(CommitGraphError::AliasedArenaSlot(*id));
-        }
-
-        if current_hashes != 1 {
-            return Err(CommitGraphError::IncompleteTree(current_hashes));
-        }
+        let suffix = build_merkle_from_leaves(
+            lifting_log_size,
+            unretained_bottom_layers,
+            leaf_state,
+            interior_outputs,
+            tail,
+            interior_fused,
+            &input_slots,
+        )?;
+        launches.extend(suffix.launches);
         Ok(Self {
             context_token,
             launches,
-            root: current,
+            root: suffix.root,
             hash_from_tile,
             producer_fused_log_sizes: producer_fused_log_sizes.into_iter().collect(),
             retained_fused_log_sizes: retained_fused_log_sizes.into_iter().collect(),
+        })
+    }
+
+    /// Build only the qualified column-free Merkle suffix from an already
+    /// materialized Blake2s leaf layer. No leaf init, LDE, or leaf absorb
+    /// launch is emitted. The interior and fused-tail launch sequence is the
+    /// exact suffix used by every legacy constructor above.
+    pub fn new_merkle_from_leaves(
+        lifting_log_size: u32,
+        unretained_bottom_layers: u32,
+        leaf_hashes: ArenaSlice,
+        interior_outputs: Vec<ArenaSlice>,
+        tail: Option<CommitTailPlan>,
+    ) -> Result<Self, CommitGraphError> {
+        Self::new_merkle_from_leaves_with_mode(
+            lifting_log_size,
+            unretained_bottom_layers,
+            leaf_hashes,
+            interior_outputs,
+            tail,
+            super::blake2s::blake2s_interior_fused_enabled(),
+        )
+    }
+
+    /// Explicit interior-fusion twin used by A/B suffix tests.
+    pub fn new_merkle_from_leaves_with_mode(
+        lifting_log_size: u32,
+        unretained_bottom_layers: u32,
+        leaf_hashes: ArenaSlice,
+        interior_outputs: Vec<ArenaSlice>,
+        tail: Option<CommitTailPlan>,
+        interior_fused: bool,
+    ) -> Result<Self, CommitGraphError> {
+        let suffix = build_merkle_from_leaves(
+            lifting_log_size,
+            unretained_bottom_layers,
+            leaf_hashes,
+            interior_outputs,
+            tail,
+            interior_fused,
+            &BTreeSet::new(),
+        )?;
+        Ok(Self {
+            context_token: leaf_hashes.context_token(),
+            launches: suffix.launches,
+            root: suffix.root,
+            hash_from_tile: CommitHashFromTileTelemetry::default(),
+            producer_fused_log_sizes: Vec::new(),
+            retained_fused_log_sizes: Vec::new(),
         })
     }
 
@@ -1126,6 +1056,162 @@ impl CommitGraphPlan {
     }
 }
 
+struct MerkleFromLeavesBuild {
+    launches: Vec<CommitLaunch>,
+    root: ArenaSlice,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_merkle_from_leaves(
+    lifting_log_size: u32,
+    unretained_bottom_layers: u32,
+    leaf_hashes: ArenaSlice,
+    interior_outputs: Vec<ArenaSlice>,
+    tail: Option<CommitTailPlan>,
+    interior_fused: bool,
+    forbidden_input_slots: &BTreeSet<ArenaSlotId>,
+) -> Result<MerkleFromLeavesBuild, CommitGraphError> {
+    if lifting_log_size >= 31 {
+        return Err(CommitGraphError::InvalidLiftingLogSize(lifting_log_size));
+    }
+    if unretained_bottom_layers > lifting_log_size {
+        return Err(CommitGraphError::InvalidUnretainedBottomLayers {
+            lifting_log_size,
+            unretained: unretained_bottom_layers,
+        });
+    }
+    let leaf_size = 1u32 << lifting_log_size;
+    require_hash_capacity("leaf_state", leaf_hashes, leaf_size)?;
+    let context_token = leaf_hashes.context_token();
+    let mut hash_slots = BTreeSet::from([leaf_hashes.id()]);
+    let mut retained_slots = BTreeSet::new();
+    if unretained_bottom_layers == 0 {
+        retained_slots.insert(leaf_hashes.id());
+    }
+    let mut input_slots = forbidden_input_slots.clone();
+    let mut launches = Vec::new();
+
+    // Validate every interior level exactly as the per-level plan always has.
+    let mut interior_levels = Vec::with_capacity(interior_outputs.len());
+    let mut current = leaf_hashes;
+    let mut current_hashes = leaf_size;
+    for (level, &output) in interior_outputs.iter().enumerate() {
+        require_same_context(context_token, output)?;
+        if current_hashes < 2 {
+            return Err(CommitGraphError::InteriorPastRoot(level as u32));
+        }
+        if output.id() == current.id() {
+            return Err(CommitGraphError::InPlaceInteriorLayer(output.id()));
+        }
+        if retained_slots.contains(&output.id()) {
+            return Err(CommitGraphError::PrematureArenaSlotReuse(output.id()));
+        }
+        hash_slots.insert(output.id());
+        let output_hashes = current_hashes / 2;
+        require_hash_capacity("interior_output", output, output_hashes)?;
+        interior_levels.push(CommitLaunch::InteriorLayer {
+            level: level as u32,
+            input: current,
+            output,
+            output_hashes,
+        });
+        current = output;
+        current_hashes = output_hashes;
+        if (level as u32 + 1) >= unretained_bottom_layers {
+            retained_slots.insert(output.id());
+        }
+    }
+
+    // Emission is byte-for-byte the legacy qualified suffix.
+    let mut level = 0usize;
+    while level < interior_levels.len() {
+        let CommitLaunch::InteriorLayer { input, .. } = interior_levels[level] else {
+            unreachable!("interior_levels holds only InteriorLayer records");
+        };
+        if interior_fused
+            && interior4_window_fusible(level, interior_levels.len(), unretained_bottom_layers)
+        {
+            let CommitLaunch::InteriorLayer {
+                output,
+                output_hashes,
+                ..
+            } = interior_levels[level + 3]
+            else {
+                unreachable!("interior_levels holds only InteriorLayer records");
+            };
+            if output.id() != input.id() {
+                launches.push(CommitLaunch::FusedInterior4 {
+                    first_level: level as u32,
+                    input,
+                    output,
+                    output_hashes,
+                });
+                level += 4;
+                continue;
+            }
+        }
+        launches.push(interior_levels[level]);
+        level += 1;
+    }
+
+    if let Some(tail) = tail {
+        if tail.level_outputs.is_empty() {
+            return Err(CommitGraphError::EmptyTail);
+        }
+        if current_hashes > MAX_FUSED_TAIL_HASHES {
+            return Err(CommitGraphError::TailTooWide(current_hashes));
+        }
+        if tail.level_outputs.len() >= 32 {
+            return Err(CommitGraphError::TooManyTailLevels(
+                tail.level_outputs.len(),
+            ));
+        }
+        require_same_context(context_token, tail.level_ptrs)?;
+        input_slots.insert(tail.level_ptrs.id());
+        require_pointer_table(
+            "tail_level_ptrs",
+            tail.level_ptrs,
+            tail.level_outputs.len() as u32,
+        )?;
+        let first_hashes = current_hashes;
+        let tail_input = current;
+        for &output in &tail.level_outputs {
+            require_same_context(context_token, output)?;
+            if current_hashes < 2 {
+                return Err(CommitGraphError::InteriorPastRoot(launches.len() as u32));
+            }
+            if output.id() == current.id() {
+                return Err(CommitGraphError::InPlaceInteriorLayer(output.id()));
+            }
+            if retained_slots.contains(&output.id()) {
+                return Err(CommitGraphError::PrematureArenaSlotReuse(output.id()));
+            }
+            hash_slots.insert(output.id());
+            retained_slots.insert(output.id());
+            current_hashes /= 2;
+            require_hash_capacity("tail_output", output, current_hashes)?;
+            current = output;
+        }
+        launches.push(CommitLaunch::FusedTail {
+            input: tail_input,
+            first_hashes,
+            level_ptrs: tail.level_ptrs,
+            levels: tail.level_outputs.len() as u32,
+        });
+    }
+
+    if let Some(id) = hash_slots.intersection(&input_slots).next() {
+        return Err(CommitGraphError::AliasedArenaSlot(*id));
+    }
+    if current_hashes != 1 {
+        return Err(CommitGraphError::IncompleteTree(current_hashes));
+    }
+    Ok(MerkleFromLeavesBuild {
+        launches,
+        root: current,
+    })
+}
+
 /// Whether the four consecutive interior levels `[first_level, first_level+4)`
 /// may fuse into one `FusedInterior4` launch. Pure planning math (unit-tested
 /// below): the window must fit inside the ordinary interior levels (the fused
@@ -1274,6 +1360,70 @@ mod tests {
                 retain_evaluations: false,
             },
         ]
+    }
+
+    #[test]
+    fn extracted_merkle_suffix_is_launch_for_launch_identical_in_both_fusion_modes() {
+        for interior_fused in [false, true] {
+            let leaves = slice(1, 64 * HASH_WORDS);
+            let interior = vec![
+                slice(2, 32 * HASH_WORDS),
+                leaves,
+                slice(2, 8 * HASH_WORDS),
+                slice(3, 4 * HASH_WORDS),
+            ];
+            let tail = CommitTailPlan {
+                level_ptrs: slice(4, 4),
+                level_outputs: vec![slice(5, 2 * HASH_WORDS), slice(6, HASH_WORDS)],
+            };
+            let legacy = CommitGraphPlan::new_pruned_with_modes(
+                6,
+                4,
+                leaves,
+                groups(),
+                interior.clone(),
+                Some(tail.clone()),
+                interior_fused,
+                RetainedLdeHashMode::Separate,
+            )
+            .unwrap();
+            let suffix = CommitGraphPlan::new_merkle_from_leaves_with_mode(
+                6,
+                4,
+                leaves,
+                interior,
+                Some(tail),
+                interior_fused,
+            )
+            .unwrap();
+            let legacy_suffix = legacy
+                .launch_sequence()
+                .filter(|kind| {
+                    matches!(
+                        kind,
+                        CommitLaunchKind::InteriorLayer { .. }
+                            | CommitLaunchKind::FusedInterior4 { .. }
+                            | CommitLaunchKind::FusedTail { .. }
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(legacy_suffix, suffix.launch_sequence().collect::<Vec<_>>());
+            assert_eq!(legacy.root().id(), suffix.root().id());
+            if interior_fused {
+                assert!(matches!(
+                    legacy_suffix[0],
+                    CommitLaunchKind::FusedInterior4 { .. }
+                ));
+            } else {
+                assert_eq!(
+                    legacy_suffix
+                        .iter()
+                        .filter(|kind| matches!(kind, CommitLaunchKind::InteriorLayer { .. }))
+                        .count(),
+                    4
+                );
+            }
+        }
     }
 
     #[test]

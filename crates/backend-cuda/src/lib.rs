@@ -36,11 +36,12 @@ pub use backend::pcs_driver::{
     CudaPcsRuntimeMode,
 };
 pub use backend::prepared_commit::{
-    commit_workspace_requirements, CommitArenaSlotRequirement, CommitBatchRequirements,
-    CommitBatchSlots, CommitCoefficientColumn, CommitCoefficientGroup, CommitEvaluationGroup,
-    CommitGroupRequirements, CommitGroupSlots, CommitLayerRequirements, CommitWorkspaceConfig,
-    CommitWorkspaceRequirements, CommitWorkspaceSlots, PreparedCommitError, PreparedCommitGraph,
-    COMMIT_HASH_ALIGNMENT_WORDS, COMMIT_POINTER_ALIGNMENT_WORDS,
+    commit_workspace_requirements, merkle_from_leaves_requirements, CommitArenaSlotRequirement,
+    CommitBatchRequirements, CommitBatchSlots, CommitCoefficientColumn, CommitCoefficientGroup,
+    CommitEvaluationGroup, CommitGroupRequirements, CommitGroupSlots, CommitLayerRequirements,
+    CommitWorkspaceConfig, CommitWorkspaceRequirements, CommitWorkspaceSlots,
+    MerkleFromLeavesRequirements, MerkleFromLeavesSlots, PreparedCommitError, PreparedCommitGraph,
+    PreparedMerkleFromLeaves, COMMIT_HASH_ALIGNMENT_WORDS, COMMIT_POINTER_ALIGNMENT_WORDS,
 };
 pub use backend::prepared_decommit::{
     decommit_workspace_requirements, DecommitArenaSlotRequirement, DecommitAssembly,
@@ -108,9 +109,12 @@ pub use backend::prepared_pow::{
     PreparedBlake2sPowGraph, POW_GRIND_LOW_BITS, POW_NONCE_WORDS, POW_U64_ALIGNMENT_WORDS,
 };
 pub use backend::prepared_progressive_commit::{
-    progressive_leaf_workspace_requirements, progressive_leaf_workspace_requirements_for_mode,
-    progressive_prepare_mode_admission, PreparedProgressiveCommitError, PreparedProgressiveLeaves,
-    ProgressiveBatchRequirements, ProgressiveBatchSlots, ProgressiveLeafLaunchKind,
+    progressive_commit_workspace_requirements_for_mode, progressive_leaf_workspace_requirements,
+    progressive_leaf_workspace_requirements_for_mode, progressive_prepare_mode_admission,
+    ModeAwareCommitWorkspaceRequirements, ModeAwareCommitWorkspaceSlots,
+    PreparedProgressiveCommitError, PreparedProgressiveCommitGraph, PreparedProgressiveLeaves,
+    ProgressiveBatchRequirements, ProgressiveBatchSlots, ProgressiveCommitWorkspaceRequirements,
+    ProgressiveCommitWorkspaceSlots, ProgressiveLeafLaunchKind,
     ProgressiveLeafWorkspaceRequirements, ProgressiveLeafWorkspaceSlots,
 };
 pub use backend::prepared_quotient::{

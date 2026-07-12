@@ -90,6 +90,77 @@ enum InteriorStorage {
     Retained(usize),
 }
 
+/// Exact arena shape for the qualified column-free Merkle suffix. `leaf_words`
+/// is the zero-copy input layer produced by either legacy or progressive leaf
+/// construction; every other field is unchanged from the historical commit
+/// workspace.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MerkleFromLeavesRequirements {
+    pub leaf_words: usize,
+    pub merkle_scratch_words: Option<usize>,
+    pub retained_layers: Vec<CommitLayerRequirements>,
+    pub tail_pointer_words: Option<usize>,
+    pub tail_outputs: Vec<CommitLayerRequirements>,
+    interior: Vec<(CommitLayerRequirements, InteriorStorage)>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MerkleFromLeavesSlots {
+    pub leaves: ArenaSlotId,
+    pub merkle_scratch: Option<ArenaSlotId>,
+    pub retained_layers: Vec<ArenaSlotId>,
+    pub tail_level_ptrs: Option<ArenaSlotId>,
+    pub tail_outputs: Vec<ArenaSlotId>,
+}
+
+impl MerkleFromLeavesRequirements {
+    pub fn arena_slot_requirements(
+        &self,
+        slots: &MerkleFromLeavesSlots,
+    ) -> Result<Vec<CommitArenaSlotRequirement>, PreparedCommitError> {
+        validate_merkle_slot_shape(self, slots)?;
+        let mut output = vec![CommitArenaSlotRequirement {
+            id: slots.leaves,
+            len_words: self.leaf_words,
+            alignment_words: COMMIT_HASH_ALIGNMENT_WORDS,
+        }];
+        if let (Some(id), Some(words)) = (slots.merkle_scratch, self.merkle_scratch_words) {
+            output.push(CommitArenaSlotRequirement {
+                id,
+                len_words: words,
+                alignment_words: COMMIT_HASH_ALIGNMENT_WORDS,
+            });
+        }
+        output.extend(slots.retained_layers.iter().zip(&self.retained_layers).map(
+            |(&id, layer)| CommitArenaSlotRequirement {
+                id,
+                len_words: layer.words,
+                alignment_words: COMMIT_HASH_ALIGNMENT_WORDS,
+            },
+        ));
+        if let (Some(id), Some(words)) = (slots.tail_level_ptrs, self.tail_pointer_words) {
+            output.push(CommitArenaSlotRequirement {
+                id,
+                len_words: words,
+                alignment_words: COMMIT_POINTER_ALIGNMENT_WORDS,
+            });
+        }
+        output.extend(
+            slots
+                .tail_outputs
+                .iter()
+                .zip(&self.tail_outputs)
+                .map(|(&id, layer)| CommitArenaSlotRequirement {
+                    id,
+                    len_words: layer.words,
+                    alignment_words: COMMIT_HASH_ALIGNMENT_WORDS,
+                }),
+        );
+        ensure_distinct(&output.iter().map(|entry| entry.id).collect::<Vec<_>>())?;
+        Ok(output)
+    }
+}
+
 /// Exact arena capacity needed by one prepared commitment. Pointer tables use
 /// [`COMMIT_POINTER_ALIGNMENT_WORDS`]; hash layers use
 /// [`COMMIT_HASH_ALIGNMENT_WORDS`]; word buffers use one-word alignment.
@@ -327,6 +398,60 @@ impl From<CudaRuntimeError> for PreparedCommitError {
     }
 }
 
+/// Pure sizing pass for the column-free suffix shared by both leaf producers.
+pub fn merkle_from_leaves_requirements(
+    config: CommitWorkspaceConfig,
+) -> Result<MerkleFromLeavesRequirements, PreparedCommitError> {
+    validate_config(config)?;
+    let leaf_words = hash_words(config.lifting_log_size)?;
+    let first_retained_log = config.lifting_log_size - config.unretained_bottom_layers;
+    let tail_levels = config.max_fused_tail_levels.min(first_retained_log);
+    let mut retained_layers = Vec::new();
+    let mut interior = Vec::new();
+    let mut scratch_words = None;
+    let mut scratch_on_leaf = true;
+    for log_size in (tail_levels..config.lifting_log_size).rev() {
+        let layer = CommitLayerRequirements {
+            log_size,
+            words: hash_words(log_size)?,
+        };
+        let storage = if log_size > first_retained_log {
+            if scratch_on_leaf {
+                scratch_words.get_or_insert(layer.words);
+                scratch_on_leaf = false;
+                InteriorStorage::ScratchPong
+            } else {
+                scratch_on_leaf = true;
+                InteriorStorage::LeafPing
+            }
+        } else {
+            let index = retained_layers.len();
+            retained_layers.push(layer);
+            InteriorStorage::Retained(index)
+        };
+        interior.push((layer, storage));
+    }
+    let tail_outputs: Vec<_> = (0..tail_levels)
+        .rev()
+        .map(|log_size| {
+            Ok(CommitLayerRequirements {
+                log_size,
+                words: hash_words(log_size)?,
+            })
+        })
+        .collect::<Result<_, PreparedCommitError>>()?;
+    Ok(MerkleFromLeavesRequirements {
+        leaf_words,
+        merkle_scratch_words: scratch_words,
+        retained_layers,
+        tail_pointer_words: (!tail_outputs.is_empty())
+            .then(|| pointer_words(tail_outputs.len()))
+            .transpose()?,
+        tail_outputs,
+        interior,
+    })
+}
+
 /// Pure sizing/shape pass. `grouped_coefficient_log_sizes` must already be in
 /// canonical global order and use the exact update/finalize grouping that will
 /// be passed to [`PreparedCommitGraph::prepare`].
@@ -426,57 +551,18 @@ pub fn commit_workspace_requirements(
         });
     }
 
-    let leaf_state_words = hash_words(config.lifting_log_size)?;
-    let first_retained_log = config.lifting_log_size - config.unretained_bottom_layers;
-    let tail_levels = config.max_fused_tail_levels.min(first_retained_log);
-    let mut retained_layers = Vec::new();
-    let mut interior = Vec::new();
-    let mut scratch_words = None;
-    let mut scratch_on_leaf = true;
-    for log_size in (tail_levels..config.lifting_log_size).rev() {
-        let layer = CommitLayerRequirements {
-            log_size,
-            words: hash_words(log_size)?,
-        };
-        let storage = if log_size > first_retained_log {
-            if scratch_on_leaf {
-                scratch_words.get_or_insert(layer.words);
-                scratch_on_leaf = false;
-                InteriorStorage::ScratchPong
-            } else {
-                scratch_on_leaf = true;
-                InteriorStorage::LeafPing
-            }
-        } else {
-            let index = retained_layers.len();
-            retained_layers.push(layer);
-            InteriorStorage::Retained(index)
-        };
-        interior.push((layer, storage));
-    }
-
-    let tail_outputs: Vec<_> = (0..tail_levels)
-        .rev()
-        .map(|log_size| {
-            Ok(CommitLayerRequirements {
-                log_size,
-                words: hash_words(log_size)?,
-            })
-        })
-        .collect::<Result<_, PreparedCommitError>>()?;
+    let merkle = merkle_from_leaves_requirements(config)?;
 
     Ok(CommitWorkspaceRequirements {
         twiddle_words,
         lde_tile_words,
-        leaf_state_words,
-        merkle_scratch_words: scratch_words,
-        retained_layers,
-        tail_pointer_words: (!tail_outputs.is_empty())
-            .then(|| pointer_words(tail_outputs.len()))
-            .transpose()?,
-        tail_outputs,
+        leaf_state_words: merkle.leaf_words,
+        merkle_scratch_words: merkle.merkle_scratch_words,
+        retained_layers: merkle.retained_layers,
+        tail_pointer_words: merkle.tail_pointer_words,
+        tail_outputs: merkle.tail_outputs,
         groups,
-        interior,
+        interior: merkle.interior,
     })
 }
 
@@ -550,6 +636,151 @@ pub struct PreparedCommitGraph<'a> {
     plan: CommitGraphPlan,
     retained_layers_bottom_up: Vec<ArenaSlice>,
     retained_evaluations: Vec<Option<Vec<ArenaSlice>>>,
+}
+
+/// Prepared qualified Merkle suffix over a caller-produced leaf layer.
+pub struct PreparedMerkleFromLeaves<'a> {
+    arena: &'a DeviceArena,
+    plan: CommitGraphPlan,
+    leaves: ArenaSlice,
+    retained_layers_bottom_up: Vec<ArenaSlice>,
+}
+
+impl<'a> PreparedMerkleFromLeaves<'a> {
+    pub fn prepare(
+        arena: &'a DeviceArena,
+        config: CommitWorkspaceConfig,
+        requirements: &MerkleFromLeavesRequirements,
+        slots: &MerkleFromLeavesSlots,
+    ) -> Result<Self, PreparedCommitError> {
+        Self::prepare_with_interior_mode(
+            arena,
+            config,
+            requirements,
+            slots,
+            super::blake2s::blake2s_interior_fused_enabled(),
+        )
+    }
+
+    pub fn prepare_with_interior_mode(
+        arena: &'a DeviceArena,
+        config: CommitWorkspaceConfig,
+        requirements: &MerkleFromLeavesRequirements,
+        slots: &MerkleFromLeavesSlots,
+        interior_fused: bool,
+    ) -> Result<Self, PreparedCommitError> {
+        if merkle_from_leaves_requirements(config)? != *requirements {
+            return Err(PreparedCommitError::SlotShapeMismatch {
+                role: "merkle_requirements",
+                expected: 1,
+                actual: 0,
+            });
+        }
+        requirements.arena_slot_requirements(slots)?;
+        let leaves = bind_slot(
+            arena,
+            slots.leaves,
+            requirements.leaf_words,
+            COMMIT_HASH_ALIGNMENT_WORDS,
+        )?;
+        let scratch = match (requirements.merkle_scratch_words, slots.merkle_scratch) {
+            (Some(words), Some(id)) => {
+                Some(bind_slot(arena, id, words, COMMIT_HASH_ALIGNMENT_WORDS)?)
+            }
+            (None, None) => None,
+            _ => unreachable!("slot shape validated"),
+        };
+        let retained: Vec<_> = slots
+            .retained_layers
+            .iter()
+            .zip(&requirements.retained_layers)
+            .map(|(&id, layer)| bind_slot(arena, id, layer.words, COMMIT_HASH_ALIGNMENT_WORDS))
+            .collect::<Result<_, _>>()?;
+        let tail_outputs: Vec<_> = slots
+            .tail_outputs
+            .iter()
+            .zip(&requirements.tail_outputs)
+            .map(|(&id, layer)| bind_slot(arena, id, layer.words, COMMIT_HASH_ALIGNMENT_WORDS))
+            .collect::<Result<_, _>>()?;
+        let interior_outputs = requirements
+            .interior
+            .iter()
+            .map(|(_, storage)| match *storage {
+                InteriorStorage::LeafPing => leaves,
+                InteriorStorage::ScratchPong => scratch.expect("slot shape validated"),
+                InteriorStorage::Retained(index) => retained[index],
+            })
+            .collect();
+        let tail = if tail_outputs.is_empty() {
+            None
+        } else {
+            let level_ptrs = bind_slot(
+                arena,
+                slots.tail_level_ptrs.expect("slot shape validated"),
+                requirements
+                    .tail_pointer_words
+                    .expect("requirements have tail"),
+                COMMIT_POINTER_ALIGNMENT_WORDS,
+            )?;
+            let pointers = tail_outputs
+                .iter()
+                .map(|slice| slice.as_u32_ptr() as usize)
+                .collect::<Vec<_>>();
+            unsafe {
+                arena.context().memcpy_h2d_async(
+                    level_ptrs.as_void_ptr(),
+                    pointers.as_ptr().cast(),
+                    core::mem::size_of_val(pointers.as_slice()),
+                )?;
+            }
+            Some(CommitTailPlan {
+                level_ptrs,
+                level_outputs: tail_outputs.clone(),
+            })
+        };
+        arena.context().sync()?;
+        let plan = CommitGraphPlan::new_merkle_from_leaves_with_mode(
+            config.lifting_log_size,
+            config.unretained_bottom_layers,
+            leaves,
+            interior_outputs,
+            tail,
+            interior_fused,
+        )?;
+        let mut retained_layers_bottom_up = Vec::new();
+        if config.unretained_bottom_layers == 0 {
+            retained_layers_bottom_up.push(leaves);
+        }
+        retained_layers_bottom_up.extend(retained);
+        retained_layers_bottom_up.extend(tail_outputs);
+        Ok(Self {
+            arena,
+            plan,
+            leaves,
+            retained_layers_bottom_up,
+        })
+    }
+
+    pub fn launch(&self) -> Result<(), PreparedCommitError> {
+        self.plan.launch(self.arena.context())?;
+        Ok(())
+    }
+
+    pub fn launch_sequence(&self) -> impl ExactSizeIterator<Item = CommitLaunchKind> + '_ {
+        self.plan.launch_sequence()
+    }
+
+    pub fn leaves(&self) -> ArenaSlice {
+        self.leaves
+    }
+
+    pub fn root_slice(&self) -> ArenaSlice {
+        self.plan.root()
+    }
+
+    pub fn retained_layers_bottom_up(&self) -> &[ArenaSlice] {
+        &self.retained_layers_bottom_up
+    }
 }
 
 impl<'a> PreparedCommitGraph<'a> {
@@ -1099,6 +1330,37 @@ fn validate_slot_shape(
             requirement.batches.len(),
             group_slots.batches.len(),
         )?;
+    }
+    Ok(())
+}
+
+fn validate_merkle_slot_shape(
+    requirements: &MerkleFromLeavesRequirements,
+    slots: &MerkleFromLeavesSlots,
+) -> Result<(), PreparedCommitError> {
+    check_count(
+        "retained_layers",
+        requirements.retained_layers.len(),
+        slots.retained_layers.len(),
+    )?;
+    check_count(
+        "tail_outputs",
+        requirements.tail_outputs.len(),
+        slots.tail_outputs.len(),
+    )?;
+    if requirements.merkle_scratch_words.is_some() != slots.merkle_scratch.is_some() {
+        return Err(PreparedCommitError::SlotShapeMismatch {
+            role: "merkle_scratch",
+            expected: usize::from(requirements.merkle_scratch_words.is_some()),
+            actual: usize::from(slots.merkle_scratch.is_some()),
+        });
+    }
+    if requirements.tail_pointer_words.is_some() != slots.tail_level_ptrs.is_some() {
+        return Err(PreparedCommitError::SlotShapeMismatch {
+            role: "tail_level_ptrs",
+            expected: usize::from(requirements.tail_pointer_words.is_some()),
+            actual: usize::from(slots.tail_level_ptrs.is_some()),
+        });
     }
     Ok(())
 }

@@ -11,7 +11,12 @@ use std::collections::BTreeSet;
 use stwo::core::vcs::blake2_hash::Blake2sHash;
 
 use super::exec_context::{check_cuda, ArenaSlice, ArenaSlotId, DeviceArena};
-use super::prepared_commit::{bind_slot, CommitArenaSlotRequirement, CommitCoefficientColumn};
+use super::prepared_commit::{
+    bind_slot, merkle_from_leaves_requirements, CommitArenaSlotRequirement,
+    CommitCoefficientColumn, CommitWorkspaceConfig, CommitWorkspaceRequirements,
+    CommitWorkspaceSlots, MerkleFromLeavesRequirements, MerkleFromLeavesSlots,
+    PreparedMerkleFromLeaves,
+};
 use super::progressive_commit::{
     plan_progressive_commit, ProgressiveCommitError, ProgressiveCommitGeometry,
     ProgressiveCommitMode, ProgressiveCommitPlan, PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES,
@@ -56,6 +61,32 @@ pub struct ProgressiveLeafWorkspaceSlots {
     pub batches: Vec<ProgressiveBatchSlots>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProgressiveCommitWorkspaceRequirements {
+    pub leaves: ProgressiveLeafWorkspaceRequirements,
+    pub merkle: MerkleFromLeavesRequirements,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProgressiveCommitWorkspaceSlots {
+    pub leaves: ProgressiveLeafWorkspaceSlots,
+    pub merkle: MerkleFromLeavesSlots,
+}
+
+/// Mode-tagged workspace shapes for later production dispatch. Each variant
+/// owns exactly one leaf layout; no fake group and no dual allocation exists.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ModeAwareCommitWorkspaceRequirements {
+    FullLifting(CommitWorkspaceRequirements),
+    DomainProgressive(ProgressiveCommitWorkspaceRequirements),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ModeAwareCommitWorkspaceSlots {
+    FullLifting(CommitWorkspaceSlots),
+    DomainProgressive(ProgressiveCommitWorkspaceSlots),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProgressiveLeafLaunchKind {
     Init {
@@ -87,6 +118,7 @@ pub enum PreparedProgressiveCommitError {
     ContextMismatch(ArenaSlotId),
     MissingRetainedOutput(usize),
     UnexpectedRetainedOutput(usize),
+    GeometryMismatch,
     SlotTooSmall {
         slot: ArenaSlotId,
         required: usize,
@@ -96,6 +128,72 @@ pub enum PreparedProgressiveCommitError {
     Arena(super::exec_context::ArenaError),
     Prepared(super::prepared_commit::PreparedCommitError),
     Cuda(super::exec_context::CudaRuntimeError),
+}
+
+pub fn progressive_commit_workspace_requirements_for_mode(
+    mode: ProgressiveCommitMode,
+    config: CommitWorkspaceConfig,
+    geometry: ProgressiveCommitGeometry,
+) -> Result<ProgressiveCommitWorkspaceRequirements, PreparedProgressiveCommitError> {
+    if geometry.lifting_log_size != config.lifting_log_size
+        || geometry.log_blowup_factor != config.log_blowup_factor
+    {
+        return Err(PreparedProgressiveCommitError::GeometryMismatch);
+    }
+    Ok(ProgressiveCommitWorkspaceRequirements {
+        leaves: progressive_leaf_workspace_requirements_for_mode(mode, geometry)?,
+        merkle: merkle_from_leaves_requirements(config)?,
+    })
+}
+
+impl ProgressiveCommitWorkspaceRequirements {
+    pub fn arena_slot_requirements(
+        &self,
+        slots: &ProgressiveCommitWorkspaceSlots,
+    ) -> Result<Vec<CommitArenaSlotRequirement>, PreparedProgressiveCommitError> {
+        if slots.leaves.leaf_hashes != slots.merkle.leaves {
+            return Err(PreparedProgressiveCommitError::GeometryMismatch);
+        }
+        let mut output = self.leaves.arena_slot_requirements(&slots.leaves)?;
+        let merkle = self.merkle.arena_slot_requirements(&slots.merkle)?;
+        let mut ids = output.iter().map(|entry| entry.id).collect::<BTreeSet<_>>();
+        for entry in merkle {
+            if entry.id == slots.merkle.leaves {
+                let leaf = output
+                    .iter()
+                    .find(|candidate| candidate.id == entry.id)
+                    .ok_or(PreparedProgressiveCommitError::GeometryMismatch)?;
+                if leaf.len_words != entry.len_words {
+                    return Err(PreparedProgressiveCommitError::GeometryMismatch);
+                }
+                continue;
+            }
+            if !ids.insert(entry.id) {
+                return Err(PreparedProgressiveCommitError::AliasedSlot(entry.id));
+            }
+            output.push(entry);
+        }
+        Ok(output)
+    }
+}
+
+impl ModeAwareCommitWorkspaceRequirements {
+    pub fn arena_slot_requirements(
+        &self,
+        slots: &ModeAwareCommitWorkspaceSlots,
+    ) -> Result<Vec<CommitArenaSlotRequirement>, PreparedProgressiveCommitError> {
+        match (self, slots) {
+            (
+                Self::FullLifting(requirements),
+                ModeAwareCommitWorkspaceSlots::FullLifting(slots),
+            ) => Ok(requirements.arena_slot_requirements(slots)?),
+            (
+                Self::DomainProgressive(requirements),
+                ModeAwareCommitWorkspaceSlots::DomainProgressive(slots),
+            ) => requirements.arena_slot_requirements(slots),
+            _ => Err(PreparedProgressiveCommitError::GeometryMismatch),
+        }
+    }
 }
 
 impl core::fmt::Display for PreparedProgressiveCommitError {
@@ -715,6 +813,142 @@ impl<'a> PreparedProgressiveLeaves<'a> {
     }
 }
 
+/// Additive full commitment composed from progressive leaves and the qualified
+/// legacy Merkle suffix. Production dispatch is deliberately outside this API.
+pub struct PreparedProgressiveCommitGraph<'a> {
+    leaves: PreparedProgressiveLeaves<'a>,
+    merkle: PreparedMerkleFromLeaves<'a>,
+    retained_evaluations: Vec<Option<ArenaSlice>>,
+}
+
+impl<'a> PreparedProgressiveCommitGraph<'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare(
+        arena: &'a DeviceArena,
+        config: CommitWorkspaceConfig,
+        requirements: &ProgressiveCommitWorkspaceRequirements,
+        slots: &ProgressiveCommitWorkspaceSlots,
+        coefficients: &[CommitCoefficientColumn],
+        retained_outputs: &[Option<ArenaSlice>],
+        twiddles: ArenaSlice,
+    ) -> Result<Self, PreparedProgressiveCommitError> {
+        Self::prepare_with_interior_mode(
+            arena,
+            config,
+            requirements,
+            slots,
+            coefficients,
+            retained_outputs,
+            twiddles,
+            super::blake2s::blake2s_interior_fused_enabled(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_with_interior_mode(
+        arena: &'a DeviceArena,
+        config: CommitWorkspaceConfig,
+        requirements: &ProgressiveCommitWorkspaceRequirements,
+        slots: &ProgressiveCommitWorkspaceSlots,
+        coefficients: &[CommitCoefficientColumn],
+        retained_outputs: &[Option<ArenaSlice>],
+        twiddles: ArenaSlice,
+        interior_fused: bool,
+    ) -> Result<Self, PreparedProgressiveCommitError> {
+        let workspace = requirements.arena_slot_requirements(slots)?;
+        let workspace_ids = workspace
+            .iter()
+            .map(|entry| entry.id)
+            .collect::<BTreeSet<_>>();
+        let mut external = BTreeSet::new();
+        for source in coefficients
+            .iter()
+            .map(|column| column.coefficients)
+            .chain(retained_outputs.iter().flatten().copied())
+            .chain(core::iter::once(twiddles))
+        {
+            if workspace_ids.contains(&source.id()) || !external.insert(source.id()) {
+                return Err(PreparedProgressiveCommitError::AliasedSlot(source.id()));
+            }
+        }
+        let leaves = PreparedProgressiveLeaves::prepare(
+            arena,
+            &requirements.leaves,
+            &slots.leaves,
+            coefficients,
+            retained_outputs,
+            twiddles,
+        )?;
+        let merkle = PreparedMerkleFromLeaves::prepare_with_interior_mode(
+            arena,
+            config,
+            &requirements.merkle,
+            &slots.merkle,
+            interior_fused,
+        )?;
+        if leaves.leaf_hashes().id() != merkle.leaves().id()
+            || leaves.leaf_hashes().as_u32_ptr() != merkle.leaves().as_u32_ptr()
+        {
+            return Err(PreparedProgressiveCommitError::GeometryMismatch);
+        }
+        Ok(Self {
+            leaves,
+            merkle,
+            retained_evaluations: retained_outputs.to_vec(),
+        })
+    }
+
+    pub fn launch(&self) -> Result<(), PreparedProgressiveCommitError> {
+        self.leaves.launch()?;
+        self.merkle.launch()?;
+        Ok(())
+    }
+
+    pub fn leaf_launch_sequence(
+        &self,
+    ) -> impl ExactSizeIterator<Item = ProgressiveLeafLaunchKind> + '_ {
+        self.leaves.launch_sequence()
+    }
+
+    pub fn merkle_launch_sequence(
+        &self,
+    ) -> impl ExactSizeIterator<Item = super::commit_graph::CommitLaunchKind> + '_ {
+        self.merkle.launch_sequence()
+    }
+
+    pub fn leaf_hashes(&self) -> ArenaSlice {
+        self.leaves.leaf_hashes()
+    }
+
+    pub fn root_slice(&self) -> ArenaSlice {
+        self.merkle.root_slice()
+    }
+
+    pub fn retained_layers_bottom_up(&self) -> &[ArenaSlice] {
+        self.merkle.retained_layers_bottom_up()
+    }
+
+    pub fn retained_evaluations(&self) -> &[Option<ArenaSlice>] {
+        &self.retained_evaluations
+    }
+
+    pub fn read_root_at_transcript_boundary(
+        &self,
+    ) -> Result<Blake2sHash, PreparedProgressiveCommitError> {
+        let mut root = Blake2sHash::default();
+        let arena = self.leaves.arena;
+        unsafe {
+            arena.context().memcpy_d2h_async(
+                root.0.as_mut_ptr().cast(),
+                self.root_slice().as_void_ptr().cast_const(),
+                core::mem::size_of::<Blake2sHash>(),
+            )?;
+        }
+        arena.context().sync()?;
+        Ok(root)
+    }
+}
+
 enum HostDescriptor {
     Pointers(Vec<usize>),
     U32(Vec<u32>),
@@ -842,6 +1076,101 @@ mod tests {
         assert_eq!(
             result.unwrap_err(),
             PreparedProgressiveCommitError::Disabled
+        );
+    }
+
+    #[test]
+    fn combined_workspace_shares_exactly_the_leaf_layer_and_matches_legacy_merkle_shape() {
+        let config = CommitWorkspaceConfig {
+            log_blowup_factor: 1,
+            lifting_log_size: 8,
+            unretained_bottom_layers: 4,
+            max_fused_tail_levels: 2,
+        };
+        let geometry = ProgressiveCommitGeometry {
+            lifting_log_size: 8,
+            log_blowup_factor: 1,
+            groups: vec![ProgressiveCommitGroupGeometry {
+                coefficient_log_sizes: vec![4, 4, 6],
+                retain_evaluations: false,
+            }],
+        };
+        let combined = progressive_commit_workspace_requirements_for_mode(
+            ProgressiveCommitMode::DomainProgressive,
+            config,
+            geometry,
+        )
+        .unwrap();
+        let legacy =
+            super::super::prepared_commit::commit_workspace_requirements(config, &[vec![4, 4, 6]])
+                .unwrap();
+        let extracted = merkle_from_leaves_requirements(config).unwrap();
+        assert_eq!(combined.merkle, extracted);
+        assert_eq!(legacy.leaf_state_words, extracted.leaf_words);
+        assert_eq!(legacy.merkle_scratch_words, extracted.merkle_scratch_words);
+        assert_eq!(legacy.retained_layers, extracted.retained_layers);
+        assert_eq!(legacy.tail_outputs, extracted.tail_outputs);
+        assert_eq!(combined.leaves.leaf_hash_words, combined.merkle.leaf_words);
+
+        let slots = ProgressiveCommitWorkspaceSlots {
+            leaves: ProgressiveLeafWorkspaceSlots {
+                lde_scratch: combined.leaves.lde_scratch_words.map(|_| ArenaSlotId(1)),
+                state_ping: ArenaSlotId(2),
+                state_pong: combined.leaves.state_pong_words.map(|_| ArenaSlotId(3)),
+                leaf_hashes: ArenaSlotId(4),
+                batches: combined
+                    .leaves
+                    .batches
+                    .iter()
+                    .enumerate()
+                    .map(|(index, _)| {
+                        let base = 10 + index as u32 * 3;
+                        ProgressiveBatchSlots {
+                            coefficient_ptrs: ArenaSlotId(base),
+                            coefficient_sizes: ArenaSlotId(base + 1),
+                            output_ptrs: ArenaSlotId(base + 2),
+                        }
+                    })
+                    .collect(),
+            },
+            merkle: MerkleFromLeavesSlots {
+                leaves: ArenaSlotId(4),
+                merkle_scratch: combined
+                    .merkle
+                    .merkle_scratch_words
+                    .map(|_| ArenaSlotId(30)),
+                retained_layers: combined
+                    .merkle
+                    .retained_layers
+                    .iter()
+                    .enumerate()
+                    .map(|(index, _)| ArenaSlotId(40 + index as u32))
+                    .collect(),
+                tail_level_ptrs: combined.merkle.tail_pointer_words.map(|_| ArenaSlotId(60)),
+                tail_outputs: combined
+                    .merkle
+                    .tail_outputs
+                    .iter()
+                    .enumerate()
+                    .map(|(index, _)| ArenaSlotId(70 + index as u32))
+                    .collect(),
+            },
+        };
+        let requested = combined.arena_slot_requirements(&slots).unwrap();
+        assert_eq!(
+            requested
+                .iter()
+                .filter(|entry| entry.id == ArenaSlotId(4))
+                .count(),
+            1
+        );
+        assert_eq!(
+            requested
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            requested.len()
         );
     }
 }
