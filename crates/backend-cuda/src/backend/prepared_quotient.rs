@@ -16,6 +16,7 @@ use stwo::core::poly::circle::CanonicCoset;
 use super::exec_context::{
     check_cuda, ArenaError, ArenaSlice, ArenaSlotId, CudaRuntimeError, DeviceArena,
 };
+use super::prepared_interpolation::is_supported_interpolation_log_size;
 use crate::columns::bindings::{CirclePointSecureField, CudaSecureField};
 
 const WORD_BYTES: usize = core::mem::size_of::<u32>();
@@ -93,6 +94,7 @@ pub enum PreparedQuotientError {
         lifting_log_size: u32,
         log_blowup_factor: u32,
     },
+    UnsupportedNativeInterpolationLogSize(u32),
     EmptySources,
     TooManySources(usize),
     PartialLogSizeTooLarge {
@@ -171,13 +173,18 @@ pub fn quotient_workspace_requirements(
             log_blowup_factor: config.log_blowup_factor,
         });
     }
+    let subdomain_log_size = config.lifting_log_size - config.log_blowup_factor;
+    if !is_supported_interpolation_log_size(subdomain_log_size) {
+        return Err(
+            PreparedQuotientError::UnsupportedNativeInterpolationLogSize(subdomain_log_size),
+        );
+    }
     if partial_log_sizes.is_empty() {
         return Err(PreparedQuotientError::EmptySources);
     }
     let sample_count = partial_log_sizes.len();
     let _ = u32::try_from(sample_count)
         .map_err(|_| PreparedQuotientError::TooManySources(sample_count))?;
-    let subdomain_log_size = config.lifting_log_size - config.log_blowup_factor;
     for (source, &log_size) in partial_log_sizes.iter().enumerate() {
         if log_size > subdomain_log_size {
             return Err(PreparedQuotientError::PartialLogSizeTooLarge {
@@ -815,6 +822,38 @@ mod tests {
                 subdomain_log_size: 6
             }
         );
+    }
+
+    #[test]
+    fn requirements_reject_subdomains_unsupported_by_native_interpolation() {
+        for (lifting_log_size, log_blowup_factor, subdomain_log_size) in
+            [(2, 1, 1), (3, 1, 2), (4, 2, 2)]
+        {
+            assert_eq!(
+                quotient_workspace_requirements(
+                    QuotientWorkspaceConfig {
+                        lifting_log_size,
+                        log_blowup_factor,
+                    },
+                    &[1],
+                ),
+                Err(
+                    PreparedQuotientError::UnsupportedNativeInterpolationLogSize(
+                        subdomain_log_size,
+                    )
+                )
+            );
+        }
+
+        let requirements = quotient_workspace_requirements(
+            QuotientWorkspaceConfig {
+                lifting_log_size: 4,
+                log_blowup_factor: 1,
+            },
+            &[3],
+        )
+        .unwrap();
+        assert_eq!(requirements.subdomain_log_size, 3);
     }
 
     #[test]

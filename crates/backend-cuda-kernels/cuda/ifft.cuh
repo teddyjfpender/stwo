@@ -42,8 +42,8 @@ void interpolate(int eval_domain_size, m31 *values, m31 *inverse_twiddles_tree, 
 extern "C"
 void interpolate_columns(int eval_domain_size, m31 **values, m31 *inverse_twiddles_tree, int inverse_twiddles_size, int values_size, int number_of_rows);
 
-// Allocation-free inverse transform. `device_values` is a device-resident
-// pointer table and all stages launch on `stream`.
+// Allocation-free inverse transform for 3 <= log_n <= 30. `device_values` is
+// a device-resident pointer table and all stages launch on `stream`.
 extern "C"
 int stwo_ntt_b2n_columns_on(
         uint32_t **device_values,
@@ -55,11 +55,11 @@ int stwo_ntt_b2n_columns_on(
         void *stream
 );
 
-// Allocation-free inverse transform with separate pointer tables. An input may
-// exactly alias its paired output: each init tile completes all reads before
-// its first write. Partial and cross-column aliases are forbidden by the Rust
-// binder. Every later interval runs in-place on `outputs`; all launches use
-// `stream`.
+// Allocation-free inverse transform for 3 <= log_n <= 30 with separate pointer
+// tables. An input may exactly alias its paired output: each init tile completes
+// all reads before its first write. Partial and cross-column aliases are
+// forbidden by the Rust binder. Every later interval runs in-place on `outputs`;
+// all launches use `stream`.
 extern "C"
 int stwo_ntt_b2n_columns_out_of_place_on(
         const uint32_t *const *inputs,

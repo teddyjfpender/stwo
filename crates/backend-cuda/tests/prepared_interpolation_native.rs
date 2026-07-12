@@ -1,4 +1,5 @@
-//! Native CUDA differential for resident interpolation with exact aliases.
+//! Native CUDA differential for resident interpolation with exact aliases on
+//! the supported log-size range 3 through 30.
 //!
 //! Hardware admission must require exactly one passed test from this target. A
 //! stub build compiles zero tests, so a host-only pass is not CUDA evidence.
@@ -16,7 +17,8 @@ use stwo::prover::poly::BitReversedOrder;
 use stwo_backend_cuda::{
     b2n_stage_intervals, gpu_memory_info, ArenaLayout, ArenaSlice, ArenaSlotId, ArenaSlotSpec,
     CudaBackend, CudaExecContext, DeviceArena, InterpolationBatch, InterpolationColumn,
-    InterpolationLaunchMode, PreparedInterpolationGraph, INTERPOLATION_POINTER_ALIGNMENT_WORDS,
+    InterpolationLaunchMode, PreparedInterpolationError, PreparedInterpolationGraph,
+    INTERPOLATION_POINTER_ALIGNMENT_WORDS,
 };
 
 const MAX_LOG_SIZE: u32 = 30;
@@ -53,6 +55,11 @@ const CORE_PATTERNS: [InputPattern; 3] = [
     InputPattern::Zero,
     InputPattern::CarryHeavy,
     InputPattern::Random(RANDOM_SEED_0),
+];
+
+const STAGEWISE_PATTERNS: [InputPattern; 2] = [
+    InputPattern::Random(RANDOM_SEED_0),
+    InputPattern::CarryHeavy,
 ];
 
 const EXHAUSTIVE_PATTERNS: [InputPattern; 11] = [
@@ -340,16 +347,10 @@ fn assert_exact_word_parity(
     }
 }
 
-fn interpolation_for_log(
+fn interpolation_batch_for_log(
     arena: &DeviceArena,
     log_size: u32,
-    mode: InterpolationLaunchMode,
-) -> (
-    PreparedInterpolationGraph<'_>,
-    ArenaSlice,
-    ArenaSlice,
-    ArenaSlice,
-) {
+) -> (InterpolationBatch, ArenaSlice, ArenaSlice, ArenaSlice) {
     let words = 1usize << log_size;
     let aliased = arena.bind(ALIASED_VALUES).unwrap().truncated(words);
     let distinct_evaluations = arena.bind(DISTINCT_EVALUATIONS).unwrap().truncated(words);
@@ -370,6 +371,21 @@ fn interpolation_for_log(
         input_pointers: INPUT_POINTERS,
         output_pointers: OUTPUT_POINTERS,
     };
+    (batch, aliased, distinct_evaluations, distinct_coefficients)
+}
+
+fn interpolation_for_log(
+    arena: &DeviceArena,
+    log_size: u32,
+    mode: InterpolationLaunchMode,
+) -> (
+    PreparedInterpolationGraph<'_>,
+    ArenaSlice,
+    ArenaSlice,
+    ArenaSlice,
+) {
+    let (batch, aliased, distinct_evaluations, distinct_coefficients) =
+        interpolation_batch_for_log(arena, log_size);
     let prepared = PreparedInterpolationGraph::prepare(
         arena,
         &[batch],
@@ -387,56 +403,77 @@ fn interpolation_for_log(
     )
 }
 
-fn stagewise_exact_alias_matches_distinct_through_cpu_oracle_boundary() {
-    let arena = arena(CPU_ORACLE_MAX_LOG_SIZE);
-    upload_inverse_twiddles(&arena, CPU_ORACLE_MAX_LOG_SIZE);
-    let cpu_twiddles = CpuBackend::precompute_twiddles(
-        CanonicCoset::new(CPU_ORACLE_MAX_LOG_SIZE)
-            .circle_domain()
-            .half_coset,
-    );
-
-    for log_size in 1..=CPU_ORACLE_MAX_LOG_SIZE {
+fn exercise_supported_logs(
+    arena: &DeviceArena,
+    cpu_twiddles: &TwiddleTree<CpuBackend>,
+    mode: InterpolationLaunchMode,
+) {
+    for log_size in 3..=MAX_LOG_SIZE {
         let (prepared, aliased, distinct_evaluations, distinct_coefficients) =
-            interpolation_for_log(
-                &arena,
-                log_size,
-                InterpolationLaunchMode::StageWiseCopyThenInPlace,
-            );
-        let eager = InputPattern::Random(RANDOM_SEED_0);
-        upload_equal_inputs(&arena, aliased, distinct_evaluations, log_size, eager);
+            interpolation_for_log(arena, log_size, mode);
+        let patterns = match mode {
+            InterpolationLaunchMode::StageWiseCopyThenInPlace => &STAGEWISE_PATTERNS,
+            InterpolationLaunchMode::StageFusedOutOfPlace => patterns_for_log(log_size),
+        };
+
+        let eager = patterns[0];
+        upload_equal_inputs(arena, aliased, distinct_evaluations, log_size, eager);
         prepared.launch().unwrap();
-        let expected = cpu_ifft(eager, log_size, &cpu_twiddles);
+        let expected =
+            (log_size <= CPU_ORACLE_MAX_LOG_SIZE).then(|| cpu_ifft(eager, log_size, cpu_twiddles));
         assert_exact_word_parity(
-            &arena,
+            arena,
             aliased,
             distinct_coefficients,
             log_size,
             eager.name(),
-            Some(&expected),
+            expected.as_deref(),
         );
 
         let capture = arena.context().capture().unwrap();
         prepared.launch().unwrap();
         let graph = capture.finish().unwrap();
-        assert_eq!(graph.kernel_nodes(), u64::from(log_size));
-        let replay = InputPattern::CarryHeavy;
-        upload_equal_inputs(&arena, aliased, distinct_evaluations, log_size, replay);
-        graph.launch(arena.context()).unwrap();
-        let expected = cpu_ifft(replay, log_size, &cpu_twiddles);
-        assert_exact_word_parity(
-            &arena,
-            aliased,
-            distinct_coefficients,
-            log_size,
-            replay.name(),
-            Some(&expected),
+        let expected_nodes = match mode {
+            InterpolationLaunchMode::StageWiseCopyThenInPlace => u64::from(log_size),
+            InterpolationLaunchMode::StageFusedOutOfPlace => {
+                b2n_stage_intervals(log_size).unwrap().len() as u64
+            }
+        };
+        assert_eq!(
+            graph.kernel_nodes(),
+            expected_nodes,
+            "unexpected {mode:?} topology at log {log_size}",
         );
+
+        for &pattern in &patterns[1..] {
+            upload_equal_inputs(arena, aliased, distinct_evaluations, log_size, pattern);
+            graph.launch(arena.context()).unwrap();
+            let expected = (log_size <= CPU_ORACLE_MAX_LOG_SIZE)
+                .then(|| cpu_ifft(pattern, log_size, cpu_twiddles));
+            assert_exact_word_parity(
+                arena,
+                aliased,
+                distinct_coefficients,
+                log_size,
+                pattern.name(),
+                expected.as_deref(),
+            );
+        }
+
+        if matches!(log_size, 17 | 18 | 30) {
+            eprintln!(
+                "{mode:?} interpolation boundary log {log_size}: {} patterns passed exact alias parity; CPU oracle={}",
+                patterns.len(),
+                log_size <= CPU_ORACLE_MAX_LOG_SIZE,
+            );
+        }
     }
 }
 
 #[test]
-fn fused_exact_alias_matches_distinct_for_logs_1_through_30() {
+fn exact_alias_matches_distinct_for_supported_logs_3_through_30() {
+    assert_eq!(b2n_stage_intervals(1), None);
+    assert_eq!(b2n_stage_intervals(2), None);
     assert_eq!(b2n_stage_intervals(17), Some(vec![9, 8]));
     assert_eq!(b2n_stage_intervals(18), Some(vec![10, 8]));
     assert_eq!(b2n_stage_intervals(30), Some(vec![1; 30]));
@@ -450,16 +487,32 @@ fn fused_exact_alias_matches_distinct_for_logs_1_through_30() {
         total_bytes as f64 / (1u64 << 30) as f64,
     );
 
-    // Keep this target at one counted test while isolating the default
-    // copy-then-in-place path in a small log-18 arena first.
-    stagewise_exact_alias_matches_distinct_through_cpu_oracle_boundary();
-
     // Generate the real inverse-twiddle tower once on-device. The legacy
     // producer is fenced before its result crosses onto the proof-owned stream.
-    // One maximum-size arena is reused serially. This keeps the explicit log-30
-    // boundary below 20 GiB while every prepared graph still sees its exact
-    // logical extent.
+    // One maximum-size arena and twiddle upload are reused serially by both
+    // launch modes. This keeps the explicit log-30 boundary below 20 GiB while
+    // every prepared graph still sees its exact logical extent.
     let arena = arena(MAX_LOG_SIZE);
+
+    for mode in [
+        InterpolationLaunchMode::StageWiseCopyThenInPlace,
+        InterpolationLaunchMode::StageFusedOutOfPlace,
+    ] {
+        for log_size in [1, 2] {
+            let (batch, ..) = interpolation_batch_for_log(&arena, log_size);
+            assert_eq!(
+                PreparedInterpolationGraph::prepare(
+                    &arena,
+                    &[batch],
+                    arena.bind(INVERSE_TWIDDLES).unwrap(),
+                    mode,
+                )
+                .err(),
+                Some(PreparedInterpolationError::InvalidLogSize { batch: 0, log_size }),
+            );
+        }
+    }
+
     upload_inverse_twiddles(&arena, MAX_LOG_SIZE);
 
     // Exhaustive host-oracle coverage stops at log 18: it includes both the
@@ -474,73 +527,15 @@ fn fused_exact_alias_matches_distinct_for_logs_1_through_30() {
             .half_coset,
     );
 
-    let mut log_30_patterns = 0usize;
-    for log_size in 1..=MAX_LOG_SIZE {
-        let (prepared, aliased, distinct_evaluations, distinct_coefficients) =
-            interpolation_for_log(
-                &arena,
-                log_size,
-                InterpolationLaunchMode::StageFusedOutOfPlace,
-            );
-        let patterns = patterns_for_log(log_size);
-        if log_size == MAX_LOG_SIZE {
-            log_30_patterns += patterns.len();
-        }
-
-        let eager_pattern = patterns[0];
-        upload_equal_inputs(
-            &arena,
-            aliased,
-            distinct_evaluations,
-            log_size,
-            eager_pattern,
-        );
-        prepared.launch().unwrap();
-        let expected = (log_size <= CPU_ORACLE_MAX_LOG_SIZE)
-            .then(|| cpu_ifft(eager_pattern, log_size, &cpu_twiddles));
-        assert_exact_word_parity(
-            &arena,
-            aliased,
-            distinct_coefficients,
-            log_size,
-            eager_pattern.name(),
-            expected.as_deref(),
-        );
-
-        let capture = arena.context().capture().unwrap();
-        prepared.launch().unwrap();
-        let graph = capture.finish().unwrap();
-        assert_eq!(
-            graph.kernel_nodes(),
-            b2n_stage_intervals(log_size).unwrap().len() as u64,
-            "unexpected fused topology at log {log_size}",
-        );
-
-        for &pattern in &patterns[1..] {
-            upload_equal_inputs(&arena, aliased, distinct_evaluations, log_size, pattern);
-            graph.launch(arena.context()).unwrap();
-            let expected = (log_size <= CPU_ORACLE_MAX_LOG_SIZE)
-                .then(|| cpu_ifft(pattern, log_size, &cpu_twiddles));
-            assert_exact_word_parity(
-                &arena,
-                aliased,
-                distinct_coefficients,
-                log_size,
-                pattern.name(),
-                expected.as_deref(),
-            );
-        }
-
-        // Logs 17 and 18 are the block-init/warp continuation boundaries;
-        // log 30 is the largest supported stagewise-fallback boundary. The
-        // loop and topology assertion above exercise all three explicitly.
-        if matches!(log_size, 17 | 18 | 30) {
-            eprintln!(
-                "fused interpolation boundary log {log_size}: {} patterns passed exact alias parity; CPU oracle={}",
-                patterns.len(),
-                log_size <= CPU_ORACLE_MAX_LOG_SIZE,
-            );
-        }
-    }
-    assert_eq!(log_30_patterns, CORE_PATTERNS.len());
+    exercise_supported_logs(
+        &arena,
+        &cpu_twiddles,
+        InterpolationLaunchMode::StageWiseCopyThenInPlace,
+    );
+    exercise_supported_logs(
+        &arena,
+        &cpu_twiddles,
+        InterpolationLaunchMode::StageFusedOutOfPlace,
+    );
+    assert_eq!(patterns_for_log(MAX_LOG_SIZE), CORE_PATTERNS);
 }

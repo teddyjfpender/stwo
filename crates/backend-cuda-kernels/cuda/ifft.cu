@@ -860,7 +860,7 @@ static cudaError_t ntt_b2n_native_device_batch_on(
         unsigned eval_domain_size,
         cudaStream_t stream) {
     if (device_values == nullptr || g_twiddles == nullptr || stream == nullptr ||
-        log_n == 0 || log_n > 30 || num_poly == 0 ||
+        log_n < 3 || log_n > 30 || num_poly == 0 ||
         eval_domain_size != (1u << (log_n - 1)) ||
         eval_domain_size > twiddles_size) {
         return cudaErrorInvalidValue;
@@ -907,7 +907,7 @@ extern "C" int stwo_ntt_b2n_columns_on(
         uint32_t eval_domain_size,
         void *stream) {
     if (device_values == nullptr || g_twiddles == nullptr || stream == nullptr ||
-        log_n == 0 || log_n > 30 || num_poly == 0 ||
+        log_n < 3 || log_n > 30 || num_poly == 0 ||
         eval_domain_size != (1u << (log_n - 1)) ||
         eval_domain_size > twiddles_size) {
         return cudaErrorInvalidValue;
@@ -1107,7 +1107,7 @@ extern "C" int stwo_ntt_b2n_columns_out_of_place_on(
     uint32_t num_poly, const uint32_t *g_twiddles, uint32_t twiddles_size,
     uint32_t eval_domain_size, void *stream_raw) {
     if (inputs == nullptr || outputs == nullptr || g_twiddles == nullptr ||
-        stream_raw == nullptr || log_n == 0 || log_n > 30 || num_poly == 0 ||
+        stream_raw == nullptr || log_n < 3 || log_n > 30 || num_poly == 0 ||
         eval_domain_size != (1u << (log_n - 1)) ||
         eval_domain_size > twiddles_size)
         return (int)cudaErrorInvalidValue;

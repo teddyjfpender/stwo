@@ -965,7 +965,8 @@ extern "C" {
         eval_domain_size: u32,
     );
 
-    /// Allocation-free B2N transform using a device pointer table and explicit stream.
+    /// Allocation-free B2N transform for logs 3 through 30 using a device
+    /// pointer table and explicit stream.
     pub fn stwo_ntt_b2n_columns_on(
         device_values: *const *mut u32,
         log_n: u32,
@@ -976,8 +977,9 @@ extern "C" {
         stream: *mut c_void,
     ) -> i32;
 
-    /// Allocation-free B2N transform using separate input/output pointer tables
-    /// on an explicit stream. Each input may exactly alias its paired output.
+    /// Allocation-free B2N transform for logs 3 through 30 using separate
+    /// input/output pointer tables on an explicit stream. Each input may
+    /// exactly alias its paired output.
     pub fn stwo_ntt_b2n_columns_out_of_place_on(
         inputs: *const *const u32,
         outputs: *const *mut u32,

@@ -6,7 +6,8 @@
 //! exactly in either launch mode. Setup binds and uploads immutable input/output
 //! pointer tables once. Replay uses one sealed launch mode: the proven
 //! copy-then-in-place path, or the opt-in stage-fused path. Both run on the
-//! proof-owned stream.
+//! proof-owned stream. Prepared interpolation supports domain logs 3 through
+//! 30; smaller domains require the legacy backend's CPU fallback.
 
 use core::ffi::c_void;
 use std::collections::BTreeSet;
@@ -45,6 +46,9 @@ impl InterpolationLaunchMode {
 /// Audited stage intervals mirrored by `LAUNCH_B2N_CONFIG_*` in `ifft.cuh`.
 /// Logs outside the fused range deliberately use one interval per stage.
 pub fn b2n_stage_intervals(log_n: u32) -> Option<Vec<u32>> {
+    if !is_supported_interpolation_log_size(log_n) {
+        return None;
+    }
     let intervals = match log_n {
         13 => vec![7, 6],
         14 => vec![8, 6],
@@ -63,10 +67,25 @@ pub fn b2n_stage_intervals(log_n: u32) -> Option<Vec<u32>> {
         27 => vec![7, 8, 6, 6],
         28 => vec![8, 8, 6, 6],
         29 => vec![7, 8, 8, 6],
-        1..=12 | 30 => vec![1; log_n as usize],
-        _ => return None,
+        3..=12 | 30 => vec![1; log_n as usize],
+        _ => unreachable!("supported interpolation log has a stage partition"),
     };
     Some(intervals)
+}
+
+pub(super) const fn is_supported_interpolation_log_size(log_size: u32) -> bool {
+    matches!(log_size, 3..=30)
+}
+
+fn validate_interpolation_log_size(
+    batch: usize,
+    log_size: u32,
+) -> Result<(), PreparedInterpolationError> {
+    if is_supported_interpolation_log_size(log_size) {
+        Ok(())
+    } else {
+        Err(PreparedInterpolationError::InvalidLogSize { batch, log_size })
+    }
 }
 
 pub fn b2n_chunk_ranges(column_count: usize) -> Vec<core::ops::Range<usize>> {
@@ -336,12 +355,7 @@ fn validate_batches(
         let Some(first) = batch.columns.first() else {
             return Err(PreparedInterpolationError::EmptyBatch(batch_index));
         };
-        if !(1..=30).contains(&first.log_size) {
-            return Err(PreparedInterpolationError::InvalidLogSize {
-                batch: batch_index,
-                log_size: first.log_size,
-            });
-        }
+        validate_interpolation_log_size(batch_index, first.log_size)?;
         let required_words = pow2(first.log_size)?;
         max_twiddle_words = max_twiddle_words.max(required_words / 2);
 
@@ -658,8 +672,23 @@ mod tests {
     }
 
     #[test]
-    fn fused_stage_intervals_cover_every_stage_once_and_rescale_once() {
-        for log_n in 1..=30 {
+    fn prepared_log_size_boundary_is_fail_closed() {
+        for log_size in [3, 30] {
+            assert_eq!(validate_interpolation_log_size(7, log_size), Ok(()));
+            assert!(b2n_stage_intervals(log_size).is_some());
+        }
+        for log_size in [0, 1, 2, 31] {
+            assert_eq!(
+                validate_interpolation_log_size(7, log_size),
+                Err(PreparedInterpolationError::InvalidLogSize { batch: 7, log_size })
+            );
+            assert_eq!(b2n_stage_intervals(log_size), None);
+        }
+    }
+
+    #[test]
+    fn fused_stage_intervals_cover_every_supported_stage_once_and_rescale_once() {
+        for log_n in 3..=30 {
             let intervals = b2n_stage_intervals(log_n).unwrap();
             assert_eq!(intervals.iter().sum::<u32>(), log_n);
             let mut next = 1;
@@ -673,8 +702,6 @@ mod tests {
             assert_eq!(next, log_n + 1);
             assert_eq!(final_intervals, 1);
         }
-        assert_eq!(b2n_stage_intervals(0), None);
-        assert_eq!(b2n_stage_intervals(31), None);
     }
 
     #[test]
