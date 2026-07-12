@@ -1843,6 +1843,56 @@ mod tests {
     }
 
     #[test]
+    fn recompute_topology_preserves_mixed_coefficient_and_evaluation_logs() {
+        let requirements = decommit_workspace_requirements(DecommitWorkspaceConfig {
+            query_log_size: 5,
+            n_queries: 4,
+            trees: vec![DecommitTreeGeometry::Trace(TraceDecommitGeometry {
+                role: TraceTreeRole::Composition,
+                tree_query_log_size: 5,
+                leaf_log_size: 5,
+                unretained_bottom_layers: 2,
+                groups: vec![TraceSourceGroupGeometry {
+                    mode: DecommitSourceMode::RecomputeQueriedLde,
+                    columns: vec![
+                        DecommitColumnGeometry {
+                            coefficient_log_size: 2,
+                            evaluation_log_size: 4,
+                        },
+                        DecommitColumnGeometry {
+                            coefficient_log_size: 3,
+                            evaluation_log_size: 4,
+                        },
+                        DecommitColumnGeometry {
+                            coefficient_log_size: 4,
+                            evaluation_log_size: 5,
+                        },
+                    ],
+                }],
+            })],
+        })
+        .unwrap();
+        let DecommitTreeRequirements::Trace(tree) = &requirements.trees[0] else {
+            panic!("trace")
+        };
+        let group = &tree.groups[0];
+        let DecommitTreeGeometry::Trace(geometry) = &requirements.config.trees[0] else {
+            panic!("trace geometry")
+        };
+        assert_eq!(
+            geometry.groups[0]
+                .columns
+                .iter()
+                .map(|column| (column.coefficient_log_size, column.evaluation_log_size))
+                .collect::<Vec<_>>(),
+            [(2, 4), (3, 4), (4, 5)]
+        );
+        assert_eq!(group.lde_batches, [(0, 2, 4), (2, 1, 5)]);
+        assert_eq!(group.coefficient_size_words, Some(3));
+        assert_eq!(group.lde_tile_words, Some(64));
+    }
+
+    #[test]
     fn canonical_order_and_hash_group_boundaries_fail_closed() {
         let mut bad_order = DecommitWorkspaceConfig {
             query_log_size: 10,
@@ -1902,6 +1952,40 @@ mod tests {
         let packed: Vec<_> = expected.iter().map(|position| position >> 2).collect();
         let packed: Vec<_> = BTreeSet::from_iter(packed).into_iter().collect();
         assert_eq!(packed, vec![0, 2, 3]);
+    }
+
+    #[test]
+    fn packed_fri_fold_three_geometry_covers_duplicate_coset_boundaries() {
+        let requirements = decommit_workspace_requirements(DecommitWorkspaceConfig {
+            query_log_size: 12,
+            n_queries: 5,
+            trees: vec![DecommitTreeGeometry::Fri(FriDecommitGeometry {
+                fri_tree_index: 0,
+                evaluation_log_size: 12,
+                cumulative_fold: 0,
+                outgoing_fold_step: 3,
+                log_rows_per_leaf: 2,
+            })],
+        })
+        .unwrap();
+        let DecommitTreeRequirements::Fri(tree) = &requirements.trees[0] else {
+            panic!("fri")
+        };
+        assert_eq!(tree.max_expanded_positions, 5 * 8);
+        assert_eq!(tree.coordinate_pointer_words, 8);
+
+        let queries = [0u32, 7, 8, 8, 15];
+        let cosets = queries
+            .iter()
+            .map(|query| query >> 3)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(cosets, [0, 1].into_iter().collect());
+        let packed_leaves = cosets
+            .into_iter()
+            .flat_map(|coset| (coset << 3)..((coset + 1) << 3))
+            .map(|position| position >> 2)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(packed_leaves, [0, 1, 2, 3].into_iter().collect());
     }
 
     #[test]

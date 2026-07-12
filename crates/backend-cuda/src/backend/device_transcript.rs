@@ -32,6 +32,15 @@ const FNV_PRIME: u64 = 0x100000001b3;
 const MAX_BLAKE_MIX_WORDS: usize = (u32::MAX as usize - 32) / WORD_BYTES;
 const MAX_SEED_DRAWS: u32 = 1 << 20;
 
+fn query_position(word: u32, log_domain_size: u32) -> u32 {
+    let mask = if log_domain_size == 0 {
+        0
+    } else {
+        (1u32 << log_domain_size) - 1
+    };
+    word & mask
+}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct TranscriptInputId(pub u32);
 
@@ -1263,17 +1272,12 @@ pub fn replay_blake2s_reference(
                 n_queries,
                 ..
             } => {
-                let mask = if log_domain_size == 0 {
-                    0
-                } else {
-                    (1u32 << log_domain_size) - 1
-                };
                 let output_start = output_words.len();
                 let query_count =
                     usize::try_from(n_queries).map_err(|_| DeviceTranscriptError::SizeOverflow)?;
                 while output_words.len() - output_start < query_count {
                     for word in channel.draw_u32s() {
-                        output_words.push(word & mask);
+                        output_words.push(query_position(word, log_domain_size));
                         if output_words.len() - output_start == query_count {
                             break;
                         }
@@ -1555,6 +1559,24 @@ mod tests {
         let changed =
             Blake2sTranscriptSchedule::new(TranscriptStart::Default, operations, 64).unwrap();
         assert_ne!(schedule.protocol_key(), changed.protocol_key());
+    }
+
+    #[test]
+    fn host_query_oracle_preserves_draw_order_dedups_and_masks_high_bits() {
+        let words = [
+            0x8000_0007,
+            0x4000_0007,
+            0x2000_0003,
+            0x1000_0007,
+            0x0800_0003,
+        ];
+        let raw = words.map(|word| query_position(word, 3));
+        assert_eq!(raw, [7, 7, 3, 7, 3]);
+        assert_eq!(
+            BTreeSet::from_iter(raw).into_iter().collect::<Vec<_>>(),
+            [3, 7]
+        );
+        assert_eq!(query_position(u32::MAX, 0), 0);
     }
 
     #[test]

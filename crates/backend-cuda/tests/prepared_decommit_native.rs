@@ -172,9 +172,9 @@ fn aux_words(
 fn eager_and_captured_trace_and_fri_decommit_match_cpu_layout() {
     const LOG_SIZE: u32 = 4;
     const TRACE_UNRETAINED: u32 = 2;
-    let raw_queries = [3u32, 1];
+    let raw_queries = [7u32, 7, 3, 7, 3];
     let trace_column: Vec<_> = (0..1 << LOG_SIZE)
-        .map(|value| BaseField::from_u32_unchecked(if value == 1 { P } else { value as u32 + 11 }))
+        .map(|value| BaseField::from_u32_unchecked(if value == 3 { P } else { value as u32 + 11 }))
         .collect();
     let trace_tree = MerkleProverLifted::<CpuBackend, Blake2sMerkleHasher>::commit(
         vec![&trace_column],
@@ -215,7 +215,7 @@ fn eager_and_captured_trace_and_fri_decommit_match_cpu_layout() {
                 fri_tree_index: 0,
                 evaluation_log_size: LOG_SIZE,
                 cumulative_fold: 0,
-                outgoing_fold_step: 1,
+                outgoing_fold_step: 3,
                 log_rows_per_leaf: 0,
             }),
         ],
@@ -310,9 +310,9 @@ fn eager_and_captured_trace_and_fri_decommit_match_cpu_layout() {
     let captured = prepared.read_assembly_once().unwrap();
     assert_eq!(eager.words(), captured.words(), "captured layout drift");
     assert_eq!(eager.raw_queries(), raw_queries);
-    assert_eq!(eager.unique_queries(), [1, 3]);
+    assert_eq!(eager.unique_queries(), [3, 7]);
 
-    let sorted_queries = [1usize, 3];
+    let sorted_queries = [3usize, 7];
     let (trace_values, trace_decommitment) =
         trace_tree.decommit(&sorted_queries, vec![&trace_column]);
     let trace_meta = eager.trees[0];
@@ -334,7 +334,7 @@ fn eager_and_captured_trace_and_fri_decommit_match_cpu_layout() {
         aux_words(&trace_decommitment.aux.all_node_values, LOG_SIZE)
     );
 
-    let expanded = [0usize, 1, 2, 3];
+    let expanded = (0usize..8).collect::<Vec<_>>();
     let (_, fri_decommitment) = fri_tree.decommit(&expanded, Vec::new());
     let fri_meta = eager.trees[1];
     let query_set = BTreeSet::from(sorted_queries);

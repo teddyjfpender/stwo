@@ -1423,4 +1423,30 @@ mod tests {
             Err(Blake2sProofAssemblyError::InvalidColumnPermutation(3))
         ));
     }
+
+    #[test]
+    fn preprocessed_projection_preserves_downmap_collisions_until_merkle_walk() {
+        assert_eq!(map_trace_queries(&[0, 1, 2, 3], 9, 12), [0, 1, 16, 17]);
+
+        let mapped = map_trace_queries(&[0, 1, 2, 3, 4], 12, 9);
+        assert_eq!(mapped, [0, 1, 0, 1, 0]);
+        let walk = BTreeSet::from_iter(mapped.iter().copied())
+            .into_iter()
+            .collect::<Vec<_>>();
+        assert_eq!(walk, [0, 1]);
+        assert_eq!(merkle_topology(&walk, 9), merkle_topology(&[0, 1], 9));
+    }
+
+    #[test]
+    fn packed_fri_fold_three_dedups_cosets_across_boundaries() {
+        let queries = [0, 0, 7, 8, 8, 15, 16, 17];
+        let expanded = expanded_fri_positions(&queries, 3);
+        assert_eq!(expanded, (0..24).collect::<Vec<_>>());
+        assert_eq!(
+            BTreeSet::from_iter(expanded.iter().map(|position| position >> 2))
+                .into_iter()
+                .collect::<Vec<_>>(),
+            [0, 1, 2, 3, 4, 5]
+        );
+    }
 }
