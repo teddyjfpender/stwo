@@ -149,6 +149,16 @@ pub use backend::prepared_witness_input::{
     WitnessInputSeedRequirements, WitnessInputSeedSlots, WITNESS_INPUT_GATHER_DESCRIPTOR_WORDS,
     WITNESS_INPUT_GATHER_PACKED_LANES, WITNESS_INPUT_GATHER_POINTER_ALIGNMENT_WORDS,
 };
+pub use backend::progressive_commit::{
+    full_lifting_leaf_oracle, lifted_column_index, merkle_root, plan_progressive_commit,
+    progressive_commit_cache_key, progressive_leaf_oracle, Blake2sStateExpansion,
+    CanonicalLeafBlock, ProgressiveBlockSegment, ProgressiveColumn, ProgressiveCommitAccounting,
+    ProgressiveCommitError, ProgressiveCommitGeometry, ProgressiveCommitGroupGeometry,
+    ProgressiveCommitMode, ProgressiveCommitPlan, SameLogLdeBatch, StateExpansion,
+    BLAKE2S_BLOCK_BYTES, PROGRESSIVE_BLAKE2S_COUNTER_OFFSET, PROGRESSIVE_BLAKE2S_FLAGS_OFFSET,
+    PROGRESSIVE_BLAKE2S_H_OFFSET, PROGRESSIVE_BLAKE2S_PENDING_BLOCK_OFFSET,
+    PROGRESSIVE_BLAKE2S_PENDING_LEN_OFFSET, PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES,
+};
 pub use backend::proof_assembly::{
     assemble_blake2s_stark_proof, Blake2sFriAssemblyShape, Blake2sProofAssemblyError,
     Blake2sProofAssemblyInput, Blake2sProofAssemblyShape, Blake2sTraceAssemblyShape,

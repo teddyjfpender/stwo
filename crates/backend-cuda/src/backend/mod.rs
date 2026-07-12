@@ -41,6 +41,7 @@ pub mod prepared_quotient_numerator;
 pub mod prepared_witness;
 pub mod prepared_witness_feed;
 pub mod prepared_witness_input;
+pub mod progressive_commit;
 pub mod proof_assembly;
 mod quotient;
 pub mod relation_graph;
