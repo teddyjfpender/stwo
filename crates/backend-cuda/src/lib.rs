@@ -107,6 +107,12 @@ pub use backend::prepared_pow::{
     Blake2sPowWorkspaceRequirements, Blake2sPowWorkspaceSlots, PreparedBlake2sPowError,
     PreparedBlake2sPowGraph, POW_GRIND_LOW_BITS, POW_NONCE_WORDS, POW_U64_ALIGNMENT_WORDS,
 };
+pub use backend::prepared_progressive_commit::{
+    progressive_leaf_workspace_requirements, progressive_leaf_workspace_requirements_for_mode,
+    progressive_prepare_mode_admission, PreparedProgressiveCommitError, PreparedProgressiveLeaves,
+    ProgressiveBatchRequirements, ProgressiveBatchSlots, ProgressiveLeafLaunchKind,
+    ProgressiveLeafWorkspaceRequirements, ProgressiveLeafWorkspaceSlots,
+};
 pub use backend::prepared_quotient::{
     quotient_workspace_requirements, PreparedQuotientError, PreparedQuotientGraph,
     QuotientArenaSlotRequirement, QuotientNumeratorSource, QuotientSampleConstants,

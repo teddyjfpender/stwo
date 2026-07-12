@@ -36,6 +36,7 @@ pub mod prepared_interpolation;
 pub mod prepared_memory_trace;
 pub mod prepared_oods;
 pub mod prepared_pow;
+pub mod prepared_progressive_commit;
 pub mod prepared_quotient;
 pub mod prepared_quotient_numerator;
 pub mod prepared_witness;

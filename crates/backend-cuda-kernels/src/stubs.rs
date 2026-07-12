@@ -1225,6 +1225,47 @@ pub unsafe extern "C" fn stwo_blake2s_leaf_init_on(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_blake2s_progressive_init_on(
+    _size: u32,
+    _states: *mut crate::raw::ProgressiveBlake2sState,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_blake2s_progressive_init_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_blake2s_progressive_absorb_on(
+    _size: u32,
+    _number_of_columns: u32,
+    _columns: *const *mut u32,
+    _states: *mut crate::raw::ProgressiveBlake2sState,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_blake2s_progressive_absorb_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_blake2s_progressive_expand_on(
+    _from_log_size: u32,
+    _to_log_size: u32,
+    _states_in: *const crate::raw::ProgressiveBlake2sState,
+    _states_out: *mut crate::raw::ProgressiveBlake2sState,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_blake2s_progressive_expand_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_blake2s_progressive_finalize_on(
+    _size: u32,
+    _states: *const crate::raw::ProgressiveBlake2sState,
+    _result: *mut crate::raw::Blake2sHash,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_blake2s_progressive_finalize_on")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stwo_blake2s_leaf_update_on(
     _size: u32,
     _group_n_cols: u32,

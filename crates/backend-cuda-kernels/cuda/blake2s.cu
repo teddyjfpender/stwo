@@ -135,6 +135,121 @@ __device__ void blake2s_finalize(Blake2sState* S, Blake2sHash* out) {
     }
 }
 
+// Full-state progressive lane.  Unlike the legacy streaming leaf path, this
+// state is clonable across circle-domain rises and therefore carries the
+// counter, finalization flags, pending block, and pending length explicitly.
+__device__ __forceinline__ void progressive_blake2s_compress(
+    ProgressiveBlake2sState *S, const uint8_t block[64]) {
+    uint32_t m[16];
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        m[i] = ((uint32_t)block[4*i+0]) |
+               ((uint32_t)block[4*i+1] << 8) |
+               ((uint32_t)block[4*i+2] << 16) |
+               ((uint32_t)block[4*i+3] << 24);
+    }
+    uint32_t v[16];
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) v[i] = S->h[i];
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) v[i + 8] = blake2s_IV[i];
+    v[12] ^= S->t[0];
+    v[13] ^= S->t[1];
+    v[14] ^= S->f[0];
+    v[15] ^= S->f[1];
+    #pragma unroll
+    for (int r = 0; r < 10; ++r) {
+        G(r,0,v[0],v[4],v[8],v[12]);
+        G(r,1,v[1],v[5],v[9],v[13]);
+        G(r,2,v[2],v[6],v[10],v[14]);
+        G(r,3,v[3],v[7],v[11],v[15]);
+        G(r,4,v[0],v[5],v[10],v[15]);
+        G(r,5,v[1],v[6],v[11],v[12]);
+        G(r,6,v[2],v[7],v[8],v[13]);
+        G(r,7,v[3],v[4],v[9],v[14]);
+    }
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) S->h[i] ^= v[i] ^ v[i + 8];
+}
+
+__device__ __forceinline__ void progressive_add_counter(
+    ProgressiveBlake2sState *S, uint32_t bytes) {
+    uint32_t previous = S->t[0];
+    S->t[0] += bytes;
+    S->t[1] += S->t[0] < previous;
+}
+
+__device__ __forceinline__ void progressive_absorb_word(
+    ProgressiveBlake2sState *S, uint32_t word) {
+    if (S->pending_len == 64) {
+        progressive_add_counter(S, 64);
+        progressive_blake2s_compress(S, S->pending);
+        S->pending_len = 0;
+    }
+    uint32_t offset = S->pending_len;
+    S->pending[offset + 0] = static_cast<uint8_t>(word);
+    S->pending[offset + 1] = static_cast<uint8_t>(word >> 8);
+    S->pending[offset + 2] = static_cast<uint8_t>(word >> 16);
+    S->pending[offset + 3] = static_cast<uint8_t>(word >> 24);
+    S->pending_len = offset + 4;
+}
+
+__global__ void progressive_leaf_init_in_gpu(
+    uint32_t size, ProgressiveBlake2sState *states) {
+    uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= size) return;
+    ProgressiveBlake2sState state = {};
+    state.h[0] = 0x6A09E667 ^ 0x01010020;
+    state.h[1] = 0xBB67AE85;
+    state.h[2] = 0x3C6EF372;
+    state.h[3] = 0xA54FF53A;
+    state.h[4] = 0x510E527F;
+    state.h[5] = 0x9B05688C;
+    state.h[6] = 0x1F83D9AB;
+    state.h[7] = 0x5BE0CD19;
+    states[row] = state;
+}
+
+__global__ void progressive_leaf_absorb_in_gpu(
+    uint32_t size,
+    uint32_t number_of_columns,
+    uint32_t **columns,
+    ProgressiveBlake2sState *states) {
+    uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= size) return;
+    ProgressiveBlake2sState state = states[row];
+    for (uint32_t column = 0; column < number_of_columns; ++column) {
+        progressive_absorb_word(&state, columns[column][row]);
+    }
+    states[row] = state;
+}
+
+__global__ void progressive_leaf_expand_in_gpu(
+    uint32_t to_size,
+    uint32_t log_ratio,
+    const ProgressiveBlake2sState *states_in,
+    ProgressiveBlake2sState *states_out) {
+    uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= to_size) return;
+    uint32_t parent = ((row >> (log_ratio + 1)) << 1) | (row & 1);
+    states_out[row] = states_in[parent];
+}
+
+__global__ void progressive_leaf_finalize_in_gpu(
+    uint32_t size,
+    const ProgressiveBlake2sState *states,
+    Blake2sHash *result) {
+    uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= size) return;
+    ProgressiveBlake2sState state = states[row];
+    progressive_add_counter(&state, state.pending_len);
+    for (uint32_t i = state.pending_len; i < 64; ++i) state.pending[i] = 0;
+    state.f[0] = 0xFFFFFFFFu;
+    progressive_blake2s_compress(&state, state.pending);
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) result[row].s[i] = state.h[i];
+}
+
 // Kept in this translation unit deliberately: transcript hashing must share
 // the exact compression implementation used by the ordinary Blake2s Merkle
 // channel.  Relocatable device code resolves this symbol for
@@ -982,6 +1097,68 @@ extern "C" int stwo_blake2s_leaf_init_on(
     }
     stream_leaf_init_in_gpu<<<number_of_blocks_for(size), BLOCK_SIZE, 0,
                               reinterpret_cast<cudaStream_t>(stream)>>>(size, state);
+    return cudaGetLastError();
+}
+
+extern "C" int stwo_blake2s_progressive_init_on(
+    uint32_t size, ProgressiveBlake2sState *states, void *stream
+) {
+    if (size == 0 || states == nullptr || stream == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    progressive_leaf_init_in_gpu<<<number_of_blocks_for(size), BLOCK_SIZE, 0,
+                                   reinterpret_cast<cudaStream_t>(stream)>>>(size, states);
+    return cudaGetLastError();
+}
+
+extern "C" int stwo_blake2s_progressive_absorb_on(
+    uint32_t size,
+    uint32_t number_of_columns,
+    uint32_t **columns,
+    ProgressiveBlake2sState *states,
+    void *stream
+) {
+    if (size == 0 || number_of_columns == 0 || columns == nullptr ||
+        states == nullptr || stream == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    progressive_leaf_absorb_in_gpu<<<number_of_blocks_for(size), BLOCK_SIZE, 0,
+                                     reinterpret_cast<cudaStream_t>(stream)>>>(
+        size, number_of_columns, columns, states);
+    return cudaGetLastError();
+}
+
+extern "C" int stwo_blake2s_progressive_expand_on(
+    uint32_t from_log_size,
+    uint32_t to_log_size,
+    const ProgressiveBlake2sState *states_in,
+    ProgressiveBlake2sState *states_out,
+    void *stream
+) {
+    if (from_log_size >= to_log_size || to_log_size >= 31 ||
+        states_in == nullptr || states_out == nullptr || states_in == states_out ||
+        stream == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    uint32_t to_size = 1u << to_log_size;
+    progressive_leaf_expand_in_gpu<<<number_of_blocks_for(to_size), BLOCK_SIZE, 0,
+                                     reinterpret_cast<cudaStream_t>(stream)>>>(
+        to_size, to_log_size - from_log_size, states_in, states_out);
+    return cudaGetLastError();
+}
+
+extern "C" int stwo_blake2s_progressive_finalize_on(
+    uint32_t size,
+    const ProgressiveBlake2sState *states,
+    Blake2sHash *result,
+    void *stream
+) {
+    if (size == 0 || states == nullptr || result == nullptr || stream == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    progressive_leaf_finalize_in_gpu<<<number_of_blocks_for(size), BLOCK_SIZE, 0,
+                                       reinterpret_cast<cudaStream_t>(stream)>>>(
+        size, states, result);
     return cudaGetLastError();
 }
 

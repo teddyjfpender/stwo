@@ -1,0 +1,847 @@
+//! Prepared domain-progressive commitment leaves.
+//!
+//! This is intentionally an additive producer for the existing Merkle graph:
+//! it ends at the ordinary `Blake2sHash` leaf layer, so the qualified interior
+//! and fused-tail kernels remain unchanged.  Topology and mode are sealed by
+//! [`progressive_leaf_workspace_requirements`] before arena allocation.
+
+use core::ffi::c_void;
+use std::collections::BTreeSet;
+
+use stwo::core::vcs::blake2_hash::Blake2sHash;
+
+use super::exec_context::{check_cuda, ArenaSlice, ArenaSlotId, DeviceArena};
+use super::prepared_commit::{bind_slot, CommitArenaSlotRequirement, CommitCoefficientColumn};
+use super::progressive_commit::{
+    plan_progressive_commit, ProgressiveCommitError, ProgressiveCommitGeometry,
+    ProgressiveCommitMode, ProgressiveCommitPlan, PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES,
+};
+
+const WORD_BYTES: usize = core::mem::size_of::<u32>();
+const POINTER_WORDS: usize = core::mem::size_of::<*mut u32>().div_ceil(WORD_BYTES);
+const HASH_WORDS: usize = core::mem::size_of::<Blake2sHash>() / WORD_BYTES;
+const STATE_WORDS: usize = PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES / WORD_BYTES;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProgressiveBatchRequirements {
+    pub coefficient_pointer_words: usize,
+    pub coefficient_size_words: usize,
+    pub output_pointer_words: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProgressiveLeafWorkspaceRequirements {
+    pub plan: ProgressiveCommitPlan,
+    pub twiddle_words: usize,
+    pub lde_scratch_words: Option<usize>,
+    pub state_ping_words: usize,
+    pub state_pong_words: Option<usize>,
+    pub leaf_hash_words: usize,
+    pub batches: Vec<ProgressiveBatchRequirements>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProgressiveBatchSlots {
+    pub coefficient_ptrs: ArenaSlotId,
+    pub coefficient_sizes: ArenaSlotId,
+    pub output_ptrs: ArenaSlotId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProgressiveLeafWorkspaceSlots {
+    pub lde_scratch: Option<ArenaSlotId>,
+    pub state_ping: ArenaSlotId,
+    pub state_pong: Option<ArenaSlotId>,
+    pub leaf_hashes: ArenaSlotId,
+    pub batches: Vec<ProgressiveBatchSlots>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProgressiveLeafLaunchKind {
+    Init {
+        log_size: u32,
+    },
+    Expand {
+        from_log_size: u32,
+        to_log_size: u32,
+    },
+    Lde {
+        log_size: u32,
+        columns: u32,
+    },
+    Absorb {
+        log_size: u32,
+        columns: u32,
+    },
+    Finalize {
+        log_size: u32,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PreparedProgressiveCommitError {
+    Disabled,
+    Planner(ProgressiveCommitError),
+    InvalidSlotShape,
+    SizeOverflow,
+    ContextMismatch(ArenaSlotId),
+    MissingRetainedOutput(usize),
+    UnexpectedRetainedOutput(usize),
+    SlotTooSmall {
+        slot: ArenaSlotId,
+        required: usize,
+        actual: usize,
+    },
+    AliasedSlot(ArenaSlotId),
+    Arena(super::exec_context::ArenaError),
+    Prepared(super::prepared_commit::PreparedCommitError),
+    Cuda(super::exec_context::CudaRuntimeError),
+}
+
+impl core::fmt::Display for PreparedProgressiveCommitError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "invalid prepared progressive CUDA commitment: {self:?}")
+    }
+}
+
+impl std::error::Error for PreparedProgressiveCommitError {}
+
+impl From<ProgressiveCommitError> for PreparedProgressiveCommitError {
+    fn from(value: ProgressiveCommitError) -> Self {
+        Self::Planner(value)
+    }
+}
+impl From<super::exec_context::ArenaError> for PreparedProgressiveCommitError {
+    fn from(value: super::exec_context::ArenaError) -> Self {
+        Self::Arena(value)
+    }
+}
+impl From<super::exec_context::CudaRuntimeError> for PreparedProgressiveCommitError {
+    fn from(value: super::exec_context::CudaRuntimeError) -> Self {
+        Self::Cuda(value)
+    }
+}
+impl From<super::prepared_commit::PreparedCommitError> for PreparedProgressiveCommitError {
+    fn from(value: super::prepared_commit::PreparedCommitError) -> Self {
+        Self::Prepared(value)
+    }
+}
+
+/// Seal the environment-selected mode and complete topology before allocating
+/// any arena storage.  The default (`FullLifting`) fails closed: callers must
+/// continue through the legacy prepared commitment, never silently reinterpret
+/// progressive slots as a fallback layout.
+pub fn progressive_leaf_workspace_requirements(
+    geometry: ProgressiveCommitGeometry,
+) -> Result<ProgressiveLeafWorkspaceRequirements, PreparedProgressiveCommitError> {
+    let mode = ProgressiveCommitMode::from_env();
+    if mode != ProgressiveCommitMode::DomainProgressive {
+        return Err(PreparedProgressiveCommitError::Disabled);
+    }
+    progressive_leaf_workspace_requirements_for_mode(mode, geometry)
+}
+
+/// Explicit-mode twin used by topology tests and process-level mode dispatch.
+pub fn progressive_leaf_workspace_requirements_for_mode(
+    mode: ProgressiveCommitMode,
+    geometry: ProgressiveCommitGeometry,
+) -> Result<ProgressiveLeafWorkspaceRequirements, PreparedProgressiveCommitError> {
+    if mode != ProgressiveCommitMode::DomainProgressive {
+        return Err(PreparedProgressiveCommitError::Disabled);
+    }
+    let plan = plan_progressive_commit(mode, geometry)?;
+    let twiddle_words = plan
+        .columns
+        .iter()
+        .map(|column| pow2(column.evaluation_log_size - 1))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .max()
+        .unwrap_or(0);
+    let lde_scratch_words = plan
+        .lde_batches
+        .iter()
+        .map(|batch| {
+            let words = pow2(batch.evaluation_log_size)?;
+            batch
+                .retained_columns
+                .iter()
+                .filter(|destination| destination.is_none())
+                .count()
+                .checked_mul(words)
+                .ok_or(PreparedProgressiveCommitError::SizeOverflow)
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .max()
+        .filter(|words| *words != 0);
+
+    let first_log = plan.columns[0].evaluation_log_size;
+    let mut ping_words = state_words(first_log)?;
+    let mut pong_words = 0usize;
+    let mut current_is_ping = true;
+    for expansion in &plan.state_expansions {
+        let destination_words = state_words(expansion.domain.to_log_size)?;
+        if current_is_ping {
+            pong_words = pong_words.max(destination_words);
+        } else {
+            ping_words = ping_words.max(destination_words);
+        }
+        current_is_ping = !current_is_ping;
+    }
+    let leaf_hash_words = pow2(plan.geometry.lifting_log_size)?
+        .checked_mul(HASH_WORDS)
+        .ok_or(PreparedProgressiveCommitError::SizeOverflow)?;
+    let batches = plan
+        .lde_batches
+        .iter()
+        .map(|batch| ProgressiveBatchRequirements {
+            coefficient_pointer_words: batch.columns.len() * POINTER_WORDS,
+            coefficient_size_words: batch.columns.len(),
+            output_pointer_words: batch.columns.len() * POINTER_WORDS,
+        })
+        .collect();
+    Ok(ProgressiveLeafWorkspaceRequirements {
+        plan,
+        twiddle_words,
+        lde_scratch_words,
+        state_ping_words: ping_words,
+        state_pong_words: (pong_words != 0).then_some(pong_words),
+        leaf_hash_words,
+        batches,
+    })
+}
+
+/// Shared fail-closed admission used as the first step of preparation. This is
+/// public so a process can prove its default-off posture before CUDA resources
+/// exist; it does not allocate, launch, or select a fallback implementation.
+pub fn progressive_prepare_mode_admission(
+    requirements: &ProgressiveLeafWorkspaceRequirements,
+) -> Result<(), PreparedProgressiveCommitError> {
+    if requirements.plan.mode != ProgressiveCommitMode::DomainProgressive
+        || ProgressiveCommitMode::from_env() != ProgressiveCommitMode::DomainProgressive
+    {
+        return Err(PreparedProgressiveCommitError::Disabled);
+    }
+    Ok(())
+}
+
+impl ProgressiveLeafWorkspaceRequirements {
+    pub fn cache_key(&self) -> u64 {
+        self.plan.cache_key
+    }
+
+    pub fn arena_slot_requirements(
+        &self,
+        slots: &ProgressiveLeafWorkspaceSlots,
+    ) -> Result<Vec<CommitArenaSlotRequirement>, PreparedProgressiveCommitError> {
+        validate_slots(self, slots)?;
+        let mut output = Vec::new();
+        if let (Some(id), Some(len_words)) = (slots.lde_scratch, self.lde_scratch_words) {
+            output.push(slot_requirement(id, len_words, 1));
+        }
+        output.push(slot_requirement(
+            slots.state_ping,
+            self.state_ping_words,
+            STATE_WORDS,
+        ));
+        if let (Some(id), Some(len_words)) = (slots.state_pong, self.state_pong_words) {
+            output.push(slot_requirement(id, len_words, STATE_WORDS));
+        }
+        output.push(slot_requirement(
+            slots.leaf_hashes,
+            self.leaf_hash_words,
+            HASH_WORDS,
+        ));
+        for (batch, batch_slots) in self.batches.iter().zip(&slots.batches) {
+            output.push(slot_requirement(
+                batch_slots.coefficient_ptrs,
+                batch.coefficient_pointer_words,
+                POINTER_WORDS,
+            ));
+            output.push(slot_requirement(
+                batch_slots.coefficient_sizes,
+                batch.coefficient_size_words,
+                1,
+            ));
+            output.push(slot_requirement(
+                batch_slots.output_ptrs,
+                batch.output_pointer_words,
+                POINTER_WORDS,
+            ));
+        }
+        let mut distinct = BTreeSet::new();
+        for entry in &output {
+            if !distinct.insert(entry.id) {
+                return Err(PreparedProgressiveCommitError::AliasedSlot(entry.id));
+            }
+        }
+        Ok(output)
+    }
+
+    /// Address-free launch topology used by arena planning and cache admission.
+    pub fn launch_sequence(&self) -> Vec<ProgressiveLeafLaunchKind> {
+        let first_log = self.plan.columns[0].evaluation_log_size;
+        let mut current_log = first_log;
+        let mut launches = vec![ProgressiveLeafLaunchKind::Init {
+            log_size: first_log,
+        }];
+        for batch in &self.plan.lde_batches {
+            if batch.evaluation_log_size > current_log {
+                launches.push(ProgressiveLeafLaunchKind::Expand {
+                    from_log_size: current_log,
+                    to_log_size: batch.evaluation_log_size,
+                });
+                current_log = batch.evaluation_log_size;
+            }
+            let columns =
+                u32::try_from(batch.columns.len()).expect("planner column count fits u32");
+            launches.push(ProgressiveLeafLaunchKind::Lde {
+                log_size: current_log,
+                columns,
+            });
+            launches.push(ProgressiveLeafLaunchKind::Absorb {
+                log_size: current_log,
+                columns,
+            });
+        }
+        if current_log < self.plan.geometry.lifting_log_size {
+            launches.push(ProgressiveLeafLaunchKind::Expand {
+                from_log_size: current_log,
+                to_log_size: self.plan.geometry.lifting_log_size,
+            });
+        }
+        launches.push(ProgressiveLeafLaunchKind::Finalize {
+            log_size: self.plan.geometry.lifting_log_size,
+        });
+        launches
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PreparedBatch {
+    coefficient_ptrs: ArenaSlice,
+    coefficient_sizes: ArenaSlice,
+    output_ptrs: ArenaSlice,
+    log_size: u32,
+    columns: u32,
+}
+
+#[derive(Clone, Copy)]
+enum Launch {
+    Init {
+        log_size: u32,
+        states: ArenaSlice,
+    },
+    Expand {
+        from_log: u32,
+        to_log: u32,
+        input: ArenaSlice,
+        output: ArenaSlice,
+    },
+    Lde(PreparedBatch),
+    Absorb {
+        log_size: u32,
+        batch: PreparedBatch,
+        states: ArenaSlice,
+    },
+    Finalize {
+        log_size: u32,
+        states: ArenaSlice,
+        output: ArenaSlice,
+    },
+}
+
+pub struct PreparedProgressiveLeaves<'a> {
+    arena: &'a DeviceArena,
+    launches: Vec<Launch>,
+    leaf_hashes: ArenaSlice,
+    twiddles: ArenaSlice,
+    twiddle_words: u32,
+    cache_key: u64,
+}
+
+impl<'a> PreparedProgressiveLeaves<'a> {
+    /// Bind a pre-sealed topology, upload all descriptor tables, and drain setup
+    /// once. `retained_outputs` is in canonical column order and must be `Some`
+    /// exactly where the sealed geometry says the evaluation remains resident.
+    pub fn prepare(
+        arena: &'a DeviceArena,
+        requirements: &ProgressiveLeafWorkspaceRequirements,
+        slots: &ProgressiveLeafWorkspaceSlots,
+        coefficients: &[CommitCoefficientColumn],
+        retained_outputs: &[Option<ArenaSlice>],
+        twiddles: ArenaSlice,
+    ) -> Result<Self, PreparedProgressiveCommitError> {
+        progressive_prepare_mode_admission(requirements)?;
+        let workspace = requirements.arena_slot_requirements(slots)?;
+        let workspace_ids: BTreeSet<_> = workspace.iter().map(|entry| entry.id).collect();
+        if coefficients.len() != requirements.plan.columns.len()
+            || retained_outputs.len() != requirements.plan.columns.len()
+        {
+            return Err(PreparedProgressiveCommitError::InvalidSlotShape);
+        }
+        let token = arena.context().identity_token();
+        if twiddles.context_token() != token {
+            return Err(PreparedProgressiveCommitError::ContextMismatch(
+                twiddles.id(),
+            ));
+        }
+        if workspace_ids.contains(&twiddles.id()) {
+            return Err(PreparedProgressiveCommitError::AliasedSlot(twiddles.id()));
+        }
+        if twiddles.len_words() < requirements.twiddle_words {
+            return Err(PreparedProgressiveCommitError::SlotTooSmall {
+                slot: twiddles.id(),
+                required: requirements.twiddle_words,
+                actual: twiddles.len_words(),
+            });
+        }
+        let twiddle_words = u32::try_from(twiddles.len_words())
+            .map_err(|_| PreparedProgressiveCommitError::SizeOverflow)?;
+        let ping = bind_slot(
+            arena,
+            slots.state_ping,
+            requirements.state_ping_words,
+            STATE_WORDS,
+        )?;
+        let pong = match (slots.state_pong, requirements.state_pong_words) {
+            (Some(id), Some(words)) => Some(bind_slot(arena, id, words, STATE_WORDS)?),
+            (None, None) => None,
+            _ => return Err(PreparedProgressiveCommitError::InvalidSlotShape),
+        };
+        let leaf_hashes = bind_slot(
+            arena,
+            slots.leaf_hashes,
+            requirements.leaf_hash_words,
+            HASH_WORDS,
+        )?;
+        let scratch = match (slots.lde_scratch, requirements.lde_scratch_words) {
+            (Some(id), Some(words)) => Some(bind_slot(arena, id, words, 1)?),
+            (None, None) => None,
+            _ => return Err(PreparedProgressiveCommitError::InvalidSlotShape),
+        };
+
+        let mut uploads: Vec<(ArenaSlice, HostDescriptor)> = Vec::new();
+        let mut external_ids = BTreeSet::from([twiddles.id()]);
+        let mut prepared_batches = Vec::with_capacity(requirements.batches.len());
+        for ((batch, batch_requirement), batch_slots) in requirements
+            .plan
+            .lde_batches
+            .iter()
+            .zip(&requirements.batches)
+            .zip(&slots.batches)
+        {
+            let coefficient_ptrs = bind_slot(
+                arena,
+                batch_slots.coefficient_ptrs,
+                batch_requirement.coefficient_pointer_words,
+                POINTER_WORDS,
+            )?;
+            let coefficient_sizes = bind_slot(
+                arena,
+                batch_slots.coefficient_sizes,
+                batch_requirement.coefficient_size_words,
+                1,
+            )?;
+            let output_ptrs = bind_slot(
+                arena,
+                batch_slots.output_ptrs,
+                batch_requirement.output_pointer_words,
+                POINTER_WORDS,
+            )?;
+            let evaluation_words = pow2(batch.evaluation_log_size)?;
+            let mut scratch_offset = 0usize;
+            let mut coefficient_addresses = Vec::with_capacity(batch.columns.len());
+            let mut coefficient_lengths = Vec::with_capacity(batch.columns.len());
+            let mut output_addresses = Vec::with_capacity(batch.columns.len());
+            for (&canonical, retained_destination) in
+                batch.columns.iter().zip(&batch.retained_columns)
+            {
+                let coefficient = coefficients[canonical];
+                let column = requirements.plan.columns[canonical];
+                if coefficient.log_size != column.coefficient_log_size
+                    || coefficient.coefficients.context_token() != token
+                {
+                    return Err(PreparedProgressiveCommitError::ContextMismatch(
+                        coefficient.coefficients.id(),
+                    ));
+                }
+                if workspace_ids.contains(&coefficient.coefficients.id())
+                    || !external_ids.insert(coefficient.coefficients.id())
+                {
+                    return Err(PreparedProgressiveCommitError::AliasedSlot(
+                        coefficient.coefficients.id(),
+                    ));
+                }
+                let coefficient_words = pow2(column.coefficient_log_size)?;
+                if coefficient.coefficients.len_words() < coefficient_words {
+                    return Err(PreparedProgressiveCommitError::SlotTooSmall {
+                        slot: coefficient.coefficients.id(),
+                        required: coefficient_words,
+                        actual: coefficient.coefficients.len_words(),
+                    });
+                }
+                coefficient_addresses.push(coefficient.coefficients.as_u32_ptr() as usize);
+                coefficient_lengths.push(
+                    u32::try_from(coefficient_words)
+                        .map_err(|_| PreparedProgressiveCommitError::SizeOverflow)?,
+                );
+                let output = match (*retained_destination, retained_outputs[canonical]) {
+                    (Some(_), Some(output)) => {
+                        if output.context_token() != token {
+                            return Err(PreparedProgressiveCommitError::ContextMismatch(
+                                output.id(),
+                            ));
+                        }
+                        if output.len_words() < evaluation_words {
+                            return Err(PreparedProgressiveCommitError::SlotTooSmall {
+                                slot: output.id(),
+                                required: evaluation_words,
+                                actual: output.len_words(),
+                            });
+                        }
+                        if workspace_ids.contains(&output.id()) || !external_ids.insert(output.id())
+                        {
+                            return Err(PreparedProgressiveCommitError::AliasedSlot(output.id()));
+                        }
+                        output.as_u32_ptr()
+                    }
+                    (Some(_), None) => {
+                        return Err(PreparedProgressiveCommitError::MissingRetainedOutput(
+                            canonical,
+                        ))
+                    }
+                    (None, Some(_)) => {
+                        return Err(PreparedProgressiveCommitError::UnexpectedRetainedOutput(
+                            canonical,
+                        ))
+                    }
+                    (None, None) => {
+                        let base =
+                            scratch.ok_or(PreparedProgressiveCommitError::InvalidSlotShape)?;
+                        let pointer = unsafe { base.as_u32_ptr().add(scratch_offset) };
+                        scratch_offset = scratch_offset
+                            .checked_add(evaluation_words)
+                            .ok_or(PreparedProgressiveCommitError::SizeOverflow)?;
+                        pointer
+                    }
+                };
+                output_addresses.push(output as usize);
+            }
+            uploads.push((
+                coefficient_ptrs,
+                HostDescriptor::Pointers(coefficient_addresses),
+            ));
+            uploads.push((coefficient_sizes, HostDescriptor::U32(coefficient_lengths)));
+            uploads.push((output_ptrs, HostDescriptor::Pointers(output_addresses)));
+            prepared_batches.push(PreparedBatch {
+                coefficient_ptrs,
+                coefficient_sizes,
+                output_ptrs,
+                log_size: batch.evaluation_log_size,
+                columns: u32::try_from(batch.columns.len())
+                    .map_err(|_| PreparedProgressiveCommitError::SizeOverflow)?,
+            });
+        }
+
+        let mut launches = Vec::new();
+        let first_log = requirements.plan.columns[0].evaluation_log_size;
+        let mut current_log = first_log;
+        let mut current = ping;
+        let mut next = pong;
+        launches.push(Launch::Init {
+            log_size: first_log,
+            states: current,
+        });
+        for batch in prepared_batches {
+            if batch.log_size > current_log {
+                let output = next.ok_or(PreparedProgressiveCommitError::InvalidSlotShape)?;
+                launches.push(Launch::Expand {
+                    from_log: current_log,
+                    to_log: batch.log_size,
+                    input: current,
+                    output,
+                });
+                next = Some(current);
+                current = output;
+                current_log = batch.log_size;
+            }
+            launches.push(Launch::Lde(batch));
+            launches.push(Launch::Absorb {
+                log_size: current_log,
+                batch,
+                states: current,
+            });
+        }
+        if current_log < requirements.plan.geometry.lifting_log_size {
+            let output = next.ok_or(PreparedProgressiveCommitError::InvalidSlotShape)?;
+            launches.push(Launch::Expand {
+                from_log: current_log,
+                to_log: requirements.plan.geometry.lifting_log_size,
+                input: current,
+                output,
+            });
+            current = output;
+        }
+        launches.push(Launch::Finalize {
+            log_size: requirements.plan.geometry.lifting_log_size,
+            states: current,
+            output: leaf_hashes,
+        });
+
+        for (destination, descriptor) in &uploads {
+            let (source, bytes) = descriptor.bytes();
+            unsafe {
+                arena
+                    .context()
+                    .memcpy_h2d_async(destination.as_void_ptr(), source, bytes)?;
+            }
+        }
+        arena.context().sync()?;
+        Ok(Self {
+            arena,
+            launches,
+            leaf_hashes,
+            twiddles,
+            twiddle_words,
+            cache_key: requirements.plan.cache_key,
+        })
+    }
+
+    pub fn launch(&self) -> Result<(), PreparedProgressiveCommitError> {
+        let stream = self.arena.context().stream_raw().as_ptr();
+        for launch in &self.launches {
+            let (operation, code) = unsafe {
+                match *launch {
+                    Launch::Init { log_size, states } => (
+                        "progressive_leaf_init",
+                        stwo_backend_cuda_kernels::raw::stwo_blake2s_progressive_init_on(
+                            1u32 << log_size,
+                            states.as_u32_ptr().cast(),
+                            stream,
+                        ),
+                    ),
+                    Launch::Expand {
+                        from_log,
+                        to_log,
+                        input,
+                        output,
+                    } => (
+                        "progressive_leaf_expand",
+                        stwo_backend_cuda_kernels::raw::stwo_blake2s_progressive_expand_on(
+                            from_log,
+                            to_log,
+                            input.as_u32_ptr().cast(),
+                            output.as_u32_ptr().cast(),
+                            stream,
+                        ),
+                    ),
+                    Launch::Lde(batch) => (
+                        "progressive_lde_n2b",
+                        stwo_backend_cuda_kernels::raw::stwo_lde_n2b_columns_on(
+                            batch.coefficient_ptrs.as_u32_ptr().cast(),
+                            batch.coefficient_sizes.as_u32_ptr(),
+                            batch.output_ptrs.as_u32_ptr().cast(),
+                            batch.log_size,
+                            batch.columns,
+                            self.twiddles.as_u32_ptr(),
+                            self.twiddle_words,
+                            1u32 << (batch.log_size - 1),
+                            stream,
+                        ),
+                    ),
+                    Launch::Absorb {
+                        log_size,
+                        batch,
+                        states,
+                    } => (
+                        "progressive_leaf_absorb",
+                        stwo_backend_cuda_kernels::raw::stwo_blake2s_progressive_absorb_on(
+                            1u32 << log_size,
+                            batch.columns,
+                            batch.output_ptrs.as_u32_ptr().cast(),
+                            states.as_u32_ptr().cast(),
+                            stream,
+                        ),
+                    ),
+                    Launch::Finalize {
+                        log_size,
+                        states,
+                        output,
+                    } => (
+                        "progressive_leaf_finalize",
+                        stwo_backend_cuda_kernels::raw::stwo_blake2s_progressive_finalize_on(
+                            1u32 << log_size,
+                            states.as_u32_ptr().cast(),
+                            output.as_u32_ptr().cast(),
+                            stream,
+                        ),
+                    ),
+                }
+            };
+            check_cuda(operation, code)?;
+        }
+        Ok(())
+    }
+
+    pub fn launch_sequence(&self) -> impl ExactSizeIterator<Item = ProgressiveLeafLaunchKind> + '_ {
+        self.launches.iter().map(|launch| match *launch {
+            Launch::Init { log_size, .. } => ProgressiveLeafLaunchKind::Init { log_size },
+            Launch::Expand {
+                from_log, to_log, ..
+            } => ProgressiveLeafLaunchKind::Expand {
+                from_log_size: from_log,
+                to_log_size: to_log,
+            },
+            Launch::Lde(batch) => ProgressiveLeafLaunchKind::Lde {
+                log_size: batch.log_size,
+                columns: batch.columns,
+            },
+            Launch::Absorb {
+                log_size, batch, ..
+            } => ProgressiveLeafLaunchKind::Absorb {
+                log_size,
+                columns: batch.columns,
+            },
+            Launch::Finalize { log_size, .. } => ProgressiveLeafLaunchKind::Finalize { log_size },
+        })
+    }
+    pub fn leaf_hashes(&self) -> ArenaSlice {
+        self.leaf_hashes
+    }
+    pub fn cache_key(&self) -> u64 {
+        self.cache_key
+    }
+}
+
+enum HostDescriptor {
+    Pointers(Vec<usize>),
+    U32(Vec<u32>),
+}
+impl HostDescriptor {
+    fn bytes(&self) -> (*const c_void, usize) {
+        match self {
+            Self::Pointers(values) => (
+                values.as_ptr().cast(),
+                values.len() * core::mem::size_of::<usize>(),
+            ),
+            Self::U32(values) => (values.as_ptr().cast(), values.len() * WORD_BYTES),
+        }
+    }
+}
+
+fn validate_slots(
+    requirements: &ProgressiveLeafWorkspaceRequirements,
+    slots: &ProgressiveLeafWorkspaceSlots,
+) -> Result<(), PreparedProgressiveCommitError> {
+    if requirements.batches.len() != slots.batches.len()
+        || requirements.lde_scratch_words.is_some() != slots.lde_scratch.is_some()
+        || requirements.state_pong_words.is_some() != slots.state_pong.is_some()
+    {
+        return Err(PreparedProgressiveCommitError::InvalidSlotShape);
+    }
+    Ok(())
+}
+fn slot_requirement(
+    id: ArenaSlotId,
+    len_words: usize,
+    alignment_words: usize,
+) -> CommitArenaSlotRequirement {
+    CommitArenaSlotRequirement {
+        id,
+        len_words,
+        alignment_words,
+    }
+}
+fn pow2(log_size: u32) -> Result<usize, PreparedProgressiveCommitError> {
+    1usize
+        .checked_shl(log_size)
+        .ok_or(PreparedProgressiveCommitError::SizeOverflow)
+}
+fn state_words(log_size: u32) -> Result<usize, PreparedProgressiveCommitError> {
+    pow2(log_size)?
+        .checked_mul(STATE_WORDS)
+        .ok_or(PreparedProgressiveCommitError::SizeOverflow)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::progressive_commit::ProgressiveCommitGroupGeometry;
+    use super::*;
+
+    #[test]
+    fn mixed_log_requirements_seal_ping_pong_and_direct_outputs() {
+        let requirements = progressive_leaf_workspace_requirements_for_mode(
+            ProgressiveCommitMode::DomainProgressive,
+            ProgressiveCommitGeometry {
+                lifting_log_size: 8,
+                log_blowup_factor: 1,
+                groups: vec![
+                    ProgressiveCommitGroupGeometry {
+                        coefficient_log_sizes: vec![4, 4],
+                        retain_evaluations: false,
+                    },
+                    ProgressiveCommitGroupGeometry {
+                        coefficient_log_sizes: vec![6],
+                        retain_evaluations: true,
+                    },
+                ],
+            },
+        )
+        .unwrap();
+        assert_eq!(requirements.plan.lde_batches.len(), 2);
+        assert_eq!(requirements.lde_scratch_words, Some(64));
+        assert_eq!(requirements.state_ping_words, 256 * STATE_WORDS);
+        assert_eq!(requirements.state_pong_words, Some(128 * STATE_WORDS));
+        assert_eq!(requirements.leaf_hash_words, 256 * HASH_WORDS);
+        assert_ne!(requirements.cache_key(), 0);
+        assert_eq!(
+            requirements.launch_sequence(),
+            vec![
+                ProgressiveLeafLaunchKind::Init { log_size: 5 },
+                ProgressiveLeafLaunchKind::Lde {
+                    log_size: 5,
+                    columns: 2
+                },
+                ProgressiveLeafLaunchKind::Absorb {
+                    log_size: 5,
+                    columns: 2
+                },
+                ProgressiveLeafLaunchKind::Expand {
+                    from_log_size: 5,
+                    to_log_size: 7
+                },
+                ProgressiveLeafLaunchKind::Lde {
+                    log_size: 7,
+                    columns: 1
+                },
+                ProgressiveLeafLaunchKind::Absorb {
+                    log_size: 7,
+                    columns: 1
+                },
+                ProgressiveLeafLaunchKind::Expand {
+                    from_log_size: 7,
+                    to_log_size: 8
+                },
+                ProgressiveLeafLaunchKind::Finalize { log_size: 8 },
+            ]
+        );
+    }
+
+    #[test]
+    fn full_lifting_mode_cannot_allocate_progressive_slots() {
+        let result = progressive_leaf_workspace_requirements_for_mode(
+            ProgressiveCommitMode::FullLifting,
+            ProgressiveCommitGeometry {
+                lifting_log_size: 5,
+                log_blowup_factor: 1,
+                groups: vec![],
+            },
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            PreparedProgressiveCommitError::Disabled
+        );
+    }
+}

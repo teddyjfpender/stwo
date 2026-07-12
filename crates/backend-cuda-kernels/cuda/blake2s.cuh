@@ -1,10 +1,32 @@
 #ifndef BLAKE2S_H
 #define BLAKE2S_H
 
+#include <stddef.h>
 #include "fields.cuh"
 #include "utils.cuh"
 
 const unsigned int BLOCK_SIZE = 256;
+
+// Clonable state for domain-progressive commitment leaves.  This is a public
+// device ABI: Rust sizes arena ping/pong slots from the same 128-byte stride.
+// A full 64-byte pending block is deliberately retained until another word
+// arrives (or finalize), matching Blake2s' lazy-final-block semantics.
+typedef struct {
+    uint32_t h[8];
+    uint32_t t[2];
+    uint32_t f[2];
+    uint8_t pending[64];
+    uint32_t pending_len;
+    uint8_t reserved[12];
+} ProgressiveBlake2sState;
+
+static_assert(sizeof(ProgressiveBlake2sState) == 128,
+              "progressive Blake2s state ABI must be 128 bytes");
+static_assert(offsetof(ProgressiveBlake2sState, t) == 32, "invalid counter offset");
+static_assert(offsetof(ProgressiveBlake2sState, f) == 40, "invalid flags offset");
+static_assert(offsetof(ProgressiveBlake2sState, pending) == 48, "invalid pending offset");
+static_assert(offsetof(ProgressiveBlake2sState, pending_len) == 112,
+              "invalid pending length offset");
 
 // Shared device primitive for the transcript engine.  It is defined by
 // blake2s.cu so the channel and Merkle paths use one compression
@@ -83,6 +105,33 @@ void stream_leaf_finalize(uint32_t size, uint32_t rem_cols, uint32_t **columns, 
 // segments. All pointer tables, state, and outputs are caller-owned device memory.
 extern "C"
 int stwo_blake2s_leaf_init_on(uint32_t size, Blake2sHash *state, void *stream);
+
+// Domain-progressive leaf ABI.  `columns` is a device pointer table in exact
+// canonical commitment order, and every column has exactly `size` words.
+// Expansion is output-parallel and requires disjoint input/output buffers.
+extern "C"
+int stwo_blake2s_progressive_init_on(
+    uint32_t size, ProgressiveBlake2sState *states, void *stream);
+extern "C"
+int stwo_blake2s_progressive_absorb_on(
+    uint32_t size,
+    uint32_t number_of_columns,
+    uint32_t **columns,
+    ProgressiveBlake2sState *states,
+    void *stream);
+extern "C"
+int stwo_blake2s_progressive_expand_on(
+    uint32_t from_log_size,
+    uint32_t to_log_size,
+    const ProgressiveBlake2sState *states_in,
+    ProgressiveBlake2sState *states_out,
+    void *stream);
+extern "C"
+int stwo_blake2s_progressive_finalize_on(
+    uint32_t size,
+    const ProgressiveBlake2sState *states,
+    Blake2sHash *result,
+    void *stream);
 extern "C"
 int stwo_blake2s_leaf_update_on(uint32_t size, uint32_t group_n_cols, uint32_t **columns, const uint32_t *column_log_sizes, uint32_t lifting_log_size, uint32_t cols_done, Blake2sHash *state, void *stream);
 // ILP2 explicit-stream twin of stwo_blake2s_leaf_update_on (same contract,

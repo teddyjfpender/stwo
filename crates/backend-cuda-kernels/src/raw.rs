@@ -44,6 +44,25 @@ pub struct LayerIndexPair {
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 pub struct Blake2sHash(pub [u8; 32]);
 
+/// Exact device ABI for a clonable domain-progressive Blake2s leaf state.
+/// Keep in sync with `ProgressiveBlake2sState` in `cuda/blake2s.cuh`.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct ProgressiveBlake2sState {
+    pub h: [u32; 8],
+    pub t: [u32; 2],
+    pub f: [u32; 2],
+    pub pending: [u8; 64],
+    pub pending_len: u32,
+    pub reserved: [u8; 12],
+}
+
+const _: () = assert!(core::mem::size_of::<ProgressiveBlake2sState>() == 128);
+const _: () = assert!(core::mem::offset_of!(ProgressiveBlake2sState, t) == 32);
+const _: () = assert!(core::mem::offset_of!(ProgressiveBlake2sState, f) == 40);
+const _: () = assert!(core::mem::offset_of!(ProgressiveBlake2sState, pending) == 48);
+const _: () = assert!(core::mem::offset_of!(ProgressiveBlake2sState, pending_len) == 112);
+
 /// Process-local provenance counters for generated CUDA kernels. Strict
 /// GPU-native admission requires `aot_misses == runtime_loads ==
 /// strict_rejections == 0`; cache hits retain their original provenance.
@@ -490,6 +509,31 @@ extern "C" {
     pub fn stwo_blake2s_leaf_init_on(
         size: u32,
         state: *mut Blake2sHash,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+    pub fn stwo_blake2s_progressive_init_on(
+        size: u32,
+        states: *mut ProgressiveBlake2sState,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+    pub fn stwo_blake2s_progressive_absorb_on(
+        size: u32,
+        number_of_columns: u32,
+        columns: *const *mut u32,
+        states: *mut ProgressiveBlake2sState,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+    pub fn stwo_blake2s_progressive_expand_on(
+        from_log_size: u32,
+        to_log_size: u32,
+        states_in: *const ProgressiveBlake2sState,
+        states_out: *mut ProgressiveBlake2sState,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+    pub fn stwo_blake2s_progressive_finalize_on(
+        size: u32,
+        states: *const ProgressiveBlake2sState,
+        result: *mut Blake2sHash,
         stream: *mut core::ffi::c_void,
     ) -> i32;
     pub fn stwo_blake2s_leaf_update_on(

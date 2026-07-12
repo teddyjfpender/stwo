@@ -1129,7 +1129,7 @@ fn ensure_distinct(ids: &[ArenaSlotId]) -> Result<(), PreparedCommitError> {
     Ok(())
 }
 
-fn bind_slot(
+pub(crate) fn bind_slot(
     arena: &DeviceArena,
     id: ArenaSlotId,
     required_words: usize,
