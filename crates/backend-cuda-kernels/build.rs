@@ -10,6 +10,7 @@
 //! - `STWO_CUDA_NVCC`: path to the nvcc binary (default: `nvcc` from `PATH`)
 //! - `STWO_CUDA_ARCH`: value for `-arch` (default: `native`)
 //! - `STWO_CUDA_NVCC_FLAGS`: extra whitespace-separated flags appended to every call
+//! - `STWO_CUDA_BUILD_JOBS`: maximum concurrent nvcc processes (default: host parallelism)
 //!
 //! The kernels are compiled with `-rdc=true` (they cross-reference `fields.cu` across
 //! translation units) and `-dlto`, so device link-time optimization can inline field ops
@@ -18,6 +19,20 @@
 use std::env;
 use std::path::PathBuf;
 use std::process::Command;
+
+fn cuda_build_workers(job_count: usize) -> usize {
+    env::var("STWO_CUDA_BUILD_JOBS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+        })
+        .min(16)
+        .min(job_count)
+}
 
 /// Content-addressed CUDA object cache (STWO_CUDA_OBJ_CACHE=<dir>): keyed by
 /// FNV-1a of the source bytes, every header in the include dirs, the compile
@@ -65,6 +80,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=STWO_CUDA_NVCC");
     println!("cargo:rerun-if-env-changed=STWO_CUDA_ARCH");
     println!("cargo:rerun-if-env-changed=STWO_CUDA_NVCC_FLAGS");
+    println!("cargo:rerun-if-env-changed=STWO_CUDA_BUILD_JOBS");
 
     let sources = kernel_sources();
     for source in &sources {
@@ -194,11 +210,7 @@ fn main() {
         objects.push(object);
     }
     if !obj_jobs.is_empty() {
-        let workers = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-            .min(16)
-            .min(obj_jobs.len());
+        let workers = cuda_build_workers(obj_jobs.len());
         let next = std::sync::atomic::AtomicUsize::new(0);
         let jobs_ref = &obj_jobs;
         let next_ref = &next;
@@ -436,11 +448,7 @@ fn build_aot_pack(
         }
     }
     if !jobs.is_empty() {
-        let workers = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-            .min(16)
-            .min(jobs.len());
+        let workers = cuda_build_workers(jobs.len());
         let next = std::sync::atomic::AtomicUsize::new(0);
         let jobs_ref = &jobs;
         let next_ref = &next;

@@ -95,7 +95,8 @@ container_cargo() {
     -v "$PWD:/workspace" -v "${RUST_VOLUME}:/root/.rustup" \
     -v "${RUST_VOLUME}-cargo:/root/.cargo" \
     -e STWO_CUDA_OBJ_CACHE=/workspace/.docker_cuda_obj_cache \
-    -e STWO_CUDA_ARCH="${ARCH}" -e RUST_MIN_STACK=33554432 \
+    -e STWO_CUDA_ARCH="${ARCH}" -e STWO_CUDA_BUILD_JOBS="${JOBS}" \
+    -e RUST_MIN_STACK=33554432 \
     -w /workspace "$IMAGE" bash -lc "
       set -e
       export PATH=\$HOME/.cargo/bin:\$PATH
