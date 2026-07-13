@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -ne 3 ]]; then
+  echo "usage: $0 witness_pedersen_builtin tiny sm_86" >&2
+  exit 2
+fi
+
+slab="$1"
+case_class="$2"
+arch="$3"
+if [[ "$slab" != "witness_pedersen_builtin" || "$case_class" != "tiny" ]]; then
+  echo "stage-0 slice currently supports only: witness_pedersen_builtin tiny" >&2
+  exit 2
+fi
+if [[ ! "$arch" =~ ^sm_([0-9][0-9][0-9]?)$ ]]; then
+  echo "architecture must look like sm_86, sm_90, or sm_100" >&2
+  exit 2
+fi
+sm="${BASH_REMATCH[1]}"
+
+lab_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+repo_root="$(cd "$lab_root/.." && pwd)"
+pod_id="${RUNPOD_POD_ID:-}"
+local_root="${GPU_LAB_LOCAL_ROOT:-}"
+if [[ -n "$pod_id" && -z "$local_root" && -f /tmp/stwo-gpu-lab/ACTIVE_ROOT ]]; then
+  IFS= read -r local_root < /tmp/stwo-gpu-lab/ACTIVE_ROOT
+fi
+if [[ -n "$pod_id" ]]; then
+  if [[ -z "$local_root" ]]; then
+    echo "RUNPOD pod requires the labctl-declared GPU_LAB_LOCAL_ROOT" >&2
+    exit 1
+  fi
+  build_root="${GPU_LAB_BUILD_ROOT:-$local_root/build/gpu-lab-sm$sm}"
+else
+  build_root="${GPU_LAB_BUILD_ROOT:-$repo_root/build/gpu-lab-sm$sm}"
+fi
+fixture_source="$lab_root/cases/tiny/witness_pedersen_builtin.semantic.json"
+oracle_index="$lab_root/cases/tiny/witness_pedersen_builtin.oracle-index.json"
+abi="$lab_root/manifests/witness_pedersen_builtin.abi.json"
+module_index="$build_root/modules/witness_pedersen_builtin.sm$sm.module.json"
+run_dir="$build_root/runs/witness_pedersen_builtin-tiny"
+execution="$run_dir/execution.json"
+replay="$run_dir/fixture.replay"
+plan="$run_dir/execution.plan"
+staging_seed="$run_dir/staging.seed.json"
+staging_record="$run_dir/staging.json"
+stage_root=()
+if [[ -n "$local_root" ]]; then
+  stage_root=(--local-root "$local_root")
+fi
+clock='import time; print(time.monotonic_ns())'
+total_start_ns="$(python3 -c "$clock")"
+
+fixture="$(python3 "$lab_root/tools/stage-run" fixture \
+  --source "$fixture_source" --build-root "$build_root" \
+  "${stage_root[@]}" --pod-id "$pod_id" --output "$staging_seed")"
+
+mkdir -p "$build_root" "$run_dir"
+environment_before="$run_dir/environment.before.json"
+environment_after="$run_dir/environment.after.json"
+python3 "$lab_root/tools/lab.py" capture-environment \
+  --device "${GPU_LAB_DEVICE:-0}" --output "$environment_before"
+
+build_start_ns="$(python3 -c "$clock")"
+cmake -S "$lab_root" -B "$build_root" -G Ninja \
+  -DGPU_LAB_SM="$sm" -DCMAKE_BUILD_TYPE=Release
+
+cmake --build "$build_root" --target stwo-gpu-lab witness_pedersen_builtin_cubin --parallel
+build_commands="$run_dir/build.commands"
+ninja -C "$build_root" -t commands \
+  stwo-gpu-lab witness_pedersen_builtin_cubin > "$build_commands"
+build_done_ns="$(python3 -c "$clock")"
+
+prepare_start_ns="$build_done_ns"
+python3 "$lab_root/tools/lab.py" prepare \
+  --fixture "$fixture" \
+  --oracle-index "$oracle_index" \
+  --module-index "$module_index" \
+  --abi "$abi" \
+  --sm "$sm" \
+  --execution "$execution" \
+  --replay "$replay" \
+  --plan "$plan" > "$run_dir/identity.json"
+prepare_done_ns="$(python3 -c "$clock")"
+
+module="$(python3 - "$module_index" <<'PY'
+import json, pathlib, sys
+print(json.loads(pathlib.Path(sys.argv[1]).read_text())["module_path"])
+PY
+)"
+python3 "$lab_root/tools/stage-run" seal \
+  --seed "$staging_seed" --build-root "$build_root" \
+  --artifact "build_commands=$build_commands" --artifact "execution=$execution" \
+  --artifact "harness=$build_root/stwo-gpu-lab" --artifact "module=$module" \
+  --artifact "module_index=$module_index" --artifact "plan=$plan" \
+  --artifact "replay=$replay" --output "$staging_record" >/dev/null
+
+hashes="$(python3 - "$plan" "$replay" "$execution" <<'PY'
+import hashlib, pathlib, sys
+digest = lambda path: hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
+print(digest(sys.argv[1]), digest(sys.argv[2]), digest(sys.argv[3]))
+PY
+)"
+read -r plan_sha replay_sha manifest_sha <<< "$hashes"
+if [[ -z "$plan_sha" || -z "$replay_sha" || -z "$manifest_sha" ]]; then
+  echo "failed to compute launch identities" >&2
+  exit 1
+fi
+
+harness="$build_root/stwo-gpu-lab"
+common=(
+  --plan "$plan"
+  --plan-sha256 "$plan_sha"
+  --replay "$replay"
+  --manifest "$execution"
+  --manifest-sha256 "$manifest_sha"
+  --device "${GPU_LAB_DEVICE:-0}"
+)
+
+correctness_start_ns="$prepare_done_ns"
+"$harness" "${common[@]}" --mode correctness --result "$run_dir/correctness.json"
+python3 "$lab_root/tools/lab.py" validate-result \
+  --result "$run_dir/correctness.json" --fixture "$fixture" \
+  --oracle-index "$oracle_index" \
+  --module-index "$module_index" --execution "$execution" \
+  --replay "$replay" --plan "$plan" --harness "$harness" --mode correctness
+correctness_done_ns="$(python3 -c "$clock")"
+benchmark_start_ns="$correctness_done_ns"
+set +e
+"$harness" "${common[@]}" --mode benchmark \
+  --warmup-budget-ms 5000 --budget-ms 30000 --min-iterations 5 --max-iterations 500 \
+  --result "$run_dir/benchmark.json"
+benchmark_rc=$?
+set -e
+performance_flag=()
+performance_status="admissible"
+if [[ "$benchmark_rc" -eq 2 ]]; then
+  performance_flag=(--allow-performance-failure)
+  performance_status="non_admissible"
+elif [[ "$benchmark_rc" -ne 0 ]]; then
+  echo "benchmark harness failed without a diagnostic result (exit $benchmark_rc)" >&2
+  exit "$benchmark_rc"
+fi
+python3 "$lab_root/tools/lab.py" validate-result \
+  --result "$run_dir/benchmark.json" --fixture "$fixture" \
+  --oracle-index "$oracle_index" \
+  --module-index "$module_index" --execution "$execution" \
+  --replay "$replay" --plan "$plan" --harness "$harness" \
+  --mode benchmark "${performance_flag[@]}"
+benchmark_done_ns="$(python3 -c "$clock")"
+
+python3 "$lab_root/tools/lab.py" capture-environment \
+  --device "${GPU_LAB_DEVICE:-0}" --output "$environment_after"
+comparison="$run_dir/baseline-comparison.json"
+python3 "$lab_root/tools/lab.py" compare-baseline \
+  --result "$run_dir/benchmark.json" --fixture "$fixture" \
+  --oracle-index "$oracle_index" --module-index "$module_index" \
+  --execution "$execution" --replay "$replay" --plan "$plan" \
+  --harness "$harness" \
+  --environment-before "$environment_before" --environment-after "$environment_after" \
+  --output "$comparison" "${performance_flag[@]}"
+total_end_ns="$(python3 -c "$clock")"
+
+python3 "$lab_root/tools/lab.py" write-loop \
+  --phase "configure_build=$build_start_ns:$build_done_ns" \
+  --phase "prepare=$prepare_start_ns:$prepare_done_ns" \
+  --phase "correctness=$correctness_start_ns:$correctness_done_ns" \
+  --phase "benchmark=$benchmark_start_ns:$benchmark_done_ns" \
+  --total "$total_start_ns:$total_end_ns" \
+  --artifact "fixture=$fixture" --artifact "oracle_index=$oracle_index" \
+  --artifact "module_index=$module_index" --artifact "execution=$execution" \
+  --artifact "replay=$replay" --artifact "plan=$plan" \
+  --artifact "harness=$harness" \
+  --artifact "correctness_result=$run_dir/correctness.json" \
+  --artifact "benchmark_result=$run_dir/benchmark.json" \
+  --artifact "baseline_comparison=$comparison" \
+  --artifact "build_commands=$build_commands" \
+  --environment-before "$environment_before" --environment-after "$environment_after" \
+  --harness "$harness" --runtime-mode correctness --runtime-mode benchmark \
+  --orchestrator "$lab_root/tools/quick-loop" --slo-checker "$lab_root/tools/check-loop-slo" \
+  --benchmark-exit-code "$benchmark_rc" --performance-status "$performance_status" \
+  --staging-record "$staging_record" \
+  --output "$run_dir/loop.json"
+
+set +e
+"$lab_root/tools/check-loop-slo" "$run_dir/loop.json" ordinary
+slo_rc=$?
+set -e
+if [[ "$benchmark_rc" -eq 2 ]]; then
+  exit 2
+fi
+exit "$slo_rc"

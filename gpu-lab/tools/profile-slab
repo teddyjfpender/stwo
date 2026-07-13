@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -ne 4 ]]; then
+  echo "usage: $0 witness_pedersen_builtin tiny sm_86 systems|compute" >&2
+  exit 2
+fi
+
+slab="$1"
+case_class="$2"
+arch="$3"
+profiler="$4"
+if [[ "$slab" != "witness_pedersen_builtin" || "$case_class" != "tiny" ]]; then
+  echo "stage-0 profiling currently supports only: witness_pedersen_builtin tiny" >&2
+  exit 2
+fi
+if [[ ! "$arch" =~ ^sm_([0-9][0-9][0-9]?)$ ]]; then
+  echo "architecture must look like sm_86, sm_90, or sm_100" >&2
+  exit 2
+fi
+if [[ "$profiler" != "systems" && "$profiler" != "compute" ]]; then
+  echo "profiler must be systems or compute" >&2
+  exit 2
+fi
+sm="${BASH_REMATCH[1]}"
+
+lab_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+repo_root="$(cd "$lab_root/.." && pwd)"
+pod_id="${RUNPOD_POD_ID:-}"
+local_root="${GPU_LAB_LOCAL_ROOT:-}"
+if [[ -z "$pod_id" ]]; then
+  local_root=""
+elif [[ -z "$local_root" && -f /tmp/stwo-gpu-lab/ACTIVE_ROOT ]]; then
+  IFS= read -r local_root < /tmp/stwo-gpu-lab/ACTIVE_ROOT
+fi
+if [[ -n "$pod_id" && -z "$local_root" ]]; then
+  echo "RUNPOD pod requires the labctl-declared GPU_LAB_LOCAL_ROOT" >&2
+  exit 1
+fi
+if [[ -n "$local_root" ]]; then
+  build_root="${GPU_LAB_BUILD_ROOT:-$local_root/build/gpu-lab-sm$sm}"
+else
+  build_root="${GPU_LAB_BUILD_ROOT:-$repo_root/build/gpu-lab-sm$sm}"
+fi
+run_dir="$build_root/runs/witness_pedersen_builtin-tiny"
+profile_dir="$run_dir/profiles"
+harness="$build_root/stwo-gpu-lab"
+staging="$run_dir/staging.json"
+oracle_index="$lab_root/cases/tiny/witness_pedersen_builtin.oracle-index.json"
+module_index="$build_root/modules/witness_pedersen_builtin.sm$sm.module.json"
+execution="$run_dir/execution.json"
+replay="$run_dir/fixture.replay"
+plan="$run_dir/execution.plan"
+
+python3 "$lab_root/tools/stage-run" verify --record "$staging" >/dev/null
+fixture="$(python3 - "$staging" <<'PY'
+import json, pathlib, sys
+record = json.loads(pathlib.Path(sys.argv[1]).read_text())
+print(next(item["destination_path"] for item in record["entries"] if item["role"] == "fixture"))
+PY
+)"
+
+for artifact in "$harness" "$fixture" "$oracle_index" "$module_index" "$execution" "$replay" "$plan" "$staging"; do
+  [[ -e "$artifact" ]] || {
+    echo "missing prepared artifact: $artifact; run tools/quick-loop first" >&2
+    exit 1
+  }
+done
+
+read -r plan_sha manifest_sha symbol <<<"$(python3 - "$plan" "$execution" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+plan = pathlib.Path(sys.argv[1])
+manifest = pathlib.Path(sys.argv[2])
+symbol = json.loads(manifest.read_text())["kernel"]["symbol"]
+print(
+    hashlib.sha256(plan.read_bytes()).hexdigest(),
+    hashlib.sha256(manifest.read_bytes()).hexdigest(),
+    symbol,
+)
+PY
+)"
+
+common=(
+  --plan "$plan"
+  --plan-sha256 "$plan_sha"
+  --replay "$replay"
+  --manifest "$execution"
+  --manifest-sha256 "$manifest_sha"
+  --device "${GPU_LAB_DEVICE:-0}"
+  --mode correctness
+)
+
+mkdir -p "$profile_dir"
+result="$profile_dir/$profiler.result.json"
+if [[ "$profiler" == "systems" ]]; then
+  command -v nsys >/dev/null || {
+    echo "nsys is required for a Systems profile" >&2
+    exit 1
+  }
+  nsys profile --force-overwrite=true --trace=cuda,nvtx,osrt \
+    --output "$profile_dir/timeline" \
+    "$harness" "${common[@]}" --result "$result"
+else
+  command -v ncu >/dev/null || {
+    echo "ncu is required for a Compute profile" >&2
+    exit 1
+  }
+  ncu --force-overwrite --target-processes all --kernel-name "regex:$symbol" \
+    --launch-count 1 --set basic --output "$profile_dir/kernel-basic" \
+    "$harness" "${common[@]}" --result "$result"
+fi
+
+python3 "$lab_root/tools/lab.py" validate-result \
+  --result "$result" --fixture "$fixture" --module-index "$module_index" \
+  --oracle-index "$oracle_index" \
+  --execution "$execution" --replay "$replay" --plan "$plan" \
+  --harness "$harness" --mode correctness

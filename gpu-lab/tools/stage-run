@@ -1,0 +1,8 @@
+#!/usr/bin/env python3
+"""Stage and seal one GPU-lab execution without touching the candidate GPU."""
+
+from gpu_lab.staging import main
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

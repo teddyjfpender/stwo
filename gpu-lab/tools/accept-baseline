@@ -1,0 +1,8 @@
+#!/usr/bin/env python3
+"""Explicitly promote one fully validated, device-specific benchmark envelope."""
+
+from gpu_lab.baselines import accept_main
+
+
+if __name__ == "__main__":
+    raise SystemExit(accept_main())
