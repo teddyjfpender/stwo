@@ -516,13 +516,13 @@ mod tests {
 
     use crate::core::channel::{Blake2sChannel, Channel, MerkleChannel};
     use crate::core::circle::{CirclePointIndex, Coset};
-    use crate::core::fields::m31::BaseField;
+    use crate::core::fields::m31::{BaseField, P};
     use crate::core::fields::qm31::{SecureField, SECURE_EXTENSION_DEGREE};
     use crate::core::fri::FriConfig;
     use crate::core::poly::circle::CircleDomain;
     use crate::core::queries::Queries;
     use crate::core::test_utils::test_channel;
-    use crate::core::vcs::blake2_hash::Blake2sHash;
+    use crate::core::vcs::blake2_hash::{Blake2sHash, Blake2sHasher};
     use crate::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
     use crate::core::vcs_lifted::verifier::PACKED_LEAF_SIZE;
     use crate::prover::backend::cpu::CpuCirclePoly;
@@ -559,6 +559,135 @@ mod tests {
                 channel.n_draws(),
             ));
         }
+    }
+
+    #[derive(Clone)]
+    struct SimdObservedFold {
+        input: crate::prover::line::LineEvaluation<CpuBackend>,
+        alpha: SecureField,
+        root: Blake2sHash,
+        digest: Blake2sHash,
+        n_draws: u32,
+    }
+
+    #[derive(Default)]
+    struct SimdRecordingObserver {
+        folds: Vec<SimdObservedFold>,
+    }
+
+    impl super::FriCommitObserver<SimdBackend, Blake2sMerkleChannel> for SimdRecordingObserver {
+        fn observe_inner_fold(
+            &mut self,
+            input: &crate::prover::line::LineEvaluation<SimdBackend>,
+            alpha: SecureField,
+            root: Blake2sHash,
+            channel: &Blake2sChannel,
+        ) {
+            self.folds.push(SimdObservedFold {
+                input: input.to_cpu(),
+                alpha,
+                root,
+                digest: channel.digest(),
+                n_draws: channel.n_draws(),
+            });
+        }
+    }
+
+    fn packed_blake_root(
+        evaluation: &crate::prover::line::LineEvaluation<CpuBackend>,
+    ) -> Blake2sHash {
+        assert!(evaluation.len() >= PACKED_LEAF_SIZE);
+        let mut layer = (0..evaluation.len() / PACKED_LEAF_SIZE)
+            .map(|packed_row| {
+                let mut hasher = Blake2sHasher::new();
+                for offset in 0..PACKED_LEAF_SIZE {
+                    for coord in 0..SECURE_EXTENSION_DEGREE {
+                        hasher.update(
+                            &evaluation.values.columns[coord]
+                                [packed_row * PACKED_LEAF_SIZE + offset]
+                                .0
+                                .to_le_bytes(),
+                        );
+                    }
+                }
+                hasher.finalize()
+            })
+            .collect::<Vec<_>>();
+        while layer.len() > 1 {
+            layer = layer
+                .chunks_exact(2)
+                .map(|pair| Blake2sHasher::concat_and_hash(&pair[0], &pair[1]))
+                .collect();
+        }
+        layer[0]
+    }
+
+    fn draw_secure_felt_from_digest(digest: Blake2sHash) -> (SecureField, u32) {
+        for counter in 0u32.. {
+            let mut input = digest.0.to_vec();
+            input.extend_from_slice(&counter.to_le_bytes());
+            input.push(0);
+            let hash = Blake2sHasher::hash(&input);
+            let words = hash
+                .0
+                .chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            if words.iter().all(|word| *word < 2 * P) {
+                return (
+                    SecureField::from_m31_array(core::array::from_fn(|i| {
+                        BaseField::reduce(words[i] as u64)
+                    })),
+                    counter + 1,
+                );
+            }
+        }
+        unreachable!()
+    }
+
+    fn line_bytes(evaluation: &crate::prover::line::LineEvaluation<CpuBackend>) -> Vec<u8> {
+        evaluation
+            .values
+            .into_iter()
+            .flat_map(|value| value.to_m31_array())
+            .flat_map(|value| value.0.to_le_bytes())
+            .collect()
+    }
+
+    fn transcript_transition_is_valid(
+        previous: &SimdObservedFold,
+        next: &SimdObservedFold,
+    ) -> bool {
+        if packed_blake_root(&next.input) != next.root {
+            return false;
+        }
+        let digest = Blake2sHasher::concat_and_hash(&previous.digest, &next.root);
+        let (alpha, n_draws) = draw_secure_felt_from_digest(digest);
+        digest == next.digest && alpha == next.alpha && n_draws == next.n_draws
+    }
+
+    fn round6_pair_is_valid(
+        previous: &SimdObservedFold,
+        round6: &SimdObservedFold,
+        round3: &SimdObservedFold,
+        twiddles: &crate::prover::poly::twiddles::TwiddleTree<CpuBackend>,
+    ) -> bool {
+        if previous.input.domain().log_size() != 9
+            || round6.input.domain().log_size() != 6
+            || round3.input.domain().log_size() != 3
+            || !transcript_transition_is_valid(previous, round6)
+            || !transcript_transition_is_valid(round6, round3)
+        {
+            return false;
+        }
+        let alpha2 = round6.alpha * round6.alpha;
+        let folded = <CpuBackend as super::FriOps>::fold_line(
+            &round6.input,
+            &[round6.alpha, alpha2, alpha2 * alpha2],
+            twiddles,
+        );
+        folded.values.to_vec() == round3.input.values.to_vec()
+            && line_bytes(&folded) == line_bytes(&round3.input)
     }
 
     #[test]
@@ -647,6 +776,103 @@ mod tests {
             assert_eq!(observed.3, replay.digest());
             assert_eq!(observed.4, replay.n_draws());
         }
+    }
+
+    #[test]
+    fn simd_observer_seals_exact_production_round6_boundary() {
+        let config = FriConfig::new(0, 1, 70, 3);
+        let cpu_column: SecureEvaluation<CpuBackend, BitReversedOrder> = {
+            let poly =
+                CpuCirclePoly::new((0..1 << 11).map(|i| BaseField::from(i * 17 + 29)).collect());
+            let domain = CircleDomain::new(Coset::half_odds(11));
+            let values = poly.evaluate(domain);
+            SecureEvaluation::new(domain, values.into_iter().map(SecureField::from).collect())
+        };
+        let column = SecureEvaluation::new(
+            cpu_column.domain,
+            cpu_column.values.to_vec().into_iter().collect(),
+        );
+        let simd_twiddles = SimdBackend::precompute_twiddles(column.domain.half_coset);
+        let cpu_twiddles = CpuBackend::precompute_twiddles(cpu_column.domain.half_coset);
+        let mut observer = SimdRecordingObserver::default();
+
+        super::FriProver::<'_, SimdBackend, Blake2sMerkleChannel>::commit_with_observer(
+            &mut test_channel(),
+            config,
+            &column,
+            &simd_twiddles,
+            &mut observer,
+        );
+
+        let logs = observer
+            .folds
+            .iter()
+            .map(|fold| fold.input.domain().log_size())
+            .collect::<Vec<_>>();
+        assert_eq!(logs, [9, 6, 3], "unexpected production callback order");
+        let round6_positions = logs
+            .windows(2)
+            .enumerate()
+            .filter_map(|(i, logs)| (logs == [6, 3]).then_some(i))
+            .collect::<Vec<_>>();
+        assert_eq!(round6_positions, [1], "round6 boundary must be unique");
+
+        let [previous, round6, round3] = observer.folds.as_slice() else {
+            panic!("production configuration must expose exactly three inner folds");
+        };
+        assert!(round6_pair_is_valid(
+            previous,
+            round6,
+            round3,
+            &cpu_twiddles
+        ));
+
+        let mut bad_round6_input = round6.clone();
+        let changed = bad_round6_input.input.values.at(0) + SecureField::one();
+        bad_round6_input.input.values.set(0, changed);
+        assert!(!round6_pair_is_valid(
+            previous,
+            &bad_round6_input,
+            round3,
+            &cpu_twiddles
+        ));
+
+        let mut bad_round3_input = round3.clone();
+        let changed = bad_round3_input.input.values.at(0) + SecureField::one();
+        bad_round3_input.input.values.set(0, changed);
+        assert!(!round6_pair_is_valid(
+            previous,
+            round6,
+            &bad_round3_input,
+            &cpu_twiddles
+        ));
+
+        let mut bad_root = round6.clone();
+        bad_root.root.0[0] ^= 1;
+        assert!(!round6_pair_is_valid(
+            previous,
+            &bad_root,
+            round3,
+            &cpu_twiddles
+        ));
+
+        let mut bad_alpha = round6.clone();
+        bad_alpha.alpha += SecureField::one();
+        assert!(!round6_pair_is_valid(
+            previous,
+            &bad_alpha,
+            round3,
+            &cpu_twiddles
+        ));
+
+        let mut bad_digest = round3.clone();
+        bad_digest.digest.0[0] ^= 1;
+        assert!(!round6_pair_is_valid(
+            previous,
+            round6,
+            &bad_digest,
+            &cpu_twiddles
+        ));
     }
 
     #[test]
