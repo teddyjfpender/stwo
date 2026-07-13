@@ -33,7 +33,7 @@ __global__ void fold_line_kernel(
     }
 }
 
-__global__ void fold_line_device_alpha_kernel(
+extern "C" __global__ void stwo_gpu_lab_fold_line_device_alpha(
     const m31 *domain,
     const uint32_t twiddle_offset,
     const uint32_t n,
@@ -102,8 +102,8 @@ extern "C" int stwo_fold_line_on(
     }
     constexpr int block_dim = 256;
     const int num_blocks = (n / 2 + block_dim - 1) / block_dim;
-    fold_line_device_alpha_kernel<<<num_blocks, block_dim, 0,
-                                    reinterpret_cast<cudaStream_t>(stream)>>>(
+    stwo_gpu_lab_fold_line_device_alpha<<<num_blocks, block_dim, 0,
+                                          reinterpret_cast<cudaStream_t>(stream)>>>(
         reinterpret_cast<const m31 *>(gpu_domain),
         twiddle_offset,
         n,

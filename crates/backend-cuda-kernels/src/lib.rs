@@ -96,4 +96,39 @@ mod tests {
         assert_ne!(raw::stwo_decommit_gather_fri_values_on as usize, 0);
         assert_ne!(raw::stwo_decommit_assemble_fri_on as usize, 0);
     }
+
+    #[test]
+    fn gpu_lab_fri_entry_names_are_stable() {
+        let sources = [
+            include_str!("../cuda/fold_line.cu"),
+            include_str!("../cuda/blake2s.cu"),
+            include_str!("../cuda/device_transcript.cu"),
+        ]
+        .join("\n");
+        for (name, declaration) in [
+            (
+                "stwo_gpu_lab_fold_line_device_alpha",
+                "extern \"C\" __global__ void stwo_gpu_lab_fold_line_device_alpha",
+            ),
+            (
+                "stwo_gpu_lab_blake2s_fri_leaf",
+                "extern \"C\" __global__ void __launch_bounds__(BLOCK_SIZE) stwo_gpu_lab_blake2s_fri_leaf",
+            ),
+            (
+                "stwo_gpu_lab_blake2s_layer",
+                "extern \"C\" __global__ void __launch_bounds__(BLOCK_SIZE, STWO_LEAF_MIN_BLOCKS) stwo_gpu_lab_blake2s_layer",
+            ),
+            (
+                "stwo_gpu_lab_blake2s_transcript_mix_words",
+                "}  // namespace\n\nextern \"C\" __global__ void stwo_gpu_lab_blake2s_transcript_mix_words",
+            ),
+            (
+                "stwo_gpu_lab_blake2s_transcript_draw_secure",
+                "}  // namespace\n\nextern \"C\" __global__ void stwo_gpu_lab_blake2s_transcript_draw_secure",
+            ),
+        ] {
+            assert!(sources.contains(declaration));
+            assert!(sources.contains(&format!("{name}<<<")));
+        }
+    }
 }

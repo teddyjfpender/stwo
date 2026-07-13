@@ -820,7 +820,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE) sparse_leaf_group_in_gpu(
 // FRI's packed-leaf transform is purely a byte-layout transform:
 // packed[coord + 4*offset][row] = coords[coord][4*row + offset]. Hash that
 // exact 16-word stream directly so no second full-size evaluation is needed.
-__global__ void __launch_bounds__(BLOCK_SIZE) fri_leaf_in_gpu(
+extern "C" __global__ void __launch_bounds__(BLOCK_SIZE) stwo_gpu_lab_blake2s_fri_leaf(
     uint32_t evaluation_size,
     m31 **coordinates,
     uint32_t log_rows_per_leaf,
@@ -854,7 +854,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE) fri_leaf_in_gpu(
     for (int i = 0; i < 8; ++i) result[leaf_index].s[i] = h[i];
 }
 
-__global__ void __launch_bounds__(BLOCK_SIZE, STWO_LEAF_MIN_BLOCKS) commit_on_layer_using_previous_in_gpu(
+extern "C" __global__ void __launch_bounds__(BLOCK_SIZE, STWO_LEAF_MIN_BLOCKS) stwo_gpu_lab_blake2s_layer(
     uint32_t size,
     uint32_t number_of_columns,
     uint32_t **data,
@@ -891,7 +891,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE, STWO_LEAF_MIN_BLOCKS) commit_on_la
 // per launch. For output index i it produces
 //     out[i] = H( H(prev[4i], prev[4i+1]), H(prev[4i+2], prev[4i+3]) )
 // which is *exactly* two sequential applications of
-// `commit_on_layer_using_previous_in_gpu` with number_of_columns == 0 — i.e.
+// `stwo_gpu_lab_blake2s_layer` with number_of_columns == 0 — i.e.
 // byte-identical to the reference by construction, no hash-function or ordering
 // change. It is only valid where BOTH fused levels inject zero columns (the common
 // internal-tree case in the lifted Merkle tree); the caller must not use it across
@@ -900,7 +900,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE, STWO_LEAF_MIN_BLOCKS) commit_on_la
 // ---------------------------------------------------------------------------
 
 // Hash a pair of child digests into one, matching the column-free byte stream of
-// `commit_on_layer_using_previous_in_gpu` (left.s[0..8] then right.s[0..8], each
+// `stwo_gpu_lab_blake2s_layer` (left.s[0..8] then right.s[0..8], each
 // word little-endian) exactly.
 __device__ __forceinline__ Blake2sHash blake2s_hash_children_device(
     const Blake2sHash& left,
@@ -1005,7 +1005,7 @@ static void stwo_maybe_probe_commit_occupancy() {
         {"commit_on_first_layer_lifted",
          reinterpret_cast<const void *>(commit_on_first_layer_lifted_in_gpu), BLOCK_SIZE},
         {"commit_on_layer_using_previous",
-         reinterpret_cast<const void *>(commit_on_layer_using_previous_in_gpu), BLOCK_SIZE},
+         reinterpret_cast<const void *>(stwo_gpu_lab_blake2s_layer), BLOCK_SIZE},
     };
     int dev = 0;
     cudaGetDevice(&dev);
@@ -1275,8 +1275,8 @@ extern "C" int stwo_blake2s_layer_on(
         (output_size & (output_size - 1)) != 0 || result == nullptr || stream == nullptr) {
         return cudaErrorInvalidValue;
     }
-    commit_on_layer_using_previous_in_gpu<<<number_of_blocks_for(output_size), BLOCK_SIZE, 0,
-                                            reinterpret_cast<cudaStream_t>(stream)>>>(
+    stwo_gpu_lab_blake2s_layer<<<number_of_blocks_for(output_size), BLOCK_SIZE, 0,
+                                 reinterpret_cast<cudaStream_t>(stream)>>>(
         output_size, 0, nullptr, const_cast<Blake2sHash *>(previous_layer), result);
     return cudaGetLastError();
 }
@@ -1297,8 +1297,8 @@ extern "C" int stwo_blake2s_fri_leaf_on(
         return cudaErrorInvalidValue;
     }
     const uint32_t leaf_count = evaluation_size >> log_rows_per_leaf;
-    fri_leaf_in_gpu<<<number_of_blocks_for(leaf_count), BLOCK_SIZE, 0,
-                      reinterpret_cast<cudaStream_t>(stream)>>>(
+    stwo_gpu_lab_blake2s_fri_leaf<<<number_of_blocks_for(leaf_count), BLOCK_SIZE, 0,
+                                    reinterpret_cast<cudaStream_t>(stream)>>>(
         evaluation_size,
         reinterpret_cast<m31 **>(coordinate_columns),
         log_rows_per_leaf,
@@ -1342,7 +1342,7 @@ void commit_on_layer_with_previous(
     Blake2sHash* previous_layer,
     Blake2sHash* result
 ) {
-    commit_on_layer_using_previous_in_gpu<<<number_of_blocks_for(size), BLOCK_SIZE>>>(
+    stwo_gpu_lab_blake2s_layer<<<number_of_blocks_for(size), BLOCK_SIZE>>>(
         size, number_of_columns, device_columns, previous_layer, result);
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
     stwo_maybe_debug_sync();
@@ -1465,7 +1465,7 @@ extern "C" int stwo_blake2s_tail_on(
 // kernel (see commit_graph.rs).
 //
 // BYTE IDENTITY: every parent is blake2s_hash_children_device — the SAME
-// routine the per-level kernel (commit_on_layer_using_previous_in_gpu with
+// routine the per-level kernel (stwo_gpu_lab_blake2s_layer with
 // number_of_columns == 0), the layer-pair kernel, and the fused tail use —
 // and at each of the four local levels parent[j] = H(child[2j], child[2j+1]),
 // exactly the per-level index mapping. By induction over the four levels the

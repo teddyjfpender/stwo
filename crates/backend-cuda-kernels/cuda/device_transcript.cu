@@ -173,7 +173,9 @@ __global__ void transcript_init_kernel(uint32_t *state_words,
   state->padding[1] = 0U;
 }
 
-__global__ void transcript_mix_words_kernel(
+}  // namespace
+
+extern "C" __global__ void stwo_gpu_lab_blake2s_transcript_mix_words(
     uint32_t *state_words,
     uint32_t expected_step,
     uint64_t expected_chain,
@@ -199,6 +201,8 @@ __global__ void transcript_mix_words_kernel(
   }
   finish_step(state, next_chain, boundary_snapshot);
 }
+
+namespace {
 
 __global__ void transcript_absorb_pow_kernel(
     uint32_t *state_words,
@@ -241,7 +245,9 @@ __global__ void transcript_draw_u32s_kernel(
   finish_step(state, next_chain, boundary_snapshot);
 }
 
-__global__ void transcript_draw_secure_kernel(
+}  // namespace
+
+extern "C" __global__ void stwo_gpu_lab_blake2s_transcript_draw_secure(
     uint32_t *state_words,
     uint32_t expected_step,
     uint64_t expected_chain,
@@ -285,6 +291,8 @@ __global__ void transcript_draw_secure_kernel(
   }
   finish_step(state, next_chain, boundary_snapshot);
 }
+
+namespace {
 
 __global__ void transcript_draw_queries_kernel(
     uint32_t *state_words,
@@ -348,7 +356,7 @@ extern "C" int stwo_blake2s_transcript_mix_words_on(
     return static_cast<int>(cudaErrorInvalidValue);
   }
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_raw);
-  transcript_mix_words_kernel<<<1, 1, 0, stream>>>(
+  stwo_gpu_lab_blake2s_transcript_mix_words<<<1, 1, 0, stream>>>(
       state, expected_step, expected_chain, next_chain, source, n_words,
       validate_m31, input_snapshot, boundary_snapshot);
   return static_cast<int>(cudaGetLastError());
@@ -412,7 +420,7 @@ extern "C" int stwo_blake2s_transcript_draw_secure_on(
     return static_cast<int>(cudaErrorInvalidValue);
   }
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_raw);
-  transcript_draw_secure_kernel<<<1, 1, 0, stream>>>(
+  stwo_gpu_lab_blake2s_transcript_draw_secure<<<1, 1, 0, stream>>>(
       state, expected_step, expected_chain, next_chain, n_felts,
       max_rejection_rounds, output, output_snapshot, boundary_snapshot);
   return static_cast<int>(cudaGetLastError());

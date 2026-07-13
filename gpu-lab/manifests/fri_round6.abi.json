@@ -1,0 +1,71 @@
+{
+  "schema_version": "stwo.gpu-lab.fri-round6-abi.v1",
+  "module": "fri_round6",
+  "source": "gpu-lab/kernels/fri_round6.cu",
+  "driver_entries": [
+    {
+      "symbol": "stwo_gpu_lab_fold_line_device_alpha",
+      "arguments": [
+        {"name": "domain", "type": "const device m31*", "size_bytes": 8},
+        {"name": "twiddle_offset", "type": "u32", "size_bytes": 4},
+        {"name": "n", "type": "u32", "size_bytes": 4},
+        {"name": "alpha_device", "type": "const device qm31*", "size_bytes": 8},
+        {"name": "alpha_squarings", "type": "u32", "size_bytes": 4},
+        {"name": "eval_values", "type": "device m31**", "size_bytes": 8},
+        {"name": "folded_values", "type": "device m31**", "size_bytes": 8}
+      ],
+      "launch": {"block": [256, 1, 1], "dynamic_shared_bytes": 0}
+    },
+    {
+      "symbol": "stwo_gpu_lab_blake2s_fri_leaf",
+      "arguments": [
+        {"name": "evaluation_size", "type": "u32", "size_bytes": 4},
+        {"name": "coordinates", "type": "device m31**", "size_bytes": 8},
+        {"name": "log_rows_per_leaf", "type": "u32", "size_bytes": 4},
+        {"name": "result", "type": "device Blake2sHash*", "size_bytes": 8}
+      ],
+      "launch": {"block": [256, 1, 1], "dynamic_shared_bytes": 0}
+    },
+    {
+      "symbol": "stwo_gpu_lab_blake2s_layer",
+      "arguments": [
+        {"name": "size", "type": "u32", "size_bytes": 4},
+        {"name": "number_of_columns", "type": "u32", "size_bytes": 4},
+        {"name": "data", "type": "device u32**", "size_bytes": 8},
+        {"name": "previous_layer", "type": "device Blake2sHash*", "size_bytes": 8},
+        {"name": "result", "type": "device Blake2sHash*", "size_bytes": 8}
+      ],
+      "launch": {"block": [256, 1, 1], "dynamic_shared_bytes": 0}
+    },
+    {
+      "symbol": "stwo_gpu_lab_blake2s_transcript_mix_words",
+      "arguments": [
+        {"name": "state_words", "type": "device u32*", "size_bytes": 8},
+        {"name": "expected_step", "type": "u32", "size_bytes": 4},
+        {"name": "expected_chain", "type": "u64", "size_bytes": 8},
+        {"name": "next_chain", "type": "u64", "size_bytes": 8},
+        {"name": "source", "type": "const device u32*", "size_bytes": 8},
+        {"name": "n_words", "type": "u32", "size_bytes": 4},
+        {"name": "validate_m31", "type": "u32", "size_bytes": 4},
+        {"name": "input_snapshot", "type": "device u32*", "size_bytes": 8},
+        {"name": "boundary_snapshot", "type": "device u32*", "size_bytes": 8}
+      ],
+      "launch": {"block": [1, 1, 1], "dynamic_shared_bytes": 0}
+    },
+    {
+      "symbol": "stwo_gpu_lab_blake2s_transcript_draw_secure",
+      "arguments": [
+        {"name": "state_words", "type": "device u32*", "size_bytes": 8},
+        {"name": "expected_step", "type": "u32", "size_bytes": 4},
+        {"name": "expected_chain", "type": "u64", "size_bytes": 8},
+        {"name": "next_chain", "type": "u64", "size_bytes": 8},
+        {"name": "n_felts", "type": "u32", "size_bytes": 4},
+        {"name": "max_rejection_rounds", "type": "u32", "size_bytes": 4},
+        {"name": "output", "type": "device u32*", "size_bytes": 8},
+        {"name": "output_snapshot", "type": "device u32*", "size_bytes": 8},
+        {"name": "boundary_snapshot", "type": "device u32*", "size_bytes": 8}
+      ],
+      "launch": {"block": [1, 1, 1], "dynamic_shared_bytes": 0}
+    }
+  ]
+}
