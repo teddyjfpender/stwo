@@ -123,6 +123,10 @@ pub struct CudaPcsDriverTelemetry {
     /// Resident-context counters. Detached migration runs deliberately report
     /// `None`; strict ArenaGraph admission requires this evidence.
     pub exec: Option<CudaExecTelemetry>,
+    /// Exact captured topology accepted before the ArenaGraph proof returned.
+    /// Detached migration runs do not have a resident replay topology.
+    pub expected_graph_launches: Option<u64>,
+    pub expected_kernel_launches: Option<u64>,
 }
 
 impl CudaPcsDriverTelemetry {
@@ -134,10 +138,24 @@ impl CudaPcsDriverTelemetry {
             stage_finished: [0; PcsProofStage::ALL.len()],
             batched_tree_decommit: false,
             exec: None,
+            expected_graph_launches: None,
+            expected_kernel_launches: None,
         }
     }
 
-    pub fn completed_arena_graph(exec: CudaExecTelemetry) -> Self {
+    pub fn completed_arena_graph(
+        exec: CudaExecTelemetry,
+        expected_graph_launches: u64,
+        expected_kernel_launches: u64,
+    ) -> Self {
+        assert_eq!(
+            exec.graph_launches, expected_graph_launches,
+            "ArenaGraph telemetry graph count was not budget-accepted"
+        );
+        assert_eq!(
+            exec.kernel_launches, expected_kernel_launches,
+            "ArenaGraph telemetry kernel count was not budget-accepted"
+        );
         Self {
             architecture: "cuda-typed-pcs-driver-v1",
             runtime_mode: CudaPcsRuntimeMode::ArenaGraph,
@@ -145,6 +163,8 @@ impl CudaPcsDriverTelemetry {
             stage_finished: [1; PcsProofStage::ALL.len()],
             batched_tree_decommit: true,
             exec: Some(exec),
+            expected_graph_launches: Some(expected_graph_launches),
+            expected_kernel_launches: Some(expected_kernel_launches),
         }
     }
 
@@ -304,5 +324,29 @@ mod tests {
         assert!(!telemetry.is_complete());
         telemetry.batched_tree_decommit = true;
         assert!(telemetry.is_complete());
+    }
+
+    #[test]
+    fn arena_graph_telemetry_preserves_accepted_topology() {
+        let exec = CudaExecTelemetry {
+            graph_launches: 14,
+            kernel_launches: 2_530,
+            ..CudaExecTelemetry::default()
+        };
+        let telemetry = CudaPcsDriverTelemetry::completed_arena_graph(exec, 14, 2_530);
+        assert_eq!(telemetry.exec, Some(exec));
+        assert_eq!(telemetry.expected_graph_launches, Some(14));
+        assert_eq!(telemetry.expected_kernel_launches, Some(2_530));
+    }
+
+    #[test]
+    #[should_panic(expected = "ArenaGraph telemetry graph count was not budget-accepted")]
+    fn arena_graph_telemetry_rejects_unaccepted_topology() {
+        let exec = CudaExecTelemetry {
+            graph_launches: 13,
+            kernel_launches: 2_530,
+            ..CudaExecTelemetry::default()
+        };
+        let _ = CudaPcsDriverTelemetry::completed_arena_graph(exec, 14, 2_530);
     }
 }
