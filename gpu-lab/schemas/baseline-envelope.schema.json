@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://stwo.dev/gpu-lab/baseline-v1.schema.json",
+  "title": "Stwo GPU lab accepted baseline envelope",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "identity", "module", "measurement", "environment", "audit", "snapshot"
+  ],
+  "properties": {
+    "schema_version": {"const": "stwo.gpu-lab.baseline.v1"},
+    "identity": {"type": "object"},
+    "module": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["content_sha256", "build_recipe_hash", "source_sha256"],
+      "properties": {
+        "content_sha256": {"$ref": "#/$defs/sha256"},
+        "build_recipe_hash": {"$ref": "#/$defs/sha256"},
+        "source_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "measurement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["result_sha256", "resources", "timing", "derived"],
+      "properties": {
+        "result_sha256": {"$ref": "#/$defs/sha256"},
+        "resources": {"type": "object"},
+        "timing": {"type": "object"},
+        "derived": {"type": "object"}
+      }
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["before", "after"],
+      "properties": {
+        "before": {"$ref": "https://stwo.dev/gpu-lab/environment-v1.schema.json"},
+        "after": {"$ref": "https://stwo.dev/gpu-lab/environment-v1.schema.json"}
+      }
+    },
+    "audit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "loop_record_sha256", "correctness_result_sha256", "comparison_sha256",
+        "build", "runtime"
+      ],
+      "properties": {
+        "loop_record_sha256": {"$ref": "#/$defs/sha256"},
+        "correctness_result_sha256": {"$ref": "#/$defs/sha256"},
+        "comparison_sha256": {"$ref": "#/$defs/sha256"},
+        "build": {"type": "object"},
+        "runtime": {"type": "object"}
+      }
+    },
+    "snapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["top_level", "transitive", "sha256"],
+      "properties": {
+        "top_level": {"type": "object"},
+        "transitive": {"type": "array", "minItems": 1},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    }
+  },
+  "$defs": {"sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+}

@@ -1,0 +1,340 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://stwo.dev/gpu-lab/result-v1.schema.json",
+  "title": "Stwo GPU lab result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "passed",
+    "post_benchmark_passed",
+    "mode",
+    "semantic_fixture_sha256",
+    "module_content_sha256",
+    "build_recipe_hash",
+    "host_oracle_index_sha256",
+    "execution_manifest_sha256",
+    "plan_sha256",
+    "replay_sha256",
+    "harness_executable_sha256",
+    "device",
+    "launch",
+    "correctness",
+    "resources",
+    "timing"
+  ],
+  "properties": {
+    "schema_version": {"const": "stwo.gpu-lab.result.v1"},
+    "passed": {"type": "boolean"},
+    "post_benchmark_passed": {"type": "boolean"},
+    "mode": {"enum": ["correctness", "benchmark"]},
+    "semantic_fixture_sha256": {"$ref": "#/$defs/sha256"},
+    "module_content_sha256": {"$ref": "#/$defs/sha256"},
+    "build_recipe_hash": {"$ref": "#/$defs/sha256"},
+    "host_oracle_index_sha256": {"$ref": "#/$defs/sha256"},
+    "execution_manifest_sha256": {"$ref": "#/$defs/sha256"},
+    "plan_sha256": {"$ref": "#/$defs/sha256"},
+    "replay_sha256": {"$ref": "#/$defs/sha256"},
+    "harness_executable_sha256": {"$ref": "#/$defs/sha256"},
+    "device": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name", "uuid", "ordinal", "sm_major", "sm_minor", "target_sm", "driver_version",
+        "total_memory_bytes", "multiprocessor_count", "clock_rate_khz",
+        "memory_clock_rate_khz", "memory_bus_width_bits", "ecc_enabled"
+      ],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "uuid": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+        "ordinal": {"type": "integer", "minimum": 0},
+        "sm_major": {"type": "integer", "minimum": 5},
+        "sm_minor": {"type": "integer", "minimum": 0, "maximum": 9},
+        "target_sm": {"type": "integer", "minimum": 50, "maximum": 999},
+        "driver_version": {"type": "integer", "minimum": 1},
+        "total_memory_bytes": {"type": "integer", "minimum": 1},
+        "multiprocessor_count": {"type": "integer", "minimum": 1},
+        "clock_rate_khz": {"type": "integer", "minimum": 1},
+        "memory_clock_rate_khz": {"type": "integer", "minimum": 1},
+        "memory_bus_width_bits": {"type": "integer", "minimum": 1},
+        "ecc_enabled": {"type": "boolean"}
+      }
+    },
+    "launch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["symbol", "grid", "block", "dynamic_shared_bytes"],
+      "properties": {
+        "symbol": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"},
+        "grid": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "items": {"type": "integer", "minimum": 1}
+        },
+        "block": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "items": {"type": "integer", "minimum": 1}
+        },
+        "dynamic_shared_bytes": {"type": "integer", "minimum": 0}
+      }
+    },
+    "correctness": {"$ref": "#/$defs/correctness"},
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["registers_per_thread", "static_shared_bytes", "local_bytes_per_thread"],
+      "properties": {
+        "registers_per_thread": {"type": "integer", "minimum": 0},
+        "static_shared_bytes": {"type": "integer", "minimum": 0},
+        "local_bytes_per_thread": {"type": "integer", "minimum": 0}
+      }
+    },
+    "timing": {
+      "oneOf": [
+        {"$ref": "#/$defs/empty_timing"},
+        {"$ref": "#/$defs/benchmark_timing"},
+        {"$ref": "#/$defs/failed_benchmark_timing"}
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"mode": {"const": "correctness"}}},
+      "then": {
+        "properties": {
+          "post_benchmark_passed": {"const": true},
+          "correctness": {
+            "not": {
+              "anyOf": [
+                {"required": ["post_eager_passed"]},
+                {"required": ["post_graph_passed"]}
+              ]
+            }
+          },
+          "timing": {"$ref": "#/$defs/empty_timing"}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"mode": {"const": "benchmark"}},
+        "required": ["mode"],
+        "anyOf": [
+          {"properties": {"passed": {"const": true}}, "required": ["passed"]},
+          {
+            "properties": {"post_benchmark_passed": {"const": false}},
+            "required": ["post_benchmark_passed"]
+          }
+        ]
+      },
+      "then": {
+        "properties": {
+          "correctness": {
+            "required": [
+              "post_eager_passed",
+              "post_graph_passed",
+              "post_eager_checked_words",
+              "post_graph_checked_words",
+              "post_eager_error",
+              "post_graph_error"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "mode": {"const": "benchmark"},
+          "passed": {"const": true},
+          "post_benchmark_passed": {"const": true}
+        },
+        "required": ["mode", "passed", "post_benchmark_passed"]
+      },
+      "then": {"properties": {"timing": {"$ref": "#/$defs/benchmark_timing"}}},
+      "else": {
+        "if": {
+          "properties": {
+            "mode": {"const": "benchmark"},
+            "post_benchmark_passed": {"const": false}
+          },
+          "required": ["mode", "post_benchmark_passed"]
+        },
+        "then": {
+          "properties": {"timing": {"$ref": "#/$defs/failed_benchmark_timing"}}
+        },
+        "else": {
+          "if": {"properties": {"mode": {"const": "benchmark"}}},
+          "then": {"properties": {"timing": {"$ref": "#/$defs/empty_timing"}}}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"passed": {"const": true}}, "required": ["passed"]},
+      "then": {
+        "properties": {
+          "post_benchmark_passed": {"const": true},
+          "correctness": {
+            "properties": {
+              "eager_passed": {"const": true},
+              "graph_passed": {"const": true},
+              "mutated_eager_passed": {"const": true},
+              "mutated_graph_passed": {"const": true}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "mode": {"const": "benchmark"},
+          "passed": {"const": true}
+        },
+        "required": ["mode", "passed"]
+      },
+      "then": {
+        "properties": {
+          "correctness": {
+            "properties": {
+              "post_eager_passed": {"const": true},
+              "post_graph_passed": {"const": true}
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "correctness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "eager_passed",
+        "graph_passed",
+        "mutated_eager_passed",
+        "mutated_graph_passed",
+        "eager_checked_words",
+        "graph_checked_words",
+        "mutated_eager_checked_words",
+        "mutated_graph_checked_words",
+        "eager_error",
+        "graph_error",
+        "mutated_eager_error",
+        "mutated_graph_error"
+      ],
+      "properties": {
+        "eager_passed": {"type": "boolean"},
+        "graph_passed": {"type": "boolean"},
+        "mutated_eager_passed": {"type": "boolean"},
+        "mutated_graph_passed": {"type": "boolean"},
+        "eager_checked_words": {"type": "integer", "minimum": 0},
+        "graph_checked_words": {"type": "integer", "minimum": 0},
+        "mutated_eager_checked_words": {"type": "integer", "minimum": 0},
+        "mutated_graph_checked_words": {"type": "integer", "minimum": 0},
+        "eager_error": {"type": "string"},
+        "graph_error": {"type": "string"},
+        "mutated_eager_error": {"type": "string"},
+        "mutated_graph_error": {"type": "string"},
+        "post_eager_passed": {"type": "boolean"},
+        "post_graph_passed": {"type": "boolean"},
+        "post_eager_checked_words": {"type": "integer", "minimum": 0},
+        "post_graph_checked_words": {"type": "integer", "minimum": 0},
+        "post_eager_error": {"type": "string"},
+        "post_graph_error": {"type": "string"}
+      }
+    },
+    "empty_timing": {
+      "type": "object",
+      "additionalProperties": false,
+      "maxProperties": 0
+    },
+    "positive_samples": {
+      "type": "array",
+      "minItems": 5,
+      "items": {"type": "number", "exclusiveMinimum": 0}
+    },
+    "series": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "warmup_iterations",
+        "warmup_stable",
+        "iterations",
+        "p5_gpu_ms",
+        "p50_gpu_ms",
+        "p95_gpu_ms",
+        "stddev_gpu_ms",
+        "p50_submit_us",
+        "p95_submit_us",
+        "p50_wall_ms",
+        "p95_wall_ms",
+        "p95_exploratory",
+        "raw_gpu_ms",
+        "raw_submit_us",
+        "raw_wall_ms"
+      ],
+      "properties": {
+        "warmup_iterations": {"type": "integer", "minimum": 1},
+        "warmup_stable": {"type": "boolean"},
+        "iterations": {"type": "integer", "minimum": 5},
+        "p5_gpu_ms": {"type": "number", "exclusiveMinimum": 0},
+        "p50_gpu_ms": {"type": "number", "exclusiveMinimum": 0},
+        "p95_gpu_ms": {"type": "number", "exclusiveMinimum": 0},
+        "stddev_gpu_ms": {"type": "number", "minimum": 0},
+        "p50_submit_us": {"type": "number", "minimum": 0},
+        "p95_submit_us": {"type": "number", "minimum": 0},
+        "p50_wall_ms": {"type": "number", "exclusiveMinimum": 0},
+        "p95_wall_ms": {"type": "number", "exclusiveMinimum": 0},
+        "p95_exploratory": {"type": "boolean"},
+        "raw_gpu_ms": {"$ref": "#/$defs/positive_samples"},
+        "raw_submit_us": {
+          "type": "array",
+          "minItems": 5,
+          "items": {"type": "number", "minimum": 0}
+        },
+        "raw_wall_ms": {"$ref": "#/$defs/positive_samples"}
+      }
+    },
+    "benchmark_timing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "post_benchmark_passed",
+        "performance_admissible",
+        "budget_ms",
+        "budget_used_ms",
+        "budget_remaining_ms",
+        "graph_capture_ms",
+        "graph_instantiate_ms",
+        "eager",
+        "graph"
+      ],
+      "properties": {
+        "post_benchmark_passed": {"const": true},
+        "performance_admissible": {"const": true},
+        "budget_ms": {"type": "number", "exclusiveMinimum": 0},
+        "budget_used_ms": {"type": "number", "exclusiveMinimum": 0},
+        "budget_remaining_ms": {"type": "number", "minimum": 0},
+        "graph_capture_ms": {"type": "number", "minimum": 0},
+        "graph_instantiate_ms": {"type": "number", "minimum": 0},
+        "eager": {"$ref": "#/$defs/series"},
+        "graph": {"$ref": "#/$defs/series"}
+      }
+    },
+    "failed_benchmark_timing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["post_benchmark_passed", "performance_admissible", "error"],
+      "properties": {
+        "post_benchmark_passed": {"const": false},
+        "performance_admissible": {"const": false},
+        "error": {"type": "string", "minLength": 1}
+      }
+    }
+  }
+}

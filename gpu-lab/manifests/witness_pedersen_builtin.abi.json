@@ -1,0 +1,278 @@
+{
+  "schema_version": "stwo.gpu-lab.kernel-entry.v1",
+  "semantic_operation": "cairo.witness.pedersen_builtin",
+  "source": "crates/backend-cuda-kernels/cuda/generated/witness_pedersen_builtin_d7b6e6ef82833ff3.cu",
+  "cache_key": "d7b6e6ef82833ff3",
+  "semantic_ir_hash": "da729390f0d884f9",
+  "symbol": "stwo_jit_witness_da729390f0d884f9",
+  "abi_version": "stwo.generated-witness.v1",
+  "arguments": [
+    {
+      "name": "input_cols",
+      "kind": "device_pointer_table",
+      "index": 0,
+      "access": "read",
+      "parameter_offset_bytes": 0,
+      "size_bytes": 8,
+      "alignment_bytes": 8,
+      "address_space": "device_global",
+      "pointer_depth": 2,
+      "element_type": "u32",
+      "logical_extent": 3,
+      "count": 3
+    },
+    {
+      "name": "table_bases",
+      "kind": "device_pointer_table",
+      "index": 1,
+      "access": "read",
+      "parameter_offset_bytes": 8,
+      "size_bytes": 8,
+      "alignment_bytes": 8,
+      "address_space": "device_global",
+      "pointer_depth": 2,
+      "element_type": "u32",
+      "logical_extent": 37,
+      "count": 37
+    },
+    {
+      "name": "table_strides",
+      "kind": "device_pointer",
+      "index": 2,
+      "access": "read",
+      "parameter_offset_bytes": 16,
+      "size_bytes": 8,
+      "alignment_bytes": 8,
+      "address_space": "device_global",
+      "pointer_depth": 1,
+      "element_type": "u32",
+      "logical_extent": 3,
+      "words": 3
+    },
+    {
+      "name": "out_cols",
+      "kind": "device_pointer_table",
+      "index": 3,
+      "access": "write",
+      "parameter_offset_bytes": 24,
+      "size_bytes": 8,
+      "alignment_bytes": 8,
+      "address_space": "device_global",
+      "pointer_depth": 2,
+      "element_type": "u32",
+      "logical_extent": 3,
+      "count": 3
+    },
+    {
+      "name": "mult_counts",
+      "kind": "device_pointer_table",
+      "index": 4,
+      "access": "unused",
+      "parameter_offset_bytes": 32,
+      "size_bytes": 8,
+      "alignment_bytes": 8,
+      "address_space": "device_global",
+      "pointer_depth": 2,
+      "element_type": "u32",
+      "logical_extent": 1,
+      "count": 1
+    },
+    {
+      "name": "lookup_words",
+      "kind": "device_pointer",
+      "index": 5,
+      "access": "write",
+      "parameter_offset_bytes": 40,
+      "size_bytes": 8,
+      "alignment_bytes": 8,
+      "address_space": "device_global",
+      "pointer_depth": 1,
+      "element_type": "u32",
+      "logical_extent": "14*row_count",
+      "words_per_row": 14
+    },
+    {
+      "name": "sub_words",
+      "kind": "device_pointer",
+      "index": 6,
+      "access": "write",
+      "parameter_offset_bytes": 48,
+      "size_bytes": 8,
+      "alignment_bytes": 8,
+      "address_space": "device_global",
+      "pointer_depth": 1,
+      "element_type": "u32",
+      "logical_extent": "6*row_count",
+      "words_per_row": 6
+    },
+    {
+      "name": "row_count",
+      "kind": "u32",
+      "index": 7,
+      "access": "value",
+      "parameter_offset_bytes": 56,
+      "size_bytes": 4,
+      "alignment_bytes": 4,
+      "address_space": "value",
+      "pointer_depth": 0,
+      "element_type": "u32",
+      "logical_extent": 1
+    }
+  ],
+  "launch": {
+    "grid_x": "ceil_div(row_count,256)",
+    "grid_y": 1,
+    "grid_z": 1,
+    "block": [256, 1, 1],
+    "dynamic_shared_bytes": 0,
+    "cooperative": false,
+    "graph_capture": true,
+    "graph_parameter_policy": "row_count_change_requires_recapture",
+    "parameter_buffer_size_bytes": 60,
+    "launch_bounds": {
+      "max_threads_per_block": 256,
+      "min_blocks_per_sm": null
+    },
+    "required_function_attributes": {
+      "max_dynamic_shared_bytes": 0,
+      "preferred_shared_memory_carveout": null
+    },
+    "supported_shape": {
+      "field": "M31",
+      "row_count_min": 1,
+      "row_count_max": 4294967040,
+      "input_columns": 3,
+      "output_columns": 3,
+      "table_pointer_slots": 37
+    }
+  },
+  "module_globals": [],
+  "effects": {
+    "reads": ["input_cols[0,2]", "table_bases[0]", "table_strides[0]"],
+    "writes": ["out_cols[0..3]", "lookup_words[0..14*rows]", "sub_words[0..6*rows]"],
+    "aliases_allowed": false,
+    "alias_pairs": [],
+    "reset_before_replay": ["out_cols", "lookup_words", "sub_words"],
+    "ranges": [
+      {
+        "argument": "input_cols",
+        "region": "pointer_table",
+        "access": "read",
+        "slots": [0, 2],
+        "offset_elements": 0,
+        "length_elements": 1,
+        "element_size_bytes": 8
+      },
+      {
+        "argument": "input_cols",
+        "region": "pointee",
+        "access": "read",
+        "slots": [0, 2],
+        "offset_elements": 0,
+        "length_elements": "row_count",
+        "element_size_bytes": 4
+      },
+      {
+        "argument": "table_bases",
+        "region": "pointer_table",
+        "access": "read",
+        "slots": [0],
+        "offset_elements": 0,
+        "length_elements": 1,
+        "element_size_bytes": 8
+      },
+      {
+        "argument": "table_bases",
+        "region": "pointee",
+        "access": "read",
+        "slots": [0],
+        "offset_elements": 0,
+        "length_elements": "table_strides[0]",
+        "element_size_bytes": 4
+      },
+      {
+        "argument": "table_strides",
+        "region": "direct",
+        "access": "read",
+        "slots": [],
+        "offset_elements": 0,
+        "length_elements": 1,
+        "element_size_bytes": 4
+      },
+      {
+        "argument": "out_cols",
+        "region": "pointer_table",
+        "access": "read",
+        "slots": [0, 1, 2],
+        "offset_elements": 0,
+        "length_elements": 1,
+        "element_size_bytes": 8
+      },
+      {
+        "argument": "out_cols",
+        "region": "pointee",
+        "access": "write",
+        "slots": [0, 1, 2],
+        "offset_elements": 0,
+        "length_elements": "row_count",
+        "element_size_bytes": 4
+      },
+      {
+        "argument": "lookup_words",
+        "region": "direct",
+        "access": "write",
+        "slots": [],
+        "offset_elements": 0,
+        "length_elements": "14*row_count",
+        "element_size_bytes": 4
+      },
+      {
+        "argument": "sub_words",
+        "region": "direct",
+        "access": "write",
+        "slots": [],
+        "offset_elements": 0,
+        "length_elements": "6*row_count",
+        "element_size_bytes": 4
+      },
+      {
+        "argument": "row_count",
+        "region": "argument_value",
+        "access": "read",
+        "slots": [],
+        "offset_elements": 0,
+        "length_elements": 1,
+        "element_size_bytes": 4
+      }
+    ],
+    "reset_ranges": [
+      {
+        "argument": "out_cols",
+        "region": "pointee",
+        "access": "reset",
+        "slots": [0, 1, 2],
+        "offset_elements": 0,
+        "length_elements": "row_count",
+        "element_size_bytes": 4
+      },
+      {
+        "argument": "lookup_words",
+        "region": "direct",
+        "access": "reset",
+        "slots": [],
+        "offset_elements": 0,
+        "length_elements": "14*row_count",
+        "element_size_bytes": 4
+      },
+      {
+        "argument": "sub_words",
+        "region": "direct",
+        "access": "reset",
+        "slots": [],
+        "offset_elements": 0,
+        "length_elements": "6*row_count",
+        "element_size_bytes": 4
+      }
+    ]
+  }
+}

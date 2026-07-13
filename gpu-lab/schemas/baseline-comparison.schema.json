@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://stwo.dev/gpu-lab/baseline-comparison-v1.schema.json",
+  "title": "Stwo GPU lab same-device comparison",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "status", "baseline_path", "baseline_sha256", "matching_identity",
+    "before_module_sha256", "after_module_sha256", "metrics"
+  ],
+  "properties": {
+    "schema_version": {"const": "stwo.gpu-lab.baseline-comparison.v1"},
+    "status": {"enum": ["missing", "non_admissible", "incomparable", "compared"]},
+    "baseline_path": {"type": "string", "minLength": 1},
+    "baseline_sha256": {"oneOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]},
+    "matching_identity": {"oneOf": [{"type": "object"}, {"type": "null"}]},
+    "before_module_sha256": {"oneOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]},
+    "after_module_sha256": {"$ref": "#/$defs/sha256"},
+    "metrics": {"oneOf": [{"type": "object"}, {"type": "null"}]}
+  },
+  "$defs": {"sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+}

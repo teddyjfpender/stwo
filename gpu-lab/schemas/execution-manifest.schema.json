@@ -1,0 +1,157 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://stwo.dev/gpu-lab/execution-manifest-v1.schema.json",
+  "title": "Stwo GPU lab candidate execution manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "semantic_fixture_sha256",
+    "target",
+    "program_image",
+    "kernel",
+    "host_oracle",
+    "physical_layout",
+    "effects",
+    "artifacts"
+  ],
+  "properties": {
+    "schema_version": {"const": "stwo.gpu-lab.execution-manifest.v1"},
+    "semantic_fixture_sha256": {"$ref": "#/$defs/sha256"},
+    "proof_semantic_hash": {"$ref": "#/$defs/sha256"},
+    "semantic_identity": {"$ref": "#/$defs/semantic_identity"},
+    "full_proof_semantic_hash": {"type": "null"},
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sm"],
+      "properties": {
+        "sm": {"type": "integer", "minimum": 50, "maximum": 999}
+      }
+    },
+    "program_image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "program_image_hash",
+        "build_recipe_hash",
+        "module_content_sha256",
+        "path"
+      ],
+      "properties": {
+        "program_image_hash": {"$ref": "#/$defs/sha256"},
+        "build_recipe_hash": {"$ref": "#/$defs/sha256"},
+        "module_content_sha256": {"$ref": "#/$defs/sha256"},
+        "path": {"type": "string", "pattern": "^/.+\\.cubin$"}
+      }
+    },
+    "kernel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "abi_sha256",
+        "semantic_operation",
+        "symbol",
+        "abi_version",
+        "arguments",
+        "launch",
+        "module_globals"
+      ],
+      "properties": {
+        "abi_sha256": {"$ref": "#/$defs/sha256"},
+        "semantic_operation": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]+$"},
+        "symbol": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"},
+        "abi_version": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]+$"},
+        "arguments": {
+          "$ref": "https://stwo.dev/gpu-lab/kernel-entry-v1.schema.json#/$defs/arguments"
+        },
+        "launch": {
+          "$ref": "https://stwo.dev/gpu-lab/kernel-entry-v1.schema.json#/$defs/launch"
+        },
+        "module_globals": {
+          "type": "array",
+          "items": {
+            "$ref": "https://stwo.dev/gpu-lab/kernel-entry-v1.schema.json#/$defs/module_global"
+          }
+        }
+      }
+    },
+    "host_oracle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["index_sha256", "artifact_sha256", "exporter_closure_sha256"],
+      "properties": {
+        "index_sha256": {"$ref": "#/$defs/sha256"},
+        "artifact_sha256": {"$ref": "#/$defs/sha256"},
+        "exporter_closure_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "physical_layout": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "word_type",
+        "input_columns",
+        "table_pointer_slots",
+        "table_slot_bindings",
+        "table_stride_words",
+        "output_columns",
+        "lookup_words_per_row",
+        "sub_words_per_row",
+        "device_pointer_values_serialized"
+      ],
+      "properties": {
+        "word_type": {"const": "u32_le"},
+        "input_columns": {"const": 3},
+        "table_pointer_slots": {"const": 37},
+        "table_slot_bindings": {
+          "type": "array",
+          "prefixItems": [{"const": "address_to_id"}],
+          "items": {"type": "null"},
+          "minItems": 37,
+          "maxItems": 37
+        },
+        "table_stride_words": {"const": 3},
+        "output_columns": {"const": 3},
+        "lookup_words_per_row": {"const": 14},
+        "sub_words_per_row": {"const": 6},
+        "device_pointer_values_serialized": {"const": false}
+      }
+    },
+    "effects": {
+      "$ref": "https://stwo.dev/gpu-lab/kernel-entry-v1.schema.json#/$defs/effects"
+    },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["replay_image_sha256", "launch_plan_sha256"],
+      "properties": {
+        "replay_image_sha256": {"$ref": "#/$defs/sha256"},
+        "launch_plan_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    }
+  },
+  "oneOf": [
+    {
+      "required": ["proof_semantic_hash"],
+      "not": {"anyOf": [{"required": ["semantic_identity"]}, {"required": ["full_proof_semantic_hash"]}]}
+    },
+    {
+      "required": ["semantic_identity", "full_proof_semantic_hash"],
+      "not": {"required": ["proof_semantic_hash"]}
+    }
+  ],
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "semantic_identity": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "schema", "scope", "sha256"],
+      "properties": {
+        "kind": {"const": "kernel_slice"},
+        "schema": {"const": "stwo.gpu-lab.slab-semantics.v1"},
+        "scope": {"const": "cairo.witness.pedersen_builtin.base-trace-and-facts"},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    }
+  }
+}

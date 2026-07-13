@@ -1,0 +1,129 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://stwo.dev/gpu-lab/loop-result-v3.schema.json",
+  "title": "Stwo GPU lab auditable fast-loop result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "phases_s", "end_to_end_s", "artifacts", "build_audit",
+    "runtime_audit", "environment", "staging", "record_sha256"
+  ],
+  "properties": {
+    "schema_version": {"const": "stwo.gpu-lab.loop-result.v3"},
+    "phases_s": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["configure_build", "prepare", "correctness", "benchmark"],
+      "properties": {
+        "configure_build": {"$ref": "#/$defs/seconds"},
+        "prepare": {"$ref": "#/$defs/seconds"},
+        "correctness": {"$ref": "#/$defs/seconds"},
+        "benchmark": {"$ref": "#/$defs/seconds"}
+      }
+    },
+    "end_to_end_s": {"$ref": "#/$defs/seconds"},
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fixture", "oracle_index", "module_index", "execution", "replay", "plan",
+        "harness", "correctness_result", "benchmark_result", "baseline_comparison", "build_commands"
+      ],
+      "patternProperties": {"^[a-z_]+$": {"$ref": "#/$defs/artifact"}}
+    },
+    "build_audit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "commands_sha256", "command_count", "commands", "forbidden_hits", "cargo_builds", "scope"
+      ],
+      "properties": {
+        "commands_sha256": {"$ref": "#/$defs/sha256"},
+        "command_count": {"type": "integer", "minimum": 1},
+        "commands": {
+          "type": "array", "minItems": 1,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "forbidden_hits": {"const": []},
+        "cargo_builds": {"const": 0},
+        "scope": {"type": "string", "minLength": 1}
+      }
+    },
+    "runtime_audit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "harness_sha256", "orchestrator_sha256", "slo_checker_sha256",
+        "invocations", "benchmark_exit_code", "performance_admissible", "full_proofs", "scope"
+      ],
+      "properties": {
+        "harness_sha256": {"$ref": "#/$defs/sha256"},
+        "orchestrator_sha256": {"$ref": "#/$defs/sha256"},
+        "slo_checker_sha256": {"$ref": "#/$defs/sha256"},
+        "invocations": {"const": ["correctness", "benchmark"]},
+        "benchmark_exit_code": {"enum": [0, 2]},
+        "performance_admissible": {"type": "boolean"},
+        "full_proofs": {"const": 0},
+        "scope": {"type": "string", "minLength": 1}
+      }
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["before", "after"],
+      "properties": {
+        "before": {"$ref": "https://stwo.dev/gpu-lab/environment-v1.schema.json"},
+        "after": {"$ref": "https://stwo.dev/gpu-lab/environment-v1.schema.json"}
+      }
+    },
+    "staging": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version", "mode", "pod_id", "local_root", "build_root", "entries",
+        "record_sha256"
+      ],
+      "properties": {
+        "schema_version": {"const": "stwo.gpu-lab.staging.v1"},
+        "mode": {"enum": ["local_developer", "pod_local_nvme"]},
+        "pod_id": {"type": ["string", "null"]},
+        "local_root": {"type": ["string", "null"]},
+        "build_root": {"type": "string", "minLength": 1},
+        "entries": {
+          "type": "array", "minItems": 8,
+          "items": {
+            "type": "object", "additionalProperties": false,
+            "required": [
+              "bytes", "destination_path", "destination_sha256", "origin", "role",
+              "source_path", "source_sha256"
+            ],
+            "properties": {
+              "bytes": {"type": "integer", "minimum": 0},
+              "destination_path": {"type": "string", "minLength": 1},
+              "destination_sha256": {"$ref": "#/$defs/sha256"},
+              "origin": {"enum": ["generated_local", "local_developer", "verified_copy"]},
+              "role": {"type": "string", "minLength": 1},
+              "source_path": {"type": "string", "minLength": 1},
+              "source_sha256": {"$ref": "#/$defs/sha256"}
+            }
+          }
+        },
+        "record_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "record_sha256": {"$ref": "#/$defs/sha256"}
+  },
+  "$defs": {
+    "seconds": {"type": "number", "minimum": 0},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sha256", "bytes"],
+      "properties": {
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "bytes": {"type": "integer", "minimum": 0}
+      }
+    }
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://stwo.dev/gpu-lab/module-index-v1.schema.json",
+  "title": "Stwo GPU lab recipe-to-module index",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "build_recipe_hash",
+    "build_recipe",
+    "module_content_sha256",
+    "module_path",
+    "target_sm",
+    "abi_path"
+  ],
+  "properties": {
+    "schema_version": {"const": "stwo.gpu-lab.module-index.v1"},
+    "build_recipe_hash": {"$ref": "#/$defs/sha256"},
+    "build_recipe": {
+      "$ref": "https://stwo.dev/gpu-lab/build-recipe-v2.schema.json"
+    },
+    "module_content_sha256": {"$ref": "#/$defs/sha256"},
+    "module_path": {"type": "string", "pattern": "^/.+\\.cubin$"},
+    "target_sm": {"type": "integer", "minimum": 50, "maximum": 999},
+    "abi_path": {"type": "string", "pattern": "^/.+\\.json$"}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

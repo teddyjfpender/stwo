@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://stwo.dev/gpu-lab/environment-v1.schema.json",
+  "title": "Stwo GPU lab nvidia-smi environment snapshot",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "device_selector", "fields"],
+  "properties": {
+    "schema_version": {"const": "stwo.gpu-lab.environment.v1"},
+    "device_selector": {"type": "string", "minLength": 1},
+    "fields": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "uuid", "name", "pci_bus_id", "persistence_mode", "performance_state",
+        "power_draw_w", "power_limit_w", "temperature_c", "graphics_clock_mhz",
+        "sm_clock_mhz", "memory_clock_mhz", "mig_mode", "ecc_mode"
+      ],
+      "properties": {
+        "uuid": {"$ref": "#/$defs/reading"},
+        "name": {"$ref": "#/$defs/reading"},
+        "pci_bus_id": {"$ref": "#/$defs/reading"},
+        "persistence_mode": {"$ref": "#/$defs/reading"},
+        "performance_state": {"$ref": "#/$defs/reading"},
+        "power_draw_w": {"$ref": "#/$defs/reading"},
+        "power_limit_w": {"$ref": "#/$defs/reading"},
+        "temperature_c": {"$ref": "#/$defs/reading"},
+        "graphics_clock_mhz": {"$ref": "#/$defs/reading"},
+        "sm_clock_mhz": {"$ref": "#/$defs/reading"},
+        "memory_clock_mhz": {"$ref": "#/$defs/reading"},
+        "mig_mode": {"$ref": "#/$defs/reading"},
+        "ecc_mode": {"$ref": "#/$defs/reading"}
+      }
+    }
+  },
+  "$defs": {
+    "reading": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "value"],
+          "properties": {
+            "status": {"const": "available"},
+            "value": {"type": "string", "minLength": 1}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "reason"],
+          "properties": {
+            "status": {"const": "unavailable"},
+            "reason": {"type": "string", "minLength": 1}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "reason"],
+          "properties": {
+            "status": {"const": "not_supported"},
+            "reason": {"type": "string", "minLength": 1}
+          }
+        }
+      ]
+    }
+  }
+}
