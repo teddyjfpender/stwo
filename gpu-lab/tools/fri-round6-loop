@@ -1,0 +1,8 @@
+#!/usr/bin/env python3
+"""Preflight the exact, non-production FRI round-6 replay lane."""
+
+from gpu_lab.fri_round6_loop_cli import main
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
