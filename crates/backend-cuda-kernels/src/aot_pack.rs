@@ -86,6 +86,20 @@ pub fn aot_pack_supports_arch(sm_major: u32, sm_minor: u32) -> bool {
     AOT_INDEX.iter().any(|entry| entry.1 == sm)
 }
 
+/// True when this binary contains the exact `(cache_key, architecture)` entry.
+/// This only searches the immutable embedded index and never initializes CUDA.
+pub fn aot_pack_contains(cache_key: u64, sm_major: u32, sm_minor: u32) -> bool {
+    let Some(sm) = sm_major
+        .checked_mul(10)
+        .and_then(|major| major.checked_add(sm_minor))
+    else {
+        return false;
+    };
+    AOT_INDEX
+        .binary_search_by_key(&(cache_key, sm), |entry| (entry.0, entry.1))
+        .is_ok()
+}
+
 #[cfg(test)]
 mod manifest_tests {
     use super::*;
@@ -106,5 +120,13 @@ mod manifest_tests {
         for &(_, sm, ..) in AOT_INDEX {
             assert!(aot_pack_supports_arch(sm / 10, sm % 10));
         }
+    }
+
+    #[test]
+    fn exact_membership_matches_embedded_index() {
+        for &(cache_key, sm, ..) in AOT_INDEX {
+            assert!(aot_pack_contains(cache_key, sm / 10, sm % 10));
+        }
+        assert!(!aot_pack_contains(0, u32::MAX, u32::MAX));
     }
 }

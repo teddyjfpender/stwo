@@ -133,11 +133,11 @@ fn try_jit_constraint_quotients_inner<E: FrameworkEval>(
         now_ms()
     ));
 
-    // Lowering hoists every ext constant (lookup elements, cumsum shift) into
-    // `ext_param_values`, so each program — and its semantic hash — depends only on
-    // the AIR structure. The hash therefore stays stable across statements and the
-    // compiled kernel is reused from the in-memory or on-disk PTX cache.
-    let (parts, ext_param_values) = lower_framework_eval_to_v1_split(
+    // Lowering hoists every base and ext constant into runtime parameters, so each
+    // program — and its semantic hash — depends only on the AIR structure. The hash
+    // therefore stays stable across statements and the compiled kernel is reused
+    // from the in-memory or on-disk PTX cache.
+    let (parts, base_param_values, ext_param_values) = lower_framework_eval_to_v1_split(
         component.evaluator(),
         inputs.trace_ptrs.len() as u32,
         0,
@@ -219,7 +219,11 @@ fn try_jit_constraint_quotients_inner<E: FrameworkEval>(
             .collect(),
     );
 
-    let empty = BaseFieldVec::new_zeroes(1);
+    let base_params = BaseFieldVec::from_vec(if base_param_values.is_empty() {
+        vec![num_traits::Zero::zero()]
+    } else {
+        base_param_values
+    });
     // Ext params = every constant the lowering hoisted out of the bytecode (lookup
     // elements, cumsum shift, structural constants), uploaded in slot order — shared
     // by every split kernel (slot numbering is global to the component). A
@@ -310,7 +314,7 @@ fn try_jit_constraint_quotients_inner<E: FrameworkEval>(
                 kernel.cache_key,
                 trace_table.as_ptr().cast(),
                 offsets_dev.device_ptr,
-                empty.device_ptr,
+                base_params.device_ptr,
                 ext_params.device_ptr,
                 inputs.random_coeff_powers.device_ptr,
                 inputs.denom_inv.device_ptr,

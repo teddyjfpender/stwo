@@ -32,6 +32,12 @@ pub fn supports_arch(sm_major: u32, sm_minor: u32) -> bool {
     stwo_backend_cuda_kernels::aot_pack::aot_pack_supports_arch(sm_major, sm_minor)
 }
 
+/// Cheap read-only admission check for an exact embedded kernel. This searches
+/// the sealed binary's static AOT index and does not initialize CUDA.
+pub fn contains_loaded_kernel(cache_key: u64, sm_major: u32, sm_minor: u32) -> bool {
+    stwo_backend_cuda_kernels::aot_pack::aot_pack_contains(cache_key, sm_major, sm_minor)
+}
+
 pub use stwo_backend_cuda_kernels::raw::CudaJitAotStats as RuntimeStats;
 
 /// Permanently select the fail-closed AOT-only lane for subsequent generated
@@ -51,6 +57,7 @@ pub fn reset_runtime_stats() {
     unsafe { stwo_backend_cuda_kernels::raw::stwo_cuda_jit_reset_aot_stats() }
 }
 
+use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
 use stwo_constraint_framework::FrameworkEval;
 
@@ -74,11 +81,12 @@ pub struct EmittedConstraintKernel {
 }
 
 /// Structural constraint program plus the evaluator constants hoisted into its
-/// mutable extension-parameter table. The kernel identities are statement
-/// independent; `ext_param_values` is the setup oracle used by higher layers to
-/// bind each stable slot to its device-side transcript/claim producer.
+/// mutable parameter tables. The kernel identities are statement independent;
+/// the parameter values are the setup oracle used by higher layers to bind each
+/// stable slot to its device-side statement producer.
 pub struct EmittedConstraintProgram {
     pub kernels: Vec<EmittedConstraintKernel>,
+    pub base_param_values: Vec<BaseField>,
     pub ext_param_values: Vec<SecureField>,
 }
 
@@ -93,7 +101,7 @@ pub fn constraint_program<F: FrameworkEval>(
     log_size: u32,
     max_kernel_instrs: usize,
 ) -> Option<EmittedConstraintProgram> {
-    let (parts, ext_param_values) = lower_framework_eval_to_v1_split(
+    let (parts, base_param_values, ext_param_values) = lower_framework_eval_to_v1_split(
         eval,
         n_interactions,
         0,
@@ -121,14 +129,15 @@ pub fn constraint_program<F: FrameworkEval>(
         .collect::<Option<Vec<_>>>()?;
     Some(EmittedConstraintProgram {
         kernels,
+        base_param_values,
         ext_param_values,
     })
 }
 
 /// Emit the fused constraint kernel(s) for a component's evaluator. The lowering
-/// hoists every statement constant into parameters, so the sources and cache
-/// keys depend only on the AIR structure — any statement's evaluator emits the
-/// same kernels. `max_kernel_instrs = usize::MAX` (the default) emits ONE fused
+/// hoists every statement constant into parameters, so structurally identical
+/// evaluator recordings emit the same sources and cache keys across statement
+/// values. `max_kernel_instrs = usize::MAX` (the default) emits ONE fused
 /// kernel unless a single constraint cone alone exceeds even that.
 pub fn constraint_kernel_sources<F: FrameworkEval>(
     eval: &F,

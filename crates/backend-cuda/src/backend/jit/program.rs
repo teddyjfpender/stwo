@@ -16,6 +16,7 @@
 #![allow(clippy::too_many_arguments)]
 
 use num_traits::Zero;
+use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
 use stwo_constraint_framework::FrameworkEval;
 
@@ -374,6 +375,7 @@ pub enum MetalEvaluationProgramLoweringError {
     InvalidVirtualSnosColumnCount {
         n_columns: u32,
     },
+    ParameterBudgetOverflow,
     RegisterBudgetOverflow,
     AbiLayoutMismatch {
         record: &'static str,
@@ -686,8 +688,14 @@ pub fn lower_framework_eval_to_v1<F: FrameworkEval>(
     n_interactions: u32,
     n_base_params: u32,
     n_ext_params: u32,
-) -> Result<(OwnedMetalEvaluationProgramV1, Vec<SecureField>), MetalEvaluationProgramLoweringError>
-{
+) -> Result<
+    (
+        OwnedMetalEvaluationProgramV1,
+        Vec<BaseField>,
+        Vec<SecureField>,
+    ),
+    MetalEvaluationProgramLoweringError,
+> {
     lower_framework_eval_to_v1_with_logup(
         eval,
         n_interactions,
@@ -707,13 +715,14 @@ pub fn lower_framework_eval_to_v1<F: FrameworkEval>(
 /// zero (e.g. for components without logup), the shift is zero and has no
 /// effect.
 ///
-/// Returns the program together with its ext-parameter values: every ext
-/// constant the recorder produced (channel-drawn lookup elements, logup
-/// cumsum shift, structural constants) is hoisted out of the bytecode into a
-/// runtime parameter slot, so the bytecode — and therefore the semantic hash
-/// and the JIT-compiled kernel — depends only on the AIR's structure, never
-/// on the statement being proven. The returned values must be uploaded as the
-/// kernel's `ext_params` buffer in slot order.
+/// Returns the program together with its base- and ext-parameter values: every
+/// constant the recorder produced is hoisted out of the bytecode into a runtime
+/// parameter slot, so the bytecode — and therefore the semantic hash and the
+/// JIT-compiled kernel — is value-independent for structurally identical
+/// evaluator recordings. The returned values must be uploaded as the kernel's
+/// `base_params` and `ext_params` buffers in slot order. If the caller reserves
+/// existing parameter slots, the returned vectors are the suffix to append after
+/// those caller-owned values.
 pub fn lower_framework_eval_to_v1_with_logup<F: FrameworkEval>(
     eval: &F,
     n_interactions: u32,
@@ -721,11 +730,17 @@ pub fn lower_framework_eval_to_v1_with_logup<F: FrameworkEval>(
     n_ext_params: u32,
     claimed_sum: SecureField,
     log_size: u32,
-) -> Result<(OwnedMetalEvaluationProgramV1, Vec<SecureField>), MetalEvaluationProgramLoweringError>
-{
+) -> Result<
+    (
+        OwnedMetalEvaluationProgramV1,
+        Vec<BaseField>,
+        Vec<SecureField>,
+    ),
+    MetalEvaluationProgramLoweringError,
+> {
     // Uncapped: always the single fused program (the historical pipeline —
     // record, hoist, compact, build — unchanged byte-for-byte).
-    let (mut parts, ext_param_values) = lower_framework_eval_to_v1_split(
+    let (mut parts, base_param_values, ext_param_values) = lower_framework_eval_to_v1_split(
         eval,
         n_interactions,
         n_base_params,
@@ -736,7 +751,7 @@ pub fn lower_framework_eval_to_v1_with_logup<F: FrameworkEval>(
     )?;
     debug_assert_eq!(parts.len(), 1);
     let part = parts.pop().expect("uncapped lowering yields one program");
-    Ok((part.program, ext_param_values))
+    Ok((part.program, base_param_values, ext_param_values))
 }
 
 /// One kernel of a (possibly split) lowering.
@@ -775,7 +790,10 @@ pub fn lower_framework_eval_to_v1_split<F: FrameworkEval>(
     claimed_sum: SecureField,
     log_size: u32,
     max_kernel_instrs: usize,
-) -> Result<(Vec<JitKernelPart>, Vec<SecureField>), MetalEvaluationProgramLoweringError> {
+) -> Result<
+    (Vec<JitKernelPart>, Vec<BaseField>, Vec<SecureField>),
+    MetalEvaluationProgramLoweringError,
+> {
     validate_eval_program_abi_layout_v1()?;
 
     let mut recorder = RecordingEvaluator::new();
@@ -791,25 +809,49 @@ pub fn lower_framework_eval_to_v1_split<F: FrameworkEval>(
     let recorder = eval.evaluate(recorder);
     let mut state = recorder.finish();
 
-    // Statement-independence: channel-drawn lookup elements, the logup cumsum shift
-    // (claimed_sum / 2^log_size), and record-time const folds of either all land in
-    // the bytecode as ext CONSTANTS, which would change the semantic hash — and
-    // therefore force an NVRTC recompile — for every new statement. Hoist EVERY ext
-    // constant into its own runtime parameter slot. Slots are assigned by instruction
-    // occurrence, in encounter order, and values are returned to the dispatcher for
-    // the ext_params buffer. Do not deduplicate by value: equality between two
-    // statement values (most notably a zero claimed sum colliding with another zero
-    // constant) is statement-dependent and would otherwise change subsequent slot
-    // numbers, the bytecode, and the kernel semantic hash. After this rewrite the
-    // bytecode is a pure function of the AIR's structure, so the kernel cache
-    // (in-memory and on-disk) hits across statements, inputs, and processes. The
-    // kernel reads ext_params[slot] instead of an immediate — identical values,
-    // identical arithmetic, byte-identical results.
+    // Statement-independence: base-field statement constants, channel-drawn lookup
+    // elements, the logup cumsum shift (claimed_sum / 2^log_size), and record-time
+    // const folds all land in bytecode as CONSTANTS, which would change the semantic
+    // hash — and therefore force an NVRTC recompile — for every new statement. Hoist
+    // EVERY constant into its own runtime parameter slot. Slots are assigned by
+    // instruction occurrence, in encounter order, and values are returned to the
+    // dispatcher for the base_params/ext_params buffers. Do not deduplicate by value:
+    // equality between two statement values (most notably a zero claimed sum
+    // colliding with another zero constant) is statement-dependent and would
+    // otherwise change subsequent slot numbers, the bytecode, and the kernel semantic
+    // hash. After this rewrite the bytecode is a pure function of the AIR's structure,
+    // so the kernel cache (in-memory and on-disk) hits across statements, inputs, and
+    // processes. The kernel reads params[slot] instead of an immediate — identical
+    // values, identical arithmetic, byte-identical results.
+    let checked_param_count = |reserved: u32, hoisted: usize| {
+        reserved
+            .checked_add(
+                u32::try_from(hoisted)
+                    .map_err(|_| MetalEvaluationProgramLoweringError::ParameterBudgetOverflow)?,
+            )
+            .ok_or(MetalEvaluationProgramLoweringError::ParameterBudgetOverflow)
+    };
+    let base_param_offset = n_base_params;
+    let mut base_param_values = Vec::new();
+    for inst in state.base_insts.iter_mut() {
+        if inst.op == MetalEvaluationProgramBaseOpcodeV1::Const as u8 {
+            let slot = checked_param_count(base_param_offset, base_param_values.len())?;
+            base_param_values.push(BaseField::from_u32_unchecked(inst.a));
+            inst.op = MetalEvaluationProgramBaseOpcodeV1::Param as u8;
+            inst.interaction = 0;
+            inst.a = slot;
+            inst.b = 0;
+            inst.imm = 0;
+        }
+    }
+    let n_base_params = checked_param_count(base_param_offset, base_param_values.len())?;
+
+    let ext_param_offset = n_ext_params;
     let mut ext_param_values: Vec<SecureField> = Vec::new();
     for inst in state.ext_insts.iter_mut() {
         if inst.op == MetalEvaluationProgramExtOpcodeV1::Const as u8 {
             let limbs = [inst.a, inst.b, inst.c, inst.d];
-            let slot = ext_param_values.len() as u32;
+            let slot = checked_param_count(ext_param_offset, ext_param_values.len())?;
             ext_param_values.push(SecureField::from_m31_array(
                 limbs.map(stwo::core::fields::m31::BaseField::from_u32_unchecked),
             ));
@@ -820,7 +862,7 @@ pub fn lower_framework_eval_to_v1_split<F: FrameworkEval>(
             inst.d = 0;
         }
     }
-    let n_ext_params = n_ext_params.max(ext_param_values.len() as u32);
+    let n_ext_params = checked_param_count(ext_param_offset, ext_param_values.len())?;
 
     // Size governor: split the still-SSA state (each register written exactly once,
     // so backward slicing is trivial) into root groups BEFORE register compaction;
@@ -834,6 +876,7 @@ pub fn lower_framework_eval_to_v1_split<F: FrameworkEval>(
                 program,
                 rc_base: 0,
             }],
+            base_param_values,
             ext_param_values,
         ));
     }
@@ -851,7 +894,7 @@ pub fn lower_framework_eval_to_v1_split<F: FrameworkEval>(
             rc_base,
         })
         .collect();
-    Ok((parts, ext_param_values))
+    Ok((parts, base_param_values, ext_param_values))
 }
 
 /// Compact registers, sanity-check operands, and build the owned program. This is the
@@ -1179,8 +1222,9 @@ mod tests {
             )
             .unwrap()
         };
-        let (zero_parts, zero_values) = lower(&zero_eval, SecureField::zero());
-        let (distinct_parts, distinct_values) = lower(&distinct_eval, distinct_claimed_sum);
+        let (zero_parts, zero_base_values, zero_values) = lower(&zero_eval, SecureField::zero());
+        let (distinct_parts, distinct_base_values, distinct_values) =
+            lower(&distinct_eval, distinct_claimed_sum);
 
         assert_eq!(zero_parts.len(), 1);
         assert_eq!(distinct_parts.len(), 1);
@@ -1189,6 +1233,7 @@ mod tests {
             zero_parts[0].program.header().semantic_hash,
             distinct_parts[0].program.header().semantic_hash
         );
+        assert_eq!(zero_base_values, distinct_base_values);
 
         let rows = BaseField::from_u32_unchecked(1 << distinct_eval.log_size());
         assert_eq!(
@@ -1214,6 +1259,58 @@ mod tests {
         assert_eq!(distinct_parts[0].program.header().n_ext_params, 3);
     }
 
+    #[test]
+    fn hoisted_param_slots_follow_reserved_prefixes_without_collisions() {
+        let eval = ExtParamCollisionEval {
+            first: SecureField::from_u32_unchecked(17, 29, 43, 71),
+            second: SecureField::from_u32_unchecked(101, 131, 173, 211),
+        };
+        let lower = |n_base_params, n_ext_params| {
+            lower_framework_eval_to_v1_split(
+                &eval,
+                3,
+                n_base_params,
+                n_ext_params,
+                SecureField::from_u32_unchecked(257, 263, 269, 271),
+                eval.log_size(),
+                usize::MAX,
+            )
+        };
+        let (parts, base_values, ext_values) = lower(5, 7).unwrap();
+        let program = &parts[0].program;
+
+        assert_eq!(base_values.len(), 1);
+        assert_eq!(ext_values.len(), 3);
+        assert_eq!(program.header().n_base_params, 6);
+        assert_eq!(program.header().n_ext_params, 10);
+        assert_eq!(
+            program
+                .base_insts()
+                .iter()
+                .filter(|inst| inst.op == MetalEvaluationProgramBaseOpcodeV1::Param as u8)
+                .map(|inst| inst.a)
+                .collect::<Vec<_>>(),
+            vec![5]
+        );
+        assert_eq!(
+            program
+                .ext_insts()
+                .iter()
+                .filter(|inst| inst.op == MetalEvaluationProgramExtOpcodeV1::Param as u8)
+                .map(|inst| inst.a)
+                .collect::<Vec<_>>(),
+            vec![7, 8, 9]
+        );
+        assert!(matches!(
+            lower(u32::MAX, 7),
+            Err(MetalEvaluationProgramLoweringError::ParameterBudgetOverflow)
+        ));
+        assert!(matches!(
+            lower(5, u32::MAX),
+            Err(MetalEvaluationProgramLoweringError::ParameterBudgetOverflow)
+        ));
+    }
+
     /// Deterministic synthetic trace value for the reference interpreter.
     fn trace_value(interaction: u8, column: u32, offset: i32) -> BaseField {
         let mix = (interaction as u64 + 1) * 1_000_003
@@ -1228,6 +1325,7 @@ mod tests {
     /// program's.
     fn interpret(
         program: &OwnedMetalEvaluationProgramV1,
+        base_params: &[BaseField],
         ext_params: &[SecureField],
     ) -> Vec<SecureField> {
         use {MetalEvaluationProgramBaseOpcodeV1 as B, MetalEvaluationProgramExtOpcodeV1 as X};
@@ -1237,7 +1335,8 @@ mod tests {
         for inst in program.base_insts() {
             let value = match B::from_raw(inst.op).unwrap() {
                 B::TraceCol => trace_value(inst.interaction, inst.a, inst.imm),
-                B::Param | B::PreprocessedCol => unreachable!("not emitted by these tests"),
+                B::Param => base_params[inst.a as usize],
+                B::PreprocessedCol => unreachable!("not emitted by these tests"),
                 B::Const => BaseField::from_u32_unchecked(inst.a),
                 B::Add => base[inst.a as usize] + base[inst.b as usize],
                 B::Sub => base[inst.a as usize] - base[inst.b as usize],
@@ -1271,6 +1370,99 @@ mod tests {
             .iter()
             .map(|&root| ext[root as usize])
             .collect()
+    }
+
+    #[derive(Clone, Copy)]
+    struct BaseParamCollisionEval {
+        first: BaseField,
+        second: BaseField,
+    }
+
+    impl FrameworkEval for BaseParamCollisionEval {
+        fn log_size(&self) -> u32 {
+            4
+        }
+
+        fn max_constraint_log_degree_bound(&self) -> u32 {
+            5
+        }
+
+        fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
+            let first_trace = eval.next_trace_mask();
+            eval.add_constraint(first_trace * E::F::from(self.first));
+            let second_trace = eval.next_trace_mask();
+            eval.add_constraint(second_trace * E::F::from(self.second));
+            eval
+        }
+    }
+
+    #[test]
+    fn base_param_slots_make_program_hash_and_cache_key_value_independent() {
+        let zero_eval = BaseParamCollisionEval {
+            first: BaseField::zero(),
+            second: BaseField::zero(),
+        };
+        let distinct_eval = BaseParamCollisionEval {
+            first: BaseField::from_u32_unchecked(17),
+            second: BaseField::from_u32_unchecked(29),
+        };
+        let lower = |eval: &BaseParamCollisionEval| {
+            lower_framework_eval_to_v1_split(
+                eval,
+                1,
+                0,
+                0,
+                SecureField::zero(),
+                eval.log_size(),
+                usize::MAX,
+            )
+            .unwrap()
+        };
+        let (zero_parts, zero_base_values, zero_ext_values) = lower(&zero_eval);
+        let (distinct_parts, distinct_base_values, distinct_ext_values) = lower(&distinct_eval);
+
+        assert_eq!(zero_parts.len(), 1);
+        assert_eq!(distinct_parts.len(), 1);
+        let zero_program = &zero_parts[0].program;
+        let distinct_program = &distinct_parts[0].program;
+        assert_eq!(zero_program, distinct_program);
+        assert_eq!(zero_ext_values, distinct_ext_values);
+        assert_eq!(zero_base_values, vec![BaseField::zero(); 3]);
+        assert_eq!(
+            distinct_base_values,
+            vec![distinct_eval.first, BaseField::zero(), distinct_eval.second]
+        );
+        assert_eq!(distinct_program.header().n_base_params, 3);
+        let slots = distinct_program
+            .base_insts()
+            .iter()
+            .filter(|inst| inst.op == MetalEvaluationProgramBaseOpcodeV1::Param as u8)
+            .map(|inst| inst.a)
+            .collect::<Vec<_>>();
+        assert_eq!(slots, vec![0, 1, 2]);
+
+        let zero_hash = zero_program.header().semantic_hash;
+        let distinct_hash = distinct_program.header().semantic_hash;
+        assert_eq!(zero_hash, distinct_hash);
+        assert_eq!(
+            super::super::cuda_codegen::jit_cache_key(zero_hash),
+            super::super::cuda_codegen::jit_cache_key(distinct_hash)
+        );
+        assert_eq!(
+            interpret(zero_program, &zero_base_values, &zero_ext_values),
+            vec![SecureField::zero(), SecureField::zero()]
+        );
+        assert_eq!(
+            interpret(
+                distinct_program,
+                &distinct_base_values,
+                &distinct_ext_values
+            ),
+            vec![
+                SecureField::from(trace_value(1, 0, 0) * distinct_eval.first),
+                SecureField::from(trace_value(1, 1, 0) * distinct_eval.second),
+            ]
+        );
     }
 
     /// Builder for synthetic SSA states (each register written exactly once), the
@@ -1428,7 +1620,7 @@ mod tests {
     fn split_concatenated_semantics_equal_fused() {
         let ext_params = test_ext_params();
         let fused = finalize(synthetic_state(16, 8));
-        let fused_roots = interpret(&fused, &ext_params);
+        let fused_roots = interpret(&fused, &[], &ext_params);
         assert_eq!(fused_roots.len(), 16);
 
         const CAP: usize = 60;
@@ -1450,7 +1642,7 @@ mod tests {
                 instrs <= CAP,
                 "split kernel has {instrs} instrs, cap is {CAP}"
             );
-            let roots = interpret(&program, &ext_params);
+            let roots = interpret(&program, &[], &ext_params);
             for (j, value) in roots.iter().enumerate() {
                 split_acc += *value * rc[rc_base as usize + j];
             }
@@ -1512,7 +1704,7 @@ mod tests {
         const CAP: usize = 32;
         let ext_params = test_ext_params();
         let fused = finalize(build());
-        let fused_roots = interpret(&fused, &ext_params);
+        let fused_roots = interpret(&fused, &[], &ext_params);
 
         let parts = split_recording_state(&build(), CAP);
         assert!(parts.len() >= 2);
@@ -1524,7 +1716,7 @@ mod tests {
         let mut concatenated: Vec<SecureField> = Vec::new();
         for (slice, rc_base) in parts {
             assert_eq!(rc_base as usize, concatenated.len());
-            concatenated.extend(interpret(&finalize(slice), &ext_params));
+            concatenated.extend(interpret(&finalize(slice), &[], &ext_params));
         }
         assert_eq!(concatenated, fused_roots);
     }

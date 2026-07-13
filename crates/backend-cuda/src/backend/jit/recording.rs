@@ -45,12 +45,9 @@ pub(crate) struct RecordingState {
     columns_per_interaction: Vec<u32>,
     n_base_params: u32,
     n_ext_params: u32,
-    /// Memoized result of [`Self::ensure_zero_const`]. The instruction list is
-    /// append-only, so once a scan has found (or created) the first `Const(0)`, every
-    /// later scan would find exactly the same instruction — caching the register is
-    /// bit-identical to rescanning. Without the memo the scan is O(insts) per
-    /// base→ext promotion, which goes quadratic on PIE-scale components
-    /// (pedersen partial_ec_mul-class recording spun for hours on one core).
+    /// Memoized dedicated structural zero from [`Self::ensure_zero_const`]. It
+    /// must not alias an arbitrary statement `Const(0)`, because whether a
+    /// statement value happens to be zero cannot change recorded structure.
     zero_const_reg: Option<u16>,
 }
 
@@ -115,21 +112,12 @@ impl RecordingState {
         col
     }
 
-    /// Ensure there is a `Const(0)` base instruction and return its register.
-    ///
-    /// The first scan's result is memoized: `base_insts` only ever grows, so the
-    /// first matching instruction is stable and the memo returns the identical
-    /// register the scan would — same bytecode, same semantic hash. (Rescanning per
-    /// call was O(insts) and dominated recording time on very wide components.)
+    /// Ensure there is a dedicated structural `Const(0)` instruction and return its
+    /// register. Do not reuse an arbitrary earlier zero: it may be statement data,
+    /// which would make the recorded program depend on whether that value is zero.
     fn ensure_zero_const(&mut self) -> u16 {
         if let Some(reg) = self.zero_const_reg {
             return reg;
-        }
-        for inst in &self.base_insts {
-            if inst.op == MetalEvaluationProgramBaseOpcodeV1::Const as u8 && inst.a == 0 {
-                self.zero_const_reg = Some(inst.dst);
-                return inst.dst;
-            }
         }
         let dst = self.alloc_base_reg();
         self.base_insts
