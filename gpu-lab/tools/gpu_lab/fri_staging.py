@@ -14,7 +14,7 @@ from .common import canonical_bytes, require, require_sha256, sha256_bytes, sha2
 from .immutable_output import write_immutable_bytes
 
 
-STAGE_ROOT = Path("/tmp/stwo-gpu-lab-fri-v1").resolve()
+STAGE_ROOT = Path("/tmp/stwo-gpu-lab-fri-v1")
 STAGE_POLICY = "private-content-addressed-source-tree-v1"
 
 
@@ -132,9 +132,10 @@ def _install_sources(closure: list[dict[str, str]], repo_root: Path,
                 "FRI staged source escapes/is missing")
         require(sha256_file(source) == identity["sha256"],
                 "FRI source changed before canonical staging")
-        require(not Path(identity["path"]).is_absolute(), "FRI staged source path is absolute")
-        destination = (working_directory / identity["path"]).resolve(strict=False)
-        require(destination.is_relative_to(working_directory), "FRI staged source path escapes")
+        relative = Path(identity["path"])
+        require(not relative.is_absolute() and ".." not in relative.parts,
+                "FRI staged source path escapes")
+        destination = working_directory / relative
         _private_tree(destination.parent)
         write_immutable_bytes(destination, source.read_bytes(), [source])
         os.chmod(destination, 0o400, follow_symlinks=False)
@@ -211,10 +212,11 @@ def original_dependencies(paths: list[Path], closure: list[dict[str, str]],
     expected = Path(staging_identity(closure_sha256)["working_directory"])
     require(working_directory == expected,
             "FRI dependency mapping uses a foreign staging directory")
+    resolved_working_directory = working_directory.resolve()
     original: list[Path] = []
     for path in paths:
-        if path.is_relative_to(working_directory):
-            relative = path.relative_to(working_directory)
+        if path.is_relative_to(resolved_working_directory):
+            relative = path.relative_to(resolved_working_directory)
             mapped = (repo_root / relative).resolve()
             require(mapped.is_relative_to(repo_root), "staged FRI dependency escapes repository")
             original.append(mapped)

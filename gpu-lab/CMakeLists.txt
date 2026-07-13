@@ -53,7 +53,9 @@ set(FRI_MODULE_TOOL_SOURCES
     "${FRI_MODULE_TOOL}"
     "${CMAKE_CURRENT_SOURCE_DIR}/tools/gpu_lab/__init__.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/tools/gpu_lab/fri_module_cli.py"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tools/gpu_lab/fri_discovery.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/tools/gpu_lab/fri_module.py"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tools/gpu_lab/fri_publication.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/tools/gpu_lab/fri_staging.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/tools/gpu_lab/fri_tool_identity.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/tools/gpu_lab/common.py"
@@ -135,7 +137,7 @@ set(FRI_ROUND6_ABI "${CMAKE_CURRENT_SOURCE_DIR}/manifests/fri_round6.abi.json")
 set(CUDA_KERNEL_ROOT
     "${CMAKE_CURRENT_SOURCE_DIR}/../crates/backend-cuda-kernels/cuda")
 set(FRI_ROUND6_INDEX
-    "${MODULE_DIR}/fri_round6.sm${GPU_LAB_SM}.module.json")
+    "${MODULE_DIR}/fri_round6.sm${GPU_LAB_SM}.locator.non-evidence.json")
 set(FRI_ROUND6_STAMP
     "${MODULE_DIR}/fri_round6.sm${GPU_LAB_SM}.stamp")
 set(FRI_ROUND6_DEPFILE

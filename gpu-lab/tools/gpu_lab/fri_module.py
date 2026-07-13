@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
-import shlex
 import subprocess
 import tempfile
 from pathlib import Path
@@ -21,6 +19,15 @@ from .common import (
     sha256_bytes,
     sha256_file,
 )
+from .fri_discovery import (
+    CUDA_ROOT_RELATIVE,
+    SOURCE_RELATIVE,
+    discover_source_closure as _discover_source_closure,
+    parse_nvcc_depfile,
+    require_sealed_closure as _require_sealed_closure,
+    source_closure,
+    validate_closure as _validate_closure,
+)
 from .fri_staging import (
     original_dependencies,
     stage_repository,
@@ -33,47 +40,26 @@ from .fri_tool_identity import (
     validate_fri_build_tool,
 )
 from .identity import toolchain_identity
-from .immutable_output import guard_output, install_output, write_immutable_bytes
+from .immutable_output import guard_output, install_output
+from .fri_publication import (
+    atomic_text,
+    install_immutable_index,
+    install_recipe,
+    locator_document,
+    output_index_lock,
+    require_exact_index,
+    validate_locator_document,
+    write_depfile,
+)
 
 
 ABI_SCHEMA = "stwo.gpu-lab.fri-round6-abi.v1"
 ABI_SHA256 = "b232d2338e290570692011280a89232409f3f610401b9e0464a32bf9564f7776"
 ABI_RELATIVE = "gpu-lab/manifests/fri_round6.abi.json"
-SOURCE_RELATIVE = "gpu-lab/kernels/fri_round6.cu"
 RECIPE_SCHEMA = "stwo.gpu-lab.fri-round6-build-recipe.v1"
 INDEX_SCHEMA = "stwo.gpu-lab.fri-round6-module-index.v1"
 MODULE_NAME = "fri_round6"
-CUDA_ROOT_RELATIVE = "crates/backend-cuda-kernels/cuda"
 FIXED_FLAGS = ["--cubin", "-O3", "--std=c++17", "--expt-relaxed-constexpr", "-lineinfo"]
-REQUIRED_REPOSITORY_SOURCES = {
-    SOURCE_RELATIVE,
-    f"{CUDA_ROOT_RELATIVE}/fields.cu",
-    f"{CUDA_ROOT_RELATIVE}/fold_line.cu",
-    f"{CUDA_ROOT_RELATIVE}/blake2s.cu",
-    f"{CUDA_ROOT_RELATIVE}/device_transcript.cu",
-}
-
-
-def _atomic_text(path: Path, text: str) -> None:
-    require(not path.is_symlink(), f"refusing to replace symlink: {path}")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.is_file() and path.read_text() == text:
-        return
-    descriptor, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    temporary = Path(name)
-    try:
-        with os.fdopen(descriptor, "w") as output:
-            output.write(text)
-            output.flush()
-            os.fsync(output.fileno())
-        os.replace(temporary, path)
-        directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-    finally:
-        temporary.unlink(missing_ok=True)
 
 
 def _sealed_toolchain(nvcc: str, host_compiler: str) -> dict[str, Any]:
@@ -124,78 +110,6 @@ def _normalized_command(sm: int, host_compiler: str) -> list[str]:
         "nvcc", *_compile_flags(sm, host_compiler), "-MF", "<depfile>",
         "-I", CUDA_ROOT_RELATIVE, SOURCE_RELATIVE, "-o", "<output>",
     ]
-
-
-def parse_nvcc_depfile(text: str, cwd: Path, expected_target: Path | None = None) -> list[Path]:
-    require(text and "\0" not in text, "nvcc dependency file is empty or contains NUL")
-    logical = re.sub(r"\\\r?\n", " ", text)
-    lines = [line.strip() for line in logical.splitlines() if line.strip()]
-    require(len(lines) == 1 and ":" in lines[0], "nvcc dependency file must contain one rule")
-    target_text, dependency_text = lines[0].split(":", 1)
-    targets = shlex.split(target_text, comments=False, posix=True)
-    dependencies = shlex.split(dependency_text, comments=False, posix=True)
-    require(len(targets) == 1 and dependencies, "nvcc dependency rule is malformed")
-    target = Path(targets[0])
-    target = (cwd / target).resolve() if not target.is_absolute() else target.resolve()
-    if expected_target is not None:
-        require(target == expected_target.resolve(), "nvcc dependency target differs from cubin")
-    resolved = [((cwd / Path(item)).resolve() if not Path(item).is_absolute()
-                 else Path(item).resolve()) for item in dependencies]
-    require(len(resolved) == len(set(resolved)), "nvcc dependency closure contains duplicates")
-    require(all(path.is_file() and not path.is_symlink() for path in resolved),
-            "nvcc dependency closure contains a missing/non-regular file")
-    return resolved
-
-
-def _source_identity(path: Path, repo_root: Path) -> dict[str, str]:
-    resolved = path.resolve()
-    if resolved.is_relative_to(repo_root):
-        return {"scope": "repository", "path": str(resolved.relative_to(repo_root)),
-                "sha256": sha256_file(resolved)}
-    return {"scope": "toolchain", "path": str(resolved), "sha256": sha256_file(resolved)}
-
-
-def source_closure(paths: list[Path], repo_root: Path) -> list[dict[str, str]]:
-    identities = sorted((_source_identity(path, repo_root) for path in paths),
-                        key=lambda item: (item["scope"], item["path"]))
-    repository_sources = {item["path"] for item in identities if item["scope"] == "repository"}
-    require(REQUIRED_REPOSITORY_SOURCES <= repository_sources,
-            "nvcc closure omits a required FRI production source")
-    return identities
-
-
-def _identity_path(identity: dict[str, str], repo_root: Path) -> Path:
-    if identity["scope"] == "repository":
-        path = (repo_root / identity["path"]).resolve()
-        require(path.is_relative_to(repo_root), "FRI source identity escapes repository")
-        return path
-    require(identity["scope"] == "toolchain" and Path(identity["path"]).is_absolute(),
-            "FRI external source identity is invalid")
-    return Path(identity["path"])
-
-
-def _validate_closure(closure: Any, repo_root: Path, *, check_bytes: bool) -> list[Path]:
-    require(isinstance(closure, list) and closure, "FRI source closure is missing")
-    order: list[tuple[str, str]] = []
-    paths: list[Path] = []
-    for identity in closure:
-        require(isinstance(identity, dict), "FRI source identity must be an object")
-        require_exact_keys(identity, {"scope", "path", "sha256"}, "FRI source identity")
-        require(isinstance(identity["path"], str) and identity["path"],
-                "FRI source identity path is empty")
-        require_sha256(identity["sha256"], "FRI source sha256")
-        order.append((identity["scope"], identity["path"]))
-        path = _identity_path(identity, repo_root)
-        if check_bytes:
-            require(path.is_file() and not path.is_symlink(), f"FRI source is missing: {path}")
-            require(sha256_file(path) == identity["sha256"], f"FRI source changed: {path}")
-        paths.append(path)
-    require(order == sorted(order) and len(order) == len(set(order)),
-            "FRI source closure order/uniqueness differs")
-    repository_sources = {path for scope, path in order if scope == "repository"}
-    require(REQUIRED_REPOSITORY_SOURCES <= repository_sources,
-            "FRI source closure omits a required production source")
-    return paths
 
 
 def _recipe(sm: int, abi: dict[str, Any], abi_path: Path, closure: list[dict[str, str]],
@@ -324,35 +238,12 @@ def _validate_cubin(path: Path, toolchain: dict[str, Any], sm: int, symbols: lis
             f"FRI cubin stable entries differ: {stable}")
 
 
-def _make_escape(path: Path) -> str:
-    value = str(path)
-    return (value.replace("\\", "\\\\").replace("$", "$$").replace("#", "\\#")
-            .replace(" ", "\\ ").replace(":", "\\:"))
-
-
-def _write_depfile(path: Path, stamp: Path, sources: list[Path]) -> None:
-    dependencies = " \\\n  ".join(_make_escape(source) for source in sources)
-    _atomic_text(path, f"{_make_escape(stamp)}: {dependencies}\n")
-
-
-def _require_exact_index(actual: dict[str, Any], expected: dict[str, Any]) -> None:
-    require(canonical_bytes(actual) == canonical_bytes(expected),
-            "a concurrent FRI build installed a different module index")
-
 def _inputs_match(recipe: dict[str, Any], closure: list[dict[str, str]],
                   toolchain: dict[str, Any]) -> bool:
     return (recipe["source_closure"] == closure
             and recipe["toolchain"] == toolchain
             and recipe["build_tool_sources"] == fri_build_tool_sources()
             and recipe["build_tool_sha256"] == fri_build_tool_sha256())
-
-def _install_recipe(output_dir: Path, recipe: dict[str, Any], recipe_hash: str,
-                    module_hash: str, module: Path) -> Path:
-    recipe_path = output_dir / f"{recipe_hash}.recipe.json"
-    write_immutable_bytes(recipe_path, canonical_bytes(recipe), [module])
-    write_immutable_bytes(output_dir / f"{recipe_hash}.module-sha256",
-                          (module_hash + "\n").encode(), [module])
-    return recipe_path
 
 def _paths(args: argparse.Namespace) -> tuple[Path, Path, Path, Path, Path, Path]:
     repo_root = args.repo_root.resolve()
@@ -363,48 +254,54 @@ def _paths(args: argparse.Namespace) -> tuple[Path, Path, Path, Path, Path, Path
     require(source == (repo_root / SOURCE_RELATIVE).resolve(), "FRI build source differs")
     require(all(path.parent.resolve() == output_dir for path in (index, stamp, depfile)),
             "FRI index/stamp/depfile must live in the module directory")
-    require(index.name == f"fri_round6.sm{args.sm}.module.json"
+    require(index.name == f"fri_round6.sm{args.sm}.locator.non-evidence.json"
             and stamp.name == f"fri_round6.sm{args.sm}.stamp"
             and depfile.name == f"fri_round6.sm{args.sm}.d", "FRI output names differ")
     return repo_root, output_dir, source, abi, index, stamp
 
 
-def build_fri_module(args: argparse.Namespace) -> None:
+def _build_fri_module_locked(args: argparse.Namespace) -> None:
     repo_root, output_dir, source, abi_path, index_path, stamp = _paths(args)
     depfile = args.depfile.absolute()
     abi = validate_fri_abi(abi_path, repo_root)
     toolchain = _sealed_toolchain(args.nvcc, args.host_compiler)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    if index_path.is_file():
-        prior = load_json(index_path)
+    if index_path.exists() or index_path.is_symlink():
+        require(index_path.is_file() and not index_path.is_symlink(),
+                "FRI non-evidence locator is not a regular file")
+        prior_locator = load_json(index_path)
+        prior_index_path, prior = validate_locator_document(
+            prior_locator, output_dir, args.sm,
+        )
         module, recipe = _validate_index_document(prior, abi, repo_root, output_dir, args.sm)
-        prior_paths = _validate_closure(recipe["source_closure"], repo_root, check_bytes=False)
-        current = (source_closure(prior_paths, repo_root)
-                   if all(path.is_file() and not path.is_symlink() for path in prior_paths)
-                   else [])
+        with tempfile.TemporaryDirectory(dir=output_dir) as discovery_directory:
+            prior_paths, current = _discover_source_closure(
+                toolchain, args.sm, repo_root, Path(discovery_directory) / "discovery.d",
+            )
         if current and _inputs_match(recipe, current, toolchain):
+            _require_sealed_closure(recipe["source_closure"], current)
             _validate_cubin(module, toolchain, args.sm, recipe["driver_entries"])
-            _write_depfile(depfile, stamp, prior_paths)
-            _atomic_text(stamp, f"{prior['build_recipe_hash']} {prior['module_content_sha256']}\n")
-            installed = load_json(index_path)
-            _require_exact_index(installed, prior)
+            write_depfile(depfile, stamp, prior_paths)
+            atomic_text(
+                stamp, f"{prior['build_recipe_hash']} {prior['module_content_sha256']} "
+                f"{prior_locator['index_content_sha256']} {prior_index_path.name}\n",
+            )
+            installed = load_json(prior_index_path)
+            require_exact_index(installed, prior)
             _validate_index_document(installed, abi, repo_root, output_dir, args.sm)
+            require_exact_index(load_json(index_path), prior_locator)
             require(_sealed_toolchain(args.nvcc, args.host_compiler) == toolchain,
                     "FRI toolchain changed during cache validation")
-            print(f"FRI round-6 module cache hit: {module}")
+            print(f"FRI round-6 module cache hit: {prior_index_path}")
             return
 
     with tempfile.TemporaryDirectory(dir=output_dir) as temporary_name:
         temporary = Path(temporary_name)
         discovery = temporary / "discovery.d"
-        discover = [toolchain["nvcc_path"], "-M", "-O3", "--std=c++17",
-                    "--expt-relaxed-constexpr", "-lineinfo", f"-arch=sm_{args.sm}", "-ccbin",
-                    toolchain["host_compiler_path"], "-I", CUDA_ROOT_RELATIVE,
-                    "-MF", str(discovery), SOURCE_RELATIVE]
-        subprocess.run(discover, cwd=repo_root, check=True)
-        before_paths = parse_nvcc_depfile(discovery.read_text(), repo_root)
-        before = source_closure(before_paths, repo_root)
+        before_paths, before = _discover_source_closure(
+            toolchain, args.sm, repo_root, discovery,
+        )
         closure_sha256 = sha256_bytes(canonical_bytes(before))
         working_directory = stage_repository(before, repo_root, closure_sha256)
 
@@ -435,7 +332,7 @@ def build_fri_module(args: argparse.Namespace) -> None:
         prior_identity = guard_output(destination, [abi_path, *compiled_paths])
         install_output(candidate, destination, [abi_path, *compiled_paths], prior_identity)
 
-    recipe_path = _install_recipe(output_dir, recipe, recipe_hash, module_hash, destination)
+    recipe_path = install_recipe(output_dir, recipe, recipe_hash, module_hash, destination)
     index = {
         "schema_version": INDEX_SCHEMA,
         "module": MODULE_NAME,
@@ -455,45 +352,74 @@ def build_fri_module(args: argparse.Namespace) -> None:
             "FRI inputs changed before index installation")
     _validate_cubin(destination, toolchain, args.sm, recipe["driver_entries"])
     _validate_index_document(index, abi, repo_root, output_dir, args.sm)
-    _atomic_text(index_path, json.dumps(index, indent=2, sort_keys=True) + "\n")
-    _require_exact_index(load_json(index_path), index)
-    _write_depfile(depfile, stamp, compiled_paths)
-    _atomic_text(stamp, f"{recipe_hash} {module_hash}\n")
+    immutable_index_path, immutable_index_sha256 = install_immutable_index(output_dir, index)
+    locator = locator_document(immutable_index_sha256, args.sm)
+    atomic_text(index_path, json.dumps(locator, indent=2, sort_keys=True) + "\n")
+    require_exact_index(load_json(index_path), locator)
+    write_depfile(depfile, stamp, compiled_paths)
+    atomic_text(stamp, f"{recipe_hash} {module_hash} {immutable_index_sha256} "
+                f"{immutable_index_path.name}\n")
+    installed_index_path, installed = validate_locator_document(
+        load_json(index_path), output_dir, args.sm,
+    )
+    require(installed_index_path == immutable_index_path,
+            "FRI non-evidence locator advanced during publication")
     installed_module, installed_recipe = _validate_index_document(
-        load_json(index_path), abi, repo_root, output_dir, args.sm,
+        installed, abi, repo_root, output_dir, args.sm,
     )
     _validate_closure(installed_recipe["source_closure"], repo_root, check_bytes=True)
     require(_sealed_toolchain(args.nvcc, args.host_compiler) == toolchain
             and fri_build_tool_sha256() == installed_recipe["build_tool_sha256"],
             "FRI identities changed after index installation")
     _validate_cubin(installed_module, toolchain, args.sm, installed_recipe["driver_entries"])
-    final_index = load_json(index_path)
-    _require_exact_index(final_index, index)
+    final_index = load_json(immutable_index_path)
+    require_exact_index(final_index, index)
     _validate_index_document(final_index, abi, repo_root, output_dir, args.sm)
     require(source_closure(compiled_paths, repo_root) == after
             and _sealed_toolchain(args.nvcc, args.host_compiler) == toolchain
             and fri_build_tool_sha256() == installed_recipe["build_tool_sha256"],
             "FRI identities changed during final validation")
     validate_staging(after, working_directory)
-    print(f"FRI round-6 module built: {destination}")
+    require_exact_index(load_json(index_path), locator)
+    print(f"FRI round-6 module built: {immutable_index_path}")
 
 
-def validate_fri_module(args: argparse.Namespace) -> None:
+def build_fri_module(args: argparse.Namespace) -> None:
+    _, output_dir, _, _, index_path, _, = _paths(args)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with output_index_lock(index_path):
+        _build_fri_module_locked(args)
+
+
+def _validate_fri_module_locked(args: argparse.Namespace) -> None:
     repo_root, output_dir, _, abi_path, index_path, _ = _paths(args)
     abi = validate_fri_abi(abi_path, repo_root)
     toolchain = _sealed_toolchain(args.nvcc, args.host_compiler)
-    index = load_json(index_path)
+    locator = load_json(index_path)
+    immutable_index_path, index = validate_locator_document(locator, output_dir, args.sm)
     module, recipe = _validate_index_document(index, abi, repo_root, output_dir, args.sm)
     _validate_closure(recipe["source_closure"], repo_root, check_bytes=True)
+    with tempfile.TemporaryDirectory(dir=output_dir) as discovery_directory:
+        _, discovered = _discover_source_closure(
+            toolchain, args.sm, repo_root, Path(discovery_directory) / "discovery.d",
+        )
+    _require_sealed_closure(recipe["source_closure"], discovered)
     require(recipe["toolchain"] == toolchain, "FRI module toolchain identity changed")
     require(recipe["build_tool_sha256"] == fri_build_tool_sha256(),
             "FRI module build-tool identity changed")
     require(recipe["build_tool_sources"] == fri_build_tool_sources(),
             "FRI module build-tool source closure changed")
     _validate_cubin(module, toolchain, args.sm, recipe["driver_entries"])
-    installed = load_json(index_path)
-    _require_exact_index(installed, index)
+    installed = load_json(immutable_index_path)
+    require_exact_index(installed, index)
     _validate_index_document(installed, abi, repo_root, output_dir, args.sm)
     require(_sealed_toolchain(args.nvcc, args.host_compiler) == toolchain,
             "FRI toolchain changed during module validation")
-    print(f"FRI round-6 module valid: {module}")
+    require_exact_index(load_json(index_path), locator)
+    print(f"FRI round-6 module valid: {immutable_index_path}")
+
+
+def validate_fri_module(args: argparse.Namespace) -> None:
+    _, _, _, _, index_path, _ = _paths(args)
+    with output_index_lock(index_path):
+        _validate_fri_module_locked(args)
