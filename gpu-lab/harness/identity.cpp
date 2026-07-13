@@ -183,7 +183,14 @@ std::filesystem::path current_executable_path() {
 }
 
 Digest current_executable_sha256() {
+#if defined(__linux__)
+  // Opening procfs binds the bytes of the executing inode even if its original
+  // pathname is concurrently replaced. Canonicalizing first would reopen the
+  // mutable pathname and could hash a different executable.
+  return sha256_file("/proc/self/exe");
+#else
   return sha256_file(current_executable_path());
+#endif
 }
 
 std::string digest_hex(const Digest &digest) {
