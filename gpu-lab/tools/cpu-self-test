@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+lab_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+build_root="$(mktemp -d "${TMPDIR:-/tmp}/stwo-gpu-lab-cpu.XXXXXX")"
+trap 'rm -rf "$build_root"' EXIT
+
+"${CXX:-c++}" -std=c++17 -Wall -Wextra -Wpedantic -Werror \
+  "$lab_root/harness/cpu_selftest.cpp" \
+  "$lab_root/harness/budget.cpp" \
+  "$lab_root/harness/effects.cpp" \
+  "$lab_root/harness/fri_round6.cpp" \
+  "$lab_root/harness/identity.cpp" \
+  "$lab_root/harness/replay.cpp" \
+  -o "$build_root/stwo-gpu-lab-cpu-self-test"
+"$build_root/stwo-gpu-lab-cpu-self-test" "$@"

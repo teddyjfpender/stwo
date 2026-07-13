@@ -1,0 +1,17 @@
+FROM nvidia/cuda@sha256:94fd755736cb58979173d491504f0b573247b1745250249415b07fefc738e41f
+
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update -qq \
+    && apt-get install -y -qq --no-install-recommends \
+        clang-format \
+        cmake \
+        git \
+        ninja-build \
+        nsight-systems-2022.4.2=2022.4.2.50-32196742v0 \
+        python3 \
+        rsync \
+        time \
+    && test "$(dpkg-query -W -f='${Version}' nsight-systems-2022.4.2)" = \
+        "2022.4.2.50-32196742v0" \
+    && nsys --version \
+    && rm -rf /var/lib/apt/lists/*
