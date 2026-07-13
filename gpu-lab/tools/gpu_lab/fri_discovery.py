@@ -20,6 +20,14 @@ REQUIRED_REPOSITORY_SOURCES = {
     f"{CUDA_ROOT_RELATIVE}/blake2s.cu",
     f"{CUDA_ROOT_RELATIVE}/device_transcript.cu",
 }
+FRI_ENTRY_SYMBOLS = (
+    "stwo_gpu_lab_fold_line_device_alpha",
+    "stwo_gpu_lab_blake2s_fri_leaf",
+    "stwo_gpu_lab_blake2s_layer",
+    "stwo_gpu_lab_blake2s_transcript_mix_words",
+    "stwo_gpu_lab_blake2s_transcript_draw_secure",
+)
+FRI_ENTRY_OPTION = "--entries=" + ",".join(FRI_ENTRY_SYMBOLS)
 
 
 def parse_nvcc_depfile(text: str, cwd: Path, expected_target: Path | None = None) -> list[Path]:
@@ -63,7 +71,8 @@ def source_closure(paths: list[Path], repo_root: Path) -> list[dict[str, str]]:
 def discovery_command(toolchain: dict[str, Any], sm: int, depfile: Path) -> list[str]:
     return [
         toolchain["nvcc_path"], "-M", "-O3", "--std=c++17", "--expt-relaxed-constexpr",
-        "-lineinfo", f"-arch=sm_{sm}", "-ccbin", toolchain["host_compiler_path"],
+        "-lineinfo", FRI_ENTRY_OPTION, f"-arch=sm_{sm}",
+        "-ccbin", toolchain["host_compiler_path"],
         "-I", CUDA_ROOT_RELATIVE, "-MF", str(depfile), SOURCE_RELATIVE,
     ]
 

@@ -14,6 +14,8 @@ from unittest.mock import patch
 
 from .common import canonical_bytes, load_json, require, sha256_bytes, sha256_file
 from .fri_discovery import (
+    FRI_ENTRY_OPTION,
+    FRI_ENTRY_SYMBOLS,
     discover_source_closure,
     discovery_command,
     parse_nvcc_depfile,
@@ -160,7 +162,8 @@ def fri_module_self_test(lab_root: Path) -> None:
             )
         require(discovery_calls == [discovery_command(
                     _fake_toolchain(), 86, discovery_depfile,
-                )] and discovered_paths == required,
+                )] and discovery_calls[0].count(FRI_ENTRY_OPTION) == 1
+                and discovered_paths == required,
                 "FRI dependency discovery command/path closure differs")
         require_sealed_closure(closure, discovered)
         _expect_rejection(
@@ -237,6 +240,10 @@ def fri_module_self_test(lab_root: Path) -> None:
         canonical_module = output_dir / f"{module_hash}.cubin"
         module.rename(canonical_module)
         recipe = _recipe(86, abi, abi_path, closure, _fake_toolchain())
+        require(recipe["driver_entries"] == list(FRI_ENTRY_SYMBOLS)
+                and recipe["compile_flags"].count(FRI_ENTRY_OPTION) == 1
+                and recipe["normalized_command"].count(FRI_ENTRY_OPTION) == 1,
+                "FRI recipe does not seal its exact five-entry compiler option")
         recipe_hash = sha256_bytes(canonical_bytes(recipe))
         recipe_path = output_dir / f"{recipe_hash}.recipe.json"
         recipe_path.write_bytes(canonical_bytes(recipe))
@@ -374,6 +381,31 @@ def fri_module_self_test(lab_root: Path) -> None:
         ]):
             _expect_rejection(
                 "cubin without stable entries",
+                lambda: _validate_cubin(canonical_module, _fake_toolchain(), 86, symbols),
+            )
+        exact_entries = "\n".join(
+            f"0 STB_GLOBAL STO_ENTRY {symbol}" for symbol in reversed(symbols)
+        )
+        with patch("gpu_lab.fri_module.subprocess.run", side_effect=[
+            SimpleNamespace(stdout="64bit elf: sm=86\n"),
+            SimpleNamespace(stdout=exact_entries),
+        ]):
+            _validate_cubin(canonical_module, _fake_toolchain(), 86, symbols)
+        with patch("gpu_lab.fri_module.subprocess.run", side_effect=[
+            SimpleNamespace(stdout="64bit elf: sm=86\n"),
+            SimpleNamespace(stdout=exact_entries + "\n0 STB_GLOBAL STO_ENTRY production_extra"),
+        ]):
+            _expect_rejection(
+                "cubin with a non-lab global entry",
+                lambda: _validate_cubin(canonical_module, _fake_toolchain(), 86, symbols),
+            )
+        with patch("gpu_lab.fri_module.subprocess.run", side_effect=[
+            SimpleNamespace(stdout="64bit elf: sm=86\n"),
+            SimpleNamespace(stdout=exact_entries +
+                            f"\n0 STB_GLOBAL STO_ENTRY {symbols[0]}"),
+        ]):
+            _expect_rejection(
+                "cubin with a duplicate global entry",
                 lambda: _validate_cubin(canonical_module, _fake_toolchain(), 86, symbols),
             )
 

@@ -21,6 +21,8 @@ from .common import (
 )
 from .fri_discovery import (
     CUDA_ROOT_RELATIVE,
+    FRI_ENTRY_OPTION,
+    FRI_ENTRY_SYMBOLS,
     SOURCE_RELATIVE,
     discover_source_closure as _discover_source_closure,
     parse_nvcc_depfile,
@@ -59,7 +61,10 @@ ABI_RELATIVE = "gpu-lab/manifests/fri_round6.abi.json"
 RECIPE_SCHEMA = "stwo.gpu-lab.fri-round6-build-recipe.v1"
 INDEX_SCHEMA = "stwo.gpu-lab.fri-round6-module-index.v1"
 MODULE_NAME = "fri_round6"
-FIXED_FLAGS = ["--cubin", "-O3", "--std=c++17", "--expt-relaxed-constexpr", "-lineinfo"]
+FIXED_FLAGS = [
+    "--cubin", "-O3", "--std=c++17", "--expt-relaxed-constexpr", "-lineinfo",
+    FRI_ENTRY_OPTION,
+]
 
 
 def _sealed_toolchain(nvcc: str, host_compiler: str) -> dict[str, Any]:
@@ -96,6 +101,7 @@ def validate_fri_abi(abi_path: Path, repo_root: Path) -> dict[str, Any]:
                 "FRI ABI launch contract changed")
         symbols.append(entry["symbol"])
     require(len(set(symbols)) == len(symbols), "FRI ABI repeats a driver entry")
+    require(symbols == list(FRI_ENTRY_SYMBOLS), "FRI ABI exact entry order differs")
     return abi
 
 
@@ -233,9 +239,9 @@ def _validate_cubin(path: Path, toolchain: dict[str, Any], sm: int, symbols: lis
                            capture_output=True, check=True).stdout
     exported = [line.split()[-1] for line in table.splitlines()
                 if "STB_GLOBAL" in line and "STO_ENTRY" in line]
-    stable = [symbol for symbol in exported if symbol.startswith("stwo_gpu_lab_")]
-    require(sorted(stable) == sorted(symbols) and len(stable) == len(symbols),
-            f"FRI cubin stable entries differ: {stable}")
+    require(len(exported) == len(set(exported)), f"FRI cubin repeats an entry: {exported}")
+    require(sorted(exported) == sorted(symbols) and len(exported) == len(symbols),
+            f"FRI cubin complete entry set differs: {exported}")
 
 
 def _inputs_match(recipe: dict[str, Any], closure: list[dict[str, str]],
