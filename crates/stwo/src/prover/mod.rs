@@ -62,6 +62,42 @@ pub fn prove_ex<B: BackendForChannel<MC>, MC: MerkleChannel>(
     }
 }
 
+/// Runs STARK proving through the reference PCS driver while observing committed inner FRI folds.
+pub fn prove_ex_with_fri_observer<B, MC, O>(
+    components: &[&dyn ComponentProver<B>],
+    channel: &mut MC::C,
+    commitment_scheme: CommitmentSchemeProver<'_, B, MC>,
+    include_all_preprocessed_columns: bool,
+    observer: &mut O,
+) -> Result<ExtendedStarkProof<MC::H>, ProvingError>
+where
+    B: BackendForChannel<MC>,
+    MC: MerkleChannel,
+    O: crate::prover::fri::FriCommitObserver<B, MC> + ?Sized,
+{
+    let result = prove_ex_with_pcs_driver(
+        components,
+        channel,
+        commitment_scheme,
+        include_all_preprocessed_columns,
+        |commitment_scheme, sample_points, channel| {
+            Ok::<_, std::convert::Infallible>((
+                commitment_scheme.prove_values_reference_with_fri_observer(
+                    sample_points,
+                    channel,
+                    observer,
+                ),
+                (),
+            ))
+        },
+    );
+    match result {
+        Ok((proof, ())) => Ok(proof),
+        Err(ProveExWithPcsDriverError::Proving(error)) => Err(error),
+        Err(ProveExWithPcsDriverError::PcsDriver(never)) => match never {},
+    }
+}
+
 /// Runs STARK composition and delegates the final PCS/FRI protocol to an
 /// explicit caller-owned driver.
 ///

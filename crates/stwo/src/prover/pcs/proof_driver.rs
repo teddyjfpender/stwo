@@ -27,7 +27,7 @@ use crate::core::utils::MaybeOwned;
 use crate::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
 use crate::core::ColumnVec;
 use crate::prover::backend::BackendForChannel;
-use crate::prover::fri::{FriDecommitResult, FriProver};
+use crate::prover::fri::{FriCommitObserver, FriDecommitResult, FriProver, NoopFriCommitObserver};
 use crate::prover::pcs::quotient_ops::{self, compute_fri_quotients};
 use crate::prover::poly::circle::{CircleEvaluation, SecureEvaluation};
 use crate::prover::poly::BitReversedOrder;
@@ -184,15 +184,40 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         channel: &mut MC::C,
         observer: &mut O,
     ) -> ExtendedCommitmentSchemeProof<MC::H> {
+        self.prove_values_with_observers(
+            sampled_points,
+            channel,
+            observer,
+            &mut NoopFriCommitObserver,
+        )
+    }
+
+    /// Run the shared typed stages with caller-owned stage and FRI observers.
+    pub fn prove_values_with_observers<O, FO>(
+        self,
+        sampled_points: TreeVec<ColumnVec<Vec<CirclePoint<SecureField>>>>,
+        channel: &mut MC::C,
+        observer: &mut O,
+        fri_observer: &mut FO,
+    ) -> ExtendedCommitmentSchemeProof<MC::H>
+    where
+        O: PcsProofStageObserver,
+        FO: FriCommitObserver<B, MC> + ?Sized,
+    {
         self.begin_proof_driver(sampled_points)
             .evaluate_oods(channel, observer)
             .compute_quotient_and_compact(channel, observer)
-            .with_fri_commit(channel, observer, |committed, channel, observer| {
-                committed
-                    .prove_work_and_draw_queries(channel, observer)
-                    .decommit_trees(observer)
-                    .assemble(observer)
-            })
+            .with_fri_commit_observer(
+                channel,
+                observer,
+                fri_observer,
+                |committed, channel, observer| {
+                    committed
+                        .prove_work_and_draw_queries(channel, observer)
+                        .decommit_trees(observer)
+                        .assemble(observer)
+                },
+            )
     }
 }
 
@@ -446,6 +471,22 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> PcsFriStage<'a, B, MC> {
         O: PcsProofStageObserver,
         F: for<'q> FnOnce(PcsFriCommittedStage<'q, 'a, B, MC>, &mut MC::C, &mut O) -> R,
     {
+        self.with_fri_commit_observer(channel, observer, &mut NoopFriCommitObserver, continuation)
+    }
+
+    /// Commit/fold FRI with a caller-owned fold observer.
+    pub fn with_fri_commit_observer<O, FO, R, F>(
+        self,
+        channel: &mut MC::C,
+        observer: &mut O,
+        fri_observer: &mut FO,
+        continuation: F,
+    ) -> R
+    where
+        O: PcsProofStageObserver,
+        FO: FriCommitObserver<B, MC> + ?Sized,
+        F: for<'q> FnOnce(PcsFriCommittedStage<'q, 'a, B, MC>, &mut MC::C, &mut O) -> R,
+    {
         observer.stage_started(PcsProofStage::FriCommitAndFold);
         let Self {
             scheme,
@@ -456,11 +497,12 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> PcsFriStage<'a, B, MC> {
             mut timer,
         } = self;
         let span_fc = span!(Level::INFO, "FRI commit", class = "FriCommit").entered();
-        let fri_prover = FriProver::<B, MC>::commit(
+        let fri_prover = FriProver::<B, MC>::commit_with_observer(
             channel,
             scheme.config.fri_config,
             &quotients,
             scheme.twiddles,
+            fri_observer,
         );
         span_fc.exit();
         timer.mark("fri_commit");

@@ -28,6 +28,10 @@ impl<const IS_M31_OUTPUT: bool> Blake2sChannelGeneric<IS_M31_OUTPUT> {
     pub const fn digest(&self) -> Blake2sHash {
         self.digest
     }
+    /// Number of hash draws since the last digest update.
+    pub const fn n_draws(&self) -> u32 {
+        self.n_draws
+    }
     pub const fn update_digest(&mut self, new_digest: Blake2sHash) {
         self.digest = new_digest;
         self.n_draws = 0;

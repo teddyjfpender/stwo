@@ -282,6 +282,20 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         let mut observer = proof_driver::NoopPcsProofStageObserver;
         self.prove_values_with_stage_observer(sampled_points, channel, &mut observer)
     }
+
+    /// Reference PCS/FRI proof driver with a caller-owned inner-fold observer.
+    pub fn prove_values_reference_with_fri_observer<O>(
+        self,
+        sampled_points: TreeVec<ColumnVec<Vec<CirclePoint<SecureField>>>>,
+        channel: &mut MC::C,
+        fri_observer: &mut O,
+    ) -> ExtendedCommitmentSchemeProof<MC::H>
+    where
+        O: crate::prover::fri::FriCommitObserver<B, MC> + ?Sized,
+    {
+        let mut observer = proof_driver::NoopPcsProofStageObserver;
+        self.prove_values_with_observers(sampled_points, channel, &mut observer, fri_observer)
+    }
 }
 
 /// Helper struct for aggregating polynomials and evaluations for a commitment tree.

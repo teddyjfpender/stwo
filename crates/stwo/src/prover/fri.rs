@@ -92,6 +92,36 @@ pub struct FriDecommitResult<H: MerkleHasherLifted> {
     pub unsorted_query_locations: Vec<usize>,
 }
 
+/// Read-only observation of committed inner FRI folds.
+///
+/// The callback runs after the layer root is mixed and its folding challenge is drawn, but before
+/// the input evaluation is folded. The channel therefore exposes the exact live transcript state
+/// at that boundary.
+pub trait FriCommitObserver<B, MC>
+where
+    B: FriOps + MerkleOpsLifted<MC::H>,
+    MC: MerkleChannel,
+{
+    fn observe_inner_fold(
+        &mut self,
+        _input: &LineEvaluation<B>,
+        _folding_alpha: SecureField,
+        _committed_root: <MC::H as MerkleHasherLifted>::Hash,
+        _channel: &MC::C,
+    ) {
+    }
+}
+
+#[derive(Default)]
+pub struct NoopFriCommitObserver;
+
+impl<B, MC> FriCommitObserver<B, MC> for NoopFriCommitObserver
+where
+    B: FriOps + MerkleOpsLifted<MC::H>,
+    MC: MerkleChannel,
+{
+}
+
 /// A FRI prover that applies the FRI protocol to prove a set of polynomials are of low degree.
 pub struct FriProver<'a, B: FriOps + MerkleOpsLifted<MC::H>, MC: MerkleChannel> {
     config: FriConfig,
@@ -114,11 +144,28 @@ impl<'a, B: FriOps + MerkleOpsLifted<MC::H>, MC: MerkleChannel> FriProver<'a, B,
         column: &'a SecureEvaluation<B, BitReversedOrder>,
         twiddles: &TwiddleTree<B>,
     ) -> Self {
+        Self::commit_with_observer(
+            channel,
+            config,
+            column,
+            twiddles,
+            &mut NoopFriCommitObserver,
+        )
+    }
+
+    /// Runs the commitment phase while exposing each committed inner fold to `observer`.
+    pub fn commit_with_observer<O: FriCommitObserver<B, MC> + ?Sized>(
+        channel: &mut MC::C,
+        config: FriConfig,
+        column: &'a SecureEvaluation<B, BitReversedOrder>,
+        twiddles: &TwiddleTree<B>,
+        observer: &mut O,
+    ) -> Self {
         assert!(column.domain.is_canonic(), "not canonic");
 
         let first_layer = Self::commit_first_layer(channel, &config, column);
         let (inner_layers, last_layer_evaluation) =
-            Self::commit_inner_layers(channel, config, column, twiddles);
+            Self::commit_inner_layers(channel, config, column, twiddles, observer);
         let last_layer_poly = Self::commit_last_layer(channel, config, last_layer_evaluation);
 
         Self {
@@ -145,11 +192,12 @@ impl<'a, B: FriOps + MerkleOpsLifted<MC::H>, MC: MerkleChannel> FriProver<'a, B,
     /// Builds and commits to the inner FRI layers (all layers except the first and last).
     ///
     /// Returns all inner layers and the evaluation of the last layer.
-    fn commit_inner_layers(
+    fn commit_inner_layers<O: FriCommitObserver<B, MC> + ?Sized>(
         channel: &mut MC::C,
         config: FriConfig,
         column: &SecureEvaluation<B, BitReversedOrder>,
         twiddles: &TwiddleTree<B>,
+        observer: &mut O,
     ) -> (Vec<FriInnerLayerProver<B, MC::H>>, LineEvaluation<B>) {
         let mut layers = Vec::new();
         let folding_alpha = channel.draw_secure_felt();
@@ -178,8 +226,10 @@ impl<'a, B: FriOps + MerkleOpsLifted<MC::H>, MC: MerkleChannel> FriProver<'a, B,
         // While we can, skip `config.fold_step` layers.
         while line_log_size > last_layer_log_domain_size + config.fold_step {
             let layer = FriInnerLayerProver::new(layer_evaluation, config.fold_step);
-            MC::mix_root(channel, layer.merkle_tree.root());
+            let committed_root = layer.merkle_tree.root();
+            MC::mix_root(channel, committed_root);
             let folding_alpha = channel.draw_secure_felt();
+            observer.observe_inner_fold(&layer.evaluation, folding_alpha, committed_root, channel);
             let alpha_sq_powers = squared_alpha_powers(folding_alpha, config.fold_step);
             layer_evaluation = B::fold_line(&layer.evaluation, &alpha_sq_powers, twiddles);
             layers.push(layer);
@@ -189,8 +239,10 @@ impl<'a, B: FriOps + MerkleOpsLifted<MC::H>, MC: MerkleChannel> FriProver<'a, B,
         // Do one last fold (of size 0 < k <= config.fold_step) to reach the correct size.
         let last_fold_step = line_log_size - last_layer_log_domain_size;
         let layer = FriInnerLayerProver::new(layer_evaluation, last_fold_step);
-        MC::mix_root(channel, layer.merkle_tree.root());
+        let committed_root = layer.merkle_tree.root();
+        MC::mix_root(channel, committed_root);
         let folding_alpha = channel.draw_secure_felt();
+        observer.observe_inner_fold(&layer.evaluation, folding_alpha, committed_root, channel);
         let alpha_sq_powers = squared_alpha_powers(folding_alpha, last_fold_step);
         layer_evaluation = B::fold_line(&layer.evaluation, &alpha_sq_powers, twiddles);
         layers.push(layer);
@@ -462,6 +514,7 @@ mod tests {
 
     use num_traits::One;
 
+    use crate::core::channel::{Blake2sChannel, Channel, MerkleChannel};
     use crate::core::circle::{CirclePointIndex, Coset};
     use crate::core::fields::m31::BaseField;
     use crate::core::fields::qm31::{SecureField, SECURE_EXTENSION_DEGREE};
@@ -469,6 +522,7 @@ mod tests {
     use crate::core::poly::circle::CircleDomain;
     use crate::core::queries::Queries;
     use crate::core::test_utils::test_channel;
+    use crate::core::vcs::blake2_hash::Blake2sHash;
     use crate::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
     use crate::core::vcs_lifted::verifier::PACKED_LEAF_SIZE;
     use crate::prover::backend::cpu::CpuCirclePoly;
@@ -483,6 +537,29 @@ mod tests {
     const LOG_BLOWUP_FACTOR: u32 = 2;
 
     type FriProver<'a> = super::FriProver<'a, CpuBackend, Blake2sMerkleChannel>;
+
+    #[derive(Default)]
+    struct RecordingObserver {
+        folds: Vec<(u32, SecureField, Blake2sHash, Blake2sHash, u32)>,
+    }
+
+    impl super::FriCommitObserver<CpuBackend, Blake2sMerkleChannel> for RecordingObserver {
+        fn observe_inner_fold(
+            &mut self,
+            input: &crate::prover::line::LineEvaluation<CpuBackend>,
+            folding_alpha: SecureField,
+            committed_root: Blake2sHash,
+            channel: &Blake2sChannel,
+        ) {
+            self.folds.push((
+                input.domain().log_size(),
+                folding_alpha,
+                committed_root,
+                channel.digest(),
+                channel.n_draws(),
+            ));
+        }
+    }
 
     #[test]
     #[should_panic = "invalid degree"]
@@ -534,6 +611,71 @@ mod tests {
         let prover = FriProver::commit(&mut test_channel(), config, &column, &twiddles);
         let queries = Queries::from_positions(vec![0, 3], 6 + LOG_BLOWUP_FACTOR);
         prover.decommit_on_queries(&queries);
+    }
+
+    #[test]
+    fn observer_reports_inner_folds_in_transcript_order() {
+        let config = FriConfig::new(2, LOG_BLOWUP_FACTOR, 3, 2);
+        let column = polynomial_evaluation(8, LOG_BLOWUP_FACTOR);
+        let twiddles = CpuBackend::precompute_twiddles(column.domain.half_coset);
+        let mut channel = test_channel();
+        let mut observer = RecordingObserver::default();
+
+        let prover = FriProver::commit_with_observer(
+            &mut channel,
+            config,
+            &column,
+            &twiddles,
+            &mut observer,
+        );
+        let proof = prover.decommit_on_queries(&Queries::from_positions(vec![0, 3], 10));
+
+        assert_eq!(
+            observer.folds.iter().map(|fold| fold.0).collect::<Vec<_>>(),
+            [8, 6]
+        );
+        assert_eq!(observer.folds.len(), proof.proof.inner_layers.len());
+
+        let mut replay = test_channel();
+        Blake2sMerkleChannel::mix_root(&mut replay, proof.proof.first_layer.commitment);
+        replay.draw_secure_felt();
+        for (observed, layer) in observer.folds.iter().zip(&proof.proof.inner_layers) {
+            Blake2sMerkleChannel::mix_root(&mut replay, layer.commitment);
+            let alpha = replay.draw_secure_felt();
+            assert_eq!(observed.1, alpha);
+            assert_eq!(observed.2, layer.commitment);
+            assert_eq!(observed.3, replay.digest());
+            assert_eq!(observed.4, replay.n_draws());
+        }
+    }
+
+    #[test]
+    fn noop_observer_preserves_fri_proof_bytes() {
+        let config = FriConfig::new(2, LOG_BLOWUP_FACTOR, 3, 2);
+        let column = polynomial_evaluation(8, LOG_BLOWUP_FACTOR);
+        let twiddles = CpuBackend::precompute_twiddles(column.domain.half_coset);
+        let queries = || Queries::from_positions(vec![0, 3], 10);
+
+        let mut reference_channel = test_channel();
+        let reference = FriProver::commit(&mut reference_channel, config, &column, &twiddles)
+            .decommit_on_queries(&queries());
+
+        let mut observed_channel = test_channel();
+        let observed = FriProver::commit_with_observer(
+            &mut observed_channel,
+            config,
+            &column,
+            &twiddles,
+            &mut super::NoopFriCommitObserver,
+        )
+        .decommit_on_queries(&queries());
+
+        assert_eq!(
+            serde_json::to_vec(&reference.proof).unwrap(),
+            serde_json::to_vec(&observed.proof).unwrap()
+        );
+        assert_eq!(reference_channel.digest(), observed_channel.digest());
+        assert_eq!(reference_channel.n_draws(), observed_channel.n_draws());
     }
 
     #[test]

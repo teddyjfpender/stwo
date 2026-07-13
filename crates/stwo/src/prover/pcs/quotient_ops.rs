@@ -260,6 +260,7 @@ mod tests {
     use crate::prover::backend::simd::column::BaseColumn;
     use crate::prover::backend::simd::SimdBackend;
     use crate::prover::backend::{Backend, BackendForChannel, Column, CpuBackend};
+    use crate::prover::fri::{FriCommitObserver, NoopFriCommitObserver};
     use crate::prover::pcs::quotient_ops::compute_fri_quotients;
     use crate::prover::poly::circle::{CircleCoefficients, CircleEvaluation, PolyOps};
     use crate::prover::{CommitmentSchemeProver, SecureField};
@@ -329,7 +330,10 @@ mod tests {
     fn prove_and_verify_pcs<
         B: BackendForChannel<Blake2sMerkleChannel>,
         const STORE_COEFFS: bool,
-    >() -> Result<(), VerificationError> {
+        O: FriCommitObserver<B, Blake2sMerkleChannel> + ?Sized,
+    >(
+        observer: Option<&mut O>,
+    ) -> Result<(), VerificationError> {
         const N_COLS: usize = 10;
         const LIFTING_LOG_SIZE: u32 = 8;
 
@@ -362,7 +366,14 @@ mod tests {
             .map(|(_, i)| samples.into_iter().take(*i).collect_vec())
             .collect_vec()];
 
-        let proof = commitment_scheme.prove_values(TreeVec(sampled_points.clone()), &mut channel);
+        let proof = match observer {
+            Some(observer) => commitment_scheme.prove_values_reference_with_fri_observer(
+                TreeVec(sampled_points.clone()),
+                &mut channel,
+                observer,
+            ),
+            None => commitment_scheme.prove_values(TreeVec(sampled_points.clone()), &mut channel),
+        };
 
         // Verifier side of the pcs.
         let mut channel = Blake2sChannel::default();
@@ -373,7 +384,7 @@ mod tests {
 
     #[test]
     fn test_pcs_prove_and_verify_cpu() {
-        assert!(prove_and_verify_pcs::<CpuBackend, true>().is_ok());
+        assert!(prove_and_verify_pcs::<CpuBackend, true, NoopFriCommitObserver>(None).is_ok());
     }
 
     #[test]
@@ -386,7 +397,7 @@ mod tests {
             crate::prover::backend::cpu::take_prove_values_driver_stages().is_empty(),
             "test thread started with stale proof-stage telemetry"
         );
-        assert!(prove_and_verify_pcs::<CpuBackend, true>().is_ok());
+        assert!(prove_and_verify_pcs::<CpuBackend, true, NoopFriCommitObserver>(None).is_ok());
         assert!(
             crate::prover::backend::cpu::take_prove_values_driver_called(),
             "CommitmentSchemeProver::prove_values bypassed BackendForChannel dispatch"
@@ -400,11 +411,34 @@ mod tests {
 
     #[test]
     fn test_pcs_prove_and_verify_simd() {
-        assert!(prove_and_verify_pcs::<SimdBackend, true>().is_ok());
+        assert!(prove_and_verify_pcs::<SimdBackend, true, NoopFriCommitObserver>(None).is_ok());
     }
     #[test]
     fn test_pcs_prove_and_verify_simd_with_barycentric() {
-        assert!(prove_and_verify_pcs::<SimdBackend, false>().is_ok());
+        assert!(prove_and_verify_pcs::<SimdBackend, false, NoopFriCommitObserver>(None).is_ok());
+    }
+
+    #[derive(Default)]
+    struct PcsFoldLog(Vec<u32>);
+
+    impl FriCommitObserver<CpuBackend, Blake2sMerkleChannel> for PcsFoldLog {
+        fn observe_inner_fold(
+            &mut self,
+            input: &crate::prover::line::LineEvaluation<CpuBackend>,
+            _folding_alpha: SecureField,
+            _committed_root: crate::core::vcs::blake2_hash::Blake2sHash,
+            _channel: &Blake2sChannel,
+        ) {
+            self.0.push(input.domain().log_size());
+        }
+    }
+
+    #[test]
+    fn test_reference_pcs_forwards_fri_observer() {
+        let mut observer = PcsFoldLog::default();
+        assert!(prove_and_verify_pcs::<CpuBackend, true, _>(Some(&mut observer)).is_ok());
+        assert!(!observer.0.is_empty());
+        assert!(observer.0.windows(2).all(|logs| logs[0] > logs[1]));
     }
 
     /// Tests that SIMD quotient computation produces low-degree quotients even when the trace
