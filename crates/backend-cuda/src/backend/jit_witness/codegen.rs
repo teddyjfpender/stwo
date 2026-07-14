@@ -14,10 +14,14 @@
 
 use super::isa::{DeduceKind, WitnessOp, WitnessProgram};
 
+#[path = "codegen_schedule.rs"]
+mod schedule;
+use schedule::{emit_scheduled_outputs, OutputSchedule};
+
 /// Bumped whenever the emitted source for a fixed program changes, mixed into the
 /// cache key so new source can never collide with PTX an older build persisted for the
 /// same bytecode (same rule as the constraint lane's `CODEGEN_VERSION`).
-pub const WITNESS_CODEGEN_VERSION: u64 = 10;
+pub const WITNESS_CODEGEN_VERSION: u64 = 11;
 
 /// Cache key: program semantic hash mixed (FNV-1a) with [`WITNESS_CODEGEN_VERSION`].
 pub fn witness_jit_cache_key(semantic_hash: u64) -> u64 {
@@ -170,45 +174,29 @@ pub fn compile_witness_to_cuda_source(program: &WitnessProgram) -> Option<String
 }
 
 fn emit_body(program: &WitnessProgram, src: &mut String) -> Option<()> {
-    let mut declared = vec![false; program.n_regs as usize];
+    let schedule = OutputSchedule::build(program)?;
     let mut deduce_args: Vec<u32> = Vec::new();
     let mut deduce_seq = 0usize;
 
-    for inst in &program.insts {
+    for (index, inst) in program.insts.iter().enumerate() {
         let op = WitnessOp::from_raw(inst.op)?;
         let (a, b, imm) = (inst.a, inst.b, inst.imm);
 
         // Output opcodes write memory and produce no register.
         match op {
-            WitnessOp::ColWrite => {
-                src.push_str(&format!("    out_cols[{imm}u][row] = r{a};\n"));
+            WitnessOp::ColWrite | WitnessOp::LookupWord | WitnessOp::SubWord => {
                 continue;
             }
             WitnessOp::MultPush => {
                 // Order-independent atomic accumulation (byte-equal by construction —
                 // field/count adds commute), exactly as the host AtomicMultiplicityColumn.
                 src.push_str(&format!("    atomicAdd(&mult_counts[{imm}u][r{a}], 1u);\n"));
-                continue;
-            }
-            WitnessOp::LookupWord => {
-                // Word-major (`[k * row_count + row]`): adjacent threads write adjacent
-                // addresses (coalesced), and the host copy repacks each 16-lane
-                // PackedM31 from one contiguous 64B run. The prove accessors and the
-                // selftest comparator index the same way — any change here must bump
-                // WITNESS_CODEGEN_VERSION and update both.
-                src.push_str(&format!(
-                    "    lookup_words[{imm}u * row_count + row] = r{a};\n"
-                ));
-                continue;
-            }
-            WitnessOp::SubWord => {
-                src.push_str(&format!(
-                    "    sub_words[{imm}u * row_count + row] = r{a};\n"
-                ));
+                emit_scheduled_outputs(src, &schedule.after_instruction[index])?;
                 continue;
             }
             WitnessOp::DeduceArg => {
                 deduce_args.push(a);
+                emit_scheduled_outputs(src, &schedule.after_instruction[index])?;
                 continue;
             }
             WitnessOp::DeduceCall => {
@@ -228,6 +216,7 @@ fn emit_body(program: &WitnessProgram, src: &mut String) -> Option<()> {
                     "    const unsigned dargs{seq}[{n_args}] = {{ {args_list} }};\n\
                      \x20   unsigned douts{seq}[{n_outs}];\n"
                 ));
+                emit_scheduled_outputs(src, &schedule.after_deduce_arguments[index])?;
                 match kind {
                     DeduceKind::BlakeG => {
                         src.push_str(&format!("    stwo_wit_blake_g(dargs{seq}, douts{seq});\n"));
@@ -292,27 +281,17 @@ fn emit_body(program: &WitnessProgram, src: &mut String) -> Option<()> {
                 let base = inst.dst as usize;
                 for i in 0..n_outs {
                     let reg = base + i;
-                    let decl = if !declared[reg] {
-                        declared[reg] = true;
-                        "unsigned "
-                    } else {
-                        ""
-                    };
-                    src.push_str(&format!("    {decl}r{reg} = douts{seq}[{i}];\n"));
+                    src.push_str(&format!("    unsigned r{reg} = douts{seq}[{i}];\n"));
+                    emit_scheduled_outputs(src, &schedule.after_deduce_register[reg])?;
                 }
                 deduce_args.clear();
+                emit_scheduled_outputs(src, &schedule.after_instruction[index])?;
                 continue;
             }
             _ => {}
         }
 
         let dst = inst.dst as usize;
-        let decl = if !declared[dst] {
-            declared[dst] = true;
-            "unsigned "
-        } else {
-            ""
-        };
         let expr = match op {
             WitnessOp::Input => format!("input_cols[{a}u][row]"),
             WitnessOp::Const => format!("{imm}u"),
@@ -361,7 +340,8 @@ fn emit_body(program: &WitnessProgram, src: &mut String) -> Option<()> {
             | WitnessOp::DeduceArg
             | WitnessOp::DeduceCall => unreachable!(),
         };
-        src.push_str(&format!("    {decl}r{dst} = {expr};\n"));
+        src.push_str(&format!("    unsigned r{dst} = {expr};\n"));
+        emit_scheduled_outputs(src, &schedule.after_instruction[index])?;
     }
     Some(())
 }
@@ -471,6 +451,74 @@ mod tests {
         // Distinct semantic hashes give distinct keys; the version is mixed in.
         assert_ne!(witness_jit_cache_key(1), witness_jit_cache_key(2));
         assert_ne!(witness_jit_cache_key(1), 1);
+    }
+
+    #[test]
+    fn unique_output_stores_follow_their_last_uses() {
+        let mut recorder = WitnessRecorder::new("early_outputs");
+        let a = recorder.input(0);
+        let b = recorder.input(1);
+        let sum = recorder.m31_add(a, b);
+        let doubled = recorder.m31_add(sum, sum);
+        recorder.col_write(0, a);
+        recorder.lookup_word(0, b);
+        recorder.sub_word(0, sum);
+        recorder.col_write(1, doubled);
+
+        let source = compile_witness_to_cuda_source(&recorder.finish()).expect("codegen");
+        let positions = [
+            "unsigned r0 = input_cols[0u][row];",
+            "unsigned r1 = input_cols[1u][row];",
+            "unsigned r2 = stwo_m31_add(r0, r1);",
+            "out_cols[0u][row] = r0;",
+            "lookup_words[0u * row_count + row] = r1;",
+            "unsigned r3 = stwo_m31_add(r2, r2);",
+            "sub_words[0u * row_count + row] = r2;",
+            "out_cols[1u][row] = r3;",
+        ]
+        .map(|needle| {
+            source
+                .find(needle)
+                .unwrap_or_else(|| panic!("missing {needle}"))
+        });
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn duplicate_output_destinations_keep_source_order() {
+        let mut recorder = WitnessRecorder::new("duplicate_outputs");
+        let a = recorder.input(0);
+        let b = recorder.input(1);
+        recorder.col_write(0, a);
+        recorder.col_write(0, b);
+
+        let source = compile_witness_to_cuda_source(&recorder.finish()).expect("codegen");
+        let a_definition = source.find("unsigned r0 = input_cols[0u][row];").unwrap();
+        let b_definition = source.find("unsigned r1 = input_cols[1u][row];").unwrap();
+        let first_store = source.find("out_cols[0u][row] = r0;").unwrap();
+        let second_store = source.find("out_cols[0u][row] = r1;").unwrap();
+        assert!(a_definition < first_store);
+        assert!(first_store < b_definition && b_definition < second_store);
+    }
+
+    #[test]
+    fn deduce_argument_store_follows_the_argument_snapshot() {
+        let mut recorder = WitnessRecorder::new("deduce_argument_output");
+        let args = (0..6)
+            .map(|index| recorder.input(index))
+            .collect::<Vec<_>>();
+        let outputs = recorder.deduce(DeduceKind::BlakeG, &args);
+        recorder.col_write(0, args[0]);
+        recorder.col_write(1, outputs[0]);
+
+        let source = compile_witness_to_cuda_source(&recorder.finish()).expect("codegen");
+        let argument_snapshot = source.find("const unsigned dargs0[6]").unwrap();
+        let call = source.find("stwo_wit_blake_g(dargs0, douts0);").unwrap();
+        let argument_store = source.find("out_cols[0u][row] = r0;").unwrap();
+        let result_store = source.find("out_cols[1u][row] = r6;").unwrap();
+        let next_result_definition = source.find("unsigned r7 = douts0[1];").unwrap();
+        assert!(argument_snapshot < argument_store && argument_store < call);
+        assert!(call < result_store && result_store < next_result_definition);
     }
 
     #[test]
