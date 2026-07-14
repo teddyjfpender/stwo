@@ -2897,20 +2897,22 @@ pub unsafe extern "C" fn stwo_decommit_prepare_trace_queries_on(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn stwo_decommit_gather_trace_values_on(
+pub unsafe extern "C" fn stwo_decommit_pack_trace_group_on(
+    _tree_index: u32,
+    _total_column_count: u32,
+    _first_column: u32,
+    _group_column_count: u32,
     _columns: *const *const u32,
     _column_log_sizes: *const u32,
-    _column_count: u32,
     _lifting_log_size: u32,
     _mapped_queries: *const u32,
     _mapped_count: *const u32,
     _max_queries: u32,
-    _destination_first_column: u32,
-    _destination_stride: u32,
-    _queried_values: *mut u32,
+    _assembly: *mut u32,
+    _assembly_capacity_words: u32,
     _stream: *mut c_void,
 ) -> i32 {
-    no_cuda_symbol("stwo_decommit_gather_trace_values_on")
+    no_cuda_symbol("stwo_decommit_pack_trace_group_on")
 }
 
 #[unsafe(no_mangle)]
@@ -2934,13 +2936,11 @@ pub unsafe extern "C" fn stwo_decommit_assemble_trace_on(
     _leaf_log_size: u32,
     _first_retained_log_size: u32,
     _column_count: u32,
-    _mapped_queries: *const u32,
     _mapped_count: *const u32,
     _max_queries: u32,
     _walk_queries: *mut u32,
     _walk_scratch: *mut u32,
     _walk_count: *const u32,
-    _queried_values: *const u32,
     _retained_layers_by_log: *const *const Blake2sHash,
     _sparse_indices: *const u32,
     _sparse_hashes: *const Blake2sHash,
@@ -2974,18 +2974,6 @@ pub unsafe extern "C" fn stwo_decommit_prepare_fri_queries_on(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn stwo_decommit_gather_fri_values_on(
-    _coordinate_columns: *const *const u32,
-    _expanded_positions: *const u32,
-    _expanded_count: *const u32,
-    _max_expanded_positions: u32,
-    _expanded_values: *mut u32,
-    _stream: *mut c_void,
-) -> i32 {
-    no_cuda_symbol("stwo_decommit_gather_fri_values_on")
-}
-
-#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stwo_decommit_assemble_fri_on(
     _tree_index: u32,
     _leaf_log_size: u32,
@@ -2993,7 +2981,7 @@ pub unsafe extern "C" fn stwo_decommit_assemble_fri_on(
     _tree_query_count: *const u32,
     _expanded_positions: *const u32,
     _expanded_count: *const u32,
-    _expanded_values: *const u32,
+    _coordinate_columns: *const *const u32,
     _walk_queries: *mut u32,
     _walk_scratch: *mut u32,
     _walk_count: *const u32,

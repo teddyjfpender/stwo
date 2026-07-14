@@ -437,25 +437,6 @@ __global__ void prepare_trace_queries_kernel(
     *leaf_count = sort_unique(leaf_indices, leaves);
 }
 
-__global__ void gather_trace_values_kernel(
-    const uint32_t *const *columns,
-    const uint32_t *column_logs,
-    uint32_t n_columns,
-    uint32_t lifting_log,
-    const uint32_t *queries,
-    const uint32_t *query_count,
-    uint32_t max_queries,
-    uint32_t first_column,
-    uint32_t stride,
-    uint32_t *output) {
-    const uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
-    const uint32_t column = blockIdx.y;
-    if (column >= n_columns || q >= min(*query_count, max_queries)) return;
-    const uint32_t row = lifted_index(queries[q], lifting_log, column_logs[column]);
-    output[(size_t)(first_column + column) * stride + q] =
-        canonical_m31(columns[column][row]);
-}
-
 __global__ void sparse_parent_kernel(
     const uint32_t *child_indices,
     const Blake2sHash *child_hashes,
@@ -477,6 +458,90 @@ __global__ void sparse_parent_kernel(
         &parent_hashes[parent]);
 }
 
+// Consume one trace source group while its evaluation buffers are live. Recomputed
+// groups intentionally reuse one LDE tile, so postponing these reads until final
+// assembly would observe a later group. The first group reserves the canonical
+// proof-bundle range; every group writes only its disjoint column interval.
+__global__ __launch_bounds__(BLOCK)
+void pack_trace_group_kernel(
+    uint32_t tree_index,
+    uint32_t total_column_count,
+    uint32_t first_column,
+    uint32_t group_column_count,
+    const uint32_t *const *columns,
+    const uint32_t *column_logs,
+    uint32_t lifting_log,
+    const uint32_t *mapped,
+    const uint32_t *mapped_count_ptr,
+    uint32_t max_queries,
+    uint32_t *assembly,
+    uint32_t capacity) {
+    if (blockIdx.x != 0) return;
+    const uint32_t tid = threadIdx.x;
+    uint32_t *meta = tree_meta(assembly, tree_index);
+    __shared__ uint32_t query_offset;
+    __shared__ uint32_t value_offset;
+    __shared__ uint32_t mapped_count;
+    __shared__ uint32_t failed;
+    if (tid == 0) {
+        mapped_count = min(*mapped_count_ptr, max_queries);
+        failed = assembly[H_USED_WORDS] == 0;
+        const unsigned long long value_words =
+            static_cast<unsigned long long>(total_column_count) * mapped_count;
+        if (value_words > 0xffffffffULL) failed = 1;
+
+        if (!failed && first_column == 0) {
+            failed = !reserve_words(assembly, capacity, mapped_count, &query_offset);
+            if (!failed && !reserve_words(
+                    assembly, capacity, static_cast<uint32_t>(value_words),
+                    &value_offset)) {
+                failed = 1;
+            }
+            if (!failed) {
+                meta[M_QUERY_OFFSET] = query_offset;
+                meta[M_QUERY_COUNT] = mapped_count;
+                meta[M_VALUES_OFFSET] = value_offset;
+                meta[M_VALUES_COUNT] = static_cast<uint32_t>(value_words);
+            }
+        } else if (!failed) {
+            query_offset = meta[M_QUERY_OFFSET];
+            value_offset = meta[M_VALUES_OFFSET];
+            const uint32_t used = assembly[H_USED_WORDS];
+            const uint32_t expected_values = static_cast<uint32_t>(value_words);
+            failed = meta[M_QUERY_COUNT] != mapped_count ||
+                meta[M_VALUES_COUNT] != expected_values || used > capacity ||
+                query_offset > used || mapped_count > used - query_offset ||
+                value_offset > used || expected_values > used - value_offset ||
+                value_offset != query_offset + mapped_count;
+        }
+    }
+    __syncthreads();
+
+    for (uint32_t column = tid; column < group_column_count; column += BLOCK) {
+        if (column_logs[column] > lifting_log) atomicExch(&failed, 1U);
+    }
+    __syncthreads();
+    if (failed) {
+        if (tid == 0) assembly[H_USED_WORDS] = 0;
+        return;
+    }
+
+    if (first_column == 0) {
+        for (uint32_t query = tid; query < mapped_count; query += BLOCK) {
+            assembly[query_offset + query] = mapped[query];
+        }
+    }
+    for (uint32_t column = 0; column < group_column_count; ++column) {
+        for (uint32_t query = tid; query < mapped_count; query += BLOCK) {
+            const uint32_t row =
+                lifted_index(mapped[query], lifting_log, column_logs[column]);
+            assembly[value_offset +
+                     static_cast<size_t>(first_column + column) * mapped_count + query] =
+                canonical_m31(columns[column][row]);
+        }
+    }
+}
+
 __global__ __launch_bounds__(BLOCK)
 void assemble_trace_kernel(
     uint32_t tree_index,
@@ -484,13 +549,11 @@ void assemble_trace_kernel(
     uint32_t leaf_log,
     uint32_t first_retained_log,
     uint32_t column_count,
-    const uint32_t *mapped,
     const uint32_t *mapped_count_ptr,
     uint32_t max_queries,
     uint32_t *walk,
     uint32_t *scratch,
     const uint32_t *walk_count_ptr,
-    const uint32_t *values,
     const Blake2sHash *const *retained,
     const uint32_t *sparse_indices,
     const Blake2sHash *sparse_hashes,
@@ -508,16 +571,19 @@ void assemble_trace_kernel(
     __shared__ uint32_t mapped_count;
     __shared__ uint32_t failed;
     if (tid == 0) {
-        tree_start = assembly[H_USED_WORDS];
         mapped_count = min(*mapped_count_ptr, max_queries);
-        failed = !reserve_words(assembly, capacity, mapped_count, &query_offset);
         const unsigned long long value_words =
             static_cast<unsigned long long>(column_count) * mapped_count;
-        if (!failed && (value_words > 0xffffffffULL ||
-            !reserve_words(assembly, capacity, static_cast<uint32_t>(value_words),
-                           &value_offset))) {
-            failed = 1;
-        }
+        const uint32_t used = assembly[H_USED_WORDS];
+        query_offset = meta[M_QUERY_OFFSET];
+        value_offset = meta[M_VALUES_OFFSET];
+        tree_start = query_offset;
+        failed = used == 0 || used > capacity || value_words > 0xffffffffULL ||
+            meta[M_QUERY_COUNT] != mapped_count ||
+            meta[M_VALUES_COUNT] != static_cast<uint32_t>(value_words) ||
+            query_offset > used || mapped_count > used - query_offset ||
+            value_offset > used || static_cast<uint32_t>(value_words) > used - value_offset ||
+            value_offset != query_offset + mapped_count;
     }
     __syncthreads();
     if (failed) {
@@ -525,18 +591,7 @@ void assemble_trace_kernel(
         return;
     }
 
-    for (uint32_t i = tid; i < mapped_count; i += BLOCK) {
-        assembly[query_offset + i] = mapped[i];
-    }
     const uint32_t value_words = column_count * mapped_count;
-    for (uint32_t column = 0; column < column_count; ++column) {
-        for (uint32_t query = tid; query < mapped_count; query += BLOCK) {
-            assembly[value_offset + column * mapped_count + query] =
-                values[(size_t)column * max_queries + query];
-        }
-    }
-    __syncthreads();
-
     __shared__ MerkleWalkShared walk_state;
     __shared__ uint32_t hash_offset;
     __shared__ uint32_t hash_count;
@@ -606,21 +661,6 @@ __global__ void prepare_fri_queries_kernel(
     *walk_count = sort_unique(walk, out);
 }
 
-__global__ void gather_fri_values_kernel(
-    const uint32_t *const *coordinates,
-    const uint32_t *positions,
-    const uint32_t *count_ptr,
-    uint32_t max_positions,
-    uint32_t *values) {
-    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= min(*count_ptr, max_positions)) return;
-    const uint32_t position = positions[i];
-    #pragma unroll
-    for (uint32_t c = 0; c < 4; ++c) {
-        values[4 * i + c] = canonical_m31(coordinates[c][position]);
-    }
-}
-
 __device__ bool contains_sorted(const uint32_t *values, uint32_t count, uint32_t target) {
     uint32_t lo = 0, hi = count;
     while (lo < hi) {
@@ -639,7 +679,7 @@ void assemble_fri_kernel(
     const uint32_t *tree_count_ptr,
     const uint32_t *expanded,
     const uint32_t *expanded_count_ptr,
-    const uint32_t *values,
+    const uint32_t *const *coordinates,
     uint32_t *walk,
     uint32_t *scratch,
     const uint32_t *walk_count_ptr,
@@ -713,7 +753,8 @@ void assemble_fri_kernel(
                 prefix_base + walk_state.group_scan[tid] - 1U;
             #pragma unroll
             for (uint32_t c = 0; c < 4; ++c) {
-                assembly[witness_offset + 4U * destination + c] = values[4U * i + c];
+                assembly[witness_offset + 4U * destination + c] =
+                    canonical_m31(coordinates[c][expanded[i]]);
             }
         }
         __syncthreads();
@@ -752,7 +793,8 @@ void assemble_fri_kernel(
         assembly[all_values_offset + 5U * i] = expanded[i];
         #pragma unroll
         for (uint32_t c = 0; c < 4; ++c) {
-            assembly[all_values_offset + 5U * i + 1U + c] = values[4U * i + c];
+            assembly[all_values_offset + 5U * i + 1U + c] =
+                canonical_m31(coordinates[c][expanded[i]]);
         }
     }
     __syncthreads();
@@ -803,18 +845,21 @@ extern "C" int stwo_decommit_prepare_trace_queries_on(
     return cudaGetLastError();
 }
 
-extern "C" int stwo_decommit_gather_trace_values_on(
-    const uint32_t *const *columns, const uint32_t *logs, uint32_t n_columns,
-    uint32_t lifting_log, const uint32_t *queries, const uint32_t *query_count,
-    uint32_t max_queries, uint32_t first_column, uint32_t stride, uint32_t *output,
-    void *stream) {
-    if (!columns || !logs || n_columns == 0 || lifting_log >= 31 || !queries ||
-        !query_count || max_queries == 0 || stride < max_queries || !output || !stream)
+extern "C" int stwo_decommit_pack_trace_group_on(
+    uint32_t tree_index, uint32_t total_column_count, uint32_t first_column,
+    uint32_t group_column_count, const uint32_t *const *columns, const uint32_t *logs,
+    uint32_t lifting_log, const uint32_t *mapped, const uint32_t *mapped_count,
+    uint32_t max_queries, uint32_t *assembly, uint32_t capacity, void *stream) {
+    if (total_column_count == 0 || group_column_count == 0 ||
+        first_column > total_column_count ||
+        group_column_count > total_column_count - first_column || !columns || !logs ||
+        lifting_log >= 31 || !mapped || !mapped_count || max_queries == 0 || !assembly ||
+        !stream) {
         return cudaErrorInvalidValue;
-    const dim3 grid((max_queries + BLOCK - 1) / BLOCK, n_columns);
-    gather_trace_values_kernel<<<grid, BLOCK, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
-        columns, logs, n_columns, lifting_log, queries, query_count, max_queries,
-        first_column, stride, output);
+    }
+    pack_trace_group_kernel<<<1, BLOCK, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
+        tree_index, total_column_count, first_column, group_column_count, columns, logs,
+        lifting_log, mapped, mapped_count, max_queries, assembly, capacity);
     return cudaGetLastError();
 }
 
@@ -834,21 +879,21 @@ extern "C" int stwo_decommit_sparse_parent_on(
 
 extern "C" int stwo_decommit_assemble_trace_on(
     uint32_t tree_index, uint32_t role, uint32_t leaf_log, uint32_t first_retained_log,
-    uint32_t column_count, const uint32_t *mapped, const uint32_t *mapped_count,
-    uint32_t max_queries, uint32_t *walk, uint32_t *walk_scratch,
-    const uint32_t *walk_count, const uint32_t *values,
+    uint32_t column_count, const uint32_t *mapped_count, uint32_t max_queries,
+    uint32_t *walk, uint32_t *walk_scratch, const uint32_t *walk_count,
     const Blake2sHash *const *retained, const uint32_t *sparse_indices,
     const Blake2sHash *sparse_hashes, const uint32_t *sparse_offsets,
     const uint32_t *sparse_counts, uint32_t sparse_level_count, uint32_t *assembly,
     uint32_t capacity, void *stream) {
-    if (leaf_log >= 31 || first_retained_log > leaf_log || column_count == 0 || !mapped ||
-        !mapped_count || max_queries == 0 || !walk || !walk_scratch || !walk_count ||
-        !values || !retained || !sparse_indices || !sparse_hashes || !sparse_offsets ||
-        !sparse_counts || !assembly || !stream) return cudaErrorInvalidValue;
+    if (leaf_log >= 31 || first_retained_log > leaf_log || column_count == 0 ||
+        !mapped_count || max_queries == 0 || !walk || !walk_scratch || !walk_count || !retained ||
+        !sparse_indices || !sparse_hashes || !sparse_offsets || !sparse_counts ||
+        !assembly || !stream) return cudaErrorInvalidValue;
     assemble_trace_kernel<<<1, BLOCK, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
-        tree_index, role, leaf_log, first_retained_log, column_count, mapped, mapped_count,
-        max_queries, walk, walk_scratch, walk_count, values, retained, sparse_indices,
-        sparse_hashes, sparse_offsets, sparse_counts, sparse_level_count, assembly, capacity);
+        tree_index, role, leaf_log, first_retained_log, column_count, mapped_count,
+        max_queries, walk, walk_scratch, walk_count, retained, sparse_indices,
+        sparse_hashes, sparse_offsets, sparse_counts, sparse_level_count, assembly,
+        capacity);
     return cudaGetLastError();
 }
 
@@ -866,28 +911,18 @@ extern "C" int stwo_decommit_prepare_fri_queries_on(
     return cudaGetLastError();
 }
 
-extern "C" int stwo_decommit_gather_fri_values_on(
-    const uint32_t *const *coordinates, const uint32_t *positions,
-    const uint32_t *count, uint32_t max_positions, uint32_t *values, void *stream) {
-    if (!coordinates || !positions || !count || max_positions == 0 || !values || !stream)
-        return cudaErrorInvalidValue;
-    gather_fri_values_kernel<<<(max_positions + BLOCK - 1) / BLOCK, BLOCK, 0,
-        reinterpret_cast<cudaStream_t>(stream)>>>(coordinates, positions, count,
-        max_positions, values);
-    return cudaGetLastError();
-}
-
 extern "C" int stwo_decommit_assemble_fri_on(
     uint32_t tree_index, uint32_t leaf_log, const uint32_t *tree_queries,
     const uint32_t *tree_count, const uint32_t *expanded, const uint32_t *expanded_count,
-    const uint32_t *values, uint32_t *walk, uint32_t *walk_scratch,
+    const uint32_t *const *coordinates, uint32_t *walk, uint32_t *walk_scratch,
     const uint32_t *walk_count, const Blake2sHash *const *retained, uint32_t *assembly,
     uint32_t capacity, void *stream) {
     if (leaf_log >= 31 || !tree_queries || !tree_count || !expanded || !expanded_count ||
-        !values || !walk || !walk_scratch || !walk_count || !retained || !assembly || !stream)
+        !coordinates || !walk || !walk_scratch || !walk_count || !retained || !assembly ||
+        !stream)
         return cudaErrorInvalidValue;
     assemble_fri_kernel<<<1, BLOCK, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
-        tree_index, leaf_log, tree_queries, tree_count, expanded, expanded_count, values,
-        walk, walk_scratch, walk_count, retained, assembly, capacity);
+        tree_index, leaf_log, tree_queries, tree_count, expanded, expanded_count,
+        coordinates, walk, walk_scratch, walk_count, retained, assembly, capacity);
     return cudaGetLastError();
 }

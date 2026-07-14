@@ -139,11 +139,10 @@ mod tests {
         assert_ne!(raw::stwo_blake2s_sparse_leaf_group_on as usize, 0);
         assert_ne!(raw::stwo_decommit_normalize_queries_on as usize, 0);
         assert_ne!(raw::stwo_decommit_prepare_trace_queries_on as usize, 0);
-        assert_ne!(raw::stwo_decommit_gather_trace_values_on as usize, 0);
+        assert_ne!(raw::stwo_decommit_pack_trace_group_on as usize, 0);
         assert_ne!(raw::stwo_decommit_sparse_parent_on as usize, 0);
         assert_ne!(raw::stwo_decommit_assemble_trace_on as usize, 0);
         assert_ne!(raw::stwo_decommit_prepare_fri_queries_on as usize, 0);
-        assert_ne!(raw::stwo_decommit_gather_fri_values_on as usize, 0);
         assert_ne!(raw::stwo_decommit_assemble_fri_on as usize, 0);
     }
 

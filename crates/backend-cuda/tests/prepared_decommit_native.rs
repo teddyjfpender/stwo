@@ -59,6 +59,11 @@ fn workspace_slots(
         match tree {
             DecommitTreeRequirements::Trace(tree) => {
                 trees.push(DecommitTreeSlots::Trace(TraceDecommitSlots {
+                    evaluation_ptrs: allocator.alloc(
+                        tree.evaluation_pointer_words,
+                        DECOMMIT_POINTER_ALIGNMENT_WORDS,
+                    ),
+                    evaluation_log_sizes: allocator.alloc(tree.evaluation_log_words, 1),
                     retained_layers_by_log: allocator.alloc(
                         tree.retained_pointer_words,
                         DECOMMIT_POINTER_ALIGNMENT_WORDS,
@@ -69,9 +74,6 @@ fn workspace_slots(
                         .groups
                         .iter()
                         .map(|group| TraceSourceGroupSlots {
-                            evaluation_ptrs: allocator
-                                .alloc(group.pointer_words, DECOMMIT_POINTER_ALIGNMENT_WORDS),
-                            evaluation_log_sizes: allocator.alloc(group.log_words, 1),
                             coefficient_ptrs: group.coefficient_pointer_words.map(|words| {
                                 allocator.alloc(words, DECOMMIT_POINTER_ALIGNMENT_WORDS)
                             }),
@@ -112,7 +114,6 @@ fn workspace_slots(
             DECOMMIT_HASH_ALIGNMENT_WORDS,
         ),
         counts: allocator.alloc(requirements.count_words, 1),
-        values: allocator.alloc(requirements.value_words, 1),
         assembly: allocator.alloc(assembly_slot_words, 1),
         trees,
     }

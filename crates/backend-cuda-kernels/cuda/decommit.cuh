@@ -38,17 +38,19 @@ extern "C" int stwo_decommit_prepare_trace_queries_on(
     uint32_t *leaf_count,
     void *stream);
 
-extern "C" int stwo_decommit_gather_trace_values_on(
+extern "C" int stwo_decommit_pack_trace_group_on(
+    uint32_t tree_index,
+    uint32_t total_column_count,
+    uint32_t first_column,
+    uint32_t group_column_count,
     const uint32_t *const *columns,
     const uint32_t *column_log_sizes,
-    uint32_t column_count,
     uint32_t lifting_log_size,
     const uint32_t *mapped_queries,
     const uint32_t *mapped_count,
     uint32_t max_queries,
-    uint32_t destination_first_column,
-    uint32_t destination_stride,
-    uint32_t *queried_values,
+    uint32_t *assembly,
+    uint32_t assembly_capacity_words,
     void *stream);
 
 extern "C" int stwo_decommit_sparse_parent_on(
@@ -67,13 +69,11 @@ extern "C" int stwo_decommit_assemble_trace_on(
     uint32_t leaf_log_size,
     uint32_t first_retained_log_size,
     uint32_t column_count,
-    const uint32_t *mapped_queries,
     const uint32_t *mapped_count,
     uint32_t max_queries,
     uint32_t *walk_queries,
     uint32_t *walk_scratch,
     const uint32_t *walk_count,
-    const uint32_t *queried_values,
     const Blake2sHash *const *retained_layers_by_log,
     const uint32_t *sparse_indices,
     const Blake2sHash *sparse_hashes,
@@ -99,14 +99,6 @@ extern "C" int stwo_decommit_prepare_fri_queries_on(
     uint32_t *walk_count,
     void *stream);
 
-extern "C" int stwo_decommit_gather_fri_values_on(
-    const uint32_t *const *coordinate_columns,
-    const uint32_t *expanded_positions,
-    const uint32_t *expanded_count,
-    uint32_t max_expanded_positions,
-    uint32_t *expanded_values,
-    void *stream);
-
 extern "C" int stwo_decommit_assemble_fri_on(
     uint32_t tree_index,
     uint32_t leaf_log_size,
@@ -114,7 +106,7 @@ extern "C" int stwo_decommit_assemble_fri_on(
     const uint32_t *tree_query_count,
     const uint32_t *expanded_positions,
     const uint32_t *expanded_count,
-    const uint32_t *expanded_values,
+    const uint32_t *const *coordinate_columns,
     uint32_t *walk_queries,
     uint32_t *walk_scratch,
     const uint32_t *walk_count,

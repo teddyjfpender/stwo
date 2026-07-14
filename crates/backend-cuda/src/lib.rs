@@ -45,14 +45,14 @@ pub use backend::prepared_commit::{
 };
 pub use backend::prepared_decommit::{
     decommit_workspace_requirements, DecommitArenaSlotRequirement, DecommitAssembly,
-    DecommitColumnGeometry, DecommitColumnSource, DecommitSourceMode, DecommitTreeGeometry,
-    DecommitTreeMeta, DecommitTreeRequirements, DecommitTreeSlots, DecommitTreeSources,
-    DecommitWorkspaceConfig, DecommitWorkspaceRequirements, DecommitWorkspaceSlots,
-    FriDecommitGeometry, FriDecommitOwnedSources, FriDecommitSlots, FriTreeRequirements,
-    PreparedDecommitError, PreparedDecommitGraph, TraceDecommitGeometry, TraceDecommitSlots,
-    TraceDecommitSources, TraceGroupRequirements, TraceSourceGroup, TraceSourceGroupGeometry,
-    TraceSourceGroupSlots, TraceTreeRequirements, TraceTreeRole, DECOMMIT_HASH_ALIGNMENT_WORDS,
-    DECOMMIT_POINTER_ALIGNMENT_WORDS,
+    DecommitColumnGeometry, DecommitColumnSource, DecommitDirectPackModel, DecommitSourceMode,
+    DecommitTreeGeometry, DecommitTreeMeta, DecommitTreeRequirements, DecommitTreeSlots,
+    DecommitTreeSources, DecommitWorkspaceConfig, DecommitWorkspaceRequirements,
+    DecommitWorkspaceSlots, FriDecommitGeometry, FriDecommitOwnedSources, FriDecommitSlots,
+    FriTreeRequirements, PreparedDecommitError, PreparedDecommitGraph, TraceDecommitGeometry,
+    TraceDecommitSlots, TraceDecommitSources, TraceGroupRequirements, TraceSourceGroup,
+    TraceSourceGroupGeometry, TraceSourceGroupSlots, TraceTreeRequirements, TraceTreeRole,
+    DECOMMIT_HASH_ALIGNMENT_WORDS, DECOMMIT_POINTER_ALIGNMENT_WORDS,
 };
 pub use backend::prepared_ec_op::{
     ec_op_workspace_requirements, EcOpArenaSlotRequirement, EcOpMultiplicityGeometry,

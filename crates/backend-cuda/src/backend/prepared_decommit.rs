@@ -123,8 +123,6 @@ pub struct DecommitArenaSlotRequirement {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TraceGroupRequirements {
     pub column_count: usize,
-    pub pointer_words: usize,
-    pub log_words: usize,
     pub coefficient_pointer_words: Option<usize>,
     pub coefficient_size_words: Option<usize>,
     pub lde_tile_words: Option<usize>,
@@ -135,6 +133,10 @@ pub struct TraceGroupRequirements {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TraceTreeRequirements {
     pub column_count: usize,
+    /// One canonical, tree-owned descriptor sequence. Group execution binds
+    /// checked subranges instead of owning duplicate pointer/log tables.
+    pub evaluation_pointer_words: usize,
+    pub evaluation_log_words: usize,
     pub max_leaf_count: usize,
     pub sparse_level_capacities: Vec<usize>,
     pub sparse_level_offsets: Vec<u32>,
@@ -165,15 +167,24 @@ pub struct DecommitWorkspaceRequirements {
     pub sparse_index_words: usize,
     pub sparse_hash_words: usize,
     pub count_words: usize,
-    pub value_words: usize,
     pub assembly_words: usize,
     pub trees: Vec<DecommitTreeRequirements>,
 }
 
+/// Capacity-model delta from writing queried values straight into the compact
+/// proof bundle instead of round-tripping through a max-sized value slab.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DecommitDirectPackModel {
+    pub eliminated_arena_words: usize,
+    /// Trace gathers become direct final-layout packs at equal launch count.
+    pub direct_trace_pack_launches: usize,
+    /// FRI gathers disappear because assembly reads retained coordinates.
+    pub eliminated_gather_launches: usize,
+    pub eliminated_staging_traffic_bytes: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TraceSourceGroupSlots {
-    pub evaluation_ptrs: ArenaSlotId,
-    pub evaluation_log_sizes: ArenaSlotId,
     pub coefficient_ptrs: Option<ArenaSlotId>,
     pub coefficient_sizes: Option<ArenaSlotId>,
     pub lde_output_ptrs: Option<ArenaSlotId>,
@@ -182,6 +193,8 @@ pub struct TraceSourceGroupSlots {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TraceDecommitSlots {
+    pub evaluation_ptrs: ArenaSlotId,
+    pub evaluation_log_sizes: ArenaSlotId,
     pub retained_layers_by_log: ArenaSlotId,
     pub sparse_level_offsets: ArenaSlotId,
     pub groups: Vec<TraceSourceGroupSlots>,
@@ -209,7 +222,6 @@ pub struct DecommitWorkspaceSlots {
     pub sparse_indices: ArenaSlotId,
     pub sparse_hashes: ArenaSlotId,
     pub counts: ArenaSlotId,
-    pub values: ArenaSlotId,
     pub assembly: ArenaSlotId,
     pub trees: Vec<DecommitTreeSlots>,
 }
@@ -349,7 +361,6 @@ pub fn decommit_workspace_requirements(
     let mut max_expanded = 1usize;
     let mut max_sparse_words = 1usize;
     let mut max_sparse_levels = 0usize;
-    let mut max_values = 1usize;
     let mut assembly_words = HEADER_WORDS
         .checked_add(
             config
@@ -430,8 +441,6 @@ pub fn decommit_workspace_requirements(
                     }
                     group_requirements.push(TraceGroupRequirements {
                         column_count: width,
-                        pointer_words: pointer_words(width)?,
-                        log_words: width,
                         coefficient_pointer_words: (group.mode
                             == DecommitSourceMode::RecomputeQueriedLde)
                             .then_some(pointer_words(width)?),
@@ -463,11 +472,6 @@ pub fn decommit_workspace_requirements(
                     .collect::<Result<_, _>>()?;
                 max_sparse_words = max_sparse_words.max(running.max(1));
                 max_sparse_levels = max_sparse_levels.max(sparse_level_capacities.len());
-                max_values = max_values.max(
-                    column_count
-                        .checked_mul(n_queries)
-                        .ok_or(PreparedDecommitError::SizeOverflow)?,
-                );
                 assembly_words = assembly_words
                     .checked_add(n_queries)
                     .and_then(|v| v.checked_add(column_count.checked_mul(n_queries)?))
@@ -488,6 +492,8 @@ pub fn decommit_workspace_requirements(
                     .ok_or(PreparedDecommitError::SizeOverflow)?;
                 trees.push(DecommitTreeRequirements::Trace(TraceTreeRequirements {
                     column_count,
+                    evaluation_pointer_words: pointer_words(column_count)?,
+                    evaluation_log_words: column_count,
                     max_leaf_count,
                     sparse_level_capacities,
                     sparse_level_offsets,
@@ -516,11 +522,6 @@ pub fn decommit_workspace_requirements(
                     .ok_or(PreparedDecommitError::SizeOverflow)?;
                 max_expanded = max_expanded.max(max_positions);
                 max_walk = max_walk.max(max_positions);
-                max_values = max_values.max(
-                    max_positions
-                        .checked_mul(4)
-                        .ok_or(PreparedDecommitError::SizeOverflow)?,
-                );
                 let leaf_log = fri.leaf_log_size() as usize;
                 assembly_words = assembly_words
                     .checked_add(n_queries)
@@ -561,7 +562,6 @@ pub fn decommit_workspace_requirements(
             .checked_mul(HASH_WORDS)
             .ok_or(PreparedDecommitError::SizeOverflow)?,
         count_words: COUNT_SPARSE_BASE + max_sparse_levels.max(1),
-        value_words: max_values,
         assembly_words,
         trees,
     })
@@ -580,6 +580,50 @@ fn pointer_words(count: usize) -> Result<usize, PreparedDecommitError> {
 }
 
 impl DecommitWorkspaceRequirements {
+    pub fn direct_pack_capacity_model(
+        &self,
+    ) -> Result<DecommitDirectPackModel, PreparedDecommitError> {
+        let queries = self.config.n_queries as usize;
+        let mut eliminated_arena_words = 1usize;
+        let mut direct_trace_pack_launches = 0usize;
+        let mut eliminated_gather_launches = 0usize;
+        let mut staged_words = 0usize;
+        for tree in &self.trees {
+            let words = match tree {
+                DecommitTreeRequirements::Trace(tree) => {
+                    direct_trace_pack_launches = direct_trace_pack_launches
+                        .checked_add(tree.groups.len())
+                        .ok_or(PreparedDecommitError::SizeOverflow)?;
+                    tree.column_count
+                        .checked_mul(queries)
+                        .ok_or(PreparedDecommitError::SizeOverflow)?
+                }
+                DecommitTreeRequirements::Fri(tree) => {
+                    eliminated_gather_launches = eliminated_gather_launches
+                        .checked_add(1)
+                        .ok_or(PreparedDecommitError::SizeOverflow)?;
+                    tree.max_expanded_positions
+                        .checked_mul(4)
+                        .ok_or(PreparedDecommitError::SizeOverflow)?
+                }
+            };
+            eliminated_arena_words = eliminated_arena_words.max(words);
+            staged_words = staged_words
+                .checked_add(words)
+                .ok_or(PreparedDecommitError::SizeOverflow)?;
+        }
+        let eliminated_staging_traffic_bytes = u64::try_from(staged_words)
+            .map_err(|_| PreparedDecommitError::SizeOverflow)?
+            .checked_mul(2 * WORD_BYTES as u64)
+            .ok_or(PreparedDecommitError::SizeOverflow)?;
+        Ok(DecommitDirectPackModel {
+            eliminated_arena_words,
+            direct_trace_pack_launches,
+            eliminated_gather_launches,
+            eliminated_staging_traffic_bytes,
+        })
+    }
+
     pub fn arena_slot_requirements(
         &self,
         slots: &DecommitWorkspaceSlots,
@@ -604,7 +648,6 @@ impl DecommitWorkspaceRequirements {
                 DECOMMIT_HASH_ALIGNMENT_WORDS,
             ),
             slot(slots.counts, self.count_words, 1),
-            slot(slots.values, self.value_words, 1),
             slot(slots.assembly, self.assembly_words, 1),
         ];
         for (tree_index, (requirements, tree_slots)) in
@@ -629,13 +672,17 @@ impl DecommitWorkspaceRequirements {
                         tree.sparse_level_offsets.len().max(1),
                         1,
                     ));
+                    output.push(slot(
+                        tree_slots.evaluation_ptrs,
+                        tree.evaluation_pointer_words,
+                        DECOMMIT_POINTER_ALIGNMENT_WORDS,
+                    ));
+                    output.push(slot(
+                        tree_slots.evaluation_log_sizes,
+                        tree.evaluation_log_words,
+                        1,
+                    ));
                     for (group, group_slots) in tree.groups.iter().zip(&tree_slots.groups) {
-                        output.push(slot(
-                            group_slots.evaluation_ptrs,
-                            group.pointer_words,
-                            DECOMMIT_POINTER_ALIGNMENT_WORDS,
-                        ));
-                        output.push(slot(group_slots.evaluation_log_sizes, group.log_words, 1));
                         match (
                             group.coefficient_pointer_words,
                             group.coefficient_size_words,
@@ -722,15 +769,18 @@ fn exclusive_decommit_slot_ids(slots: &DecommitWorkspaceSlots) -> Vec<ArenaSlotI
         slots.sparse_indices,
         slots.sparse_hashes,
         slots.counts,
-        slots.values,
         slots.assembly,
     ];
     for tree in &slots.trees {
         match tree {
             DecommitTreeSlots::Trace(tree) => {
-                ids.extend([tree.retained_layers_by_log, tree.sparse_level_offsets]);
+                ids.extend([
+                    tree.evaluation_ptrs,
+                    tree.evaluation_log_sizes,
+                    tree.retained_layers_by_log,
+                    tree.sparse_level_offsets,
+                ]);
                 for group in &tree.groups {
-                    ids.extend([group.evaluation_ptrs, group.evaluation_log_sizes]);
                     ids.extend(group.coefficient_ptrs);
                     ids.extend(group.coefficient_sizes);
                     ids.extend(group.lde_output_ptrs);
@@ -761,12 +811,11 @@ struct LdeBatch {
 
 #[derive(Debug)]
 struct PreparedTraceGroup {
-    evaluation_ptrs: ArenaSlice,
-    evaluation_log_sizes: ArenaSlice,
     coefficient_ptrs: Option<ArenaSlice>,
     coefficient_sizes: Option<ArenaSlice>,
     lde_output_ptrs: Option<ArenaSlice>,
     batches: Vec<LdeBatch>,
+    first_column: usize,
     column_count: usize,
 }
 
@@ -781,6 +830,8 @@ struct PreparedTraceTree {
     sparse_level_capacities: Vec<usize>,
     sparse_level_offsets: Vec<u32>,
     sparse_level_offsets_device: ArenaSlice,
+    evaluation_ptrs: ArenaSlice,
+    evaluation_log_sizes: ArenaSlice,
     retained_layers_by_log: ArenaSlice,
     groups: Vec<PreparedTraceGroup>,
 }
@@ -791,7 +842,6 @@ struct PreparedFriTree {
     outgoing_fold_step: u32,
     log_rows_per_leaf: u32,
     leaf_log_size: u32,
-    max_expanded_positions: usize,
     coordinate_ptrs: ArenaSlice,
     retained_layers_by_log: ArenaSlice,
 }
@@ -815,7 +865,6 @@ pub struct PreparedDecommitGraph<'a> {
     sparse_indices: ArenaSlice,
     sparse_hashes: ArenaSlice,
     counts: ArenaSlice,
-    values: ArenaSlice,
     assembly: ArenaSlice,
     trees: Vec<PreparedTree>,
 }
@@ -928,7 +977,6 @@ impl<'a> PreparedDecommitGraph<'a> {
             DECOMMIT_HASH_ALIGNMENT_WORDS,
         )?;
         let counts = bind(slots.counts, requirements.count_words, 1)?;
-        let values = bind(slots.values, requirements.value_words, 1)?;
         let assembly = match assembly {
             Some(destination) => validate_assembly_destination(
                 destination,
@@ -1004,6 +1052,21 @@ impl<'a> PreparedDecommitGraph<'a> {
                     };
                     uploads.push((sparse_offsets, u32_bytes(&offsets)));
 
+                    let evaluation_ptrs = bind(
+                        tree_slots.evaluation_ptrs,
+                        requirement.evaluation_pointer_words,
+                        DECOMMIT_POINTER_ALIGNMENT_WORDS,
+                    )?;
+                    let evaluation_logs = bind(
+                        tree_slots.evaluation_log_sizes,
+                        requirement.evaluation_log_words,
+                        1,
+                    )?;
+                    let mut canonical_evaluation_ptrs =
+                        Vec::with_capacity(requirement.column_count);
+                    let mut canonical_evaluation_logs =
+                        Vec::with_capacity(requirement.column_count);
+
                     let mut groups = Vec::with_capacity(requirement.groups.len());
                     for (
                         group_index,
@@ -1023,26 +1086,13 @@ impl<'a> PreparedDecommitGraph<'a> {
                                 actual: group_source.columns.len(),
                             });
                         }
-                        let evaluation_ptrs = bind(
-                            group_slots.evaluation_ptrs,
-                            group_requirement.pointer_words,
-                            DECOMMIT_POINTER_ALIGNMENT_WORDS,
-                        )?;
-                        let evaluation_logs = bind(
-                            group_slots.evaluation_log_sizes,
-                            group_requirement.log_words,
-                            1,
-                        )?;
-                        uploads.push((
-                            evaluation_logs,
-                            u32_bytes(
-                                &group_geometry
-                                    .columns
-                                    .iter()
-                                    .map(|column| column.evaluation_log_size)
-                                    .collect::<Vec<_>>(),
-                            ),
-                        ));
+                        let first_column = canonical_evaluation_ptrs.len();
+                        canonical_evaluation_logs.extend(
+                            group_geometry
+                                .columns
+                                .iter()
+                                .map(|column| column.evaluation_log_size),
+                        );
 
                         let (coefficient_ptrs, coefficient_sizes, output_ptrs) =
                             match group_geometry.mode {
@@ -1073,7 +1123,7 @@ impl<'a> PreparedDecommitGraph<'a> {
                                         )?;
                                         pointers.push(source.as_u32_ptr() as usize);
                                     }
-                                    uploads.push((evaluation_ptrs, pointer_bytes(&pointers)));
+                                    canonical_evaluation_ptrs.extend(pointers);
                                     (None, None, None)
                                 }
                                 DecommitSourceMode::RecomputeQueriedLde => {
@@ -1139,14 +1189,11 @@ impl<'a> PreparedDecommitGraph<'a> {
                                     uploads.push((cp, pointer_bytes(&source_pointers)));
                                     uploads.push((cs, u32_bytes(&source_sizes)));
                                     uploads.push((op, pointer_bytes(&output_pointers)));
-                                    uploads
-                                        .push((evaluation_ptrs, pointer_bytes(&output_pointers)));
+                                    canonical_evaluation_ptrs.extend(output_pointers);
                                     (Some(cp), Some(cs), Some(op))
                                 }
                             };
                         groups.push(PreparedTraceGroup {
-                            evaluation_ptrs,
-                            evaluation_log_sizes: evaluation_logs,
                             coefficient_ptrs,
                             coefficient_sizes,
                             lde_output_ptrs: output_ptrs,
@@ -1159,9 +1206,23 @@ impl<'a> PreparedDecommitGraph<'a> {
                                     evaluation_log_size,
                                 })
                                 .collect(),
+                            first_column,
                             column_count: group_requirement.column_count,
                         });
                     }
+                    if canonical_evaluation_ptrs.len() != requirement.column_count
+                        || canonical_evaluation_logs.len() != requirement.column_count
+                    {
+                        return Err(PreparedDecommitError::SlotShapeMismatch {
+                            role: "canonical trace descriptors",
+                            expected: requirement.column_count,
+                            actual: canonical_evaluation_ptrs
+                                .len()
+                                .min(canonical_evaluation_logs.len()),
+                        });
+                    }
+                    uploads.push((evaluation_ptrs, pointer_bytes(&canonical_evaluation_ptrs)));
+                    uploads.push((evaluation_logs, u32_bytes(&canonical_evaluation_logs)));
                     trees.push(PreparedTree::Trace(PreparedTraceTree {
                         role: geometry.role,
                         tree_query_log_size: geometry.tree_query_log_size,
@@ -1172,6 +1233,8 @@ impl<'a> PreparedDecommitGraph<'a> {
                         sparse_level_capacities: requirement.sparse_level_capacities.clone(),
                         sparse_level_offsets: requirement.sparse_level_offsets.clone(),
                         sparse_level_offsets_device: sparse_offsets,
+                        evaluation_ptrs,
+                        evaluation_log_sizes: evaluation_logs,
                         retained_layers_by_log: retained,
                         groups,
                     }));
@@ -1241,7 +1304,6 @@ impl<'a> PreparedDecommitGraph<'a> {
                         outgoing_fold_step: geometry.outgoing_fold_step,
                         log_rows_per_leaf: geometry.log_rows_per_leaf,
                         leaf_log_size: leaf_log,
-                        max_expanded_positions: requirement.max_expanded_positions,
                         coordinate_ptrs,
                         retained_layers_by_log: retained,
                     }));
@@ -1309,7 +1371,6 @@ impl<'a> PreparedDecommitGraph<'a> {
             sparse_indices,
             sparse_hashes,
             counts,
-            values,
             assembly,
             trees,
         })
@@ -1368,8 +1429,6 @@ impl<'a> PreparedDecommitGraph<'a> {
         check_cuda("decommit_prepare_trace_queries", code)?;
 
         let twiddles = self.lde_twiddles;
-        let mut first_column = 0usize;
-        let mut columns_done = 0usize;
         for (group_index, group) in tree.groups.iter().enumerate() {
             if let (Some(coefficient_ptrs), Some(coefficient_sizes), Some(outputs)) = (
                 group.coefficient_ptrs,
@@ -1401,23 +1460,35 @@ impl<'a> PreparedDecommitGraph<'a> {
                 }
             }
 
+            // Consume this group before a later recompute group reuses the same LDE
+            // tile. Each launch writes directly into its disjoint final bundle range.
             let code = unsafe {
-                stwo_backend_cuda_kernels::raw::stwo_decommit_gather_trace_values_on(
-                    group.evaluation_ptrs.as_u32_ptr().cast::<*const u32>(),
-                    group.evaluation_log_sizes.as_u32_ptr(),
+                stwo_backend_cuda_kernels::raw::stwo_decommit_pack_trace_group_on(
+                    u32::try_from(tree_index).map_err(|_| PreparedDecommitError::SizeOverflow)?,
+                    u32::try_from(tree.column_count)
+                        .map_err(|_| PreparedDecommitError::SizeOverflow)?,
+                    u32::try_from(group.first_column)
+                        .map_err(|_| PreparedDecommitError::SizeOverflow)?,
                     u32::try_from(group.column_count)
                         .map_err(|_| PreparedDecommitError::SizeOverflow)?,
+                    tree.evaluation_ptrs
+                        .as_u32_ptr()
+                        .cast::<*const u32>()
+                        .add(group.first_column),
+                    tree.evaluation_log_sizes
+                        .as_u32_ptr()
+                        .add(group.first_column),
                     tree.leaf_log_size,
                     self.mapped_queries.as_u32_ptr(),
                     self.count_ptr(COUNT_MAPPED),
                     self.requirements.config.n_queries,
-                    u32::try_from(first_column).map_err(|_| PreparedDecommitError::SizeOverflow)?,
-                    self.requirements.config.n_queries,
-                    self.values.as_u32_ptr(),
+                    self.assembly.as_u32_ptr(),
+                    u32::try_from(self.requirements.assembly_words)
+                        .map_err(|_| PreparedDecommitError::SizeOverflow)?,
                     self.stream(),
                 )
             };
-            check_cuda("decommit_gather_trace_values", code)?;
+            check_cuda("decommit_pack_trace_group", code)?;
 
             if tree.unretained_bottom_layers != 0 {
                 let final_group = group_index + 1 == tree.groups.len();
@@ -1429,10 +1500,15 @@ impl<'a> PreparedDecommitGraph<'a> {
                             .map_err(|_| PreparedDecommitError::SizeOverflow)?,
                         u32::try_from(group.column_count)
                             .map_err(|_| PreparedDecommitError::SizeOverflow)?,
-                        group.evaluation_ptrs.as_u32_ptr().cast::<*mut u32>(),
-                        group.evaluation_log_sizes.as_u32_ptr(),
+                        tree.evaluation_ptrs
+                            .as_u32_ptr()
+                            .cast::<*mut u32>()
+                            .add(group.first_column),
+                        tree.evaluation_log_sizes
+                            .as_u32_ptr()
+                            .add(group.first_column),
                         tree.leaf_log_size,
-                        u32::try_from(columns_done)
+                        u32::try_from(group.first_column)
                             .map_err(|_| PreparedDecommitError::SizeOverflow)?,
                         u32::from(final_group),
                         self.sparse_hashes.as_u32_ptr().cast(),
@@ -1441,8 +1517,6 @@ impl<'a> PreparedDecommitGraph<'a> {
                 };
                 check_cuda("decommit_sparse_leaf_group", code)?;
             }
-            first_column += group.column_count;
-            columns_done += group.column_count;
         }
 
         for distance in 1..tree.unretained_bottom_layers as usize {
@@ -1479,13 +1553,11 @@ impl<'a> PreparedDecommitGraph<'a> {
                 first_retained,
                 u32::try_from(tree.column_count)
                     .map_err(|_| PreparedDecommitError::SizeOverflow)?,
-                self.mapped_queries.as_u32_ptr(),
                 self.count_ptr(COUNT_MAPPED),
                 self.requirements.config.n_queries,
                 self.walk_queries.as_u32_ptr(),
                 self.walk_scratch.as_u32_ptr(),
                 self.count_ptr(COUNT_WALK),
-                self.values.as_u32_ptr(),
                 tree.retained_layers_by_log
                     .as_u32_ptr()
                     .cast::<*const stwo_backend_cuda_kernels::raw::Blake2sHash>(),
@@ -1533,18 +1605,6 @@ impl<'a> PreparedDecommitGraph<'a> {
         };
         check_cuda("decommit_prepare_fri_queries", code)?;
         let code = unsafe {
-            stwo_backend_cuda_kernels::raw::stwo_decommit_gather_fri_values_on(
-                tree.coordinate_ptrs.as_u32_ptr().cast::<*const u32>(),
-                self.expanded_positions.as_u32_ptr(),
-                self.count_ptr(COUNT_EXPANDED),
-                u32::try_from(tree.max_expanded_positions)
-                    .map_err(|_| PreparedDecommitError::SizeOverflow)?,
-                self.values.as_u32_ptr(),
-                self.stream(),
-            )
-        };
-        check_cuda("decommit_gather_fri_values", code)?;
-        let code = unsafe {
             stwo_backend_cuda_kernels::raw::stwo_decommit_assemble_fri_on(
                 u32::try_from(tree_index).map_err(|_| PreparedDecommitError::SizeOverflow)?,
                 tree.leaf_log_size,
@@ -1552,7 +1612,7 @@ impl<'a> PreparedDecommitGraph<'a> {
                 self.count_ptr(COUNT_MAPPED),
                 self.expanded_positions.as_u32_ptr(),
                 self.count_ptr(COUNT_EXPANDED),
-                self.values.as_u32_ptr(),
+                tree.coordinate_ptrs.as_u32_ptr().cast::<*const u32>(),
                 self.walk_queries.as_u32_ptr(),
                 self.walk_scratch.as_u32_ptr(),
                 self.count_ptr(COUNT_WALK),
@@ -1985,6 +2045,197 @@ mod tests {
         })
     }
 
+    fn compositions(total: usize) -> Vec<Vec<usize>> {
+        if total == 0 {
+            return vec![Vec::new()];
+        }
+        let mut result = Vec::new();
+        for first in 1..=total {
+            for mut tail in compositions(total - first) {
+                let mut parts = vec![first];
+                parts.append(&mut tail);
+                result.push(parts);
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn canonical_tree_descriptors_cover_every_valid_group_topology() {
+        for column_count in 1..=64usize {
+            let final_width = (column_count - 1) % 16 + 1;
+            let prefix_blocks = (column_count - final_width) / 16;
+            for prefix in compositions(prefix_blocks) {
+                let mut widths = prefix
+                    .into_iter()
+                    .map(|blocks| blocks * 16)
+                    .collect::<Vec<_>>();
+                widths.push(final_width);
+                let groups = widths
+                    .iter()
+                    .map(|&width| TraceSourceGroupGeometry {
+                        mode: DecommitSourceMode::ResidentEvaluations,
+                        columns: vec![
+                            DecommitColumnGeometry {
+                                coefficient_log_size: 4,
+                                evaluation_log_size: 6,
+                            };
+                            width
+                        ],
+                    })
+                    .collect::<Vec<_>>();
+                let requirements = decommit_workspace_requirements(DecommitWorkspaceConfig {
+                    query_log_size: 6,
+                    n_queries: 3,
+                    trees: vec![DecommitTreeGeometry::Trace(TraceDecommitGeometry {
+                        role: TraceTreeRole::Base,
+                        tree_query_log_size: 6,
+                        leaf_log_size: 6,
+                        unretained_bottom_layers: 0,
+                        groups,
+                    })],
+                })
+                .unwrap();
+                let DecommitTreeRequirements::Trace(tree) = &requirements.trees[0] else {
+                    panic!("trace")
+                };
+                assert_eq!(tree.column_count, column_count);
+                assert_eq!(tree.evaluation_pointer_words, column_count * POINTER_WORDS);
+                assert_eq!(tree.evaluation_log_words, column_count);
+                assert_eq!(tree.groups.len(), widths.len());
+                assert_eq!(
+                    requirements
+                        .direct_pack_capacity_model()
+                        .unwrap()
+                        .direct_trace_pack_launches,
+                    widths.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn direct_trace_pack_matches_independent_merkle_decommit_oracle() {
+        use stwo::core::fields::m31::{BaseField, P};
+        use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleHasher;
+        use stwo::prover::backend::CpuBackend;
+        use stwo::prover::vcs_lifted::prover::MerkleProverLifted;
+
+        for lifting_log in 2..=5u32 {
+            let logs = (1..=lifting_log)
+                .flat_map(|log| [log, log])
+                .collect::<Vec<_>>();
+            let columns = logs
+                .iter()
+                .enumerate()
+                .map(|(column, &log)| {
+                    (0..1usize << log)
+                        .map(|row| {
+                            let raw = if (column + row) % 7 == 0 {
+                                P
+                            } else {
+                                (column * 257 + row * 17 + 1) as u32 % P
+                            };
+                            BaseField::from_u32_unchecked(raw)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let tree = MerkleProverLifted::<CpuBackend, Blake2sMerkleHasher>::commit(
+                columns.iter().collect(),
+                lifting_log,
+                0,
+            );
+            let domain = 1usize << lifting_log;
+            let mut query_sets = Vec::new();
+            if lifting_log <= 3 {
+                query_sets.extend((1usize..1usize << domain).map(|mask| {
+                    (0..domain)
+                        .filter(|position| mask & (1usize << position) != 0)
+                        .collect::<Vec<_>>()
+                }));
+            } else {
+                query_sets.extend((0..domain).map(|position| vec![position]));
+                query_sets.extend((0..domain - 1).map(|position| vec![position, position + 1]));
+                query_sets.push((0..domain).collect());
+            }
+
+            for queries in query_sets {
+                let (oracle, _) = tree.decommit(&queries, columns.iter().collect());
+                let oracle = oracle.into_iter().flatten().collect::<Vec<_>>();
+                let direct = columns
+                    .iter()
+                    .zip(&logs)
+                    .flat_map(|(column, &column_log)| {
+                        let shift = lifting_log - column_log;
+                        queries.iter().map(move |&position| {
+                            let row = ((position >> (shift + 1)) << 1) + (position & 1);
+                            BaseField::reduce(column[row].0 as u64)
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(direct, oracle, "lifting={lifting_log} queries={queries:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn direct_trace_pack_consumes_each_reused_tile_before_overwrite() {
+        use stwo::core::fields::m31::{BaseField, P};
+        use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleHasher;
+        use stwo::prover::backend::CpuBackend;
+        use stwo::prover::vcs_lifted::prover::MerkleProverLifted;
+
+        const LIFTING_LOG: u32 = 5;
+        let logs = (0..34)
+            .map(|column| 2 + (column as u32 * 3 / 34))
+            .collect::<Vec<_>>();
+        let columns = logs
+            .iter()
+            .enumerate()
+            .map(|(column, &log)| {
+                (0..1usize << log)
+                    .map(|row| {
+                        let raw = if (column + row) % 11 == 0 {
+                            P
+                        } else {
+                            (column * 1_009 + row * 37 + 1) as u32 % P
+                        };
+                        BaseField::from_u32_unchecked(raw)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let tree = MerkleProverLifted::<CpuBackend, Blake2sMerkleHasher>::commit(
+            columns.iter().collect(),
+            LIFTING_LOG,
+            0,
+        );
+        let queries = [0usize, 1, 7, 16, 31];
+        let (oracle, _) = tree.decommit(&queries, columns.iter().collect());
+        let oracle = oracle.into_iter().flatten().collect::<Vec<_>>();
+
+        let mut packed = vec![BaseField::from_u32_unchecked(0); oracle.len()];
+        let mut first_column = 0;
+        for width in [16usize, 16, 2] {
+            // This clone models the one physical LDE tile being overwritten by
+            // the next group. Only values copied into `packed` survive.
+            let tile = columns[first_column..first_column + width].to_vec();
+            for (local_column, (column, &log)) in tile.iter().zip(&logs[first_column..]).enumerate()
+            {
+                for (query_index, &position) in queries.iter().enumerate() {
+                    let shift = LIFTING_LOG - log;
+                    let row = ((position >> (shift + 1)) << 1) + (position & 1);
+                    packed[(first_column + local_column) * queries.len() + query_index] =
+                        BaseField::reduce(column[row].0 as u64);
+                }
+            }
+            first_column += width;
+        }
+        assert_eq!(first_column, columns.len());
+        assert_eq!(packed, oracle);
+    }
+
     #[test]
     fn requirements_cover_trace_pruning_and_all_fri_sections() {
         let config = DecommitWorkspaceConfig {
@@ -2015,12 +2266,23 @@ mod tests {
         assert_eq!(trace.max_leaf_count, 16 * 16);
         assert_eq!(trace.sparse_level_capacities, vec![256, 128, 64, 32]);
         assert_eq!(trace.sparse_level_offsets, vec![0, 256, 384, 448]);
+        assert_eq!(trace.evaluation_pointer_words, 8 * POINTER_WORDS);
+        assert_eq!(trace.evaluation_log_words, 8);
         let DecommitTreeRequirements::Fri(first) = &requirements.trees[1] else {
             panic!("fri")
         };
         assert_eq!(first.max_expanded_positions, 16 * 8);
         assert!(requirements.walk_query_words >= first.max_expanded_positions);
         assert!(requirements.assembly_words > HEADER_WORDS + 3 * TREE_META_WORDS);
+        assert_eq!(
+            requirements.direct_pack_capacity_model().unwrap(),
+            DecommitDirectPackModel {
+                eliminated_arena_words: 16 * 8 * 4,
+                direct_trace_pack_launches: 1,
+                eliminated_gather_launches: 2,
+                eliminated_staging_traffic_bytes: (16 * 8 + 16 * 8 * 4 + 16 * 4 * 4) * 8,
+            }
+        );
     }
 
     #[test]
@@ -2297,11 +2559,16 @@ mod tests {
     #[test]
     fn compiled_decommit_tail_contract_uses_one_block_without_false_sm_occupancy() {
         let source = include_str!("../../../backend-cuda-kernels/cuda/decommit.cu");
-        assert_eq!(source.matches("__launch_bounds__(BLOCK)").count(), 2);
+        assert_eq!(source.matches("__launch_bounds__(BLOCK)").count(), 3);
         assert!(!source.contains("ASSEMBLY_MIN_BLOCKS_PER_SM"));
+        assert!(source.contains("pack_trace_group_kernel<<<1, BLOCK"));
         assert!(source.contains("assemble_trace_kernel<<<1, BLOCK"));
         assert!(source.contains("assemble_fri_kernel<<<1, BLOCK"));
         assert!(!source.contains("assemble_trace_kernel<<<1, 1"));
         assert!(!source.contains("assemble_fri_kernel<<<1, 1"));
+        assert!(!source.contains("gather_trace_values_kernel"));
+        assert!(!source.contains("gather_fri_values_kernel"));
+        assert!(source.contains("canonical_m31(columns[column][row])"));
+        assert!(source.contains("canonical_m31(coordinates[c][expanded[i]])"));
     }
 }

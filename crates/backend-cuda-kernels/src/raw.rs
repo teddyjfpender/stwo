@@ -2117,17 +2117,19 @@ extern "C" {
         leaf_count: *mut u32,
         stream: *mut c_void,
     ) -> i32;
-    pub fn stwo_decommit_gather_trace_values_on(
+    pub fn stwo_decommit_pack_trace_group_on(
+        tree_index: u32,
+        total_column_count: u32,
+        first_column: u32,
+        group_column_count: u32,
         columns: *const *const u32,
         column_log_sizes: *const u32,
-        column_count: u32,
         lifting_log_size: u32,
         mapped_queries: *const u32,
         mapped_count: *const u32,
         max_queries: u32,
-        destination_first_column: u32,
-        destination_stride: u32,
-        queried_values: *mut u32,
+        assembly: *mut u32,
+        assembly_capacity_words: u32,
         stream: *mut c_void,
     ) -> i32;
     pub fn stwo_decommit_sparse_parent_on(
@@ -2146,13 +2148,11 @@ extern "C" {
         leaf_log_size: u32,
         first_retained_log_size: u32,
         column_count: u32,
-        mapped_queries: *const u32,
         mapped_count: *const u32,
         max_queries: u32,
         walk_queries: *mut u32,
         walk_scratch: *mut u32,
         walk_count: *const u32,
-        queried_values: *const u32,
         retained_layers_by_log: *const *const Blake2sHash,
         sparse_indices: *const u32,
         sparse_hashes: *const Blake2sHash,
@@ -2178,14 +2178,6 @@ extern "C" {
         walk_count: *mut u32,
         stream: *mut c_void,
     ) -> i32;
-    pub fn stwo_decommit_gather_fri_values_on(
-        coordinate_columns: *const *const u32,
-        expanded_positions: *const u32,
-        expanded_count: *const u32,
-        max_expanded_positions: u32,
-        expanded_values: *mut u32,
-        stream: *mut c_void,
-    ) -> i32;
     pub fn stwo_decommit_assemble_fri_on(
         tree_index: u32,
         leaf_log_size: u32,
@@ -2193,7 +2185,7 @@ extern "C" {
         tree_query_count: *const u32,
         expanded_positions: *const u32,
         expanded_count: *const u32,
-        expanded_values: *const u32,
+        coordinate_columns: *const *const u32,
         walk_queries: *mut u32,
         walk_scratch: *mut u32,
         walk_count: *const u32,
