@@ -54,6 +54,7 @@ def run_bounded_child(
     stdout = bytearray()
     stderr = bytearray()
     deadline = time.monotonic() + timeout_seconds
+    group_torn_down = False
     try:
         for stream, role in ((process.stdout, "stdout"), (process.stderr, "stderr")):
             os.set_blocking(stream.fileno(), False)
@@ -81,6 +82,9 @@ def run_bounded_child(
                     raise ValueError(f"{process_name} stdout exceeded {stdout_bound_name}")
                 else:
                     stdout.extend(chunk)
+            if process.poll() is not None and not group_torn_down:
+                _kill_group(process)
+                group_torn_down = True
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise ValueError(f"{process_name} exceeded {timeout_seconds}s execution timeout")
@@ -90,6 +94,9 @@ def run_bounded_child(
             raise ValueError(
                 f"{process_name} exceeded {timeout_seconds}s execution timeout"
             ) from error
+        if not group_torn_down:
+            _kill_group(process)
+            group_torn_down = True
     except BaseException:
         _kill_group(process)
         raise

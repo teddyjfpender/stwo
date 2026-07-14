@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import select
 import stat
 import subprocess
 import sys
@@ -298,6 +299,55 @@ def _process_boundary_test(directory: Path) -> None:
         process_name="adapter test", stdout_bound_name="the zero-byte bound",
         max_stderr_bytes=8, stderr_bound_name="8 bytes",
     ))
+
+    held_output = directory / "successful-child-descendant-output"
+    descendant_ready = directory / "successful-child-descendant-ready"
+    held_output.write_bytes(b"clean!")
+    descriptor = os.open(held_output, os.O_RDWR)
+    release_read, release_write = os.pipe()
+    result_read, result_write = os.pipe()
+    open_descriptors = {descriptor, release_read, release_write, result_read, result_write}
+
+    def close_descriptor(value: int) -> None:
+        if value in open_descriptors:
+            os.close(value)
+            open_descriptors.remove(value)
+
+    try:
+        descendant_source = (
+            "import os,sys,time\n"
+            "descriptor,release,result=map(int,sys.argv[1:4])\n"
+            "if os.fork() == 0:\n"
+            " os.close(1); os.close(2); open(sys.argv[4],'wb').close()\n"
+            " os.read(release,1); os.pwrite(descriptor,b'BAD!!',0)\n"
+            " os.write(result,b'mutated'); os._exit(0)\n"
+            "while not os.path.exists(sys.argv[4]): time.sleep(.001)\n"
+            "os._exit(0)\n"
+        )
+        run_bounded_child(
+            [sys.executable, "-c", descendant_source, str(descriptor), str(release_read),
+             str(result_write), str(descendant_ready)], directory,
+            (descriptor, release_read, result_write), {}, timeout_seconds=2,
+            max_stdout_bytes=0, process_name="descendant test",
+            stdout_bound_name="the zero-byte bound",
+        )
+        close_descriptor(descriptor)
+        close_descriptor(release_read)
+        close_descriptor(result_write)
+        try:
+            os.write(release_write, b"release")
+        except BrokenPipeError:
+            pass
+        close_descriptor(release_write)
+        readable, _, _ = select.select((result_read,), (), (), 2)
+        result = os.read(result_read, 16) if readable else b"timeout"
+        close_descriptor(result_read)
+    finally:
+        for value in tuple(open_descriptors):
+            close_descriptor(value)
+    require(result == b"" and descendant_ready.exists()
+            and held_output.read_bytes() == b"clean!",
+            "successful child left a descendant holding an inherited writable fd")
 
 
 def _record_type_mutation_test(record: dict) -> None:
