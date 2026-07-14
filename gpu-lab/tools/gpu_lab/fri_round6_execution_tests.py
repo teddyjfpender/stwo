@@ -28,6 +28,7 @@ from .fri_round6_process import (
     validate_environment_contract,
 )
 from .immutable_output import write_immutable_bytes
+from .sealed_process import run_bounded_child
 
 
 def _runner_source(behavior: str) -> str:
@@ -274,6 +275,29 @@ def _process_boundary_test(directory: Path) -> None:
     ))
     reject_exact("FRI runner exceeded 0.05s execution timeout",
                  lambda: run("while True: pass", 0.05))
+
+    marker = directory / "sealed-process-child-setup"
+    marker.write_bytes(b"")
+    descriptor = os.open(marker, os.O_RDWR)
+    try:
+        accepted = run_bounded_child(
+            [sys.executable, "-c", "import os;os.write(2,b'accepted')"],
+            directory, (descriptor,), {}, timeout_seconds=2, max_stdout_bytes=0,
+            process_name="adapter test", stdout_bound_name="the zero-byte bound",
+            max_stderr_bytes=8, stderr_bound_name="8 bytes",
+            child_setup=lambda: os.write(descriptor, b"setup"),
+        )
+    finally:
+        os.close(descriptor)
+    require(accepted.stdout == b"" and accepted.stderr == b"accepted"
+            and marker.read_bytes() == b"setup",
+            "sealed process did not return bounded stderr or run child setup")
+    reject_exact("adapter test stderr exceeded 8 bytes", lambda: run_bounded_child(
+        [sys.executable, "-c", "import os;os.write(2,b'123456789')"],
+        directory, (), {}, timeout_seconds=2, max_stdout_bytes=0,
+        process_name="adapter test", stdout_bound_name="the zero-byte bound",
+        max_stderr_bytes=8, stderr_bound_name="8 bytes",
+    ))
 
 
 def _record_type_mutation_test(record: dict) -> None:

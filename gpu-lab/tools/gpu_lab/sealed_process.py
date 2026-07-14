@@ -8,7 +8,7 @@ import signal
 import subprocess
 import time
 from pathlib import Path
-from typing import Mapping
+from typing import Callable, Mapping
 
 
 def _kill_group(process: subprocess.Popen[bytes]) -> None:
@@ -26,7 +26,9 @@ def _kill_group(process: subprocess.Popen[bytes]) -> None:
 def run_bounded_child(
     command: list[str], working_directory: Path, descriptors: tuple[int, ...],
     environment: Mapping[str, str], *, timeout_seconds: float, max_stdout_bytes: int,
-    process_name: str, stdout_bound_name: str,
+    process_name: str, stdout_bound_name: str, max_stderr_bytes: int = 0,
+    stderr_bound_name: str = "the zero-byte bound",
+    child_setup: Callable[[], None] | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     """Run one direct child with bounded output, time, and inherited descriptors."""
     process = subprocess.Popen(
@@ -43,12 +45,14 @@ def run_bounded_child(
         pass_fds=descriptors,
         start_new_session=True,
         bufsize=0,
+        preexec_fn=child_setup,
     )
     if process.stdout is None or process.stderr is None:
         _kill_group(process)
         raise ValueError(f"{process_name} pipes are unavailable")
     selector = selectors.DefaultSelector()
     stdout = bytearray()
+    stderr = bytearray()
     deadline = time.monotonic() + timeout_seconds
     try:
         for stream, role in ((process.stdout, "stdout"), (process.stderr, "stderr")):
@@ -67,8 +71,12 @@ def run_bounded_child(
                     continue
                 if not chunk:
                     selector.unregister(key.fileobj)
-                elif key.data == "stderr":
+                elif key.data == "stderr" and max_stderr_bytes == 0:
                     raise ValueError(f"{process_name} emitted unexpected stderr")
+                elif key.data == "stderr" and len(stderr) + len(chunk) > max_stderr_bytes:
+                    raise ValueError(f"{process_name} stderr exceeded {stderr_bound_name}")
+                elif key.data == "stderr":
+                    stderr.extend(chunk)
                 elif len(stdout) + len(chunk) > max_stdout_bytes:
                     raise ValueError(f"{process_name} stdout exceeded {stdout_bound_name}")
                 else:
@@ -89,4 +97,4 @@ def run_bounded_child(
         selector.close()
         process.stdout.close()
         process.stderr.close()
-    return subprocess.CompletedProcess(command, status, bytes(stdout), b"")
+    return subprocess.CompletedProcess(command, status, bytes(stdout), bytes(stderr))
