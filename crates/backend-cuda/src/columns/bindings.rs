@@ -10,16 +10,32 @@ use stwo::core::fields::qm31::SecureField;
 use stwo::core::vcs::blake2_hash::Blake2sHash;
 use stwo_backend_cuda_kernels::raw as sys_raw;
 
-/// One-time CUDA mem-pool setup (never-release threshold; see the kernels crate).
-/// Cheap to call before any device allocation.
+/// Checked CUDA default-pool setup. The native side caches only success, so a
+/// failed formal admission leaves the pool retryable.
+pub(crate) fn try_ensure_mem_pool_init() -> Result<(), crate::CudaRuntimeError> {
+    if !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
+        return Err(crate::CudaRuntimeError::Unavailable);
+    }
+    let code = unsafe { sys_raw::cuda_mem_pool_init() };
+    crate::backend::exec_context::check_cuda("default_pool_init", code)?;
+    Ok(())
+}
+
+/// Legacy compatibility wrapper. Allocation call sites retain their cudaMalloc
+/// fallback, while replacement backends use the checked public admission API.
 pub fn ensure_mem_pool_init() {
-    static INIT: std::sync::Once = std::sync::Once::new();
-    INIT.call_once(|| {
-        let code = unsafe { sys_raw::cuda_mem_pool_init() };
-        if code != 0 {
-            eprintln!("stwo-backend-cuda: cuda_mem_pool_init failed with CUDA error {code}");
-        }
-    });
+    static READY: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if READY.get().is_some() {
+        return;
+    }
+    if let Err(error) = try_ensure_mem_pool_init() {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            eprintln!("stwo-backend-cuda: default-pool initialization failed: {error}");
+        });
+    } else {
+        let _ = READY.set(());
+    }
 }
 
 #[repr(C)]

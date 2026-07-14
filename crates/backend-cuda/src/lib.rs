@@ -255,6 +255,15 @@ pub fn gpu_default_pool_memory() -> Result<CudaPoolMemory, CudaRuntimeError> {
     })
 }
 
+/// Initialize and admit the process-wide default CUDA pool.
+///
+/// The native initializer caches only success, so a transient failure can be
+/// retried safely before any process-lifetime table or resident workspace is
+/// created. Stub builds fail without entering a panic stub.
+pub fn ensure_gpu_default_pool() -> Result<(), CudaRuntimeError> {
+    columns::bindings::try_ensure_mem_pool_init()
+}
+
 /// Fence legacy stream 0, explicitly trim unused default-pool backing memory,
 /// and return the checked post-trim current footprint.
 ///
@@ -304,10 +313,22 @@ mod pool_tests {
     fn checked_default_pool_apis_are_unavailable_without_cuda() {
         if !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
             assert_eq!(
+                ensure_gpu_default_pool(),
+                Err(CudaRuntimeError::Unavailable)
+            );
+            assert_eq!(
                 gpu_default_pool_memory(),
                 Err(CudaRuntimeError::Unavailable)
             );
             assert_eq!(trim_gpu_default_pool(0), Err(CudaRuntimeError::Unavailable));
         }
+    }
+
+    #[cfg(stwo_cuda_link)]
+    #[test]
+    fn checked_default_pool_initialization_is_idempotent() {
+        ensure_gpu_default_pool().unwrap();
+        ensure_gpu_default_pool().unwrap();
+        gpu_default_pool_memory().unwrap();
     }
 }

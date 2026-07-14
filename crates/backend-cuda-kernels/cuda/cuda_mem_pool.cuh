@@ -30,6 +30,8 @@
 // ---------------------------------------------------------------------------
 
 // Initialize the CUDA memory pool (idempotent; sets the never-release threshold).
+// Only a successful initialization is cached; failures retain their exact CUDA
+// status and a later call retries.
 extern "C" cudaError_t cuda_mem_pool_init();
 
 // Checked current footprint of the process-wide default pool. Unlike the
@@ -51,9 +53,9 @@ extern "C" cudaError_t cuda_default_pool_trim(
 // Destroy the CUDA memory pool
 extern "C" cudaError_t cuda_mem_pool_destroy();
 
-// Cached default-mem-pool handle for the current device. Resolved once per
-// process (the backend is single-device); nullptr when stream-ordered allocation
-// is unavailable, in which case callers fall back to plain cudaMalloc/cudaFree.
+// Successfully initialized default-mem-pool handle for the admitted device.
+// Failed resolutions are not cached. nullptr means this attempt failed, in
+// which case legacy callers fall back to plain cudaMalloc/cudaFree.
 cudaMemPool_t stwo_default_mem_pool();
 
 template<typename T>

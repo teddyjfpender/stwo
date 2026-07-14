@@ -1,34 +1,96 @@
 #include "cuda_mem_pool.cuh"
 #include <cuda_runtime.h>
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 
 namespace {
 
-// Resolve the device's default memory pool once and set the never-release
-// threshold: warm proves reuse pooled allocations instead of paying
-// cudaMalloc/cudaFree on every run (threshold = UINT64_MAX, as in the NitrooZK
-// setup). Returns nullptr when stream-ordered allocation is unavailable.
-cudaMemPool_t resolve_default_pool() {
-    int device_id;
-    if (cudaGetDevice(&device_id) != cudaSuccess) {
-        return nullptr;
+struct DefaultPoolState {
+    std::mutex mutex;
+    std::atomic<cudaMemPool_t> pool{nullptr};
+    int device_id = -1;
+};
+
+DefaultPoolState& default_pool_state() {
+    static DefaultPoolState state;
+    return state;
+}
+
+cudaError_t validate_cached_pool(
+    const DefaultPoolState& state,
+    cudaMemPool_t pool,
+    bool validate_current_device,
+    cudaMemPool_t* out_pool
+) {
+    if (validate_current_device) {
+        int current_device = -1;
+        cudaError_t err = cudaGetDevice(&current_device);
+        if (err != cudaSuccess) {
+            return err;
+        }
+        if (current_device != state.device_id) {
+            return cudaErrorInvalidDevice;
+        }
     }
-    cudaMemPool_t pool = nullptr;
-    if (cudaDeviceGetDefaultMemPool(&pool, device_id) != cudaSuccess || pool == nullptr) {
-        return nullptr;
+    *out_pool = pool;
+    return cudaSuccess;
+}
+
+// Resolve the current device's default pool and publish it only after every
+// setup operation succeeds. A failed attempt leaves the state empty, allowing
+// a later formal admission check to retry instead of inheriting a cached null.
+cudaError_t resolve_default_pool(cudaMemPool_t* out_pool, bool validate_current_device) {
+    if (out_pool == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    *out_pool = nullptr;
+
+    DefaultPoolState& state = default_pool_state();
+    cudaMemPool_t cached = state.pool.load(std::memory_order_acquire);
+    if (cached != nullptr) {
+        return validate_cached_pool(state, cached, validate_current_device, out_pool);
+    }
+
+    std::lock_guard<std::mutex> guard(state.mutex);
+    cached = state.pool.load(std::memory_order_relaxed);
+    if (cached != nullptr) {
+        return validate_cached_pool(state, cached, validate_current_device, out_pool);
+    }
+
+    int device_id = -1;
+    cudaError_t err = cudaGetDevice(&device_id);
+    if (err != cudaSuccess) {
+        return err;
+    }
+    cudaMemPool_t candidate = nullptr;
+    err = cudaDeviceGetDefaultMemPool(&candidate, device_id);
+    if (err != cudaSuccess) {
+        return err;
+    }
+    if (candidate == nullptr) {
+        return cudaErrorNotSupported;
     }
     uint64_t threshold = UINT64_MAX;
-    cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &threshold);
-    return pool;
+    err = cudaMemPoolSetAttribute(candidate, cudaMemPoolAttrReleaseThreshold, &threshold);
+    if (err != cudaSuccess) {
+        return err;
+    }
+
+    state.device_id = device_id;
+    state.pool.store(candidate, std::memory_order_release);
+    *out_pool = candidate;
+    return cudaSuccess;
 }
 
 }  // namespace
 
 cudaMemPool_t stwo_default_mem_pool() {
-    static std::once_flag once;
-    static cudaMemPool_t pool = nullptr;
-    std::call_once(once, [] { pool = resolve_default_pool(); });
+    cudaMemPool_t pool = nullptr;
+    // Legacy allocators retain their cudaMalloc fallback. Unlike the checked
+    // APIs below, this compatibility path deliberately does not re-query the
+    // current device after a successful single-device initialization.
+    (void)resolve_default_pool(&pool, false);
     return pool;
 }
 
@@ -66,7 +128,8 @@ cudaError_t default_pool_current(
 }  // namespace
 
 extern "C" cudaError_t cuda_mem_pool_init() {
-    return stwo_default_mem_pool() != nullptr ? cudaSuccess : cudaErrorNotSupported;
+    cudaMemPool_t pool = nullptr;
+    return resolve_default_pool(&pool, true);
 }
 
 extern "C" cudaError_t cuda_default_pool_current(
@@ -76,7 +139,14 @@ extern "C" cudaError_t cuda_default_pool_current(
     if (used_current == nullptr || reserved_current == nullptr) {
         return cudaErrorInvalidValue;
     }
-    return default_pool_current(stwo_default_mem_pool(), used_current, reserved_current);
+    *used_current = 0;
+    *reserved_current = 0;
+    cudaMemPool_t pool = nullptr;
+    cudaError_t err = resolve_default_pool(&pool, true);
+    if (err != cudaSuccess) {
+        return err;
+    }
+    return default_pool_current(pool, used_current, reserved_current);
 }
 
 extern "C" cudaError_t cuda_default_pool_trim(
@@ -89,11 +159,12 @@ extern "C" cudaError_t cuda_default_pool_trim(
     }
     *used_current = 0;
     *reserved_current = 0;
-    cudaMemPool_t pool = stwo_default_mem_pool();
-    if (pool == nullptr) {
-        return cudaErrorNotSupported;
+    cudaMemPool_t pool = nullptr;
+    cudaError_t err = resolve_default_pool(&pool, true);
+    if (err != cudaSuccess) {
+        return err;
     }
-    cudaError_t err = cudaStreamSynchronize(0);
+    err = cudaStreamSynchronize(0);
     if (err != cudaSuccess) {
         return err;
     }
