@@ -82,6 +82,16 @@ extern "C" {
     /// Returns a CUDA error code (0 = success). Sets the default mem pool's release
     /// threshold to never-release so warm proves reuse allocations.
     pub fn cuda_mem_pool_init() -> i32;
+    /// Checked current used/reserved bytes for the process-wide default pool.
+    pub fn cuda_default_pool_current(used_current: *mut usize, reserved_current: *mut usize)
+        -> i32;
+    /// Fence stream 0, trim unused default-pool backing memory, and return its
+    /// checked post-trim current used/reserved bytes.
+    pub fn cuda_default_pool_trim(
+        min_bytes_to_keep: usize,
+        used_current: *mut usize,
+        reserved_current: *mut usize,
+    ) -> i32;
     /// Chunked atomicMin nonce search; returns the LOWEST valid nonce, matching the
     /// SIMD grind's search order byte-exactly (non-M31 Blake2s channel only).
     pub fn grind_blake2s(host_prefixed_digest: *const u32, pow_bits: u32) -> u64;
@@ -1656,6 +1666,11 @@ extern "C" {
     pub fn stwo_exec_context_create(out_handle: *mut *mut core::ffi::c_void) -> i32;
     pub fn stwo_exec_context_destroy(handle: *mut core::ffi::c_void) -> i32;
     pub fn stwo_exec_context_sync(handle: *mut core::ffi::c_void) -> i32;
+    pub fn stwo_exec_context_pool_current(
+        handle: *mut core::ffi::c_void,
+        used_current: *mut usize,
+        reserved_current: *mut usize,
+    ) -> i32;
     pub fn stwo_exec_context_stream_sync(
         handle: *mut core::ffi::c_void,
         stream: *mut core::ffi::c_void,

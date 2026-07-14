@@ -43,6 +43,17 @@ pub struct CudaExecTelemetry {
     pub graph_submit_gap_ns_max: u64,
 }
 
+/// Current CUDA memory-pool footprint in bytes.
+///
+/// `used_bytes` is live application memory. `reserved_bytes` is device backing
+/// still held by the pool, so their difference is allocator reserve/slack rather
+/// than another allocation to add to the physical ledger.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CudaPoolMemory {
+    pub used_bytes: usize,
+    pub reserved_bytes: usize,
+}
+
 /// Checked failure from the CUDA runtime boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CudaRuntimeError {
@@ -324,6 +335,27 @@ impl CudaExecContext {
         check_cuda("exec_context_sync", code)?;
         self.record(|telemetry| telemetry.sync_calls += 1);
         Ok(())
+    }
+
+    /// Checked current used/reserved bytes for this context's isolated pool.
+    ///
+    /// This is a non-synchronizing snapshot. Fence first when observing memory
+    /// after an asynchronous free; a live resident arena needs no extra fence.
+    pub fn pool_memory(&self) -> Result<CudaPoolMemory, CudaRuntimeError> {
+        let mut used_bytes = 0usize;
+        let mut reserved_bytes = 0usize;
+        let code = unsafe {
+            stwo_backend_cuda_kernels::raw::stwo_exec_context_pool_current(
+                self.handle.as_ptr(),
+                &mut used_bytes,
+                &mut reserved_bytes,
+            )
+        };
+        check_cuda("exec_context_pool_current", code)?;
+        Ok(CudaPoolMemory {
+            used_bytes,
+            reserved_bytes,
+        })
     }
 
     /// Allocate `count` u32 words from this context's isolated pool.

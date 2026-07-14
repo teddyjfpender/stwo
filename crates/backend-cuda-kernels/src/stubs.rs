@@ -2027,6 +2027,23 @@ pub unsafe extern "C" fn cuda_mem_pool_init() -> i32 {
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn cuda_default_pool_current(
+    _used_current: *mut usize,
+    _reserved_current: *mut usize,
+) -> i32 {
+    no_cuda_symbol("cuda_default_pool_current")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cuda_default_pool_trim(
+    _min_bytes_to_keep: usize,
+    _used_current: *mut usize,
+    _reserved_current: *mut usize,
+) -> i32 {
+    no_cuda_symbol("cuda_default_pool_trim")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn grind_blake2s(_host_prefixed_digest: *const u32, _pow_bits: u32) -> u64 {
     no_cuda_symbol("grind_blake2s")
 }
@@ -2224,6 +2241,15 @@ pub unsafe extern "C" fn stwo_exec_context_destroy(_handle: *mut core::ffi::c_vo
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stwo_exec_context_sync(_handle: *mut core::ffi::c_void) -> i32 {
     no_cuda_symbol("stwo_exec_context_sync")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_exec_context_pool_current(
+    _handle: *mut core::ffi::c_void,
+    _used_current: *mut usize,
+    _reserved_current: *mut usize,
+) -> i32 {
+    no_cuda_symbol("stwo_exec_context_pool_current")
 }
 
 #[unsafe(no_mangle)]

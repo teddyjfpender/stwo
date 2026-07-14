@@ -28,7 +28,7 @@ pub use backend::device_transcript::{
 pub use backend::exec_context::{
     ArenaError, ArenaLayout, ArenaRangeSpec, ArenaSlice, ArenaSlotId, ArenaSlotSpec,
     CudaExecContext, CudaExecTelemetry, CudaGraphCapture, CudaGraphExec, CudaLaunchContext,
-    CudaRuntimeError, DeviceArena,
+    CudaPoolMemory, CudaRuntimeError, DeviceArena,
 };
 pub use backend::pcs_driver::{
     prove_values_with_config as prove_cuda_pcs_values, CudaPcsDriverConfig, CudaPcsDriverError,
@@ -72,8 +72,8 @@ pub use backend::prepared_execution_tables::{
 pub use backend::prepared_fixed_table::{
     fixed_table_workspace_requirements, FixedTableArenaSlotRequirement,
     FixedTableContiguousWorkspaceSlots, FixedTableLookupSource, FixedTableMaterializationConfig,
-    FixedTableWorkspaceRequirements, FixedTableWorkspaceSlots, PreparedFixedTableError,
-    PreparedFixedTableGraph, FIXED_TABLE_LOOKUP_DESCRIPTOR_WORDS,
+    FixedTableSourceColumn, FixedTableWorkspaceRequirements, FixedTableWorkspaceSlots,
+    PreparedFixedTableError, PreparedFixedTableGraph, FIXED_TABLE_LOOKUP_DESCRIPTOR_WORDS,
     FIXED_TABLE_POINTER_ALIGNMENT_WORDS,
 };
 pub use backend::prepared_fri::{
@@ -232,6 +232,53 @@ pub fn gpu_pool_highwater_reset() {
     }
 }
 
+/// Checked current used/reserved bytes for the process-wide default CUDA pool.
+/// Unlike [`gpu_pool_highwater`], this is the resident footprint now rather than
+/// the largest cold-setup overlap seen earlier in the process.
+pub fn gpu_default_pool_memory() -> Result<CudaPoolMemory, CudaRuntimeError> {
+    if !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
+        return Err(CudaRuntimeError::Unavailable);
+    }
+    let mut used_bytes = 0usize;
+    let mut reserved_bytes = 0usize;
+    let code = unsafe {
+        stwo_backend_cuda_kernels::raw::cuda_default_pool_current(
+            &mut used_bytes,
+            &mut reserved_bytes,
+        )
+    };
+    backend::exec_context::check_cuda("default_pool_current", code)?;
+    Ok(CudaPoolMemory {
+        used_bytes,
+        reserved_bytes,
+    })
+}
+
+/// Fence legacy stream 0, explicitly trim unused default-pool backing memory,
+/// and return the checked post-trim current footprint.
+///
+/// This does not remove live allocations and therefore does not reduce the cold
+/// setup peak; it only returns already-freed pool reserve to the device.
+pub fn trim_gpu_default_pool(min_bytes_to_keep: usize) -> Result<CudaPoolMemory, CudaRuntimeError> {
+    if !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
+        return Err(CudaRuntimeError::Unavailable);
+    }
+    let mut used_bytes = 0usize;
+    let mut reserved_bytes = 0usize;
+    let code = unsafe {
+        stwo_backend_cuda_kernels::raw::cuda_default_pool_trim(
+            min_bytes_to_keep,
+            &mut used_bytes,
+            &mut reserved_bytes,
+        )
+    };
+    backend::exec_context::check_cuda("default_pool_trim", code)?;
+    Ok(CudaPoolMemory {
+        used_bytes,
+        reserved_bytes,
+    })
+}
+
 /// Fence work issued by the migration-era CUDA backend default stream before
 /// handing its buffers to an isolated [`CudaExecContext`].
 ///
@@ -245,5 +292,21 @@ pub fn synchronize_legacy_stream_for_arena_handoff() {
         // The native wrapper checks the CUDA status and aborts rather than
         // allowing a failed producer to race an arena consumer.
         unsafe { columns::bindings::stwo_legacy_stream_sync() };
+    }
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+
+    #[test]
+    fn checked_default_pool_apis_are_unavailable_without_cuda() {
+        if !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
+            assert_eq!(
+                gpu_default_pool_memory(),
+                Err(CudaRuntimeError::Unavailable)
+            );
+            assert_eq!(trim_gpu_default_pool(0), Err(CudaRuntimeError::Unavailable));
+        }
     }
 }

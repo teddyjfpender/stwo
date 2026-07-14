@@ -32,8 +32,76 @@ cudaMemPool_t stwo_default_mem_pool() {
     return pool;
 }
 
+namespace {
+
+cudaError_t default_pool_current(
+    cudaMemPool_t pool,
+    size_t* used_current,
+    size_t* reserved_current
+) {
+    if (used_current == nullptr || reserved_current == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    *used_current = 0;
+    *reserved_current = 0;
+    if (pool == nullptr) {
+        return cudaErrorNotSupported;
+    }
+
+    uint64_t used = 0;
+    uint64_t reserved = 0;
+    cudaError_t err = cudaMemPoolGetAttribute(pool, cudaMemPoolAttrUsedMemCurrent, &used);
+    if (err != cudaSuccess) {
+        return err;
+    }
+    err = cudaMemPoolGetAttribute(pool, cudaMemPoolAttrReservedMemCurrent, &reserved);
+    if (err != cudaSuccess) {
+        return err;
+    }
+    *used_current = static_cast<size_t>(used);
+    *reserved_current = static_cast<size_t>(reserved);
+    return cudaSuccess;
+}
+
+}  // namespace
+
 extern "C" cudaError_t cuda_mem_pool_init() {
     return stwo_default_mem_pool() != nullptr ? cudaSuccess : cudaErrorNotSupported;
+}
+
+extern "C" cudaError_t cuda_default_pool_current(
+    size_t* used_current,
+    size_t* reserved_current
+) {
+    if (used_current == nullptr || reserved_current == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    return default_pool_current(stwo_default_mem_pool(), used_current, reserved_current);
+}
+
+extern "C" cudaError_t cuda_default_pool_trim(
+    size_t min_bytes_to_keep,
+    size_t* used_current,
+    size_t* reserved_current
+) {
+    if (used_current == nullptr || reserved_current == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    *used_current = 0;
+    *reserved_current = 0;
+    cudaMemPool_t pool = stwo_default_mem_pool();
+    if (pool == nullptr) {
+        return cudaErrorNotSupported;
+    }
+    cudaError_t err = cudaStreamSynchronize(0);
+    if (err != cudaSuccess) {
+        return err;
+    }
+    err = cudaMemPoolTrimTo(pool, min_bytes_to_keep);
+    if (err != cudaSuccess) {
+        return err;
+    }
+    return default_pool_current(pool, used_current, reserved_current);
 }
 
 extern "C" cudaError_t cuda_mem_pool_destroy() {

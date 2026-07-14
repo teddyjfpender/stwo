@@ -10,6 +10,7 @@ use std::collections::BTreeSet;
 use super::exec_context::{
     ArenaError, ArenaSlice, ArenaSlotId, CudaLaunchContext, CudaRuntimeError, DeviceArena,
 };
+use super::pedersen_table::RegisteredPedersenColumn;
 
 const WORD_BYTES: usize = core::mem::size_of::<u32>();
 const POINTER_WORDS: usize = core::mem::size_of::<*mut u32>().div_ceil(WORD_BYTES);
@@ -18,6 +19,59 @@ const M31_MODULUS: u32 = (1 << 31) - 1;
 pub const FIXED_TABLE_LOOKUP_DESCRIPTOR_WORDS: usize = 4;
 pub const FIXED_TABLE_POINTER_ALIGNMENT_WORDS: usize =
     core::mem::align_of::<*mut u32>() / WORD_BYTES;
+
+/// Immutable source for one fixed-table word column.
+///
+/// Most sources are arena-owned. Pedersen-18 is special: its already-registered
+/// process-lifetime table is the sole evaluation owner, so resident graphs borrow
+/// those columns instead of retaining a second 1.75-GiB arena copy.
+#[derive(Clone, Copy, Debug)]
+pub enum FixedTableSourceColumn {
+    Arena(ArenaSlice),
+    RegisteredPedersen(RegisteredPedersenColumn),
+}
+
+impl FixedTableSourceColumn {
+    pub fn as_u32_ptr(self) -> *mut u32 {
+        match self {
+            Self::Arena(slice) => slice.as_u32_ptr(),
+            Self::RegisteredPedersen(column) => column.as_u32_ptr(),
+        }
+    }
+
+    pub fn len_words(self) -> usize {
+        match self {
+            Self::Arena(slice) => slice.len_words(),
+            Self::RegisteredPedersen(column) => column.len_words(),
+        }
+    }
+
+    pub fn arena_slot(self) -> Option<ArenaSlotId> {
+        match self {
+            Self::Arena(slice) => Some(slice.id()),
+            Self::RegisteredPedersen(_) => None,
+        }
+    }
+
+    pub const fn registered_pedersen_index(self) -> Option<usize> {
+        match self {
+            Self::Arena(_) => None,
+            Self::RegisteredPedersen(column) => Some(column.index()),
+        }
+    }
+}
+
+impl From<ArenaSlice> for FixedTableSourceColumn {
+    fn from(value: ArenaSlice) -> Self {
+        Self::Arena(value)
+    }
+}
+
+impl From<RegisteredPedersenColumn> for FixedTableSourceColumn {
+    fn from(value: RegisteredPedersenColumn) -> Self {
+        Self::RegisteredPedersen(value)
+    }
+}
 
 /// One word-major LookupInputs source.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -296,7 +350,13 @@ pub enum PreparedFixedTableError {
     MissingSourcePointerSlot,
     UnexpectedSourcePointerSlot,
     DuplicateSlot(ArenaSlotId),
+    DuplicateSourcePointer(usize),
     InputAliasesWorkspace(ArenaSlotId),
+    SourceSizeMismatch {
+        source: usize,
+        expected_words: usize,
+        actual_words: usize,
+    },
     SlotSizeMismatch {
         slot: ArenaSlotId,
         expected_words: usize,
@@ -475,7 +535,7 @@ fn pointer_words(count: usize) -> Result<usize, PreparedFixedTableError> {
 pub struct PreparedFixedTableGraph<'a> {
     arena: &'a DeviceArena,
     requirements: FixedTableWorkspaceRequirements,
-    source_columns: Vec<ArenaSlice>,
+    source_columns: Vec<FixedTableSourceColumn>,
     multiplicity_columns: Vec<ArenaSlice>,
     multiplicity_slab: Option<ArenaSlice>,
     source_pointers: Option<ArenaSlice>,
@@ -494,7 +554,7 @@ impl<'a> PreparedFixedTableGraph<'a> {
     pub fn prepare(
         arena: &'a DeviceArena,
         config: &FixedTableMaterializationConfig,
-        source_columns: &[ArenaSlice],
+        source_columns: &[FixedTableSourceColumn],
         multiplicity_columns: &[ArenaSlice],
         slots: &FixedTableWorkspaceSlots,
     ) -> Result<Self, PreparedFixedTableError> {
@@ -513,7 +573,7 @@ impl<'a> PreparedFixedTableGraph<'a> {
             requirements.multiplicity_column_count,
             multiplicity_columns.len(),
         )?;
-        validate_inputs(arena, source_columns, requirements.row_count)?;
+        validate_source_inputs(arena, source_columns, requirements.row_count)?;
         validate_inputs(arena, multiplicity_columns, requirements.row_count)?;
 
         let source_pointers = match slots.source_pointers {
@@ -574,7 +634,23 @@ impl<'a> PreparedFixedTableGraph<'a> {
             .chain(lookup_outputs.iter().map(|slice| slice.id()))
             .collect::<BTreeSet<_>>();
         let mut input_ids = BTreeSet::new();
-        for input in source_columns.iter().chain(multiplicity_columns) {
+        let mut input_pointers = BTreeSet::new();
+        for &input in source_columns {
+            if !input_pointers.insert(input.as_u32_ptr() as usize) {
+                return Err(PreparedFixedTableError::DuplicateSourcePointer(
+                    input.as_u32_ptr() as usize,
+                ));
+            }
+            if let Some(id) = input.arena_slot() {
+                if !input_ids.insert(id) {
+                    return Err(PreparedFixedTableError::DuplicateSlot(id));
+                }
+                if workspace_ids.contains(&id) {
+                    return Err(PreparedFixedTableError::InputAliasesWorkspace(id));
+                }
+            }
+        }
+        for &input in multiplicity_columns {
             if !input_ids.insert(input.id()) {
                 return Err(PreparedFixedTableError::DuplicateSlot(input.id()));
             }
@@ -584,7 +660,7 @@ impl<'a> PreparedFixedTableGraph<'a> {
         }
 
         if let Some(destination) = source_pointers {
-            upload(arena, destination, &pointer_values(source_columns))?;
+            upload(arena, destination, &source_pointer_values(source_columns))?;
         }
         upload(
             arena,
@@ -633,7 +709,7 @@ impl<'a> PreparedFixedTableGraph<'a> {
     pub fn prepare_contiguous(
         arena: &'a DeviceArena,
         config: &FixedTableMaterializationConfig,
-        source_columns: &[ArenaSlice],
+        source_columns: &[FixedTableSourceColumn],
         multiplicity_slab: ArenaSlice,
         slots: &FixedTableContiguousWorkspaceSlots,
     ) -> Result<Self, PreparedFixedTableError> {
@@ -647,7 +723,7 @@ impl<'a> PreparedFixedTableGraph<'a> {
             requirements.source_column_count,
             source_columns.len(),
         )?;
-        validate_inputs(arena, source_columns, requirements.row_count)?;
+        validate_source_inputs(arena, source_columns, requirements.row_count)?;
         require_context(arena, multiplicity_slab)?;
         let multiplicity_words = requirements
             .row_count
@@ -722,21 +798,35 @@ impl<'a> PreparedFixedTableGraph<'a> {
             .chain(trace_outputs.iter().map(|slice| slice.id()))
             .collect::<BTreeSet<_>>();
         let mut input_ids = BTreeSet::new();
-        for input in source_columns
-            .iter()
-            .copied()
-            .chain(core::iter::once(multiplicity_slab))
-        {
-            if !input_ids.insert(input.id()) {
-                return Err(PreparedFixedTableError::DuplicateSlot(input.id()));
+        let mut input_pointers = BTreeSet::new();
+        for &input in source_columns {
+            if !input_pointers.insert(input.as_u32_ptr() as usize) {
+                return Err(PreparedFixedTableError::DuplicateSourcePointer(
+                    input.as_u32_ptr() as usize,
+                ));
             }
-            if workspace_ids.contains(&input.id()) {
-                return Err(PreparedFixedTableError::InputAliasesWorkspace(input.id()));
+            if let Some(id) = input.arena_slot() {
+                if !input_ids.insert(id) {
+                    return Err(PreparedFixedTableError::DuplicateSlot(id));
+                }
+                if workspace_ids.contains(&id) {
+                    return Err(PreparedFixedTableError::InputAliasesWorkspace(id));
+                }
             }
+        }
+        if !input_ids.insert(multiplicity_slab.id()) {
+            return Err(PreparedFixedTableError::DuplicateSlot(
+                multiplicity_slab.id(),
+            ));
+        }
+        if workspace_ids.contains(&multiplicity_slab.id()) {
+            return Err(PreparedFixedTableError::InputAliasesWorkspace(
+                multiplicity_slab.id(),
+            ));
         }
 
         if let Some(destination) = source_pointers {
-            upload(arena, destination, &pointer_values(source_columns))?;
+            upload(arena, destination, &source_pointer_values(source_columns))?;
         }
         upload(
             arena,
@@ -824,7 +914,7 @@ impl<'a> PreparedFixedTableGraph<'a> {
         &self.requirements
     }
 
-    pub fn source_columns(&self) -> &[ArenaSlice] {
+    pub fn source_columns(&self) -> &[FixedTableSourceColumn] {
         &self.source_columns
     }
 
@@ -867,7 +957,34 @@ fn validate_inputs(
     Ok(())
 }
 
+fn validate_source_inputs(
+    arena: &DeviceArena,
+    columns: &[FixedTableSourceColumn],
+    row_count: usize,
+) -> Result<(), PreparedFixedTableError> {
+    for (source, &column) in columns.iter().enumerate() {
+        if let FixedTableSourceColumn::Arena(slice) = column {
+            require_context(arena, slice)?;
+        }
+        if column.len_words() != row_count {
+            return Err(PreparedFixedTableError::SourceSizeMismatch {
+                source,
+                expected_words: row_count,
+                actual_words: column.len_words(),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn pointer_values(slices: &[ArenaSlice]) -> Vec<usize> {
+    slices
+        .iter()
+        .map(|slice| slice.as_u32_ptr() as usize)
+        .collect()
+}
+
+fn source_pointer_values(slices: &[FixedTableSourceColumn]) -> Vec<usize> {
     slices
         .iter()
         .map(|slice| slice.as_u32_ptr() as usize)

@@ -199,6 +199,39 @@ extern "C" int stwo_exec_context_sync(void *handle) {
     return cudaStreamSynchronize(context_from(handle)->stream);
 }
 
+// Checked current footprint of this context's isolated pool. This intentionally
+// does not synchronize: callers that need a post-free snapshot must first fence
+// the context, while resident-ledger callers can inspect the live arena without
+// perturbing execution.
+extern "C" int stwo_exec_context_pool_current(
+    void *handle, size_t *used_current, size_t *reserved_current
+) {
+    if (handle == nullptr || used_current == nullptr || reserved_current == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    *used_current = 0;
+    *reserved_current = 0;
+    StwoExecContext *ctx = context_from(handle);
+    if (ctx->pool == nullptr) {
+        return cudaErrorInvalidResourceHandle;
+    }
+
+    uint64_t used = 0;
+    uint64_t reserved = 0;
+    cudaError_t err =
+        cudaMemPoolGetAttribute(ctx->pool, cudaMemPoolAttrUsedMemCurrent, &used);
+    if (err != cudaSuccess) {
+        return err;
+    }
+    err = cudaMemPoolGetAttribute(ctx->pool, cudaMemPoolAttrReservedMemCurrent, &reserved);
+    if (err != cudaSuccess) {
+        return err;
+    }
+    *used_current = static_cast<size_t>(used);
+    *reserved_current = static_cast<size_t>(reserved);
+    return cudaSuccess;
+}
+
 // Fence exactly one borrowed launch stream. The ownership check prevents a
 // stale or foreign stream handle from being synchronized through this context.
 extern "C" int stwo_exec_context_stream_sync(void *handle, void *stream) {

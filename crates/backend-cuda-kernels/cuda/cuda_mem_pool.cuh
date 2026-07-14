@@ -32,6 +32,22 @@
 // Initialize the CUDA memory pool (idempotent; sets the never-release threshold).
 extern "C" cudaError_t cuda_mem_pool_init();
 
+// Checked current footprint of the process-wide default pool. Unlike the
+// historical high-water telemetry, these values describe memory held now.
+extern "C" cudaError_t cuda_default_pool_current(
+    size_t* used_current,
+    size_t* reserved_current
+);
+
+// Drain stream 0, explicitly trim unused default-pool backing memory, and
+// return the checked post-trim footprint. The fence is part of this API so an
+// enqueued cudaFreeAsync cannot be mistaken for reclaimable memory.
+extern "C" cudaError_t cuda_default_pool_trim(
+    size_t min_bytes_to_keep,
+    size_t* used_current,
+    size_t* reserved_current
+);
+
 // Destroy the CUDA memory pool
 extern "C" cudaError_t cuda_mem_pool_destroy();
 
