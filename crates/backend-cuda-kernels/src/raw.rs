@@ -1663,6 +1663,12 @@ extern "C" {
     // cuda_exec_context.cu): an owned non-blocking stream + its own never-release
     // memory pool. Every function returns a CUDA status (0 = success); context
     // creation fails closed when an isolated pool cannot be created.
+    pub fn stwo_cuda_device_snapshot(
+        out_count: *mut u32,
+        out_current: *mut u32,
+        out_sm_major: *mut u32,
+        out_sm_minor: *mut u32,
+    ) -> i32;
     pub fn stwo_exec_context_create(out_handle: *mut *mut core::ffi::c_void) -> i32;
     pub fn stwo_exec_context_destroy(handle: *mut core::ffi::c_void) -> i32;
     pub fn stwo_exec_context_sync(handle: *mut core::ffi::c_void) -> i32;

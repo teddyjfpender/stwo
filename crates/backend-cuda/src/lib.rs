@@ -26,9 +26,9 @@ pub use backend::device_transcript::{
     BLAKE2S_TRANSCRIPT_STATE_WORDS,
 };
 pub use backend::exec_context::{
-    ArenaError, ArenaLayout, ArenaRangeSpec, ArenaSlice, ArenaSlotId, ArenaSlotSpec,
-    CudaExecContext, CudaExecTelemetry, CudaGraphCapture, CudaGraphExec, CudaLaunchContext,
-    CudaPoolMemory, CudaRuntimeError, DeviceArena,
+    cuda_device_snapshot, ArenaError, ArenaLayout, ArenaRangeSpec, ArenaSlice, ArenaSlotId,
+    ArenaSlotSpec, CudaDeviceSnapshot, CudaExecContext, CudaExecTelemetry, CudaGraphCapture,
+    CudaGraphExec, CudaLaunchContext, CudaPoolMemory, CudaRuntimeError, DeviceArena,
 };
 pub use backend::pcs_driver::{
     prove_values_with_config as prove_cuda_pcs_values, CudaPcsDriverConfig, CudaPcsDriverError,

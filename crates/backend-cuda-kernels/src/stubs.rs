@@ -2229,6 +2229,16 @@ pub unsafe extern "C" fn stwo_fanout_join(_stream: *mut core::ffi::c_void) {
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_cuda_device_snapshot(
+    _out_count: *mut u32,
+    _out_current: *mut u32,
+    _out_sm_major: *mut u32,
+    _out_sm_minor: *mut u32,
+) -> i32 {
+    no_cuda_symbol("stwo_cuda_device_snapshot")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stwo_exec_context_create(_out_handle: *mut *mut core::ffi::c_void) -> i32 {
     no_cuda_symbol("stwo_exec_context_create")
 }

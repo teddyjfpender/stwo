@@ -51,6 +51,54 @@ __global__ void fill_u32_kernel(uint32_t *dst, uint32_t value, size_t count) {
 }
 }  // namespace
 
+// Snapshot the runtime device selected for subsequent context construction.
+// Replacement-v1 uses this before creating any stream, pool, module, or device
+// table so its current single-visible-device containment fails closed.
+extern "C" int stwo_cuda_device_snapshot(
+    uint32_t *out_count,
+    uint32_t *out_current,
+    uint32_t *out_sm_major,
+    uint32_t *out_sm_minor
+) {
+    if (out_count == nullptr || out_current == nullptr || out_sm_major == nullptr ||
+        out_sm_minor == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    *out_count = 0;
+    *out_current = 0;
+    *out_sm_major = 0;
+    *out_sm_minor = 0;
+
+    int count = 0;
+    cudaError_t err = cudaGetDeviceCount(&count);
+    if (err != cudaSuccess) {
+        return err;
+    }
+    if (count <= 0) {
+        return cudaErrorNoDevice;
+    }
+
+    int current = 0;
+    err = cudaGetDevice(&current);
+    if (err != cudaSuccess) {
+        return err;
+    }
+    if (current < 0 || current >= count) {
+        return cudaErrorInvalidDevice;
+    }
+
+    cudaDeviceProp properties = {};
+    err = cudaGetDeviceProperties(&properties, current);
+    if (err != cudaSuccess) {
+        return err;
+    }
+    *out_count = static_cast<uint32_t>(count);
+    *out_current = static_cast<uint32_t>(current);
+    *out_sm_major = static_cast<uint32_t>(properties.major);
+    *out_sm_minor = static_cast<uint32_t>(properties.minor);
+    return cudaSuccess;
+}
+
 // Create a context: a non-blocking stream + its own never-release memory pool on
 // the current device. Isolation is part of the contract, so pool creation fails
 // closed instead of silently falling back to the process-wide default pool.

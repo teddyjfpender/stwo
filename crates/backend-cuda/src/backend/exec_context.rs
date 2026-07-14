@@ -103,6 +103,32 @@ pub(crate) fn check_cuda(operation: &'static str, code: i32) -> Result<(), CudaR
     }
 }
 
+/// CUDA device state observed before resident process-global resources exist.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CudaDeviceSnapshot {
+    pub count: u32,
+    pub current: u32,
+    pub sm_major: u32,
+    pub sm_minor: u32,
+}
+
+pub fn cuda_device_snapshot() -> Result<CudaDeviceSnapshot, CudaRuntimeError> {
+    if !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
+        return Err(CudaRuntimeError::Unavailable);
+    }
+    let mut snapshot = CudaDeviceSnapshot::default();
+    let code = unsafe {
+        stwo_backend_cuda_kernels::raw::stwo_cuda_device_snapshot(
+            &mut snapshot.count,
+            &mut snapshot.current,
+            &mut snapshot.sm_major,
+            &mut snapshot.sm_minor,
+        )
+    };
+    check_cuda("cuda_device_snapshot", code)?;
+    Ok(snapshot)
+}
+
 /// One proof's isolated non-blocking CUDA stream and never-release memory pool.
 ///
 /// The native constructor fails closed if the custom pool cannot be created; it
@@ -1042,6 +1068,22 @@ mod tests {
                 Err(CudaRuntimeError::Unavailable)
             ));
         }
+    }
+
+    #[test]
+    fn device_snapshot_is_unavailable_without_cuda() {
+        if !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
+            assert_eq!(cuda_device_snapshot(), Err(CudaRuntimeError::Unavailable));
+        }
+    }
+
+    #[cfg(stwo_cuda_link)]
+    #[test]
+    fn device_snapshot_reports_a_valid_current_device() {
+        let snapshot = cuda_device_snapshot().unwrap();
+        assert!(snapshot.count > 0);
+        assert!(snapshot.current < snapshot.count);
+        assert!(snapshot.sm_major > 0);
     }
 
     #[test]
