@@ -176,6 +176,105 @@ fn flattened_single_write_is_byte_identical_to_batched_read_modify_write() {
     }
 }
 
+#[test]
+fn hybrid_partition_is_complete_disjoint_and_byte_identical() {
+    let mut topology = evaluation_topology();
+    topology[1].source_kind = QuotientNumeratorSourceKind::Coefficients;
+    let legacy = build_plan(config(), &topology).unwrap();
+    let hybrid = quotient_numerator_hybrid_plan(config(), &topology).unwrap();
+    let report = hybrid.report();
+    assert_eq!(report.legacy_group_count, 1);
+    assert_eq!(
+        report.eligible_group_count + report.legacy_group_count,
+        report.group_count
+    );
+    assert_eq!(
+        hybrid.packed_terms.len(),
+        legacy.requirements.batch_term_words
+    );
+    assert!(hybrid.packed_group_offsets.len() <= legacy.requirements.batch_group_offset_words);
+
+    let eligible = &hybrid.schedule_groups[..report.eligible_group_count];
+    let legacy_groups = &hybrid.schedule_groups[report.eligible_group_count..];
+    assert!(eligible.windows(2).all(|groups| groups[0] < groups[1]));
+    assert!(legacy_groups.windows(2).all(|groups| groups[0] < groups[1]));
+    let mut partition = hybrid.schedule_groups.clone();
+    partition.sort_unstable();
+    assert_eq!(partition, (0..report.group_count).collect::<Vec<_>>());
+
+    let init_offsets = &hybrid.packed_group_offsets[..report.group_count + 1];
+    for position in 0..report.eligible_group_count {
+        let begin = init_offsets[position] as usize;
+        let end = init_offsets[position + 1] as usize;
+        for descriptor in hybrid.packed_terms[begin * 3..end * 3].chunks_exact(3) {
+            assert_eq!(
+                topology[hybrid.source_columns[descriptor[0] as usize]].source_kind,
+                QuotientNumeratorSourceKind::Evaluation
+            );
+        }
+    }
+    for position in report.eligible_group_count..report.group_count {
+        assert_eq!(init_offsets[position], init_offsets[position + 1]);
+    }
+
+    let expected_legacy_bytes = report.legacy_logical_output_bytes;
+    assert_eq!(
+        expected_legacy_bytes,
+        (report.eligible_output_rows + report.legacy_output_rows) as u64
+            * (16 + 32 * report.legacy_batch_count as u64)
+    );
+    assert_eq!(
+        report.hybrid_logical_output_bytes,
+        (report.eligible_output_rows + report.legacy_output_rows) as u64 * 16
+            + report.legacy_output_rows as u64 * 32 * report.legacy_batch_count as u64
+    );
+    assert!(report.hybrid_logical_output_bytes < report.legacy_logical_output_bytes);
+
+    let mut state = 0x96c4_56a1_deaf_beefu64;
+    for _ in 0..128 {
+        let sources = topology
+            .iter()
+            .map(|column| {
+                (0..1usize << column.coefficient_log_size)
+                    .map(|_| next_m31(&mut state))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let coefficients = (0..legacy.requirements.term_count)
+            .map(|_| {
+                (
+                    std::array::from_fn(|_| next_m31(&mut state)),
+                    std::array::from_fn(|_| next_m31(&mut state)),
+                )
+            })
+            .collect::<Vec<(Qm31Words, Qm31Words)>>();
+        assert_eq!(
+            evaluate_hybrid(&legacy, &hybrid, &sources, &coefficients),
+            evaluate_legacy(&legacy, &sources, &coefficients)
+        );
+    }
+}
+
+#[test]
+fn hybrid_handles_all_evaluation_and_rejects_all_coefficient_edges() {
+    let topology = evaluation_topology();
+    let plan = quotient_numerator_hybrid_plan(config(), &topology).unwrap();
+    assert_eq!(plan.report.legacy_group_count, 0);
+    assert!(plan.batches.iter().all(|batch| batch.term_count == 0));
+
+    let all_coefficients = topology
+        .into_iter()
+        .map(|mut column| {
+            column.source_kind = QuotientNumeratorSourceKind::Coefficients;
+            column
+        })
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        quotient_numerator_hybrid_plan(config(), &all_coefficients),
+        Err(QuotientNumeratorSingleWriteError::NoEligibleGroups)
+    ));
+}
+
 fn evaluate_legacy(
     plan: &crate::backend::prepared_quotient_numerator::NumeratorPlan,
     sources: &[Vec<u32>],
@@ -229,6 +328,64 @@ fn evaluate_candidate(
                     &sources[column],
                     coefficients,
                 );
+            }
+        }
+    }
+    output
+}
+
+fn evaluate_hybrid(
+    legacy: &crate::backend::prepared_quotient_numerator::NumeratorPlan,
+    hybrid: &QuotientNumeratorHybridPlan,
+    sources: &[Vec<u32>],
+    coefficients: &[(Qm31Words, Qm31Words)],
+) -> Vec<Vec<Qm31Words>> {
+    let report = hybrid.report;
+    let mut output = zero_outputs(&legacy.requirements);
+    let init_offsets = &hybrid.packed_group_offsets[..report.group_count + 1];
+    for (position, &group) in hybrid.schedule_groups.iter().enumerate() {
+        let begin = init_offsets[position] as usize;
+        let end = init_offsets[position + 1] as usize;
+        for (row, numerator) in output[group].iter_mut().enumerate() {
+            for descriptor in hybrid.packed_terms[begin * 3..end * 3].chunks_exact(3) {
+                let column = hybrid.source_columns[descriptor[0] as usize];
+                add_term(
+                    numerator,
+                    row,
+                    legacy.requirements.groups[group].log_size,
+                    descriptor,
+                    &sources[column],
+                    coefficients,
+                );
+            }
+        }
+    }
+
+    for (batch, placement) in legacy.batches.iter().zip(&hybrid.batches) {
+        for legacy_position in 0..report.legacy_group_count {
+            let group = hybrid.schedule_groups[report.eligible_group_count + legacy_position];
+            let begin = placement.term_offset
+                + hybrid.packed_group_offsets[placement.group_offset + legacy_position] as usize;
+            let end = placement.term_offset
+                + hybrid.packed_group_offsets[placement.group_offset + legacy_position + 1]
+                    as usize;
+            for (row, numerator) in output[group].iter_mut().enumerate() {
+                let mut batch_numerator = [0; 4];
+                for descriptor in hybrid.packed_terms[begin * 3..end * 3].chunks_exact(3) {
+                    let column = batch.columns[descriptor[0] as usize];
+                    add_term(
+                        &mut batch_numerator,
+                        row,
+                        legacy.requirements.groups[group].log_size,
+                        descriptor,
+                        &sources[column],
+                        coefficients,
+                    );
+                }
+                for coordinate in 0..4 {
+                    numerator[coordinate] =
+                        m31_add(numerator[coordinate], batch_numerator[coordinate]);
+                }
             }
         }
     }

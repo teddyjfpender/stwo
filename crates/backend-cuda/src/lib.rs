@@ -174,7 +174,9 @@ pub use backend::proof_assembly::{
     Blake2sProofAssemblyInput, Blake2sProofAssemblyShape, Blake2sTraceAssemblyShape,
 };
 pub use backend::quotient_numerator_single_write::{
-    quotient_numerator_single_write_plan, quotient_numerator_single_write_report,
+    quotient_numerator_hybrid_plan, quotient_numerator_single_write_plan,
+    quotient_numerator_single_write_report, QuotientNumeratorHybridBatch,
+    QuotientNumeratorHybridPlan, QuotientNumeratorHybridReport,
     QuotientNumeratorSingleWriteEligibility, QuotientNumeratorSingleWriteError,
     QuotientNumeratorSingleWritePlan, QuotientNumeratorSingleWriteReport,
     QUOTIENT_NUMERATOR_SINGLE_WRITE_TERM_WORDS,
