@@ -377,6 +377,11 @@
         "shell",
         "stdin",
         "working_directory",
+        "writer_precondition",
+        "attestation_scope",
+        "adapter_process_precondition",
+        "process_group_role",
+        "caller_trust_boundary",
         "argv",
         "environment",
         "bindings",
@@ -392,6 +397,21 @@
         "shell": {"const": false},
         "stdin": {"const": "devnull"},
         "working_directory": {"const": "/"},
+        "writer_precondition": {
+          "const": "caller-guaranteed-no-concurrent-artifact-tree-writers-v1"
+        },
+        "attestation_scope": {
+          "const": "point-in-time-retained-inode-observations-v1"
+        },
+        "adapter_process_precondition": {
+          "const": "trusted-exact-adapter-no-surviving-descendants-v1"
+        },
+        "process_group_role": {
+          "const": "defense-in-depth-not-hostile-containment-v1"
+        },
+        "caller_trust_boundary": {
+          "const": "cooperative-local-diagnostic-not-hostile-local-caller-security-v1"
+        },
         "argv": {
           "type": "array",
           "minItems": 8,

@@ -1,5 +1,7 @@
 """Strict data contracts for authenticated, GPU-free PIE adapter replay."""
 
+# gpu-lab-cohesion-review: one fail-closed validator keeps the record contract auditable.
+
 from __future__ import annotations
 
 import json
@@ -18,6 +20,13 @@ SOURCE_CLOSURE_STATUS = "identity-only"
 OUTPUT_ENCODING = "bincode-v1-fixed-int"
 EXECUTABLE_POLICY = "release-or-stripped-provenance-compatible-max-256mib-v1"
 EMPTY_SHA256 = sha256_bytes(b"")
+EXECUTION_HONESTY = {
+    "writer_precondition": "caller-guaranteed-no-concurrent-artifact-tree-writers-v1",
+    "attestation_scope": "point-in-time-retained-inode-observations-v1",
+    "adapter_process_precondition": "trusted-exact-adapter-no-surviving-descendants-v1",
+    "process_group_role": "defense-in-depth-not-hostile-containment-v1",
+    "caller_trust_boundary": "cooperative-local-diagnostic-not-hostile-local-caller-security-v1",
+}
 
 MIB, GIB = 1 << 20, 1 << 30
 MAX_INVOCATION_BYTES = MIB
@@ -281,11 +290,13 @@ def _validate_execution_contract(
     require_exact_keys(value, {
         "contract", "shell", "stdin", "working_directory", "argv", "environment",
         "bindings", "input_recheck", "resource_limits", "wall_timeout_seconds",
-        "exit_status", "stdout", "stderr",
+        "exit_status", "stdout", "stderr", *EXECUTION_HONESTY,
     }, "PIE adapter execution contract")
     require(value["contract"] == "linux-retained-descriptor-exec-v1"
             and value["shell"] is False and value["stdin"] == "devnull",
             "PIE adapter direct-execution contract differs")
+    require({key: value[key] for key in EXECUTION_HONESTY} == EXECUTION_HONESTY,
+            "PIE adapter execution honesty boundary differs")
     bindings = _bindings(value["bindings"], artifacts, output)
     require(value["working_directory"] == "/",
             "PIE adapter working directory is not the fixed filesystem root")

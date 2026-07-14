@@ -1,5 +1,7 @@
 """Standalone hostile checks for the PIE adapter data contracts."""
 
+# gpu-lab-cohesion-review: one mutation suite keeps runtime and schema parity auditable.
+
 from __future__ import annotations
 
 import copy
@@ -15,6 +17,7 @@ from .pie_adapter_contract import (
     DATA_LIMIT_BYTES,
     EMPTY_SHA256,
     EVIDENCE_MODE,
+    EXECUTION_HONESTY,
     EXECUTABLE_POLICY,
     EXECUTION_RECORD_SCHEMA,
     INVOCATION_SCHEMA,
@@ -169,6 +172,7 @@ def _record() -> dict[str, Any]:
             "shell": False,
             "stdin": "devnull",
             "working_directory": "/",
+            **EXECUTION_HONESTY,
             "argv": [
                 bindings["adapter_executable"]["proc_path"], "--pie",
                 bindings["source_pie"]["proc_path"], "--backend", "simd",
@@ -391,6 +395,11 @@ def test_raw_manifest_trust() -> None:
 def test_authenticated_execution_fields() -> None:
     _mutate_record("shell execution", lambda value: _contract(value).__setitem__("shell", True))
     _mutate_record("non-root cwd", lambda value: _contract(value).__setitem__("working_directory", "/sealed"))
+    for field in EXECUTION_HONESTY:
+        _mutate_record(f"missing honesty field {field}", lambda value, field=field:
+                       _contract(value).pop(field))
+        _mutate_record(f"wrong honesty field {field}", lambda value, field=field:
+                       _contract(value).__setitem__(field, "wrong"))
     _mutate_record("argv injection", lambda value: _contract(value)["argv"].append("--prove"))
     _mutate_record("environment injection", lambda value: _contract(value)[
         "environment"].__setitem__("LD_PRELOAD", "/tmp/inject.so"))
@@ -465,6 +474,9 @@ def test_schema_documents() -> None:
     require({"adapter_execution_attested", "provenance_binding", "execution_contract",
              "output_lifecycle", "exact_byte_equal"} <= required,
             "execution schema permits a hash-only success record")
+    contract_schema = execution["$defs"]["execution_contract"]
+    require(set(EXECUTION_HONESTY) <= set(contract_schema["required"]),
+            "execution schema omits an execution honesty field")
     try:
         import jsonschema
     except ImportError as error:
@@ -473,6 +485,11 @@ def test_schema_documents() -> None:
     jsonschema.Draft202012Validator(invocation).validate(_invocation())
     validator = jsonschema.Draft202012Validator(execution)
     validator.validate(_record())
+    for field in EXECUTION_HONESTY:
+        hostile = _record(); _contract(hostile).pop(field)
+        require(not validator.is_valid(hostile), f"full schema accepted missing {field}")
+        hostile = _record(); _contract(hostile)[field] = "wrong"
+        require(not validator.is_valid(hostile), f"full schema accepted wrong {field}")
     for label, mutate in (
         ("nonempty stdout", lambda value: _contract(value)["stdout"].update(
             {"byte_length": 1, "sha256": _digest("stdout")})),
