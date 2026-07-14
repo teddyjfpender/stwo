@@ -21,7 +21,6 @@ use crate::columns::bindings::{CirclePointSecureField, CudaSecureField};
 
 const WORD_BYTES: usize = core::mem::size_of::<u32>();
 const SECURE_COORDINATES: usize = 4;
-const COMPLEX_COORDINATES: usize = 2;
 const POINTER_WORDS: usize = core::mem::size_of::<*mut u32>().div_ceil(WORD_BYTES);
 
 pub const QUOTIENT_POINTER_ALIGNMENT_WORDS: usize = core::mem::align_of::<*mut u32>() / WORD_BYTES;
@@ -45,11 +44,27 @@ pub struct QuotientWorkspaceRequirements {
     pub coefficient_size_words: usize,
     pub subdomain_value_words: usize,
     pub output_value_words: usize,
-    pub denominator_words: usize,
+    pub combine_pass_bytes: QuotientCombinePassBytes,
     pub forward_twiddle_words: usize,
     pub inverse_twiddle_words: usize,
     pub half_coset_initial_index: u32,
     pub half_coset_step_size: u32,
+}
+
+/// Exact logical pass/byte model for quotient combination. These values describe
+/// explicit kernel requests, not cache behavior or measured HBM traffic.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QuotientCombinePassBytes {
+    pub rows: usize,
+    pub samples: usize,
+    pub denominator_inversions: usize,
+    /// Bytes occupied by the retired global `cm31[row][sample]` slab.
+    pub eliminated_scratch_bytes: usize,
+    /// One retired global write plus one retired global read per denominator.
+    pub eliminated_logical_traffic_bytes: usize,
+    pub denominator_global_passes: usize,
+    /// One canonical QM31 output write per row.
+    pub output_write_bytes: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -70,7 +85,6 @@ pub struct QuotientWorkspaceSlots {
     pub coefficient_sizes: ArenaSlotId,
     pub subdomain_values: ArenaSlotId,
     pub output_values: ArenaSlotId,
-    pub denominator_scratch: ArenaSlotId,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -197,6 +211,12 @@ pub fn quotient_workspace_requirements(
 
     let full_domain = pow2(config.lifting_log_size)?;
     let subdomain = pow2(subdomain_log_size)?;
+    let denominator_inversions = subdomain
+        .checked_mul(sample_count)
+        .ok_or(PreparedQuotientError::SizeOverflow)?;
+    let eliminated_scratch_bytes = denominator_inversions
+        .checked_mul(core::mem::size_of::<[u32; 2]>())
+        .ok_or(PreparedQuotientError::SizeOverflow)?;
     let eval_domain = CanonicCoset::new(config.lifting_log_size).circle_domain();
     let (quotient_domain, _) = eval_domain.split(config.log_blowup_factor);
     Ok(QuotientWorkspaceRequirements {
@@ -220,10 +240,19 @@ pub fn quotient_workspace_requirements(
         output_value_words: full_domain
             .checked_mul(SECURE_COORDINATES)
             .ok_or(PreparedQuotientError::SizeOverflow)?,
-        denominator_words: subdomain
-            .checked_mul(sample_count)
-            .and_then(|count| count.checked_mul(COMPLEX_COORDINATES))
-            .ok_or(PreparedQuotientError::SizeOverflow)?,
+        combine_pass_bytes: QuotientCombinePassBytes {
+            rows: subdomain,
+            samples: sample_count,
+            denominator_inversions,
+            eliminated_scratch_bytes,
+            eliminated_logical_traffic_bytes: eliminated_scratch_bytes
+                .checked_mul(2)
+                .ok_or(PreparedQuotientError::SizeOverflow)?,
+            denominator_global_passes: 0,
+            output_write_bytes: subdomain
+                .checked_mul(core::mem::size_of::<[u32; SECURE_COORDINATES]>())
+                .ok_or(PreparedQuotientError::SizeOverflow)?,
+        },
         forward_twiddle_words: pow2(config.lifting_log_size - 1)?,
         inverse_twiddle_words: pow2(subdomain_log_size - 1)?,
         half_coset_initial_index: quotient_domain.half_coset.initial_index.0 as u32,
@@ -258,11 +287,6 @@ impl QuotientWorkspaceRequirements {
             slot(slots.coefficient_sizes, self.coefficient_size_words, 1),
             slot(slots.subdomain_values, self.subdomain_value_words, 1),
             slot(slots.output_values, self.output_value_words, 1),
-            slot(
-                slots.denominator_scratch,
-                self.denominator_words,
-                COMPLEX_COORDINATES,
-            ),
         ];
         let mut seen = BTreeSet::new();
         for requirement in &requirements {
@@ -319,7 +343,6 @@ pub struct PreparedQuotientGraph<'a> {
     coefficient_sizes: ArenaSlice,
     subdomain_values: ArenaSlice,
     output_values: ArenaSlice,
-    denominator_scratch: ArenaSlice,
     forward_twiddles: ArenaSlice,
     inverse_twiddles: ArenaSlice,
 }
@@ -442,13 +465,6 @@ impl<'a> PreparedQuotientGraph<'a> {
             requirements.output_value_words,
             1,
         )?;
-        let denominator_scratch = bind_slot(
-            arena,
-            slots.denominator_scratch,
-            requirements.denominator_words,
-            COMPLEX_COORDINATES,
-        )?;
-
         let subdomain_stride = pow2(requirements.subdomain_log_size)?;
         let output_stride = pow2(requirements.config.lifting_log_size)?;
         let partial_pointers = (0..SECURE_COORDINATES)
@@ -504,7 +520,6 @@ impl<'a> PreparedQuotientGraph<'a> {
             coefficient_sizes,
             subdomain_values,
             output_values,
-            denominator_scratch,
             forward_twiddles,
             inverse_twiddles: inverse_subdomain_twiddles,
         })
@@ -589,9 +604,6 @@ impl<'a> PreparedQuotientGraph<'a> {
                 subdomain_coordinate(1),
                 subdomain_coordinate(2),
                 subdomain_coordinate(3),
-                self.denominator_scratch.as_u32_ptr(),
-                u64::try_from(self.requirements.denominator_words / COMPLEX_COORDINATES)
-                    .map_err(|_| PreparedQuotientError::SizeOverflow)?,
                 stream,
             )
         };
@@ -740,6 +752,9 @@ fn upload_and_sync(
 
 #[cfg(test)]
 mod tests {
+    use stwo::core::circle::SECURE_FIELD_CIRCLE_GEN;
+    use stwo::core::pcs::quotients::denominator_inverses;
+
     use super::*;
 
     #[test]
@@ -783,7 +798,6 @@ mod tests {
             coefficient_sizes: id(),
             subdomain_values: id(),
             output_values: id(),
-            denominator_scratch: id(),
         }
     }
 
@@ -796,7 +810,18 @@ mod tests {
         assert_eq!(requirements.partial_pointer_words, 8 * POINTER_WORDS);
         assert_eq!(requirements.subdomain_value_words, 4 * 64);
         assert_eq!(requirements.output_value_words, 4 * 256);
-        assert_eq!(requirements.denominator_words, 2 * 64 * 2);
+        assert_eq!(
+            requirements.combine_pass_bytes,
+            QuotientCombinePassBytes {
+                rows: 64,
+                samples: 2,
+                denominator_inversions: 128,
+                eliminated_scratch_bytes: 1024,
+                eliminated_logical_traffic_bytes: 2048,
+                denominator_global_passes: 0,
+                output_write_bytes: 1024,
+            }
+        );
         assert_eq!(requirements.forward_twiddle_words, 128);
         assert_eq!(requirements.inverse_twiddle_words, 32);
         assert_eq!(
@@ -804,8 +829,47 @@ mod tests {
                 .arena_slot_requirements(&slots())
                 .unwrap()
                 .len(),
-            10
+            9
         );
+    }
+
+    #[test]
+    fn immediate_denominators_match_materialized_reference_in_canonical_order() {
+        let domain = CanonicCoset::new(8).circle_domain();
+        let zero = SecureField::from_u32_unchecked(0, 0, 0, 0);
+        let mut seed = 0x243f_6a88u32;
+        for case in 0..128usize {
+            let sample_count = case % 8 + 1;
+            let points = (0..sample_count)
+                .map(|sample| SECURE_FIELD_CIRCLE_GEN.mul((case + sample + 1) as u128))
+                .collect::<Vec<_>>();
+            let numerators = (0..sample_count)
+                .map(|_| {
+                    let mut next = || {
+                        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                        seed & 0x3fff_ffff
+                    };
+                    SecureField::from_u32_unchecked(next(), next(), next(), next())
+                })
+                .collect::<Vec<_>>();
+            let domain_point = domain.at((case * 37) % domain.size());
+            let materialized = denominator_inverses(&points, domain_point);
+            let expected = numerators
+                .iter()
+                .zip(materialized)
+                .fold(zero, |sum, (numerator, inverse)| {
+                    sum + numerator.mul_cm31(inverse)
+                });
+            let immediate = points
+                .iter()
+                .zip(&numerators)
+                .fold(zero, |sum, (point, numerator)| {
+                    let inverse =
+                        denominator_inverses(core::slice::from_ref(point), domain_point)[0];
+                    sum + numerator.mul_cm31(inverse)
+                });
+            assert_eq!(immediate, expected, "case {case}");
+        }
     }
 
     #[test]

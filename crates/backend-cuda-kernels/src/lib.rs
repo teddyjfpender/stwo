@@ -64,6 +64,36 @@ mod tests {
     }
 
     #[test]
+    fn prepared_quotient_abi_has_no_denominator_scratch_arguments() {
+        type CombineFn = unsafe extern "C" fn(
+            u32,
+            u32,
+            u32,
+            u32,
+            *const u32,
+            u32,
+            *const raw::CudaSecureField,
+            *const u32,
+            *const *const u32,
+            *const *const u32,
+            *const *const u32,
+            *const *const u32,
+            *mut u32,
+            *mut u32,
+            *mut u32,
+            *mut u32,
+            *mut core::ffi::c_void,
+        ) -> i32;
+        let _: CombineFn = raw::stwo_combine_quotients_from_numerators_on;
+
+        let source = include_str!("../cuda/quotients.cu");
+        assert_eq!(source.matches("denominator_inverse_for_sample(").count(), 3);
+        assert!(source.contains("denominator_inverse_for_sample(sample_points[i], domain_point)"));
+        assert!(!source.contains("cm31 *denominator_inverses"));
+        assert!(!source.contains("cuda_proving_malloc<cm31>(sample_size * domain_size)"));
+    }
+
+    #[test]
     fn hash_from_tile_symbols_are_linked_in_cuda_and_stub_builds() {
         assert_ne!(raw::stwo_lde_n2b_columns_before_circle_on as usize, 0);
         assert_ne!(raw::stwo_blake2s_leaf_group_from_lde_on as usize, 0);

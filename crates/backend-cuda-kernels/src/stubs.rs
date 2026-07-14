@@ -1513,8 +1513,6 @@ pub unsafe extern "C" fn stwo_combine_quotients_from_numerators_on(
     _result_column_1: *mut u32,
     _result_column_2: *mut u32,
     _result_column_3: *mut u32,
-    _denominator_inverses: *mut u32,
-    _denominator_count: u64,
     _stream: *mut core::ffi::c_void,
 ) -> i32 {
     no_cuda_symbol("stwo_combine_quotients_from_numerators_on")

@@ -89,43 +89,17 @@ __global__ void column_line_and_batch_random_coeffs(
 }
 
 
-DEVICE_FORCEINLINE void denominator_inverse(
-        column_sample_batch *sample_batches,
-        uint32_t sample_size,
-        const point domain_point,
-        cm31 *flat_denominators) {
-
-    for (unsigned int i = 0; i < sample_size; i++) {
-        cm31 prx = sample_batches[i].point.x.a;
-        cm31 pry = sample_batches[i].point.y.a;
-        cm31 pix = sample_batches[i].point.x.b;
-        cm31 piy = sample_batches[i].point.y.b;
-
-        cm31 first_substraction = {sub(prx.a, domain_point.x), prx.b};
-        cm31 second_substraction = {sub(pry.a, domain_point.y), pry.b};
-        cm31 result = sub(mul(first_substraction, piy),
-                          mul(second_substraction, pix));
-        flat_denominators[i] = inv(result);
-    }
-}
-
-DEVICE_FORCEINLINE void denominator_inverse_from_sample_points(
-        const secure_field_point *sample_points,
-        uint32_t sample_size,
-        const point domain_point,
-        cm31 *flat_denominators) {
-    for (unsigned int i = 0; i < sample_size; i++) {
-        cm31 prx = sample_points[i].x.a;
-        cm31 pry = sample_points[i].y.a;
-        cm31 pix = sample_points[i].x.b;
-        cm31 piy = sample_points[i].y.b;
-
-        cm31 first_substraction = {sub(prx.a, domain_point.x), prx.b};
-        cm31 second_substraction = {sub(pry.a, domain_point.y), pry.b};
-        cm31 result = sub(mul(first_substraction, piy),
-                          mul(second_substraction, pix));
-        flat_denominators[i] = inv(result);
-    }
+DEVICE_FORCEINLINE cm31 denominator_inverse_for_sample(
+        const secure_field_point sample_point,
+        const point domain_point
+) {
+    const cm31 prx = sample_point.x.a;
+    const cm31 pry = sample_point.y.a;
+    const cm31 pix = sample_point.x.b;
+    const cm31 piy = sample_point.y.b;
+    const cm31 first_subtraction = {sub(prx.a, domain_point.x), prx.b};
+    const cm31 second_subtraction = {sub(pry.a, domain_point.y), pry.b};
+    return inv(sub(mul(first_subtraction, piy), mul(second_subtraction, pix)));
 }
 
 __global__ void accumulate_quotients_in_gpu(
@@ -144,21 +118,12 @@ __global__ void accumulate_quotients_in_gpu(
         uint32_t *result_column_3,
         qm31 *flattened_line_coeffs,
         uint32_t *line_coeffs_sizes,
-        qm31 *batch_random_coeffs,
-        cm31 *denominator_inverses
+        qm31 *batch_random_coeffs
 ) {
     int row = threadIdx.x + blockDim.x * blockIdx.x;
     if (row < domain_size) {
-        denominator_inverses = &denominator_inverses[row * sample_size];
         uint32_t domain_index = bit_reverse(row, domain_log_size);
         point domain_point = domain_at_index(half_coset_initial_index, half_coset_step_size, domain_index, domain_size);
-
-        denominator_inverse(
-            sample_batches,
-            sample_size,
-            domain_point,
-            denominator_inverses
-        );
 
         int i = 0;
 
@@ -166,6 +131,10 @@ __global__ void accumulate_quotients_in_gpu(
         int line_coeffs_offset = 0;
         while (i < sample_size) {
             column_sample_batch sample_batch = sample_batches[i];
+            // Keep the two-word inverse live across numerator construction,
+            // not the four-word numerator live across field inversion.
+            const cm31 denominator_inverse =
+                denominator_inverse_for_sample(sample_batch.point, domain_point);
             qm31 *line_coeffs = &flattened_line_coeffs[line_coeffs_offset * 3];
             qm31 batch_coeff = batch_random_coeffs[i];
             int line_coeffs_size = line_coeffs_sizes[i];
@@ -183,7 +152,9 @@ __global__ void accumulate_quotients_in_gpu(
                 numerator = add(numerator, sub(value, linear_term));
             }
 
-            row_accumulator = add(mul(row_accumulator, batch_coeff), mul(numerator, denominator_inverses[i]));
+            row_accumulator = add(
+                mul(row_accumulator, batch_coeff),
+                mul(numerator, denominator_inverse));
             line_coeffs_offset += line_coeffs_size;
             i++;
         }
@@ -246,12 +217,10 @@ __global__ void combine_quotients_from_numerators_in_gpu(
         uint32_t *result_column_0,
         uint32_t *result_column_1,
         uint32_t *result_column_2,
-        uint32_t *result_column_3,
-        cm31 *denominator_inverses
+        uint32_t *result_column_3
 ) {
     int row = threadIdx.x + blockDim.x * blockIdx.x;
     if (row < domain_size) {
-        denominator_inverses = &denominator_inverses[row * sample_size];
         uint32_t domain_index = bit_reverse(row, domain_log_size);
         point domain_point = domain_at_index(
                 half_coset_initial_index,
@@ -260,15 +229,11 @@ __global__ void combine_quotients_from_numerators_in_gpu(
                 domain_size
         );
 
-        denominator_inverse_from_sample_points(
-                sample_points,
-                sample_size,
-                domain_point,
-                denominator_inverses
-        );
-
         qm31 quotient = qm31{cm31{0, 0}, cm31{0, 0}};
         for (uint32_t i = 0; i < sample_size; ++i) {
+            // Bound live state through the inversion before loading QM31 data.
+            const cm31 denominator_inverse =
+                denominator_inverse_for_sample(sample_points[i], domain_point);
             uint32_t partial_log_size = partial_numerator_log_sizes[i];
             uint32_t log_ratio = domain_log_size - partial_log_size;
             uint32_t lifted_idx = (row >> (log_ratio + 1) << 1) + (row & 1);
@@ -287,7 +252,7 @@ __global__ void combine_quotients_from_numerators_in_gpu(
                     partial_numerator,
                     mul_by_scalar(first_linear_term_accs[i], domain_point.y)
             );
-            quotient = add(quotient, mul(full_numerator, denominator_inverses[i]));
+            quotient = add(quotient, mul(full_numerator, denominator_inverse));
         }
 
         result_column_0[row] = quotient.a.a;
@@ -322,8 +287,6 @@ void accumulate_quotients(
     memset(sample_batches, 0, sizeof(column_sample_batch) * sample_size);
 
     column_sample_batch *sample_batches_device = cuda_proving_malloc<column_sample_batch>(sample_size);
-    cm31* denominator_inverses = cuda_proving_malloc<cm31>(sample_size * domain_size);
-
     uint32_t *sample_column_indexes_device =
         cuda_proving_clone_to_device<uint32_t>(sample_column_indexes, sample_column_indexes_size);
     qm31 *sample_column_values_device =
@@ -376,15 +339,13 @@ void accumulate_quotients(
             result_column_3,
             flattened_line_coeffs_device,
             line_coeffs_sizes_device,
-            batch_random_coeffs_device,
-            denominator_inverses
+            batch_random_coeffs_device
     );
     stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 
     free(sample_batches);
     cuda_proving_free(sample_batches_device);
-    cuda_proving_free(denominator_inverses);
     cuda_proving_free(sample_column_indexes_device);
     cuda_proving_free(sample_column_values_device);
     cuda_proving_free(batch_random_coeffs_device);
@@ -465,8 +426,6 @@ void combine_quotients_from_numerators(
         cuda_proving_clone_to_device<qm31>(first_linear_term_accs, sample_size);
     uint32_t *partial_numerator_log_sizes_device =
         cuda_proving_clone_to_device<uint32_t>(partial_numerator_log_sizes, sample_size);
-    cm31 *denominator_inverses = cuda_proving_malloc<cm31>(sample_size * domain_size);
-
     int block_dim = 512;
     int num_blocks = (domain_size + block_dim - 1) / block_dim;
     combine_quotients_from_numerators_in_gpu<<<num_blocks, block_dim>>>(
@@ -485,8 +444,7 @@ void combine_quotients_from_numerators(
             result_column_0,
             result_column_1,
             result_column_2,
-            result_column_3,
-            denominator_inverses
+            result_column_3
     );
     stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
@@ -494,7 +452,6 @@ void combine_quotients_from_numerators(
     cuda_proving_free(sample_points_device);
     cuda_proving_free(first_linear_term_accs_device);
     cuda_proving_free(partial_numerator_log_sizes_device);
-    cuda_proving_free(denominator_inverses);
 }
 
 extern "C" int stwo_combine_quotients_from_numerators_on(
@@ -514,12 +471,8 @@ extern "C" int stwo_combine_quotients_from_numerators_on(
         uint32_t *result_column_1,
         uint32_t *result_column_2,
         uint32_t *result_column_3,
-        cm31 *denominator_inverses,
-        uint64_t denominator_count,
         void *stream
 ) {
-    const uint64_t required_denominators =
-        static_cast<uint64_t>(domain_size) * static_cast<uint64_t>(sample_size);
     if (half_coset_step_size == 0 || domain_size == 0 || sample_size == 0 ||
         domain_log_size == 0 || domain_log_size > 30 ||
         domain_size != (1u << domain_log_size) || sample_points == nullptr ||
@@ -527,9 +480,7 @@ extern "C" int stwo_combine_quotients_from_numerators_on(
         partial_numerators_0 == nullptr || partial_numerators_1 == nullptr ||
         partial_numerators_2 == nullptr || partial_numerators_3 == nullptr ||
         result_column_0 == nullptr || result_column_1 == nullptr ||
-        result_column_2 == nullptr || result_column_3 == nullptr ||
-        denominator_inverses == nullptr || denominator_count < required_denominators ||
-        stream == nullptr) {
+        result_column_2 == nullptr || result_column_3 == nullptr || stream == nullptr) {
         return cudaErrorInvalidValue;
     }
 
@@ -552,8 +503,7 @@ extern "C" int stwo_combine_quotients_from_numerators_on(
             result_column_0,
             result_column_1,
             result_column_2,
-            result_column_3,
-            denominator_inverses);
+            result_column_3);
     return cudaGetLastError();
 }
 

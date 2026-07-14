@@ -119,9 +119,9 @@ pub use backend::prepared_progressive_commit::{
 };
 pub use backend::prepared_quotient::{
     quotient_workspace_requirements, PreparedQuotientError, PreparedQuotientGraph,
-    QuotientArenaSlotRequirement, QuotientNumeratorSource, QuotientSampleConstants,
-    QuotientWorkspaceConfig, QuotientWorkspaceRequirements, QuotientWorkspaceSlots,
-    QUOTIENT_POINTER_ALIGNMENT_WORDS,
+    QuotientArenaSlotRequirement, QuotientCombinePassBytes, QuotientNumeratorSource,
+    QuotientSampleConstants, QuotientWorkspaceConfig, QuotientWorkspaceRequirements,
+    QuotientWorkspaceSlots, QUOTIENT_POINTER_ALIGNMENT_WORDS,
 };
 pub use backend::prepared_quotient_numerator::{
     quotient_numerator_workspace_requirements, PreparedNumeratorSchedule,

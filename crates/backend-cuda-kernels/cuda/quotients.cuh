@@ -63,7 +63,8 @@ void combine_quotients_from_numerators(
 );
 
 // Allocation-free, explicit-stream quotient combination for prepared proof
-// graphs. Every descriptor and scratch range is caller-owned device memory.
+// graphs. Denominator inverses are consumed immediately in canonical sample
+// order and never materialized in global memory.
 extern "C"
 int stwo_combine_quotients_from_numerators_on(
         uint32_t half_coset_initial_index,
@@ -82,8 +83,6 @@ int stwo_combine_quotients_from_numerators_on(
         uint32_t *result_column_1,
         uint32_t *result_column_2,
         uint32_t *result_column_3,
-        cm31 *denominator_inverses,
-        uint64_t denominator_count,
         void *stream
 );
 

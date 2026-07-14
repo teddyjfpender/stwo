@@ -41,7 +41,6 @@ fn workspace_slots() -> QuotientWorkspaceSlots {
         coefficient_sizes: id(),
         subdomain_values: id(),
         output_values: id(),
-        denominator_scratch: id(),
     }
 }
 

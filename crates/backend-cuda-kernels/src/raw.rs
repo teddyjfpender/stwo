@@ -774,8 +774,6 @@ extern "C" {
         result_column_1: *mut u32,
         result_column_2: *mut u32,
         result_column_3: *mut u32,
-        denominator_inverses: *mut u32,
-        denominator_count: u64,
         stream: *mut c_void,
     ) -> i32;
 

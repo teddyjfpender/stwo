@@ -86,9 +86,10 @@ Found during review of the prototype; all are inherited by these copies:
 4. **Separable compilation blocks field-op inlining**: `fields.cu` is its own translation
    unit, so `mul`/`add` cross TU boundaries as real calls. Build with `-dlto` (device
    link-time optimization) or make field ops header-inline.
-5. **Legacy quotient scratch is O(samples × domain)** in `quotients.cu`; the
-   subdomain-accumulate API above also caps the working set — implement against it, not
-   the legacy entry point.
+5. **Quotient denominator inverses must stay row-local**: both quotient entry points now
+   compute and consume each inverse in canonical sample order. Do not reintroduce an
+   O(samples × domain) global denominator slab; the prepared pass/byte model pins the
+   removed residency and logical traffic.
 
 ## How to turn this into a backend
 
