@@ -134,6 +134,27 @@ fn classify_kernel_preparation(
     }
 }
 
+fn witness_precompile_relax_opt_with<F>(
+    mode: PreparedWitnessMode,
+    n_instrs: usize,
+    prove_max_instrs: F,
+) -> bool
+where
+    F: FnOnce() -> usize,
+{
+    match mode {
+        // The embedded artifact was already admitted by its semantic key. Its build
+        // optimization is sealed into that artifact, so runtime policy must not
+        // influence (or even be observed by) this lane.
+        PreparedWitnessMode::RequireEmbeddedAot => false,
+        PreparedWitnessMode::PreResolved => n_instrs > prove_max_instrs(),
+    }
+}
+
+fn witness_precompile_relax_opt(mode: PreparedWitnessMode, n_instrs: usize) -> bool {
+    witness_precompile_relax_opt_with(mode, n_instrs, jit_witness::witness_prove_max_instrs)
+}
+
 /// Exact work submitted by one hot-path [`PreparedWitnessGraph::launch`].
 ///
 /// The CUDA execution context cannot see driver-API launches made by the generated
@@ -659,7 +680,7 @@ impl<'a> PreparedWitnessGraph<'a> {
             .map_err(|_| PreparedWitnessError::InvalidKernelString)?;
         let kernel_name = CString::new(identity.kernel_name.clone())
             .map_err(|_| PreparedWitnessError::InvalidKernelString)?;
-        let relax_opt = program.n_instrs() > jit_witness::witness_prove_max_instrs();
+        let relax_opt = witness_precompile_relax_opt(mode, program.n_instrs());
         let source_ptr = source
             .as_ref()
             .map_or(core::ptr::null(), |source| source.as_ptr());
@@ -1121,6 +1142,29 @@ mod tests {
             classify_kernel_preparation(&identity, false).unwrap_err(),
             PreparedWitnessError::StrictAotUnavailable(identity)
         );
+    }
+
+    #[test]
+    fn strict_precompile_selection_does_not_read_runtime_policy() {
+        let runtime_reads = core::cell::Cell::new(0);
+        let strict_relax_opt = witness_precompile_relax_opt_with(
+            PreparedWitnessMode::RequireEmbeddedAot,
+            usize::MAX,
+            || {
+                runtime_reads.set(runtime_reads.get() + 1);
+                0
+            },
+        );
+        assert!(!strict_relax_opt);
+        assert_eq!(runtime_reads.get(), 0);
+
+        let pre_resolved_relax_opt =
+            witness_precompile_relax_opt_with(PreparedWitnessMode::PreResolved, 3, || {
+                runtime_reads.set(runtime_reads.get() + 1);
+                2
+            });
+        assert!(pre_resolved_relax_opt);
+        assert_eq!(runtime_reads.get(), 1);
     }
 
     #[test]
