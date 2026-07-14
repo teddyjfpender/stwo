@@ -52,6 +52,7 @@ impl Slots {
 fn workspace_slots(
     requirements: &DecommitWorkspaceRequirements,
     allocator: &mut Slots,
+    assembly_slot_words: usize,
 ) -> DecommitWorkspaceSlots {
     let mut trees = Vec::new();
     for tree in &requirements.trees {
@@ -112,7 +113,7 @@ fn workspace_slots(
         ),
         counts: allocator.alloc(requirements.count_words, 1),
         values: allocator.alloc(requirements.value_words, 1),
-        assembly: allocator.alloc(requirements.assembly_words, 1),
+        assembly: allocator.alloc(assembly_slot_words, 1),
         trees,
     }
 }
@@ -172,6 +173,9 @@ fn aux_words(
 fn eager_and_captured_trace_and_fri_decommit_match_cpu_layout() {
     const LOG_SIZE: u32 = 4;
     const TRACE_UNRETAINED: u32 = 2;
+    const BUNDLE_PREFIX_WORDS: usize = 11;
+    const BUNDLE_SUFFIX_WORDS: usize = 7;
+    const BUNDLE_CANARY: u32 = 0xcafe_babe;
     let raw_queries = [7u32, 7, 3, 7, 3];
     let trace_column: Vec<_> = (0..1 << LOG_SIZE)
         .map(|value| BaseField::from_u32_unchecked(if value == 3 { P } else { value as u32 + 11 }))
@@ -222,7 +226,8 @@ fn eager_and_captured_trace_and_fri_decommit_match_cpu_layout() {
     };
     let requirements = decommit_workspace_requirements(config.clone()).unwrap();
     let mut allocator = Slots::new();
-    let slots = workspace_slots(&requirements, &mut allocator);
+    let bundle_words = BUNDLE_PREFIX_WORDS + requirements.assembly_words + BUNDLE_SUFFIX_WORDS;
+    let slots = workspace_slots(&requirements, &mut allocator, bundle_words);
     requirements.arena_slot_requirements(&slots).unwrap();
 
     let raw_slot = allocator.alloc(raw_queries.len(), 1);
@@ -262,6 +267,22 @@ fn eager_and_captured_trace_and_fri_decommit_match_cpu_layout() {
     }
     arena.context().sync().unwrap();
 
+    let proof_bundle = arena.bind(slots.assembly).unwrap();
+    let direct_tail = proof_bundle
+        .checked_subslice(BUNDLE_PREFIX_WORDS, requirements.assembly_words)
+        .unwrap();
+    unsafe {
+        arena
+            .context()
+            .fill_u32_async(
+                proof_bundle.as_u32_ptr(),
+                BUNDLE_CANARY,
+                proof_bundle.len_words(),
+            )
+            .unwrap();
+    }
+    arena.context().sync().unwrap();
+
     let sources = vec![
         DecommitTreeSources::Trace(TraceDecommitSources {
             groups: vec![TraceSourceGroup {
@@ -286,20 +307,70 @@ fn eager_and_captured_trace_and_fri_decommit_match_cpu_layout() {
                 .collect(),
         }),
     ];
-    let prepared = PreparedDecommitGraph::prepare(
+    let prepared = PreparedDecommitGraph::prepare_into(
         &arena,
         config,
         arena.bind(raw_slot).unwrap(),
         None,
         &sources,
         &slots,
+        direct_tail,
     )
     .unwrap();
+    assert_eq!(prepared.assembly_slice().id(), proof_bundle.id());
+    assert_eq!(
+        prepared.assembly_slice().as_u32_ptr(),
+        direct_tail.as_u32_ptr()
+    );
+    assert_eq!(
+        prepared.assembly_slice().len_words(),
+        requirements.assembly_words
+    );
 
     prepared.launch_query_normalization().unwrap();
     prepared.launch_trace_tree(0).unwrap();
     prepared.launch_fri_tree(1).unwrap();
     let eager = prepared.read_assembly_once().unwrap();
+    let read_bundle = || {
+        let mut words = vec![0_u32; proof_bundle.len_words()];
+        unsafe {
+            arena
+                .context()
+                .memcpy_d2h_async(
+                    words.as_mut_ptr().cast(),
+                    proof_bundle.as_void_ptr().cast_const(),
+                    proof_bundle.len_bytes(),
+                )
+                .unwrap();
+        }
+        arena.context().sync().unwrap();
+        words
+    };
+    let eager_bundle = read_bundle();
+    assert!(eager_bundle[..BUNDLE_PREFIX_WORDS]
+        .iter()
+        .all(|&word| word == BUNDLE_CANARY));
+    assert_eq!(
+        &eager_bundle[BUNDLE_PREFIX_WORDS..BUNDLE_PREFIX_WORDS + eager.words().len()],
+        eager.words()
+    );
+    assert!(
+        eager_bundle[BUNDLE_PREFIX_WORDS + requirements.assembly_words..]
+            .iter()
+            .all(|&word| word == BUNDLE_CANARY)
+    );
+
+    unsafe {
+        arena
+            .context()
+            .fill_u32_async(
+                proof_bundle.as_u32_ptr(),
+                BUNDLE_CANARY,
+                proof_bundle.len_words(),
+            )
+            .unwrap();
+    }
+    arena.context().sync().unwrap();
 
     let capture = arena.context().capture().unwrap();
     prepared.launch_query_normalization().unwrap();
@@ -309,6 +380,8 @@ fn eager_and_captured_trace_and_fri_decommit_match_cpu_layout() {
     graph.launch(arena.context()).unwrap();
     let captured = prepared.read_assembly_once().unwrap();
     assert_eq!(eager.words(), captured.words(), "captured layout drift");
+    let captured_bundle = read_bundle();
+    assert_eq!(captured_bundle, eager_bundle, "whole bundle drift");
     assert_eq!(eager.raw_queries(), raw_queries);
     assert_eq!(eager.unique_queries(), [3, 7]);
 

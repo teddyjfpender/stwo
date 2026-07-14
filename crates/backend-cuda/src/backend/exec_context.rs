@@ -921,6 +921,30 @@ impl ArenaSlice {
         self.len_words * core::mem::size_of::<u32>()
     }
 
+    /// Checked stable view into a contiguous subrange of this logical slot.
+    /// The child keeps the parent's slot identity and context token, so graph
+    /// capture and workspace-alias validation continue to reason about one
+    /// allocation while kernels observe only the requested words.
+    pub fn checked_subslice(
+        self,
+        offset_words: usize,
+        len_words: usize,
+    ) -> Result<Self, ArenaError> {
+        let end = offset_words
+            .checked_add(len_words)
+            .ok_or(ArenaError::RangeOverflow(self.id))?;
+        if end > self.len_words {
+            return Err(ArenaError::OutOfBounds(self.id));
+        }
+        let ptr = NonNull::new(self.ptr.as_ptr().wrapping_add(offset_words))
+            .ok_or(ArenaError::RangeOverflow(self.id))?;
+        Ok(Self {
+            ptr,
+            len_words,
+            ..self
+        })
+    }
+
     /// Whether this non-owning view belongs to `context`.
     pub fn belongs_to(self, context: &CudaExecContext) -> bool {
         self.context_token == context.identity_token()
@@ -1106,6 +1130,28 @@ mod tests {
         // Idempotent at the same length; zero-length views stay addressable.
         assert_eq!(truncated.truncated(24).len_words(), 24);
         assert_eq!(truncated.truncated(0).len_words(), 0);
+    }
+
+    #[test]
+    fn checked_subslice_preserves_owner_and_rejects_every_oob_shape() {
+        let slice = ArenaSlice::dangling_for_test(7, 64);
+        let child = slice.checked_subslice(17, 23).unwrap();
+        assert_eq!(child.id(), slice.id());
+        assert_eq!(child.as_u32_ptr(), slice.as_u32_ptr().wrapping_add(17));
+        assert_eq!(child.context_token(), slice.context_token());
+        assert_eq!(child.len_words(), 23);
+        assert_eq!(
+            slice.checked_subslice(65, 0).unwrap_err(),
+            ArenaError::OutOfBounds(slice.id())
+        );
+        assert_eq!(
+            slice.checked_subslice(63, 2).unwrap_err(),
+            ArenaError::OutOfBounds(slice.id())
+        );
+        assert_eq!(
+            slice.checked_subslice(usize::MAX, 2).unwrap_err(),
+            ArenaError::RangeOverflow(slice.id())
+        );
     }
 
     #[test]

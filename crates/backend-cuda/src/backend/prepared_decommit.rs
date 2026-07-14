@@ -5,7 +5,8 @@
 //! host row list, rebuilds pruned trace nodes from sparse resident LDE rows, and
 //! emits one compact word buffer. Setup owns every descriptor upload; launch
 //! methods allocate, transfer, synchronize, and touch the default stream zero
-//! times. `read_assembly_once` is the sole final D2H boundary.
+//! times. Production may bind the assembly directly into a larger proof bundle;
+//! `read_assembly_once` remains the standalone diagnostic D2H boundary.
 //!
 //! The remaining host adapter is deliberately mechanical: attach roots,
 //! sampled values, PoW/config, and the last-layer polynomial already produced
@@ -269,6 +270,10 @@ pub enum PreparedDecommitError {
     },
     DuplicateSlot(ArenaSlotId),
     ContextMismatch(ArenaSlotId),
+    AssemblySlotMismatch {
+        expected: ArenaSlotId,
+        actual: ArenaSlotId,
+    },
     SourceAliasesWorkspace(ArenaSlotId),
     SourceModeMismatch {
         tree: usize,
@@ -825,6 +830,52 @@ impl<'a> PreparedDecommitGraph<'a> {
         sources: &[DecommitTreeSources],
         slots: &DecommitWorkspaceSlots,
     ) -> Result<Self, PreparedDecommitError> {
+        Self::prepare_with_destination(
+            arena,
+            config,
+            raw_queries,
+            lde_twiddles,
+            sources,
+            slots,
+            None,
+        )
+    }
+
+    /// Prepare against an exact caller-owned assembly view. The destination
+    /// must retain `slots.assembly` as its arena identity; only its base pointer
+    /// and logical extent may narrow to a proven subrange such as the final
+    /// proof-bundle tail.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_into(
+        arena: &'a DeviceArena,
+        config: DecommitWorkspaceConfig,
+        raw_queries: ArenaSlice,
+        lde_twiddles: Option<ArenaSlice>,
+        sources: &[DecommitTreeSources],
+        slots: &DecommitWorkspaceSlots,
+        assembly: ArenaSlice,
+    ) -> Result<Self, PreparedDecommitError> {
+        Self::prepare_with_destination(
+            arena,
+            config,
+            raw_queries,
+            lde_twiddles,
+            sources,
+            slots,
+            Some(assembly),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_with_destination(
+        arena: &'a DeviceArena,
+        config: DecommitWorkspaceConfig,
+        raw_queries: ArenaSlice,
+        lde_twiddles: Option<ArenaSlice>,
+        sources: &[DecommitTreeSources],
+        slots: &DecommitWorkspaceSlots,
+        assembly: Option<ArenaSlice>,
+    ) -> Result<Self, PreparedDecommitError> {
         let requirements = decommit_workspace_requirements(config)?;
         let slot_requirements = requirements.arena_slot_requirements(slots)?;
         if sources.len() != requirements.trees.len() {
@@ -878,7 +929,15 @@ impl<'a> PreparedDecommitGraph<'a> {
         )?;
         let counts = bind(slots.counts, requirements.count_words, 1)?;
         let values = bind(slots.values, requirements.value_words, 1)?;
-        let assembly = bind(slots.assembly, requirements.assembly_words, 1)?;
+        let assembly = match assembly {
+            Some(destination) => validate_assembly_destination(
+                destination,
+                slots.assembly,
+                context_token,
+                requirements.assembly_words,
+            )?,
+            None => bind(slots.assembly, requirements.assembly_words, 1)?,
+        };
 
         let mut uploads: Vec<(ArenaSlice, Vec<u8>)> = Vec::new();
         let mut trees = Vec::with_capacity(requirements.trees.len());
@@ -1514,8 +1573,9 @@ impl<'a> PreparedDecommitGraph<'a> {
         self.assembly
     }
 
-    /// The only decommit D2H boundary. The allocation is capacity-sized; the
-    /// decoded `used_words` prefix is compact and contains no padding.
+    /// Standalone diagnostic D2H boundary. Production callers may instead bind
+    /// this view into a larger proof bundle and copy that bundle once. The
+    /// allocation is capacity-sized; the decoded `used_words` prefix is compact.
     pub fn read_assembly_once(&self) -> Result<DecommitAssembly, PreparedDecommitError> {
         let mut words = vec![0u32; self.requirements.assembly_words];
         unsafe {
@@ -1741,6 +1801,31 @@ fn ensure_hash_layer(source: ArenaSlice, log_size: u32) -> Result<(), PreparedDe
         });
     }
     Ok(())
+}
+
+fn validate_assembly_destination(
+    destination: ArenaSlice,
+    expected_id: ArenaSlotId,
+    context_token: core::ptr::NonNull<c_void>,
+    required_words: usize,
+) -> Result<ArenaSlice, PreparedDecommitError> {
+    if destination.id() != expected_id {
+        return Err(PreparedDecommitError::AssemblySlotMismatch {
+            expected: expected_id,
+            actual: destination.id(),
+        });
+    }
+    if destination.context_token() != context_token {
+        return Err(PreparedDecommitError::ContextMismatch(destination.id()));
+    }
+    if destination.len_words() < required_words {
+        return Err(PreparedDecommitError::SlotTooSmall {
+            slot: destination.id(),
+            required_words,
+            actual_words: destination.len_words(),
+        });
+    }
+    Ok(destination.truncated(required_words))
 }
 
 fn bind_slot(
@@ -2179,15 +2264,41 @@ mod tests {
     }
 
     #[test]
-    fn compiled_decommit_tail_contract_is_parallel_and_resource_bounded() {
+    fn direct_assembly_destination_keeps_owner_identity_and_exact_extent() {
+        let bundle = ArenaSlice::dangling_for_test(77, 96);
+        let tail = bundle.checked_subslice(32, 64).unwrap();
+        let destination =
+            validate_assembly_destination(tail, bundle.id(), bundle.context_token(), 48).unwrap();
+        assert_eq!(destination.id(), bundle.id());
+        assert_eq!(destination.as_u32_ptr(), tail.as_u32_ptr());
+        assert_eq!(destination.len_words(), 48);
+        assert!(matches!(
+            validate_assembly_destination(tail, ArenaSlotId(78), bundle.context_token(), 48,),
+            Err(PreparedDecommitError::AssemblySlotMismatch {
+                expected: ArenaSlotId(78),
+                actual: ArenaSlotId(77),
+            })
+        ));
+        assert!(matches!(
+            validate_assembly_destination(
+                tail.truncated(47),
+                bundle.id(),
+                bundle.context_token(),
+                48,
+            ),
+            Err(PreparedDecommitError::SlotTooSmall {
+                required_words: 48,
+                actual_words: 47,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn compiled_decommit_tail_contract_uses_one_block_without_false_sm_occupancy() {
         let source = include_str!("../../../backend-cuda-kernels/cuda/decommit.cu");
-        assert!(source.contains("constexpr uint32_t ASSEMBLY_MIN_BLOCKS_PER_SM = 4;"));
-        assert_eq!(
-            source
-                .matches("__launch_bounds__(BLOCK, ASSEMBLY_MIN_BLOCKS_PER_SM)")
-                .count(),
-            2
-        );
+        assert_eq!(source.matches("__launch_bounds__(BLOCK)").count(), 2);
+        assert!(!source.contains("ASSEMBLY_MIN_BLOCKS_PER_SM"));
         assert!(source.contains("assemble_trace_kernel<<<1, BLOCK"));
         assert!(source.contains("assemble_fri_kernel<<<1, BLOCK"));
         assert!(!source.contains("assemble_trace_kernel<<<1, 1"));

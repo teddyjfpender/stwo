@@ -6,7 +6,6 @@
 namespace {
 
 constexpr uint32_t BLOCK = 256;
-constexpr uint32_t ASSEMBLY_MIN_BLOCKS_PER_SM = 4;
 constexpr uint32_t HASH_WORDS = 8;
 constexpr uint32_t AUX_NODE_WORDS = 10; // level, index, hash[8]
 constexpr uint32_t M31_P = 0x7fffffffu;
@@ -478,7 +477,7 @@ __global__ void sparse_parent_kernel(
         &parent_hashes[parent]);
 }
 
-__global__ __launch_bounds__(BLOCK, ASSEMBLY_MIN_BLOCKS_PER_SM)
+__global__ __launch_bounds__(BLOCK)
 void assemble_trace_kernel(
     uint32_t tree_index,
     uint32_t role,
@@ -632,7 +631,7 @@ __device__ bool contains_sorted(const uint32_t *values, uint32_t count, uint32_t
     return lo < count && values[lo] == target;
 }
 
-__global__ __launch_bounds__(BLOCK, ASSEMBLY_MIN_BLOCKS_PER_SM)
+__global__ __launch_bounds__(BLOCK)
 void assemble_fri_kernel(
     uint32_t tree_index,
     uint32_t leaf_log,
