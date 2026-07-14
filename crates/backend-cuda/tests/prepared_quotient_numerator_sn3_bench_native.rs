@@ -9,43 +9,51 @@
 
 #[path = "support/sn3_quotient_numerator_bench.rs"]
 mod sn3_quotient_numerator_bench;
+#[path = "support/sn3_quotient_topology_fixture.rs"]
+mod sn3_quotient_topology_fixture;
 
 use sn3_quotient_numerator_bench::{
     artifact_identity, assert_affine_pattern_sanity, assert_canonical_output,
     capture_canonical_output, input_recipe_digest, json_samples, percentile, poison_outputs,
     replay_ms, source_pattern_seed, upload_affine_pattern, TWIDDLE_PATTERN_SEED,
 };
-use stwo::core::circle::{CirclePoint, SECURE_FIELD_CIRCLE_GEN};
+use sn3_quotient_topology_fixture::load_sn3_topology_fixture;
+use stwo::core::circle::CirclePoint;
 use stwo::core::fields::qm31::SecureField;
 use stwo_backend_cuda::{
-    quotient_numerator_hybrid_plan, quotient_numerator_workspace_requirements, ArenaLayout,
-    ArenaSlotId, ArenaSlotSpec, CudaExecContext, DeviceArena, PreparedQuotientNumeratorGraph,
-    QuotientNumeratorColumn, QuotientNumeratorColumnSource, QuotientNumeratorColumnTopology,
-    QuotientNumeratorDestination, QuotientNumeratorSourceKind, QuotientNumeratorWorkspaceConfig,
-    QuotientNumeratorWorkspaceRequirements, QuotientNumeratorWorkspaceSlots, QuotientOodsSample,
+    ArenaLayout, ArenaSlotId, ArenaSlotSpec, CudaExecContext, DeviceArena,
+    PreparedQuotientNumeratorGraph, QuotientNumeratorColumn, QuotientNumeratorColumnSource,
+    QuotientNumeratorColumnTopology, QuotientNumeratorDestination, QuotientNumeratorSourceKind,
+    QuotientNumeratorWorkspaceConfig, QuotientNumeratorWorkspaceRequirements,
+    QuotientNumeratorWorkspaceSlots,
 };
 
-const CONFIG: QuotientNumeratorWorkspaceConfig = QuotientNumeratorWorkspaceConfig {
-    lifting_log_size: 24,
-    log_blowup_factor: 1,
-    max_lde_tile_words: 2 * (1 << 24),
-};
 const GROUP_LOGS: [u32; 19] = [
     23, 19, 20, 6, 16, 18, 8, 7, 21, 14, 17, 11, 23, 15, 10, 4, 13, 12, 22,
 ];
 const ELIGIBLE_LOGS: [u32; 18] = [
     19, 20, 6, 16, 18, 8, 7, 21, 14, 17, 11, 23, 15, 10, 4, 13, 12, 22,
 ];
-const COEFFICIENT_SOURCES: usize = 152;
-const COEFFICIENT_BATCHES: usize = 74;
+const EXPECTED_SN3_CONFIG: QuotientNumeratorWorkspaceConfig = QuotientNumeratorWorkspaceConfig {
+    lifting_log_size: 24,
+    log_blowup_factor: 1,
+    max_lde_tile_words: 1 << 24,
+};
+const COEFFICIENT_COLUMNS: usize = 161;
+const LEGACY_GROUP_COEFFICIENT_SOURCES: usize = 152;
+const LEGACY_BATCHES: usize = 74;
+const COEFFICIENT_BATCHES: usize = 71;
 const TERMS: usize = 6_341;
 const LEGACY_LOGICAL_OUTPUT_BYTES: u64 = 59_993_989_376;
 const HYBRID_LOGICAL_OUTPUT_BYTES: u64 = 20_266_867_968;
-const CHEAP_GPU_BUDGET_BYTES: u64 = 24 * 1024 * 1024 * 1024;
+const EXPECTED_SN3_SHARED_ARENA_BYTES: u64 = 41_821_220_224;
+const MAX_BENCHMARK_ARENA_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const DEFAULT_WARMUPS: usize = 3;
 const DEFAULT_ITERATIONS: usize = 20;
+const EXPECTED_SN3_TOPOLOGY_FIXTURE_BLAKE3: &str =
+    "ea31e3ff054c8d12d32d5b84a3d712987b31bb1fd3fb044fb27758453b49fbda";
 const EXPECTED_SN3_INPUT_RECIPE_BLAKE3: &str =
-    "ba4d8f134e932066012cd2795a05c359ee6f4ef568daf665da4a6b94295ee93a";
+    "e4c2f871c2d05b81588a5407f06cb49c7ed76834d2e363d2214bd34e7defcf31";
 const EAGER_LEGACY_POISON: u32 = 0xdead_beef;
 const EAGER_HYBRID_POISON: u32 = 0xa5a5_5a5a;
 const CAPTURE_LEGACY_POISON: u32 = 0x1357_9bdf;
@@ -65,74 +73,57 @@ const SOURCE_BASE: u32 = 1_000;
 const OUTPUT_BASE: u32 = 10_000;
 
 #[test]
-#[ignore = "requires a CUDA GPU with at least the reported combined arena bytes"]
+#[ignore = "requires a CUDA GPU with at least the reported shared arena bytes"]
 fn sn3_hybrid_graph_host_wall_benchmark() {
-    let (topology, points) = sn3_topology();
-    let requirements = quotient_numerator_workspace_requirements(CONFIG, &topology).unwrap();
-    let hybrid_plan = quotient_numerator_hybrid_plan(CONFIG, &topology).unwrap();
-    assert_sn3_shape(&topology, &requirements, &hybrid_plan);
-    let input_recipe_blake3 = input_recipe_digest(&topology, &requirements, &hybrid_plan, &points);
+    let sn3 = load_sn3_topology_fixture(EXPECTED_SN3_TOPOLOGY_FIXTURE_BLAKE3);
+    assert_sn3_shape(sn3.config, &sn3.topology, &sn3.requirements, &sn3.hybrid);
+    let input_recipe_blake3 = input_recipe_digest(
+        &sn3.topology,
+        &sn3.requirements,
+        &sn3.hybrid,
+        &sn3.input_points,
+    );
 
     // All exact topology assertions above intentionally precede the first CUDA allocation.
-    let legacy_fixture = BenchmarkArena::new(&topology, &requirements);
-    let hybrid_fixture = BenchmarkArena::new(&topology, &requirements);
-    let combined_arena_bytes = legacy_fixture
-        .allocation_bytes
-        .checked_add(hybrid_fixture.allocation_bytes)
-        .unwrap();
-    assert!(legacy_fixture.allocation_bytes <= CHEAP_GPU_BUDGET_BYTES);
-    assert!(hybrid_fixture.allocation_bytes <= CHEAP_GPU_BUDGET_BYTES);
-    assert!(combined_arena_bytes <= CHEAP_GPU_BUDGET_BYTES);
+    let fixture = BenchmarkArena::new(&sn3.topology, &sn3.requirements);
+    assert!(fixture.allocation_bytes <= MAX_BENCHMARK_ARENA_BYTES);
 
-    let slots = workspace_slots(&requirements);
-    let legacy_columns = legacy_fixture.columns(&topology);
-    let hybrid_columns = hybrid_fixture.columns(&topology);
-    let legacy_destinations = legacy_fixture.destinations(&requirements);
-    let hybrid_destinations = hybrid_fixture.destinations(&requirements);
-    let legacy = prepare(
-        &legacy_fixture,
-        &legacy_columns,
-        &legacy_destinations,
-        &slots,
-        false,
-    );
-    let hybrid = prepare(
-        &hybrid_fixture,
-        &hybrid_columns,
-        &hybrid_destinations,
-        &slots,
-        true,
-    );
+    let slots = workspace_slots(&sn3.requirements);
+    let columns = fixture.columns(&sn3.topology);
+    let destinations = fixture.destinations(&sn3.requirements);
+    let legacy = prepare(&fixture, &columns, &destinations, &slots, sn3.config, false);
+    let hybrid = prepare(&fixture, &columns, &destinations, &slots, sn3.config, true);
 
     initialize(
-        &legacy_fixture,
-        &topology,
-        &requirements,
-        &points,
+        &fixture,
+        &sn3.topology,
+        &sn3.requirements,
+        &sn3.input_points,
         EAGER_LEGACY_POISON,
     );
+    legacy.launch().unwrap();
+    fixture.arena.context().sync().unwrap();
+    let eager = capture_canonical_output(&fixture, &sn3.requirements);
     initialize(
-        &hybrid_fixture,
-        &topology,
-        &requirements,
-        &points,
+        &fixture,
+        &sn3.topology,
+        &sn3.requirements,
+        &sn3.input_points,
         EAGER_HYBRID_POISON,
     );
-    legacy.launch().unwrap();
     hybrid.launch().unwrap();
-    legacy_fixture.arena.context().sync().unwrap();
-    hybrid_fixture.arena.context().sync().unwrap();
-    let eager = capture_canonical_output(&legacy_fixture, &requirements);
+    fixture.arena.context().sync().unwrap();
     let eager_hybrid_blake3 =
-        assert_canonical_output(&hybrid_fixture, &requirements, &eager, "eager hybrid");
-    let validated_numerator_output_bytes = requirements
+        assert_canonical_output(&fixture, &sn3.requirements, &eager, "eager hybrid");
+    let validated_numerator_output_bytes = sn3
+        .requirements
         .groups
         .iter()
         .map(|group| group.value_words as u64)
         .sum::<u64>()
         .checked_mul(16)
         .unwrap();
-    let validated_auxiliary_output_bytes = (requirements.groups.len() as u64)
+    let validated_auxiliary_output_bytes = (sn3.requirements.groups.len() as u64)
         .checked_mul(12 * 4)
         .unwrap();
     let validated_canonical_output_bytes = eager.len_bytes();
@@ -144,31 +135,31 @@ fn sn3_hybrid_graph_host_wall_benchmark() {
         validated_numerator_output_bytes + validated_auxiliary_output_bytes
     );
 
-    let capture = legacy_fixture.arena.context().capture().unwrap();
+    let capture = fixture.arena.context().capture().unwrap();
     legacy.launch().unwrap();
     let legacy_graph = capture.finish().unwrap();
-    let capture = hybrid_fixture.arena.context().capture().unwrap();
+    let capture = fixture.arena.context().capture().unwrap();
     hybrid.launch().unwrap();
     let hybrid_graph = capture.finish().unwrap();
 
-    poison_outputs(&legacy_fixture, &requirements, CAPTURE_LEGACY_POISON);
-    poison_outputs(&hybrid_fixture, &requirements, CAPTURE_HYBRID_POISON);
-    legacy_graph.launch(legacy_fixture.arena.context()).unwrap();
-    legacy_fixture.arena.context().sync().unwrap();
-    hybrid_graph.launch(hybrid_fixture.arena.context()).unwrap();
-    hybrid_fixture.arena.context().sync().unwrap();
+    poison_outputs(&fixture, &sn3.requirements, CAPTURE_LEGACY_POISON);
+    legacy_graph.launch(fixture.arena.context()).unwrap();
+    fixture.arena.context().sync().unwrap();
     let captured_legacy_blake3 =
-        assert_canonical_output(&legacy_fixture, &requirements, &eager, "captured legacy");
+        assert_canonical_output(&fixture, &sn3.requirements, &eager, "captured legacy");
+    poison_outputs(&fixture, &sn3.requirements, CAPTURE_HYBRID_POISON);
+    hybrid_graph.launch(fixture.arena.context()).unwrap();
+    fixture.arena.context().sync().unwrap();
     let captured_hybrid_blake3 =
-        assert_canonical_output(&hybrid_fixture, &requirements, &eager, "captured hybrid");
+        assert_canonical_output(&fixture, &sn3.requirements, &eager, "captured hybrid");
 
     for round in 0..DEFAULT_WARMUPS {
         if round % 2 == 0 {
-            replay_ms(&legacy_graph, legacy_fixture.arena.context());
-            replay_ms(&hybrid_graph, hybrid_fixture.arena.context());
+            replay_ms(&legacy_graph, fixture.arena.context());
+            replay_ms(&hybrid_graph, fixture.arena.context());
         } else {
-            replay_ms(&hybrid_graph, hybrid_fixture.arena.context());
-            replay_ms(&legacy_graph, legacy_fixture.arena.context());
+            replay_ms(&hybrid_graph, fixture.arena.context());
+            replay_ms(&legacy_graph, fixture.arena.context());
         }
     }
 
@@ -189,43 +180,35 @@ fn sn3_hybrid_graph_host_wall_benchmark() {
 
     // Sample zero is causally bound to work by poisoning immediately before the measured graph
     // replay and validating that exact replay in full before either graph runs again.
-    poison_outputs(&legacy_fixture, &requirements, TIMED_LEGACY_POISON);
-    poison_outputs(&hybrid_fixture, &requirements, TIMED_HYBRID_POISON);
-    legacy_ms.push(replay_ms(&legacy_graph, legacy_fixture.arena.context()));
-    hybrid_ms.push(replay_ms(&hybrid_graph, hybrid_fixture.arena.context()));
-    let timed_legacy_blake3 = assert_canonical_output(
-        &legacy_fixture,
-        &requirements,
-        &eager,
-        "timed legacy sample 0",
-    );
-    let timed_hybrid_blake3 = assert_canonical_output(
-        &hybrid_fixture,
-        &requirements,
-        &eager,
-        "timed hybrid sample 0",
-    );
+    poison_outputs(&fixture, &sn3.requirements, TIMED_LEGACY_POISON);
+    legacy_ms.push(replay_ms(&legacy_graph, fixture.arena.context()));
+    let timed_legacy_blake3 =
+        assert_canonical_output(&fixture, &sn3.requirements, &eager, "timed legacy sample 0");
+    poison_outputs(&fixture, &sn3.requirements, TIMED_HYBRID_POISON);
+    hybrid_ms.push(replay_ms(&hybrid_graph, fixture.arena.context()));
+    let timed_hybrid_blake3 =
+        assert_canonical_output(&fixture, &sn3.requirements, &eager, "timed hybrid sample 0");
 
     for iteration in 1..iterations {
         if iteration % 2 == 0 {
-            legacy_ms.push(replay_ms(&legacy_graph, legacy_fixture.arena.context()));
-            hybrid_ms.push(replay_ms(&hybrid_graph, hybrid_fixture.arena.context()));
+            legacy_ms.push(replay_ms(&legacy_graph, fixture.arena.context()));
+            hybrid_ms.push(replay_ms(&hybrid_graph, fixture.arena.context()));
         } else {
-            hybrid_ms.push(replay_ms(&hybrid_graph, hybrid_fixture.arena.context()));
-            legacy_ms.push(replay_ms(&legacy_graph, legacy_fixture.arena.context()));
+            hybrid_ms.push(replay_ms(&hybrid_graph, fixture.arena.context()));
+            legacy_ms.push(replay_ms(&legacy_graph, fixture.arena.context()));
         }
     }
 
-    poison_outputs(&legacy_fixture, &requirements, POST_TIMING_LEGACY_POISON);
-    poison_outputs(&hybrid_fixture, &requirements, POST_TIMING_HYBRID_POISON);
-    legacy_graph.launch(legacy_fixture.arena.context()).unwrap();
-    legacy_fixture.arena.context().sync().unwrap();
-    hybrid_graph.launch(hybrid_fixture.arena.context()).unwrap();
-    hybrid_fixture.arena.context().sync().unwrap();
+    poison_outputs(&fixture, &sn3.requirements, POST_TIMING_LEGACY_POISON);
+    legacy_graph.launch(fixture.arena.context()).unwrap();
+    fixture.arena.context().sync().unwrap();
     let post_timing_legacy_blake3 =
-        assert_canonical_output(&legacy_fixture, &requirements, &eager, "post-timing legacy");
+        assert_canonical_output(&fixture, &sn3.requirements, &eager, "post-timing legacy");
+    poison_outputs(&fixture, &sn3.requirements, POST_TIMING_HYBRID_POISON);
+    hybrid_graph.launch(fixture.arena.context()).unwrap();
+    fixture.arena.context().sync().unwrap();
     let post_timing_hybrid_blake3 =
-        assert_canonical_output(&hybrid_fixture, &requirements, &eager, "post-timing hybrid");
+        assert_canonical_output(&fixture, &sn3.requirements, &eager, "post-timing hybrid");
     let artifact_identity = artifact_identity();
 
     let legacy_p50 = percentile(&legacy_ms, 50);
@@ -234,18 +217,20 @@ fn sn3_hybrid_graph_host_wall_benchmark() {
     let hybrid_p95 = percentile(&hybrid_ms, 95);
     println!(
         concat!(
-            "{{\"schema\":\"stwo.sn3_quotient_numerator_hybrid.host_wall.v3\"," ,
+            "{{\"schema\":\"stwo.sn3_quotient_numerator_hybrid.host_wall.v4\"," ,
             "\"timing_scope\":\"per-replay host wall: graph launch plus stream synchronize; not CUDA events\"," ,
             "\"percentile_method\":\"nearest-rank\"," ,
             "\"result_class\":\"diagnostic same-lineage schedule A/B; not independent mathematical truth\"," ,
             "\"input_pattern\":\"input-recipe-sealed nonzero canonical-M31 affine row pattern; bounded chunked upload\"," ,
             "\"topology\":{{\"group_logs\":{:?},\"groups\":19,\"eligible_groups\":18," ,
-            "\"legacy_groups\":1,\"coefficient_sources\":152,\"coefficient_batches\":74," ,
+            "\"legacy_groups\":1,\"coefficient_columns\":161,\"coefficient_sources\":152," ,
+            "\"total_batches\":74,\"coefficient_batches\":71," ,
             "\"terms\":6341}},\"bytes\":{{\"legacy_logical_output\":{}," ,
             "\"hybrid_logical_output\":{},\"validated_numerator_output\":{}," ,
             "\"validated_auxiliary_output\":{},\"validated_canonical_output\":{}," ,
-            "\"legacy_arena\":{},\"hybrid_arena\":{},\"combined_arenas\":{}}}," ,
+            "\"shared_arena\":{}}}," ,
             "\"identity\":{{\"output_digest_encoding\":\"framed u32 little-endian v1\"," ,
+            "\"topology_fixture_blake3\":\"{}\"," ,
             "\"input_recipe_encoding\":\"typed topology, descriptors, and affine row recipes v2\"," ,
             "\"input_recipe_blake3\":\"{}\",\"eager_legacy_blake3\":\"{}\"," ,
             "\"eager_hybrid_blake3\":\"{}\",\"captured_legacy_blake3\":\"{}\"," ,
@@ -272,9 +257,8 @@ fn sn3_hybrid_graph_host_wall_benchmark() {
         validated_numerator_output_bytes,
         validated_auxiliary_output_bytes,
         validated_canonical_output_bytes,
-        legacy_fixture.allocation_bytes,
-        hybrid_fixture.allocation_bytes,
-        combined_arena_bytes,
+        fixture.allocation_bytes,
+        sn3.digest,
         input_recipe_blake3,
         eager.digest(),
         eager_hybrid_blake3,
@@ -306,81 +290,52 @@ fn sn3_hybrid_graph_host_wall_benchmark() {
 #[test]
 fn sn3_input_recipe_is_deterministic_and_shape_exact() {
     assert_affine_pattern_sanity();
-    let (topology, points) = sn3_topology();
-    let requirements = quotient_numerator_workspace_requirements(CONFIG, &topology).unwrap();
-    let hybrid = quotient_numerator_hybrid_plan(CONFIG, &topology).unwrap();
-    assert_sn3_shape(&topology, &requirements, &hybrid);
-    let digest = input_recipe_digest(&topology, &requirements, &hybrid, &points);
+    let sn3 = load_sn3_topology_fixture(EXPECTED_SN3_TOPOLOGY_FIXTURE_BLAKE3);
+    assert_sn3_shape(sn3.config, &sn3.topology, &sn3.requirements, &sn3.hybrid);
+    let digest = input_recipe_digest(
+        &sn3.topology,
+        &sn3.requirements,
+        &sn3.hybrid,
+        &sn3.input_points,
+    );
     assert_eq!(digest.to_hex().as_str(), EXPECTED_SN3_INPUT_RECIPE_BLAKE3);
-    let mut changed_points = points.clone();
-    changed_points.swap(0, 1);
+    let mut changed_points = sn3.input_points.clone();
+    let distinct = changed_points
+        .iter()
+        .position(|point| *point != changed_points[0])
+        .expect("exact SN3 fixture must contain distinct sample points");
+    changed_points.swap(0, distinct);
     assert_ne!(
-        input_recipe_digest(&topology, &requirements, &hybrid, &changed_points),
+        input_recipe_digest(
+            &sn3.topology,
+            &sn3.requirements,
+            &sn3.hybrid,
+            &changed_points,
+        ),
         digest
+    );
+    assert_eq!(
+        benchmark_arena_plan(&sn3.topology, &sn3.requirements).allocation_bytes,
+        EXPECTED_SN3_SHARED_ARENA_BYTES
     );
 }
 
-fn sn3_topology() -> (
-    Vec<QuotientNumeratorColumnTopology>,
-    Vec<CirclePoint<SecureField>>,
-) {
-    let mut points = (0..GROUP_LOGS.len())
-        .map(|index| SECURE_FIELD_CIRCLE_GEN.mul(2 * index as u128 + 3))
-        .collect::<Vec<_>>();
-    points.sort_by_key(|point| (point.x, point.y));
-    points.dedup();
-    assert_eq!(points.len(), GROUP_LOGS.len());
-
-    let legacy_sample = QuotientOodsSample {
-        input_index: 0,
-        shape_point: points[0],
-    };
-    let mut topology = Vec::with_capacity(COEFFICIENT_SOURCES + ELIGIBLE_LOGS.len());
-    topology.extend((0..114).map(|_| coefficient_topology(23, legacy_sample)));
-    for (index, &log_size) in ELIGIBLE_LOGS
-        .iter()
-        .filter(|&&log_size| log_size != 23)
-        .enumerate()
-    {
-        let count = 2 + usize::from(index < 4);
-        topology.extend((0..count).map(|_| coefficient_topology(log_size, legacy_sample)));
-    }
-    assert_eq!(topology.len(), COEFFICIENT_SOURCES);
-
-    let dense_terms = TERMS - COEFFICIENT_SOURCES - (ELIGIBLE_LOGS.len() - 1);
-    for (group, &log_size) in ELIGIBLE_LOGS.iter().enumerate() {
-        let sample = QuotientOodsSample {
-            input_index: (group + 1) as u32,
-            shape_point: points[group + 1],
-        };
-        topology.push(QuotientNumeratorColumnTopology {
-            coefficient_log_size: log_size,
-            source_kind: QuotientNumeratorSourceKind::Evaluation,
-            samples: vec![sample; if group == 0 { dense_terms } else { 1 }],
-        });
-    }
-    (topology, points)
-}
-
-fn coefficient_topology(
-    coefficient_log_size: u32,
-    sample: QuotientOodsSample,
-) -> QuotientNumeratorColumnTopology {
-    QuotientNumeratorColumnTopology {
-        coefficient_log_size,
-        source_kind: QuotientNumeratorSourceKind::Coefficients,
-        samples: vec![sample],
-    }
-}
-
 fn assert_sn3_shape(
+    config: QuotientNumeratorWorkspaceConfig,
     topology: &[QuotientNumeratorColumnTopology],
     requirements: &QuotientNumeratorWorkspaceRequirements,
     hybrid: &stwo_backend_cuda::QuotientNumeratorHybridPlan,
 ) {
-    assert_eq!(topology.len(), COEFFICIENT_SOURCES + ELIGIBLE_LOGS.len());
+    assert_eq!(config, EXPECTED_SN3_CONFIG);
+    assert!(!topology.is_empty());
+    assert_eq!(
+        topology
+            .iter()
+            .filter(|column| column.source_kind == QuotientNumeratorSourceKind::Coefficients)
+            .count(),
+        COEFFICIENT_COLUMNS
+    );
     assert_eq!(requirements.term_count, TERMS);
-    assert_eq!(requirements.input_sample_count, GROUP_LOGS.len());
     assert_eq!(requirements.groups.len(), GROUP_LOGS.len());
     assert_eq!(
         requirements
@@ -392,29 +347,33 @@ fn assert_sn3_shape(
     );
     assert_eq!(
         requirements.groups[0].coefficient_source_count,
-        COEFFICIENT_SOURCES
+        LEGACY_GROUP_COEFFICIENT_SOURCES
     );
     assert!(requirements.groups[1..]
         .iter()
         .all(|group| group.coefficient_source_count == 0));
-    assert_eq!(requirements.batches.len(), COEFFICIENT_BATCHES);
+    assert_eq!(requirements.batches.len(), LEGACY_BATCHES);
     assert_eq!(
         requirements
             .batches
             .iter()
             .map(|batch| batch.coefficient_count)
             .sum::<usize>(),
-        COEFFICIENT_SOURCES
+        LEGACY_GROUP_COEFFICIENT_SOURCES
     );
-    assert!(requirements
-        .batches
-        .iter()
-        .all(|batch| batch.coefficient_count != 0));
+    assert_eq!(
+        requirements
+            .batches
+            .iter()
+            .filter(|batch| batch.coefficient_count != 0)
+            .count(),
+        COEFFICIENT_BATCHES
+    );
 
     let report = hybrid.report();
     assert_eq!(report.eligible_group_count, ELIGIBLE_LOGS.len());
     assert_eq!(report.legacy_group_count, 1);
-    assert_eq!(report.legacy_batch_count, COEFFICIENT_BATCHES);
+    assert_eq!(report.legacy_batch_count, LEGACY_BATCHES);
     assert_eq!(report.eligible_output_rows, 16_776_656);
     assert_eq!(report.legacy_output_rows, 8_388_608);
     assert_eq!(
@@ -436,63 +395,25 @@ struct BenchmarkArena {
     allocation_bytes: u64,
 }
 
+struct BenchmarkArenaPlan {
+    layout: ArenaLayout,
+    source_ids: Vec<ArenaSlotId>,
+    destination_ids: Vec<[ArenaSlotId; 4]>,
+    allocation_bytes: u64,
+}
+
 impl BenchmarkArena {
     fn new(
         topology: &[QuotientNumeratorColumnTopology],
         requirements: &QuotientNumeratorWorkspaceRequirements,
     ) -> Self {
-        let slots = workspace_slots(requirements);
-        let mut specs = Vec::new();
-        let mut cursor = 0usize;
-        for requirement in requirements.arena_slot_requirements(&slots).unwrap() {
-            push_spec(
-                &mut specs,
-                &mut cursor,
-                requirement.id,
-                requirement.len_words,
-                requirement.alignment_words,
-            );
-        }
-        for (id, words) in [
-            (OODS_POINTS, requirements.input_sample_count * 8),
-            (OODS_VALUES, requirements.input_sample_count * 4),
-            (RANDOM_COEFFICIENT, 4),
-            (SAMPLE_POINTS_OUTPUT, requirements.groups.len() * 8),
-            (FIRST_TERMS_OUTPUT, requirements.groups.len() * 4),
-            (TWIDDLES, requirements.forward_twiddle_words),
-        ] {
-            push_spec(&mut specs, &mut cursor, id, words, 8);
-        }
-        let source_ids = topology
-            .iter()
-            .enumerate()
-            .map(|(index, column)| {
-                let id = ArenaSlotId(SOURCE_BASE + index as u32);
-                push_spec(&mut specs, &mut cursor, id, source_words(column), 8);
-                id
-            })
-            .collect::<Vec<_>>();
-        let destination_ids = requirements
-            .groups
-            .iter()
-            .enumerate()
-            .map(|(group, requirement)| {
-                std::array::from_fn(|coordinate| {
-                    let id = output_id(group, coordinate);
-                    push_spec(&mut specs, &mut cursor, id, requirement.value_words, 8);
-                    id
-                })
-            })
-            .collect::<Vec<_>>();
-        let allocation_bytes = (cursor as u64).checked_mul(4).unwrap();
-        assert!(allocation_bytes <= CHEAP_GPU_BUDGET_BYTES);
-        let layout = ArenaLayout::new(cursor, &specs).unwrap();
-        let arena = DeviceArena::new(CudaExecContext::new().unwrap(), layout).unwrap();
+        let plan = benchmark_arena_plan(topology, requirements);
+        let arena = DeviceArena::new(CudaExecContext::new().unwrap(), plan.layout).unwrap();
         Self {
             arena,
-            source_ids,
-            destination_ids,
-            allocation_bytes,
+            source_ids: plan.source_ids,
+            destination_ids: plan.destination_ids,
+            allocation_bytes: plan.allocation_bytes,
         }
     }
 
@@ -531,6 +452,63 @@ impl BenchmarkArena {
                 coordinates: ids.map(|id| self.arena.bind(id).unwrap()),
             })
             .collect()
+    }
+}
+
+fn benchmark_arena_plan(
+    topology: &[QuotientNumeratorColumnTopology],
+    requirements: &QuotientNumeratorWorkspaceRequirements,
+) -> BenchmarkArenaPlan {
+    let slots = workspace_slots(requirements);
+    let mut specs = Vec::new();
+    let mut cursor = 0usize;
+    for requirement in requirements.arena_slot_requirements(&slots).unwrap() {
+        push_spec(
+            &mut specs,
+            &mut cursor,
+            requirement.id,
+            requirement.len_words,
+            requirement.alignment_words,
+        );
+    }
+    for (id, words) in [
+        (OODS_POINTS, requirements.input_sample_count * 8),
+        (OODS_VALUES, requirements.input_sample_count * 4),
+        (RANDOM_COEFFICIENT, 4),
+        (SAMPLE_POINTS_OUTPUT, requirements.groups.len() * 8),
+        (FIRST_TERMS_OUTPUT, requirements.groups.len() * 4),
+        (TWIDDLES, requirements.forward_twiddle_words),
+    ] {
+        push_spec(&mut specs, &mut cursor, id, words, 8);
+    }
+    let source_ids = topology
+        .iter()
+        .enumerate()
+        .map(|(index, column)| {
+            let id = ArenaSlotId(SOURCE_BASE + index as u32);
+            push_spec(&mut specs, &mut cursor, id, source_words(column), 8);
+            id
+        })
+        .collect::<Vec<_>>();
+    let destination_ids = requirements
+        .groups
+        .iter()
+        .enumerate()
+        .map(|(group, requirement)| {
+            std::array::from_fn(|coordinate| {
+                let id = output_id(group, coordinate);
+                push_spec(&mut specs, &mut cursor, id, requirement.value_words, 8);
+                id
+            })
+        })
+        .collect::<Vec<_>>();
+    let allocation_bytes = (cursor as u64).checked_mul(4).unwrap();
+    assert!(allocation_bytes <= MAX_BENCHMARK_ARENA_BYTES);
+    BenchmarkArenaPlan {
+        layout: ArenaLayout::new(cursor, &specs).unwrap(),
+        source_ids,
+        destination_ids,
+        allocation_bytes,
     }
 }
 
@@ -587,6 +565,7 @@ fn prepare<'a>(
     columns: &[QuotientNumeratorColumn],
     destinations: &[QuotientNumeratorDestination],
     slots: &QuotientNumeratorWorkspaceSlots,
+    config: QuotientNumeratorWorkspaceConfig,
     hybrid: bool,
 ) -> PreparedQuotientNumeratorGraph<'a> {
     let arguments = (
@@ -600,7 +579,7 @@ fn prepare<'a>(
     if hybrid {
         PreparedQuotientNumeratorGraph::prepare_hybrid_candidate(
             &fixture.arena,
-            CONFIG,
+            config,
             columns,
             arguments.0,
             arguments.1,
@@ -615,7 +594,7 @@ fn prepare<'a>(
     } else {
         PreparedQuotientNumeratorGraph::prepare(
             &fixture.arena,
-            CONFIG,
+            config,
             columns,
             arguments.0,
             arguments.1,

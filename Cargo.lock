@@ -1350,6 +1350,7 @@ dependencies = [
  "rand",
  "rayon",
  "serde",
+ "serde_json",
  "stwo",
  "stwo-backend-cuda-kernels",
  "stwo-backend-testkit",

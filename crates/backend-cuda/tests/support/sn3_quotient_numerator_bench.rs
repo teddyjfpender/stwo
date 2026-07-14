@@ -459,6 +459,10 @@ fn candidate_source_digest() -> Hash {
             include_bytes!("sn3_quotient_numerator_bench.rs").as_slice(),
         ),
         (
+            "tests/support/sn3_quotient_topology_fixture.rs",
+            include_bytes!("sn3_quotient_topology_fixture.rs").as_slice(),
+        ),
+        (
             "src/backend/quotient_numerator_single_write.rs",
             include_bytes!("../../src/backend/quotient_numerator_single_write.rs").as_slice(),
         ),
