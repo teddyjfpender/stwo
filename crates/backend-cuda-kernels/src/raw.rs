@@ -82,6 +82,19 @@ extern "C" {
     /// Returns a CUDA error code (0 = success). Sets the default mem pool's release
     /// threshold to never-release so warm proves reuse allocations.
     pub fn cuda_mem_pool_init() -> i32;
+    /// Default-pool-only checked allocation/copy/free. These validate the
+    /// admitted current device and never use the legacy cudaMalloc fallback.
+    pub fn cuda_default_pool_alloc_checked(
+        byte_count: usize,
+        output: *mut *mut core::ffi::c_void,
+    ) -> i32;
+    pub fn cuda_default_pool_copy_h2d_checked(
+        host: *const core::ffi::c_void,
+        device: *mut core::ffi::c_void,
+        byte_count: usize,
+    ) -> i32;
+    pub fn cuda_default_pool_free_checked(device: *mut core::ffi::c_void) -> i32;
+    pub fn cuda_default_pool_stream_sync_checked() -> i32;
     /// Checked current used/reserved bytes for the process-wide default pool.
     pub fn cuda_default_pool_current(used_current: *mut usize, reserved_current: *mut usize)
         -> i32;
@@ -122,10 +135,7 @@ extern "C" {
         bits_per_segment: *const u32,
         n_segments: u32,
     ) -> i32;
-    pub fn stwo_preprocessed_gen_xor_checked(
-        output_columns: *const *mut u32,
-        n_bits: u32,
-    ) -> i32;
+    pub fn stwo_preprocessed_gen_xor_checked(output_columns: *const *mut u32, n_bits: u32) -> i32;
     pub fn stwo_preprocessed_stream_sync_checked() -> i32;
     /// JIT-compile (NVRTC; cached by the CONTENT semantic hash, never pointers) and
     /// launch a generated fused constraint kernel. `rc_base` is the kernel's first
@@ -1853,10 +1863,12 @@ extern "C" {
         n_items: u32,
     ) -> i32;
 
-    // Register caller-owned DEVICE columns as the pedersen points table
-    // (borrowed mode; see pedersen_table_init.cu). 56 pointers, n_rows each.
-    // Registration publishes the pointers to the precompiled module's device
-    // globals; asserts if a different table was already registered.
+    // Checked borrowed registration validates all 56 host pointers and rows,
+    // returns success for the exact already-active table, rejects any different
+    // active table, and commits host runtime state only after device publication
+    // completes successfully.
+    pub fn stwo_pedersen_table_init_borrowed_checked(columns: *const *mut u32, n_rows: u32) -> i32;
+    // Legacy ASSERT wrapper retained for non-formal callers.
     pub fn pedersen_table_init(columns: *const *mut u32, n_rows: u32);
 
     // Device DAG (B2): generalized multiplicity count feed over a witness

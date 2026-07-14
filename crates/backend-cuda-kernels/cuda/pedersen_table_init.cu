@@ -450,6 +450,25 @@ __global__ void set_global_pedersen_table_pointers_kernel(m31** ptrs, uint32_t n
     }
 }
 
+struct BorrowedPedersenPublication {
+    m31* columns[INIT_PEDERSEN_TABLE_N_COLUMNS];
+    uint32_t n_rows;
+};
+
+// Passing the complete pointer set by value avoids a fallible device scratch
+// allocation at the publication boundary. One thread publishes all symbols;
+// the checked host entry point fences this launch before committing host state.
+__global__ void set_global_borrowed_pedersen_table_checked_kernel(
+    BorrowedPedersenPublication publication
+) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        for (int i = 0; i < INIT_PEDERSEN_TABLE_N_COLUMNS; i++) {
+            g_pedersen_table_columns[i] = publication.columns[i];
+        }
+        g_pedersen_table_n_rows = publication.n_rows;
+    }
+}
+
 __global__ void clear_global_pedersen_table_pointers_kernel() {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         for (int i = 0; i < INIT_PEDERSEN_TABLE_N_COLUMNS; i++) {
@@ -578,30 +597,48 @@ static void pedersen_table_runtime_release() {
     pedersen_table_runtime_reset_host_state();
 }
 
-static void pedersen_table_runtime_register_borrowed_columns(m31** columns, uint32_t n_rows) {
-    ASSERT_TRUE(columns != nullptr, "Pedersen table columns must be non-null");
-    ASSERT_TRUE(n_rows != 0, "Pedersen table row count must be non-zero");
-
+static cudaError_t pedersen_table_runtime_register_borrowed_columns_checked(
+    m31* const* columns,
+    uint32_t n_rows
+) {
+    if (columns == nullptr || n_rows == 0) {
+        return cudaErrorInvalidValue;
+    }
+    for (int i = 0; i < INIT_PEDERSEN_TABLE_N_COLUMNS; i++) {
+        if (columns[i] == nullptr) {
+            return cudaErrorInvalidValue;
+        }
+    }
     if (pedersen_table_runtime_is_initialized()) {
         if (pedersen_table_runtime_matches_columns(
                 PEDERSEN_TABLE_MODE_BORROWED_COLUMNS,
                 columns,
                 n_rows
             )) {
-            return;
+            return cudaSuccess;
         }
-        ASSERT_TRUE(
-            false,
-            "Pedersen table already initialized with a different ownership mode or column set"
-        );
+        return cudaErrorInvalidValue;
     }
 
-    pedersen_table_runtime_copy_host_columns(s_pedersen_table_runtime.active_columns, columns);
+    BorrowedPedersenPublication publication = {};
+    pedersen_table_runtime_copy_host_columns(publication.columns, columns);
+    publication.n_rows = n_rows;
+    set_global_borrowed_pedersen_table_checked_kernel<<<1, 1>>>(publication);
+    cudaError_t status = cudaGetLastError();
+    if (status != cudaSuccess) {
+        return status;
+    }
+    status = cudaStreamSynchronize(0);
+    if (status != cudaSuccess) {
+        return status;
+    }
+
+    // Host-visible ownership commits only after device globals are known live.
     pedersen_table_runtime_clear_host_columns(s_pedersen_table_runtime.owned_generated_columns);
+    pedersen_table_runtime_copy_host_columns(s_pedersen_table_runtime.active_columns, columns);
     s_pedersen_table_runtime.n_rows = n_rows;
     s_pedersen_table_runtime.mode = PEDERSEN_TABLE_MODE_BORROWED_COLUMNS;
-
-    pedersen_table_runtime_publish_active_columns();
+    return cudaSuccess;
 }
 
 static void pedersen_table_runtime_prepare_owned_columns(uint32_t n_rows) {
@@ -640,8 +677,15 @@ static void pedersen_table_runtime_prepare_owned_columns(uint32_t n_rows) {
 // External C API - Similar to initialize_poseidon_constants()
 // ============================================================================
 
+extern "C" cudaError_t stwo_pedersen_table_init_borrowed_checked(
+    m31* const* columns,
+    uint32_t n_rows
+) {
+    return pedersen_table_runtime_register_borrowed_columns_checked(columns, n_rows);
+}
+
 extern "C" void pedersen_table_init(m31** columns, uint32_t n_rows) {
-    pedersen_table_runtime_register_borrowed_columns(columns, n_rows);
+    ASSERT_CUDA_SUCCESS(stwo_pedersen_table_init_borrowed_checked(columns, n_rows));
 }
 
 extern "C" void pedersen_table_free() {

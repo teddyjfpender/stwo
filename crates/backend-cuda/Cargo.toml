@@ -9,6 +9,7 @@ description = "CUDA GPU proving backend for STWO (compile-gated; stub without nv
 parallel = ["stwo/parallel", "stwo-constraint-framework/parallel"]
 
 [dependencies]
+blake3.workspace = true
 itertools.workspace = true
 num-traits.workspace = true
 rayon.workspace = true
@@ -20,7 +21,6 @@ stwo-constraint-framework = { path = "../constraint-framework", version = "~2.2.
 ] }
 
 [dev-dependencies]
-blake3.workspace = true
 rand.workspace = true
 serde_json = "1.0"
 stwo-backend-testkit = { path = "../backend-testkit" }

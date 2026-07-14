@@ -2029,6 +2029,36 @@ pub unsafe extern "C" fn cuda_mem_pool_init() -> i32 {
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn cuda_default_pool_alloc_checked(
+    _byte_count: usize,
+    output: *mut *mut core::ffi::c_void,
+) -> i32 {
+    if let Some(output) = unsafe { output.as_mut() } {
+        *output = core::ptr::null_mut();
+    }
+    CUDA_ERROR_NOT_SUPPORTED
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cuda_default_pool_copy_h2d_checked(
+    _host: *const core::ffi::c_void,
+    _device: *mut core::ffi::c_void,
+    _byte_count: usize,
+) -> i32 {
+    CUDA_ERROR_NOT_SUPPORTED
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cuda_default_pool_free_checked(_device: *mut core::ffi::c_void) -> i32 {
+    CUDA_ERROR_NOT_SUPPORTED
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cuda_default_pool_stream_sync_checked() -> i32 {
+    CUDA_ERROR_NOT_SUPPORTED
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn cuda_default_pool_current(
     _used_current: *mut usize,
     _reserved_current: *mut usize,
@@ -2564,6 +2594,14 @@ pub unsafe extern "C" fn stwo_wit_deduce_oracle_run(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pedersen_table_init(_columns: *const *mut u32, _n_rows: u32) {
     no_cuda_symbol("pedersen_table_init")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_pedersen_table_init_borrowed_checked(
+    _columns: *const *mut u32,
+    _n_rows: u32,
+) -> i32 {
+    CUDA_ERROR_NOT_SUPPORTED
 }
 
 #[unsafe(no_mangle)]

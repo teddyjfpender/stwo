@@ -13,6 +13,7 @@
 #ifndef PEDERSEN_TABLE_CUH
 #define PEDERSEN_TABLE_CUH
 
+#include <cuda_runtime.h>
 #include "fields.cuh"
 #include "ec_ops.cuh"
 
@@ -40,6 +41,11 @@ extern __device__ uint32_t g_pedersen_table_n_rows;
 // The caller retains ownership of the underlying column buffers.
 // columns: array of 56 column pointers (each column has n_rows M31 elements)
 // n_rows: number of rows in the table
+extern "C" cudaError_t stwo_pedersen_table_init_borrowed_checked(
+    m31* const* columns,
+    uint32_t n_rows
+);
+// Legacy aborting compatibility wrapper.
 extern "C" void pedersen_table_init(m31** columns, uint32_t n_rows);
 
 // Release the active Pedersen table registration.

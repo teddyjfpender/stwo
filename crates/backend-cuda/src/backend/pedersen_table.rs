@@ -10,17 +10,36 @@
 //! through a fill closure — one column at a time into a reusable buffer, so the
 //! host-side overhead peaks at one padded column (~33MB), not the whole ~1.9GB
 //! table. Columns are padded to a power of two (the deduce functions mask row
-//! indices with `n_rows - 1`) and registered via `pedersen_table_init`
-//! (borrowed mode: the pointers publish to the precompiled module's device
-//! globals; JIT modules' per-module globals fill from the same registration at
-//! module load).
+//! indices with `n_rows - 1`) and registered via the checked borrowed-table
+//! publication boundary. The pointers publish to the precompiled module's
+//! device globals; JIT modules' per-module globals fill from the same
+//! registration at module load.
 
 use std::sync::OnceLock;
 
 use crate::columns::bindings;
 
+#[path = "pedersen_table_digest.rs"]
+mod digest;
+pub use digest::compute_borrowed_pedersen_table_digest;
+use digest::{finish_pedersen_digest, hash_pedersen_column, pedersen_content_hasher};
+
 /// Column count of the pedersen points table (28 x-limbs + 28 y-limbs).
 pub const PEDERSEN_TABLE_N_COLUMNS: usize = 56;
+
+/// BLAKE3 identity of the exact padded bytes uploaded for all 56 columns.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PedersenTableContentDigest([u8; 32]);
+
+impl PedersenTableContentDigest {
+    pub const fn new(digest: [u8; 32]) -> Self {
+        Self(digest)
+    }
+
+    pub const fn bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
 
 /// One immutable, process-lifetime device column from the registered host table.
 ///
@@ -54,6 +73,7 @@ impl RegisteredPedersenColumn {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RegisteredPedersenTable {
     columns: [RegisteredPedersenColumn; PEDERSEN_TABLE_N_COLUMNS],
+    content_digest: PedersenTableContentDigest,
     source_n_rows: usize,
     n_rows: usize,
 }
@@ -61,6 +81,10 @@ pub struct RegisteredPedersenTable {
 /// A registered table failed the exact geometry required by a borrower.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RegisteredPedersenTableError {
+    ContentDigest {
+        expected: PedersenTableContentDigest,
+        actual: PedersenTableContentDigest,
+    },
     SourceRowCount {
         expected: usize,
         actual: usize,
@@ -124,6 +148,23 @@ pub enum PedersenTableRegistrationError {
         registered_source_rows: usize,
         padded_rows: usize,
     },
+    RequestContentDigestMismatch {
+        requested: PedersenTableContentDigest,
+        registered: PedersenTableContentDigest,
+    },
+    ContentDigestMismatch {
+        expected: PedersenTableContentDigest,
+        actual: PedersenTableContentDigest,
+    },
+    Cuda {
+        operation: &'static str,
+        column: Option<usize>,
+        code: i32,
+    },
+    Rollback {
+        primary: Box<PedersenTableRegistrationError>,
+        cleanup: Box<PedersenTableRegistrationError>,
+    },
 }
 
 impl core::fmt::Display for PedersenTableRegistrationError {
@@ -185,6 +226,35 @@ impl core::fmt::Display for PedersenTableRegistrationError {
                 "requested pedersen source has {requested_source_rows} rows, but the registered \
                  source has {registered_source_rows} rows (both pad to {padded_rows})"
             ),
+            Self::RequestContentDigestMismatch {
+                requested,
+                registered,
+            } => write!(
+                f,
+                "requested pedersen content digest {requested:?} differs from registered \
+                 content digest {registered:?}"
+            ),
+            Self::ContentDigestMismatch { expected, actual } => write!(
+                f,
+                "filled pedersen bytes have digest {actual:?}, expected {expected:?}"
+            ),
+            Self::Cuda {
+                operation,
+                column,
+                code,
+            } => match column {
+                Some(column) => write!(
+                    f,
+                    "CUDA operation {operation} failed for pedersen column {column} with status \
+                     {code}"
+                ),
+                None => write!(f, "CUDA operation {operation} failed with status {code}"),
+            },
+            Self::Rollback { primary, cleanup } => write!(
+                f,
+                "pedersen registration failed ({primary}); unpublished-column rollback also \
+                 failed ({cleanup})"
+            ),
         }
     }
 }
@@ -200,6 +270,10 @@ pub enum PedersenTableRegistrationState {
 }
 
 impl RegisteredPedersenTable {
+    pub const fn content_digest(self) -> PedersenTableContentDigest {
+        self.content_digest
+    }
+
     pub const fn source_n_rows(self) -> usize {
         self.source_n_rows
     }
@@ -257,9 +331,16 @@ impl RegisteredPedersenTable {
     /// Validate both the host source identity and its padded device geometry.
     pub fn validate_exact_registration_geometry(
         self,
+        expected_content_digest: PedersenTableContentDigest,
         expected_source_rows: usize,
         expected_padded_rows: usize,
     ) -> Result<(), RegisteredPedersenTableError> {
+        if self.content_digest != expected_content_digest {
+            return Err(RegisteredPedersenTableError::ContentDigest {
+                expected: expected_content_digest,
+                actual: self.content_digest,
+            });
+        }
         if self.source_n_rows != expected_source_rows {
             return Err(RegisteredPedersenTableError::SourceRowCount {
                 expected: expected_source_rows,
@@ -272,6 +353,7 @@ impl RegisteredPedersenTable {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RegistrationGeometry {
+    content_digest: PedersenTableContentDigest,
     source_rows: usize,
     padded_rows: usize,
 }
@@ -305,6 +387,7 @@ impl RegistrationSlot {
                 let table = build(geometry)?;
                 table
                     .validate_exact_registration_geometry(
+                        geometry.content_digest,
                         geometry.source_rows,
                         geometry.padded_rows,
                     )
@@ -333,6 +416,14 @@ impl RegistrationSlot {
                             requested_source_rows: requested.source_rows,
                             registered_source_rows: table.source_n_rows,
                             padded_rows: requested.padded_rows,
+                        },
+                    );
+                }
+                if table.content_digest != requested.content_digest {
+                    return Err(
+                        PedersenTableRegistrationError::RequestContentDigestMismatch {
+                            requested: requested.content_digest,
+                            registered: table.content_digest,
                         },
                     );
                 }
@@ -383,6 +474,48 @@ impl PendingDeviceColumns {
     fn mark_published(&mut self) {
         self.published = true;
     }
+
+    fn release_unpublished(&mut self) -> Result<(), PedersenTableRegistrationError> {
+        if self.pointers.is_empty() {
+            return Ok(());
+        }
+        let mut first_error = None;
+        for (column, pointer) in self.pointers.drain(..).enumerate() {
+            let code = unsafe {
+                stwo_backend_cuda_kernels::raw::cuda_default_pool_free_checked(pointer.cast())
+            };
+            if code != 0 && first_error.is_none() {
+                first_error = Some(PedersenTableRegistrationError::Cuda {
+                    operation: "pedersen_unpublished_free",
+                    column: Some(column),
+                    code,
+                });
+            }
+        }
+        let code =
+            unsafe { stwo_backend_cuda_kernels::raw::cuda_default_pool_stream_sync_checked() };
+        if code != 0 && first_error.is_none() {
+            first_error = Some(PedersenTableRegistrationError::Cuda {
+                operation: "pedersen_unpublished_free_sync",
+                column: None,
+                code,
+            });
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    fn rollback(
+        mut self,
+        primary: PedersenTableRegistrationError,
+    ) -> PedersenTableRegistrationError {
+        match self.release_unpublished() {
+            Ok(()) => primary,
+            Err(cleanup) => PedersenTableRegistrationError::Rollback {
+                primary: Box::new(primary),
+                cleanup: Box::new(cleanup),
+            },
+        }
+    }
 }
 
 impl Drop for PendingDeviceColumns {
@@ -390,22 +523,17 @@ impl Drop for PendingDeviceColumns {
         if self.published {
             return;
         }
-        for pointer in self.pointers.drain(..) {
-            unsafe {
-                // This is the only available deallocator. It returns no status;
-                // native code logs an async-free failure and falls back to a
-                // synchronous free.
-                bindings::cuda_free_memory(pointer.cast());
-            }
+        if !self.pointers.is_empty() {
+            // Unexpected unwinding still uses only checked, no-fallback CUDA
+            // calls. Normal error paths call `rollback` and return exact status.
+            let _ = self.release_unpublished();
         }
     }
 }
 
 static REGISTERED: RegistrationSlot = RegistrationSlot::new();
 
-fn requested_geometry(
-    n_rows: usize,
-) -> Result<RegistrationGeometry, PedersenTableRegistrationError> {
+fn requested_padded_rows(n_rows: usize) -> Result<usize, PedersenTableRegistrationError> {
     if n_rows == 0 {
         return Err(PedersenTableRegistrationError::EmptyTable);
     }
@@ -414,16 +542,24 @@ fn requested_geometry(
             requested_rows: n_rows,
         },
     )?;
-    // The legacy upload entry point takes a C `int`, despite the generated
-    // Rust declaration using `u32`. Reject values that would become negative.
-    let max_rows = i32::MAX as usize;
+    // Native publication records the padded geometry in a u32 device symbol.
+    let max_rows = u32::MAX as usize;
     if padded_rows > max_rows {
         return Err(PedersenTableRegistrationError::NativeRowCountLimit {
             padded_rows,
             max_rows,
         });
     }
+    Ok(padded_rows)
+}
+
+fn requested_geometry(
+    n_rows: usize,
+    content_digest: PedersenTableContentDigest,
+) -> Result<RegistrationGeometry, PedersenTableRegistrationError> {
+    let padded_rows = requested_padded_rows(n_rows)?;
     Ok(RegistrationGeometry {
+        content_digest,
         source_rows: n_rows,
         padded_rows,
     })
@@ -434,6 +570,7 @@ fn build_borrowed_pedersen_table(
     fill_column: &mut impl FnMut(usize, &mut Vec<u32>),
 ) -> Result<RegisteredPedersenTable, PedersenTableRegistrationError> {
     let RegistrationGeometry {
+        content_digest,
         source_rows,
         padded_rows,
     } = geometry;
@@ -442,8 +579,14 @@ fn build_borrowed_pedersen_table(
     }
     bindings::try_ensure_mem_pool_init()
         .map_err(PedersenTableRegistrationError::PoolInitialization)?;
+    let byte_count = padded_rows.checked_mul(core::mem::size_of::<u32>()).ok_or(
+        PedersenTableRegistrationError::RowCountOverflow {
+            requested_rows: source_rows,
+        },
+    )?;
 
     let mut pending = PendingDeviceColumns::new()?;
+    let mut hasher = pedersen_content_hasher(source_rows, padded_rows);
     let mut buf = Vec::new();
     buf.try_reserve_exact(padded_rows).map_err(|_| {
         PedersenTableRegistrationError::HostAllocationFailed {
@@ -458,30 +601,73 @@ fn build_borrowed_pedersen_table(
         }))
         .is_err()
         {
-            return Err(PedersenTableRegistrationError::FillPanicked { column });
+            let error = PedersenTableRegistrationError::FillPanicked { column };
+            return Err(pending.rollback(error));
         }
         if buf.len() != source_rows {
-            return Err(PedersenTableRegistrationError::ColumnLength {
+            let error = PedersenTableRegistrationError::ColumnLength {
                 column,
                 expected: source_rows,
                 actual: buf.len(),
-            });
+            };
+            return Err(pending.rollback(error));
         }
 
         // Padding rows are 0. Real deduce indices never reach them, and raw
         // words must not be canonicalized during transport.
-        buf.try_reserve_exact(padded_rows - buf.len())
-            .map_err(|_| PedersenTableRegistrationError::HostAllocationFailed {
+        if buf.try_reserve_exact(padded_rows - buf.len()).is_err() {
+            let error = PedersenTableRegistrationError::HostAllocationFailed {
                 allocation: "padded pedersen column buffer",
-            })?;
-        buf.resize(padded_rows, 0);
-        let device_pointer = unsafe {
-            bindings::copy_uint32_t_vec_from_host_to_device(buf.as_ptr(), padded_rows as u32)
-        };
-        if device_pointer.is_null() {
-            return Err(PedersenTableRegistrationError::DeviceUploadReturnedNull { column });
+            };
+            return Err(pending.rollback(error));
         }
-        pending.pointers.push(device_pointer.cast_mut());
+        buf.resize(padded_rows, 0);
+        hash_pedersen_column(&mut hasher, column, &buf);
+        let mut allocation = core::ptr::null_mut();
+        let code = unsafe {
+            stwo_backend_cuda_kernels::raw::cuda_default_pool_alloc_checked(
+                byte_count,
+                &mut allocation,
+            )
+        };
+        if code != 0 {
+            let error = PedersenTableRegistrationError::Cuda {
+                operation: "pedersen_default_pool_allocate",
+                column: Some(column),
+                code,
+            };
+            return Err(pending.rollback(error));
+        }
+        if allocation.is_null() {
+            let error = PedersenTableRegistrationError::DeviceUploadReturnedNull { column };
+            return Err(pending.rollback(error));
+        }
+        let device_pointer = allocation.cast::<u32>();
+        pending.pointers.push(device_pointer);
+        let code = unsafe {
+            stwo_backend_cuda_kernels::raw::cuda_default_pool_copy_h2d_checked(
+                buf.as_ptr().cast(),
+                allocation,
+                byte_count,
+            )
+        };
+        if code != 0 {
+            let error = PedersenTableRegistrationError::Cuda {
+                operation: "pedersen_host_to_device_copy",
+                column: Some(column),
+                code,
+            };
+            return Err(pending.rollback(error));
+        }
+    }
+
+    let actual_digest = finish_pedersen_digest(hasher);
+    if actual_digest != content_digest {
+        let error = PedersenTableRegistrationError::ContentDigestMismatch {
+            expected: content_digest,
+            actual: actual_digest,
+        };
+        return Err(pending.rollback(error));
     }
 
     let columns = std::array::from_fn(|index| RegisteredPedersenColumn {
@@ -491,23 +677,32 @@ fn build_borrowed_pedersen_table(
     });
     let table = RegisteredPedersenTable {
         columns,
+        content_digest,
         source_n_rows: source_rows,
         n_rows: padded_rows,
     };
-    table
-        .validate_exact_registration_geometry(source_rows, padded_rows)
-        .map_err(PedersenTableRegistrationError::InvalidReadyGeometry)?;
+    if let Err(error) =
+        table.validate_exact_registration_geometry(content_digest, source_rows, padded_rows)
+    {
+        return Err(pending.rollback(PedersenTableRegistrationError::InvalidReadyGeometry(error)));
+    }
 
-    // These legacy native APIs abort the process on CUDA allocation, copy,
-    // launch, or synchronization errors. They do not expose a status that Rust
-    // can poison and recover from. If both calls return, publication completed;
-    // only then may RAII release ownership and the OnceLock publish `Ready`.
-    unsafe {
-        stwo_backend_cuda_kernels::raw::pedersen_table_init(
+    // Checked native publication validates every pointer, rejects a different
+    // active table, fences the device-global write, and commits host runtime
+    // state only after that fence succeeds. This is the sole `Ready` boundary.
+    let code = unsafe {
+        stwo_backend_cuda_kernels::raw::stwo_pedersen_table_init_borrowed_checked(
             pending.pointers.as_ptr(),
             padded_rows as u32,
-        );
-        bindings::stwo_legacy_stream_sync();
+        )
+    };
+    if code != 0 {
+        let error = PedersenTableRegistrationError::Cuda {
+            operation: "pedersen_borrowed_publication",
+            column: None,
+            code,
+        };
+        return Err(pending.rollback(error));
     }
     pending.mark_published();
     Ok(table)
@@ -519,18 +714,34 @@ fn build_borrowed_pedersen_table(
 /// that many raw words for each column. A recoverable failure poisons this slot,
 /// frees every uploaded but unpublished prefix, and is returned unchanged on
 /// later calls without invoking their builders. A ready slot is reusable only
-/// for the same unpadded source row count and padded device geometry.
+/// for the same content digest, unpadded source rows, and padded geometry. The
+/// upload pass hashes its exact padded bytes and rejects a false expected digest
+/// before native publication.
 ///
-/// The legacy upload and publication functions still terminate the process on
-/// native CUDA errors; such aborts cannot be represented as a Rust error until
-/// those native entry points return status codes.
+/// Every CUDA operation on this formal path returns an exact status and uses the
+/// admitted default pool without a `cudaMalloc` fallback. Only the separate
+/// legacy `pedersen_table_init` native wrapper retains abort-on-error behavior.
+pub fn try_register_borrowed_pedersen_table_with_content_digest(
+    n_rows: usize,
+    content_digest: PedersenTableContentDigest,
+    mut fill_column: impl FnMut(usize, &mut Vec<u32>),
+) -> Result<RegisteredPedersenTable, PedersenTableRegistrationError> {
+    REGISTERED.try_register(requested_geometry(n_rows, content_digest), |geometry| {
+        build_borrowed_pedersen_table(geometry, &mut fill_column)
+    })
+}
+
+/// Compatibility checked registration. It derives the actual content digest in
+/// a host-only pass, then uploads a second byte-checked pass. Formal callers
+/// should cache a canonical digest and call
+/// [`try_register_borrowed_pedersen_table_with_content_digest`] directly so
+/// ready reuse never invokes their fill closure.
 pub fn try_register_borrowed_pedersen_table(
     n_rows: usize,
     mut fill_column: impl FnMut(usize, &mut Vec<u32>),
 ) -> Result<RegisteredPedersenTable, PedersenTableRegistrationError> {
-    REGISTERED.try_register(requested_geometry(n_rows), |geometry| {
-        build_borrowed_pedersen_table(geometry, &mut fill_column)
-    })
+    let content_digest = compute_borrowed_pedersen_table_digest(n_rows, &mut fill_column)?;
+    try_register_borrowed_pedersen_table_with_content_digest(n_rows, content_digest, fill_column)
 }
 
 /// Compatibility wrapper for callers that only distinguish device-ready from
@@ -562,6 +773,9 @@ pub fn pedersen_table_registration_state() -> PedersenTableRegistrationState {
 mod tests {
     use super::*;
 
+    const DIGEST_A: PedersenTableContentDigest = PedersenTableContentDigest::new([0xA5; 32]);
+    const DIGEST_B: PedersenTableContentDigest = PedersenTableContentDigest::new([0x5A; 32]);
+
     #[test]
     fn stub_build_registers_nothing() {
         if !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
@@ -579,20 +793,30 @@ mod tests {
         }
     }
 
-    const fn geometry(source_rows: usize, padded_rows: usize) -> RegistrationGeometry {
+    const fn geometry(
+        content_digest: PedersenTableContentDigest,
+        source_rows: usize,
+        padded_rows: usize,
+    ) -> RegistrationGeometry {
         RegistrationGeometry {
+            content_digest,
             source_rows,
             padded_rows,
         }
     }
 
-    fn table_with_geometry(source_rows: usize, padded_rows: usize) -> RegisteredPedersenTable {
+    fn table_with_geometry(
+        content_digest: PedersenTableContentDigest,
+        source_rows: usize,
+        padded_rows: usize,
+    ) -> RegisteredPedersenTable {
         RegisteredPedersenTable {
             columns: std::array::from_fn(|index| RegisteredPedersenColumn {
                 index,
                 device_address: 0x1000 + index * 0x100,
                 len_words: padded_rows,
             }),
+            content_digest,
             source_n_rows: source_rows,
             n_rows: padded_rows,
         }
@@ -603,14 +827,14 @@ mod tests {
         let slot = RegistrationSlot::new();
         let invocations = std::cell::Cell::new(0);
         let first = slot
-            .try_register(Ok(geometry(32, 32)), |_| {
+            .try_register(Ok(geometry(DIGEST_A, 32, 32)), |_| {
                 invocations.set(invocations.get() + 1);
-                Ok(table_with_geometry(32, 32))
+                Ok(table_with_geometry(DIGEST_A, 32, 32))
             })
             .unwrap();
         let second = slot
             .try_register(
-                Ok(geometry(32, 32)),
+                Ok(geometry(DIGEST_A, 32, 32)),
                 |_| -> Result<_, PedersenTableRegistrationError> {
                     panic!("ready registration invoked a second builder")
                 },
@@ -624,12 +848,14 @@ mod tests {
     #[test]
     fn ready_registration_rejects_request_geometry_drift() {
         let slot = RegistrationSlot::new();
-        slot.try_register(Ok(geometry(32, 32)), |_| Ok(table_with_geometry(32, 32)))
-            .unwrap();
+        slot.try_register(Ok(geometry(DIGEST_A, 32, 32)), |_| {
+            Ok(table_with_geometry(DIGEST_A, 32, 32))
+        })
+        .unwrap();
 
         assert_eq!(
             slot.try_register(
-                Ok(geometry(64, 64)),
+                Ok(geometry(DIGEST_A, 64, 64)),
                 |_| -> Result<_, PedersenTableRegistrationError> {
                     panic!("geometry drift invoked a second builder")
                 }
@@ -645,22 +871,61 @@ mod tests {
     fn ready_registration_rejects_same_padded_different_source_without_rebuilding() {
         let slot = RegistrationSlot::new();
         let invocations = std::cell::Cell::new(0);
-        slot.try_register(Ok(geometry(17, 32)), |_| {
+        slot.try_register(Ok(geometry(DIGEST_A, 17, 32)), |_| {
             invocations.set(invocations.get() + 1);
-            Ok(table_with_geometry(17, 32))
+            Ok(table_with_geometry(DIGEST_A, 17, 32))
         })
         .unwrap();
 
         assert_eq!(
-            slot.try_register(Ok(geometry(32, 32)), |_| {
+            slot.try_register(Ok(geometry(DIGEST_A, 32, 32)), |_| {
                 invocations.set(invocations.get() + 1);
-                Ok(table_with_geometry(32, 32))
+                Ok(table_with_geometry(DIGEST_A, 32, 32))
             }),
             Err(
                 PedersenTableRegistrationError::RequestSourceRowCountMismatch {
                     requested_source_rows: 32,
                     registered_source_rows: 17,
                     padded_rows: 32,
+                }
+            )
+        );
+        assert_eq!(invocations.get(), 1);
+    }
+
+    #[test]
+    fn content_digest_distinguishes_same_geometry_bytes() {
+        let first = compute_borrowed_pedersen_table_digest(3, |column, buf| {
+            buf.extend([column as u32, 7, 11]);
+        })
+        .unwrap();
+        let second = compute_borrowed_pedersen_table_digest(3, |column, buf| {
+            buf.extend([column as u32, 7, u32::from(column == 41) + 11]);
+        })
+        .unwrap();
+
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn ready_registration_rejects_same_geometry_foreign_content_digest_without_rebuilding() {
+        let slot = RegistrationSlot::new();
+        let invocations = std::cell::Cell::new(0);
+        slot.try_register(Ok(geometry(DIGEST_A, 32, 32)), |_| {
+            invocations.set(invocations.get() + 1);
+            Ok(table_with_geometry(DIGEST_A, 32, 32))
+        })
+        .unwrap();
+
+        assert_eq!(
+            slot.try_register(Ok(geometry(DIGEST_B, 32, 32)), |_| {
+                invocations.set(invocations.get() + 1);
+                Ok(table_with_geometry(DIGEST_B, 32, 32))
+            }),
+            Err(
+                PedersenTableRegistrationError::RequestContentDigestMismatch {
+                    requested: DIGEST_B,
+                    registered: DIGEST_A,
                 }
             )
         );
@@ -677,7 +942,9 @@ mod tests {
         };
 
         assert_eq!(
-            slot.try_register(Ok(geometry(32, 32)), |_| Err(malformed.clone())),
+            slot.try_register(Ok(geometry(DIGEST_A, 32, 32)), |_| {
+                Err(malformed.clone())
+            }),
             Err(malformed.clone())
         );
         assert_eq!(
@@ -692,13 +959,13 @@ mod tests {
         let slot = RegistrationSlot::new();
         let invocations = std::cell::Cell::new(0);
         let failure = PedersenTableRegistrationError::DeviceUploadReturnedNull { column: 3 };
-        let first = slot.try_register(Ok(geometry(32, 32)), |_| {
+        let first = slot.try_register(Ok(geometry(DIGEST_A, 32, 32)), |_| {
             invocations.set(invocations.get() + 1);
             Err(failure.clone())
         });
-        let second = slot.try_register(Ok(geometry(32, 32)), |_| {
+        let second = slot.try_register(Ok(geometry(DIGEST_A, 32, 32)), |_| {
             invocations.set(invocations.get() + 1);
-            Ok(table_with_geometry(32, 32))
+            Ok(table_with_geometry(DIGEST_A, 32, 32))
         });
 
         assert_eq!(first, Err(failure.clone()));
@@ -708,8 +975,9 @@ mod tests {
 
     #[test]
     fn registered_geometry_is_ordered_and_fails_closed() {
-        let table = table_with_geometry(1 << 23, 1 << 23);
+        let table = table_with_geometry(DIGEST_A, 1 << 23, 1 << 23);
 
+        assert_eq!(table.content_digest(), DIGEST_A);
         assert_eq!(table.source_n_rows(), 1 << 23);
         assert!(table.has_exact_rows(1 << 23));
         assert!(!table.has_exact_rows(1 << 22));
@@ -724,14 +992,21 @@ mod tests {
             .all(|(index, column)| column.index() == index));
         assert_eq!(table.validate_exact_geometry(1 << 23), Ok(()));
         assert_eq!(
-            table.validate_exact_registration_geometry(1 << 23, 1 << 23),
+            table.validate_exact_registration_geometry(DIGEST_A, 1 << 23, 1 << 23),
             Ok(())
         );
+
+        let mut wrong_content_digest = table;
+        wrong_content_digest.content_digest = DIGEST_B;
+        assert!(matches!(
+            wrong_content_digest.validate_exact_registration_geometry(DIGEST_A, 1 << 23, 1 << 23),
+            Err(RegisteredPedersenTableError::ContentDigest { .. })
+        ));
 
         let mut wrong_source_rows = table;
         wrong_source_rows.source_n_rows -= 1;
         assert!(matches!(
-            wrong_source_rows.validate_exact_registration_geometry(1 << 23, 1 << 23),
+            wrong_source_rows.validate_exact_registration_geometry(DIGEST_A, 1 << 23, 1 << 23),
             Err(RegisteredPedersenTableError::SourceRowCount { .. })
         ));
 

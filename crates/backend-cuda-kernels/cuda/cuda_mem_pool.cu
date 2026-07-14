@@ -132,6 +132,59 @@ extern "C" cudaError_t cuda_mem_pool_init() {
     return resolve_default_pool(&pool, true);
 }
 
+extern "C" cudaError_t cuda_default_pool_alloc_checked(
+    size_t byte_count,
+    void** output
+) {
+    if (output == nullptr || byte_count == 0) {
+        return cudaErrorInvalidValue;
+    }
+    *output = nullptr;
+    cudaMemPool_t pool = nullptr;
+    cudaError_t err = resolve_default_pool(&pool, true);
+    if (err != cudaSuccess) {
+        return err;
+    }
+    return cudaMallocFromPoolAsync(output, byte_count, pool, 0);
+}
+
+extern "C" cudaError_t cuda_default_pool_copy_h2d_checked(
+    const void* host,
+    void* device,
+    size_t byte_count
+) {
+    if (host == nullptr || device == nullptr || byte_count == 0) {
+        return cudaErrorInvalidValue;
+    }
+    cudaMemPool_t pool = nullptr;
+    cudaError_t err = resolve_default_pool(&pool, true);
+    if (err != cudaSuccess) {
+        return err;
+    }
+    return cudaMemcpy(device, host, byte_count, cudaMemcpyHostToDevice);
+}
+
+extern "C" cudaError_t cuda_default_pool_free_checked(void* device) {
+    if (device == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    cudaMemPool_t pool = nullptr;
+    cudaError_t err = resolve_default_pool(&pool, true);
+    if (err != cudaSuccess) {
+        return err;
+    }
+    return cudaFreeAsync(device, 0);
+}
+
+extern "C" cudaError_t cuda_default_pool_stream_sync_checked() {
+    cudaMemPool_t pool = nullptr;
+    cudaError_t err = resolve_default_pool(&pool, true);
+    if (err != cudaSuccess) {
+        return err;
+    }
+    return cudaStreamSynchronize(0);
+}
+
 extern "C" cudaError_t cuda_default_pool_current(
     size_t* used_current,
     size_t* reserved_current

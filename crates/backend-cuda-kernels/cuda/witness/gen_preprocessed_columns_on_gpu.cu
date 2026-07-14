@@ -21,17 +21,8 @@ cudaError_t allocate_from_default_pool_checked(size_t count, T** output) {
     if (output == nullptr || count == 0 || count > SIZE_MAX / sizeof(T)) {
         return cudaErrorInvalidValue;
     }
-    *output = nullptr;
-    cudaError_t status = cuda_mem_pool_init();
-    if (status != cudaSuccess) {
-        return status;
-    }
-    cudaMemPool_t pool = stwo_default_mem_pool();
-    if (pool == nullptr) {
-        return cudaErrorNotSupported;
-    }
-    return cudaMallocFromPoolAsync(
-        reinterpret_cast<void**>(output), sizeof(T) * count, pool, 0);
+    return cuda_default_pool_alloc_checked(
+        sizeof(T) * count, reinterpret_cast<void**>(output));
 }
 
 template <typename T>
@@ -44,12 +35,12 @@ cudaError_t clone_to_device_checked(const T* host, uint32_t count, T** output) {
     if (status != cudaSuccess) {
         return status;
     }
-    status = cudaMemcpy(
-        device, host, sizeof(T) * static_cast<size_t>(count), cudaMemcpyHostToDevice);
+    status = cuda_default_pool_copy_h2d_checked(
+        host, device, sizeof(T) * static_cast<size_t>(count));
     if (status != cudaSuccess) {
-        // Preserve the copy failure as the primary diagnosis; cudaFreeAsync is
+        // Preserve the copy failure as the primary diagnosis; checked free is
         // best-effort rollback when the CUDA context is already unhealthy.
-        cudaFreeAsync(device, 0);
+        cuda_default_pool_free_checked(device);
         return status;
     }
     *output = device;
@@ -58,7 +49,7 @@ cudaError_t clone_to_device_checked(const T* host, uint32_t count, T** output) {
 
 template <typename T>
 cudaError_t release_scratch(T* ptr) {
-    return ptr == nullptr ? cudaSuccess : cudaFreeAsync(ptr, 0);
+    return ptr == nullptr ? cudaSuccess : cuda_default_pool_free_checked(ptr);
 }
 
 uint32_t block_count(uint32_t elements) {
@@ -88,11 +79,12 @@ extern "C" cudaError_t stwo_preprocessed_copy_h2d_checked(
         count > SIZE_MAX / sizeof(uint32_t)) {
         return cudaErrorInvalidValue;
     }
-    return cudaMemcpy(device, host, count * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    return cuda_default_pool_copy_h2d_checked(
+        host, device, count * sizeof(uint32_t));
 }
 
 extern "C" cudaError_t stwo_preprocessed_stream_sync_checked() {
-    return cudaStreamSynchronize(0);
+    return cuda_default_pool_stream_sync_checked();
 }
 
 // ============================================================================

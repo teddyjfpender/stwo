@@ -34,6 +34,21 @@
 // status and a later call retries.
 extern "C" cudaError_t cuda_mem_pool_init();
 
+// Formal default-pool-only primitives. Every call validates the current device
+// against the admitted pool, returns the exact CUDA status, and never falls
+// back to cudaMalloc/cudaFree. `byte_count` must be non-zero.
+extern "C" cudaError_t cuda_default_pool_alloc_checked(
+    size_t byte_count,
+    void** output
+);
+extern "C" cudaError_t cuda_default_pool_copy_h2d_checked(
+    const void* host,
+    void* device,
+    size_t byte_count
+);
+extern "C" cudaError_t cuda_default_pool_free_checked(void* device);
+extern "C" cudaError_t cuda_default_pool_stream_sync_checked();
+
 // Checked current footprint of the process-wide default pool. Unlike the
 // historical high-water telemetry, these values describe memory held now.
 extern "C" cudaError_t cuda_default_pool_current(
