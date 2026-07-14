@@ -649,7 +649,10 @@ impl Drop for CudaGraphExec {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ArenaSlotId(pub u32);
 
-/// One statically planned, non-overlapping range in the arena slab.
+/// One statically planned stable range view in the arena slab.
+///
+/// [`ArenaLayout::new`] requires views to be spatially disjoint;
+/// [`ArenaLayout::new_reused`] may validate epoch-disjoint address reuse.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArenaSlotSpec {
     pub id: ArenaSlotId,
@@ -659,12 +662,23 @@ pub struct ArenaSlotSpec {
     pub alignment_words: usize,
 }
 
+/// One stable range view and the proof epochs in which its address is live.
+///
+/// The mask is consumed while constructing [`ArenaLayout`]; callers cannot
+/// mutate reuse after validation or after graph capture.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ArenaRangeSpec {
+    pub slot: ArenaSlotSpec,
+    pub live_mask: u16,
+}
+
 /// Rejected arena-plan condition.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ArenaError {
     ZeroSizedArena,
     DuplicateSlot(ArenaSlotId),
     EmptySlot(ArenaSlotId),
+    EmptyLiveMask(ArenaSlotId),
     InvalidAlignment(ArenaSlotId),
     Misaligned(ArenaSlotId),
     RangeOverflow(ArenaSlotId),
@@ -691,7 +705,7 @@ impl From<CudaRuntimeError> for ArenaError {
     }
 }
 
-/// Validated stable-address layout for one capture epoch.
+/// Validated stable-address layout for one workspace and its graph captures.
 #[derive(Clone, Debug)]
 pub struct ArenaLayout {
     total_words: usize,
@@ -709,22 +723,7 @@ impl ArenaLayout {
         let mut slots = BTreeMap::new();
         let mut ranges = Vec::with_capacity(specs.len());
         for &spec in specs {
-            if spec.len_words == 0 {
-                return Err(ArenaError::EmptySlot(spec.id));
-            }
-            if !spec.alignment_words.is_power_of_two() {
-                return Err(ArenaError::InvalidAlignment(spec.id));
-            }
-            if spec.offset_words % spec.alignment_words != 0 {
-                return Err(ArenaError::Misaligned(spec.id));
-            }
-            let end = spec
-                .offset_words
-                .checked_add(spec.len_words)
-                .ok_or(ArenaError::RangeOverflow(spec.id))?;
-            if end > total_words {
-                return Err(ArenaError::OutOfBounds(spec.id));
-            }
+            let end = validate_arena_slot(total_words, spec)?;
             if slots.insert(spec.id, spec).is_some() {
                 return Err(ArenaError::DuplicateSlot(spec.id));
             }
@@ -732,15 +731,59 @@ impl ArenaLayout {
         }
 
         ranges.sort_unstable_by_key(|&(start, end, id)| (start, end, id));
-        for pair in ranges.windows(2) {
-            let (_, first_end, first_id) = pair[0];
-            let (second_start, _, second_id) = pair[1];
-            if second_start < first_end {
-                return Err(ArenaError::Overlap {
-                    first: first_id,
-                    second: second_id,
-                });
+        reject_adjacent_overlaps(&ranges)?;
+        Ok(Self { total_words, slots })
+    }
+
+    /// Validate stable range views whose addresses may be reused only across
+    /// disjoint proof epochs.
+    ///
+    /// The constructor checks the declared masks independently, and
+    /// [`DeviceArena`] still has no unchecked offset-binding API.
+    ///
+    /// # Safety
+    ///
+    /// Each mask must contain every execution epoch in which its range can be
+    /// read or written, including work reachable from captured graphs. Epochs
+    /// whose ranges overlap spatially must be totally ordered with no
+    /// asynchronous execution across the boundary. Callers must also collapse
+    /// semantically authorized exact aliases to one slot id before calling.
+    pub unsafe fn new_reused(
+        total_words: usize,
+        specs: &[ArenaRangeSpec],
+    ) -> Result<Self, ArenaError> {
+        if total_words == 0 {
+            return Err(ArenaError::ZeroSizedArena);
+        }
+
+        let mut slots = BTreeMap::new();
+        let mut ranges_by_epoch: [Vec<(usize, usize, ArenaSlotId)>; u16::BITS as usize] =
+            std::array::from_fn(|_| Vec::new());
+        for &ArenaRangeSpec {
+            slot: spec,
+            live_mask,
+        } in specs
+        {
+            if live_mask == 0 {
+                return Err(ArenaError::EmptyLiveMask(spec.id));
             }
+            let end = validate_arena_slot(total_words, spec)?;
+            if slots.insert(spec.id, spec).is_some() {
+                return Err(ArenaError::DuplicateSlot(spec.id));
+            }
+            for bit in 0..u16::BITS as usize {
+                if live_mask & (1u16 << bit) != 0 {
+                    ranges_by_epoch[bit].push((spec.offset_words, end, spec.id));
+                }
+            }
+        }
+
+        // Validate each epoch independently. A single global adjacent-pair
+        // scan is insufficient when a disjoint-lifetime range is nested
+        // between two ranges that are live together.
+        for ranges in &mut ranges_by_epoch {
+            ranges.sort_unstable_by_key(|&(start, end, id)| (start, end, id));
+            reject_adjacent_overlaps(ranges)?;
         }
 
         Ok(Self { total_words, slots })
@@ -753,6 +796,40 @@ impl ArenaLayout {
     pub fn slot(&self, id: ArenaSlotId) -> Option<ArenaSlotSpec> {
         self.slots.get(&id).copied()
     }
+}
+
+fn validate_arena_slot(total_words: usize, spec: ArenaSlotSpec) -> Result<usize, ArenaError> {
+    if spec.len_words == 0 {
+        return Err(ArenaError::EmptySlot(spec.id));
+    }
+    if !spec.alignment_words.is_power_of_two() {
+        return Err(ArenaError::InvalidAlignment(spec.id));
+    }
+    if spec.offset_words % spec.alignment_words != 0 {
+        return Err(ArenaError::Misaligned(spec.id));
+    }
+    let end = spec
+        .offset_words
+        .checked_add(spec.len_words)
+        .ok_or(ArenaError::RangeOverflow(spec.id))?;
+    if end > total_words {
+        return Err(ArenaError::OutOfBounds(spec.id));
+    }
+    Ok(end)
+}
+
+fn reject_adjacent_overlaps(ranges: &[(usize, usize, ArenaSlotId)]) -> Result<(), ArenaError> {
+    for pair in ranges.windows(2) {
+        let (_, first_end, first_id) = pair[0];
+        let (second_start, _, second_id) = pair[1];
+        if second_start < first_end {
+            return Err(ArenaError::Overlap {
+                first: first_id,
+                second: second_id,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Non-owning view of a stable arena range. Dropping it never frees memory.
@@ -833,11 +910,12 @@ impl ArenaSlice {
     }
 }
 
-/// One stable device allocation partitioned by a validated slot plan.
+/// One stable device allocation exposed through validated stable range views.
 ///
-/// The slab is allocated once and never moved or individually freed during the
-/// capture epoch. [`CudaExecContext`] is owned here to make the free/stream/pool
-/// lifetime order structural rather than caller convention.
+/// Views may reuse bytes only under an [`ArenaLayout::new_reused`] lifetime
+/// contract. The slab is allocated once and never moved or individually freed
+/// during the capture epoch. [`CudaExecContext`] is owned here to make the
+/// free/stream/pool lifetime order structural rather than caller convention.
 pub struct DeviceArena {
     context: CudaExecContext,
     base: NonNull<u32>,
@@ -993,6 +1071,115 @@ mod tests {
         assert_eq!(
             ArenaLayout::new(64, &specs).unwrap_err(),
             ArenaError::OutOfBounds(B)
+        );
+    }
+
+    #[test]
+    fn reused_layout_accepts_only_epoch_disjoint_overlaps() {
+        let reused = [
+            ArenaRangeSpec {
+                slot: ArenaSlotSpec {
+                    id: A,
+                    offset_words: 0,
+                    len_words: 16,
+                    alignment_words: 8,
+                },
+                live_mask: 0b01,
+            },
+            ArenaRangeSpec {
+                slot: ArenaSlotSpec {
+                    id: B,
+                    offset_words: 0,
+                    len_words: 8,
+                    alignment_words: 8,
+                },
+                live_mask: 0b10,
+            },
+            ArenaRangeSpec {
+                slot: ArenaSlotSpec {
+                    id: ArenaSlotId(3),
+                    offset_words: 8,
+                    len_words: 8,
+                    alignment_words: 8,
+                },
+                live_mask: 0b10,
+            },
+        ];
+        // SAFETY: these test masks exactly describe the only modeled epochs.
+        let layout = unsafe { ArenaLayout::new_reused(16, &reused) }.unwrap();
+        assert_eq!(layout.slot(A).unwrap().offset_words, 0);
+        assert_eq!(layout.slot(B).unwrap().offset_words, 0);
+
+        let mut overlapping = reused;
+        overlapping[1].live_mask = 0b11;
+        assert_eq!(
+            unsafe { ArenaLayout::new_reused(16, &overlapping) }.unwrap_err(),
+            ArenaError::Overlap {
+                first: B,
+                second: A,
+            }
+        );
+    }
+
+    #[test]
+    fn reused_layout_checks_each_epoch_and_rejects_empty_masks() {
+        let nested = [
+            ArenaRangeSpec {
+                slot: ArenaSlotSpec {
+                    id: A,
+                    offset_words: 0,
+                    len_words: 64,
+                    alignment_words: 8,
+                },
+                live_mask: 1 << 15,
+            },
+            ArenaRangeSpec {
+                slot: ArenaSlotSpec {
+                    id: B,
+                    offset_words: 8,
+                    len_words: 8,
+                    alignment_words: 8,
+                },
+                live_mask: 0b10,
+            },
+            ArenaRangeSpec {
+                slot: ArenaSlotSpec {
+                    id: ArenaSlotId(3),
+                    offset_words: 24,
+                    len_words: 8,
+                    alignment_words: 8,
+                },
+                live_mask: 1 << 15,
+            },
+        ];
+        assert_eq!(
+            unsafe { ArenaLayout::new_reused(64, &nested) }.unwrap_err(),
+            ArenaError::Overlap {
+                first: A,
+                second: ArenaSlotId(3),
+            }
+        );
+
+        let mut empty = nested;
+        empty[0].live_mask = 0;
+        assert_eq!(
+            unsafe { ArenaLayout::new_reused(64, &empty) }.unwrap_err(),
+            ArenaError::EmptyLiveMask(A)
+        );
+
+        let duplicate = [
+            ArenaRangeSpec {
+                slot: nested[0].slot,
+                live_mask: 0b01,
+            },
+            ArenaRangeSpec {
+                slot: nested[0].slot,
+                live_mask: 0b10,
+            },
+        ];
+        assert_eq!(
+            unsafe { ArenaLayout::new_reused(64, &duplicate) }.unwrap_err(),
+            ArenaError::DuplicateSlot(A)
         );
     }
 
