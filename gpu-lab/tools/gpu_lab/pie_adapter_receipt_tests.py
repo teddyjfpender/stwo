@@ -23,6 +23,7 @@ from .pie_adapter_receipt import (
     parse_inventory_bytes,
     parse_source_closure_bytes,
     validate_build_receipt,
+    validate_documents,
     validate_files,
     validate_inventory,
     validate_source_closure,
@@ -165,6 +166,14 @@ def pie_adapter_receipt_self_test(_: Path | None = None) -> None:
         receipt_path = Path(temporary) / "receipt.json"
         closure, receipt = generate(inventory_path, inventory_sha, closure_path,
                                     receipt_path, root, _commit)
+        retained = validate_documents(
+            inventory_path.read_bytes(), inventory_sha, closure_path.read_bytes(),
+            receipt_path.read_bytes(), root, _commit)
+        require(retained == (closure, receipt),
+                "PIE adapter retained document validation differs")
+        _expect("retained inventory hash substitution", lambda: validate_documents(
+            inventory_path.read_bytes(), "0" * 64, closure_path.read_bytes(),
+            receipt_path.read_bytes(), root, _commit), "out-of-band")
         validate_files(inventory_path, inventory_sha, closure_path, receipt_path, root, _commit)
         require(receipt["schema_version"] == BUILD_RECEIPT_SCHEMA
                 and receipt["build_receipt"]["build_execution_attested"] is False

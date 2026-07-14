@@ -659,6 +659,18 @@ def parse_build_receipt_bytes(payload: bytes, inventory: dict[str, Any],
                                   closure, workspace_root, _commit_reader)
 
 
+def validate_documents(inventory_payload: bytes, raw_inventory_sha256: str,
+                       closure_payload: bytes, receipt_payload: bytes,
+                       workspace_root: Path = WORKSPACE_ROOT,
+                       _commit_reader: CommitReader = _git_commit) -> tuple[dict[str, Any], dict[str, Any]]:
+    inventory = parse_inventory_bytes(inventory_payload, raw_inventory_sha256, workspace_root)
+    closure = parse_source_closure_bytes(
+        closure_payload, inventory, workspace_root, _commit_reader)
+    receipt = parse_build_receipt_bytes(
+        receipt_payload, inventory, closure, workspace_root, _commit_reader)
+    return closure, receipt
+
+
 def generate(inventory_path: Path, raw_inventory_sha256: str, closure_path: Path,
              receipt_path: Path, workspace_root: Path = WORKSPACE_ROOT,
              _commit_reader: CommitReader = _git_commit) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -691,14 +703,10 @@ def generate(inventory_path: Path, raw_inventory_sha256: str, closure_path: Path
 def validate_files(inventory_path: Path, raw_inventory_sha256: str, closure_path: Path,
                    receipt_path: Path, workspace_root: Path = WORKSPACE_ROOT,
                    _commit_reader: CommitReader = _git_commit) -> tuple[dict[str, Any], dict[str, Any]]:
-    inventory = parse_inventory_bytes(
+    return validate_documents(
         _read_bounded(inventory_path, "PIE adapter source inventory"),
-        raw_inventory_sha256, workspace_root,
+        raw_inventory_sha256,
+        _read_bounded(closure_path, "PIE adapter source closure"),
+        _read_bounded(receipt_path, "PIE adapter build receipt"),
+        workspace_root, _commit_reader,
     )
-    closure = parse_source_closure_bytes(
-        _read_bounded(closure_path, "PIE adapter source closure"), inventory,
-        workspace_root, _commit_reader)
-    receipt = parse_build_receipt_bytes(
-        _read_bounded(receipt_path, "PIE adapter build receipt"), inventory,
-        closure, workspace_root, _commit_reader)
-    return closure, receipt
