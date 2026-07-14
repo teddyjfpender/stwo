@@ -1263,6 +1263,7 @@ pub unsafe extern "C" fn stwo_blake2s_progressive_init_on(
 pub unsafe extern "C" fn stwo_blake2s_progressive_absorb_on(
     _size: u32,
     _number_of_columns: u32,
+    _absorbed_columns_before: u32,
     _columns: *const *mut u32,
     _states: *mut crate::raw::ProgressiveBlake2sState,
     _stream: *mut core::ffi::c_void,
@@ -1284,6 +1285,7 @@ pub unsafe extern "C" fn stwo_blake2s_progressive_expand_on(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stwo_blake2s_progressive_finalize_on(
     _size: u32,
+    _absorbed_columns: u32,
     _states: *const crate::raw::ProgressiveBlake2sState,
     _result: *mut crate::raw::Blake2sHash,
     _stream: *mut core::ffi::c_void,

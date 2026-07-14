@@ -166,9 +166,9 @@ pub use backend::progressive_commit::{
     CanonicalLeafBlock, ProgressiveBlockSegment, ProgressiveColumn, ProgressiveCommitAccounting,
     ProgressiveCommitError, ProgressiveCommitGeometry, ProgressiveCommitGroupGeometry,
     ProgressiveCommitMode, ProgressiveCommitPlan, SameLogLdeBatch, StateExpansion,
-    BLAKE2S_BLOCK_BYTES, PROGRESSIVE_BLAKE2S_COUNTER_OFFSET, PROGRESSIVE_BLAKE2S_FLAGS_OFFSET,
+    BLAKE2S_BLOCK_BYTES, LEGACY_PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES,
     PROGRESSIVE_BLAKE2S_H_OFFSET, PROGRESSIVE_BLAKE2S_PENDING_BLOCK_OFFSET,
-    PROGRESSIVE_BLAKE2S_PENDING_LEN_OFFSET, PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES,
+    PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES,
 };
 pub use backend::proof_assembly::{
     assemble_blake2s_stark_proof, Blake2sFriAssemblyShape, Blake2sProofAssemblyError,

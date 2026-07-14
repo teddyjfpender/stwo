@@ -104,9 +104,11 @@ pub enum ProgressiveLeafLaunchKind {
     Absorb {
         log_size: u32,
         columns: u32,
+        absorbed_columns_before: u32,
     },
     Finalize {
         log_size: u32,
+        absorbed_columns: u32,
     },
 }
 
@@ -404,6 +406,7 @@ impl ProgressiveLeafWorkspaceRequirements {
     pub fn launch_sequence(&self) -> Vec<ProgressiveLeafLaunchKind> {
         let first_log = self.plan.columns[0].evaluation_log_size;
         let mut current_log = first_log;
+        let mut absorbed_columns = 0u32;
         let mut launches = vec![ProgressiveLeafLaunchKind::Init {
             log_size: first_log,
         }];
@@ -424,7 +427,11 @@ impl ProgressiveLeafWorkspaceRequirements {
             launches.push(ProgressiveLeafLaunchKind::Absorb {
                 log_size: current_log,
                 columns,
+                absorbed_columns_before: absorbed_columns,
             });
+            absorbed_columns = absorbed_columns
+                .checked_add(columns)
+                .expect("planner column count fits u32");
         }
         if current_log < self.plan.geometry.lifting_log_size {
             launches.push(ProgressiveLeafLaunchKind::Expand {
@@ -434,6 +441,7 @@ impl ProgressiveLeafWorkspaceRequirements {
         }
         launches.push(ProgressiveLeafLaunchKind::Finalize {
             log_size: self.plan.geometry.lifting_log_size,
+            absorbed_columns,
         });
         launches
     }
@@ -446,6 +454,7 @@ struct PreparedBatch {
     output_ptrs: ArenaSlice,
     log_size: u32,
     columns: u32,
+    absorbed_columns_before: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -468,6 +477,7 @@ enum Launch {
     },
     Finalize {
         log_size: u32,
+        absorbed_columns: u32,
         states: ArenaSlice,
         output: ArenaSlice,
     },
@@ -569,6 +579,7 @@ impl<'a> PreparedProgressiveLeaves<'a> {
         let mut uploads: Vec<(ArenaSlice, HostDescriptor)> = Vec::new();
         let mut external_ids = BTreeSet::from([twiddles.id()]);
         let mut prepared_batches = Vec::with_capacity(requirements.batches.len());
+        let mut absorbed_columns = 0u32;
         for ((batch, batch_requirement), batch_slots) in requirements
             .plan
             .lde_batches
@@ -694,7 +705,14 @@ impl<'a> PreparedProgressiveLeaves<'a> {
                 log_size: batch.evaluation_log_size,
                 columns: u32::try_from(batch.columns.len())
                     .map_err(|_| PreparedProgressiveCommitError::SizeOverflow)?,
+                absorbed_columns_before: absorbed_columns,
             });
+            absorbed_columns = absorbed_columns
+                .checked_add(
+                    u32::try_from(batch.columns.len())
+                        .map_err(|_| PreparedProgressiveCommitError::SizeOverflow)?,
+                )
+                .ok_or(PreparedProgressiveCommitError::SizeOverflow)?;
         }
 
         let mut launches = Vec::new();
@@ -738,6 +756,7 @@ impl<'a> PreparedProgressiveLeaves<'a> {
         }
         launches.push(Launch::Finalize {
             log_size: requirements.plan.geometry.lifting_log_size,
+            absorbed_columns,
             states: current,
             output: leaf_hashes,
         });
@@ -812,6 +831,7 @@ impl<'a> PreparedProgressiveLeaves<'a> {
                         stwo_backend_cuda_kernels::raw::stwo_blake2s_progressive_absorb_on(
                             1u32 << log_size,
                             batch.columns,
+                            batch.absorbed_columns_before,
                             batch.output_ptrs.as_u32_ptr().cast(),
                             states.as_u32_ptr().cast(),
                             stream,
@@ -819,12 +839,14 @@ impl<'a> PreparedProgressiveLeaves<'a> {
                     ),
                     Launch::Finalize {
                         log_size,
+                        absorbed_columns,
                         states,
                         output,
                     } => (
                         "progressive_leaf_finalize",
                         stwo_backend_cuda_kernels::raw::stwo_blake2s_progressive_finalize_on(
                             1u32 << log_size,
+                            absorbed_columns,
                             states.as_u32_ptr().cast(),
                             output.as_u32_ptr().cast(),
                             stream,
@@ -855,8 +877,16 @@ impl<'a> PreparedProgressiveLeaves<'a> {
             } => ProgressiveLeafLaunchKind::Absorb {
                 log_size,
                 columns: batch.columns,
+                absorbed_columns_before: batch.absorbed_columns_before,
             },
-            Launch::Finalize { log_size, .. } => ProgressiveLeafLaunchKind::Finalize { log_size },
+            Launch::Finalize {
+                log_size,
+                absorbed_columns,
+                ..
+            } => ProgressiveLeafLaunchKind::Finalize {
+                log_size,
+                absorbed_columns,
+            },
         })
     }
     pub fn leaf_hashes(&self) -> ArenaSlice {
@@ -1150,7 +1180,8 @@ mod tests {
                 },
                 ProgressiveLeafLaunchKind::Absorb {
                     log_size: 5,
-                    columns: 2
+                    columns: 2,
+                    absorbed_columns_before: 0,
                 },
                 ProgressiveLeafLaunchKind::Expand {
                     from_log_size: 5,
@@ -1162,13 +1193,17 @@ mod tests {
                 },
                 ProgressiveLeafLaunchKind::Absorb {
                     log_size: 7,
-                    columns: 1
+                    columns: 1,
+                    absorbed_columns_before: 2,
                 },
                 ProgressiveLeafLaunchKind::Expand {
                     from_log_size: 7,
                     to_log_size: 8
                 },
-                ProgressiveLeafLaunchKind::Finalize { log_size: 8 },
+                ProgressiveLeafLaunchKind::Finalize {
+                    log_size: 8,
+                    absorbed_columns: 3,
+                },
             ]
         );
     }

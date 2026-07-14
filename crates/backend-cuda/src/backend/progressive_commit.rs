@@ -19,18 +19,18 @@ const PROGRESSIVE_LDE_BATCH_POLICY: &[u8] = b"canonical-same-log-max-scratch-and
 const FIELD_WORD_BYTES: usize = core::mem::size_of::<u32>();
 pub const BLAKE2S_BLOCK_BYTES: usize = 64;
 pub const PROGRESSIVE_BLAKE2S_H_OFFSET: usize = 0;
-pub const PROGRESSIVE_BLAKE2S_COUNTER_OFFSET: usize = 32;
-pub const PROGRESSIVE_BLAKE2S_FLAGS_OFFSET: usize = 40;
-pub const PROGRESSIVE_BLAKE2S_PENDING_BLOCK_OFFSET: usize = 48;
-pub const PROGRESSIVE_BLAKE2S_PENDING_LEN_OFFSET: usize = 112;
-/// Future device ABI stride for one clonable progressive BLAKE2s state:
-/// chaining words (32), byte counter (8), finalization flags (8), pending
-/// block (64), pending length (4), and 12 reserved/alignment bytes. Expansion
-/// must copy the entire 128 bytes; copying only `h[8]` is unsound whenever a
-/// log rise occurs with a pending prefix or after prior compression.
-pub const PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES: usize = 128;
-const _: () =
-    assert!(PROGRESSIVE_BLAKE2S_PENDING_LEN_OFFSET + 4 <= PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES);
+pub const PROGRESSIVE_BLAKE2S_PENDING_BLOCK_OFFSET: usize = 32;
+/// Superseded state stride retained only for exact before/after accounting.
+pub const LEGACY_PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES: usize = 128;
+/// Device ABI stride for one clonable progressive BLAKE2s state. Every row in
+/// one launch has absorbed the same canonical column prefix, so the counter,
+/// pending length, and non-final flags are launch scalars. Only `h[8]` and the
+/// lazy 64-byte final block are row-varying and survive in HBM.
+pub const PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES: usize = 96;
+const _: () = assert!(
+    PROGRESSIVE_BLAKE2S_PENDING_BLOCK_OFFSET + BLAKE2S_BLOCK_BYTES
+        == PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES
+);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[repr(u8)]
@@ -151,7 +151,16 @@ pub struct ProgressiveCommitAccounting {
     pub state_expansion_read_bytes: usize,
     pub state_expansion_write_bytes: usize,
     pub state_expansion_total_bytes: usize,
+    pub state_init_write_bytes: usize,
+    pub state_absorb_read_bytes: usize,
+    pub state_absorb_write_bytes: usize,
+    pub state_finalize_read_bytes: usize,
+    pub state_total_traffic_bytes: usize,
+    pub legacy_state_total_traffic_bytes: usize,
+    pub state_traffic_saved_bytes: usize,
     pub peak_progressive_state_bytes: usize,
+    pub legacy_peak_progressive_state_bytes: usize,
+    pub peak_state_saved_bytes: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -267,6 +276,7 @@ fn canonical_progressive_commit_plan(
             });
         }
     }
+    u32::try_from(columns.len()).map_err(|_| ProgressiveCommitError::SizeOverflow)?;
 
     let mut lde_batches = Vec::new();
     let mut start = 0usize;
@@ -424,29 +434,81 @@ fn canonical_progressive_commit_plan(
     let state_expansion_total_bytes = state_expansion_read_bytes
         .checked_add(state_expansion_write_bytes)
         .ok_or(ProgressiveCommitError::SizeOverflow)?;
-    let initial_state_bytes = pow2(columns[0].evaluation_log_size)?
+    let initial_state_rows = pow2(columns[0].evaluation_log_size)?;
+    let absorb_state_rows = lde_batches.iter().try_fold(0usize, |total, batch| {
+        total
+            .checked_add(pow2(batch.evaluation_log_size)?)
+            .ok_or(ProgressiveCommitError::SizeOverflow)
+    })?;
+    let expansion_state_rows = state_expansions
+        .iter()
+        .try_fold(0usize, |total, expansion| {
+            total
+                .checked_add(expansion.domain.states_after)
+                .ok_or(ProgressiveCommitError::SizeOverflow)
+        })?;
+    let state_init_write_bytes = initial_state_rows
         .checked_mul(PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES)
         .ok_or(ProgressiveCommitError::SizeOverflow)?;
-    let final_state_bytes = leaf_nodes
+    let state_absorb_read_bytes = absorb_state_rows
         .checked_mul(PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES)
+        .ok_or(ProgressiveCommitError::SizeOverflow)?;
+    let state_absorb_write_bytes = state_absorb_read_bytes;
+    let state_finalize_read_bytes = leaf_nodes
+        .checked_mul(PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES)
+        .ok_or(ProgressiveCommitError::SizeOverflow)?;
+    let state_total_traffic_bytes = state_init_write_bytes
+        .checked_add(state_absorb_read_bytes)
+        .and_then(|bytes| bytes.checked_add(state_absorb_write_bytes))
+        .and_then(|bytes| bytes.checked_add(state_expansion_read_bytes))
+        .and_then(|bytes| bytes.checked_add(state_expansion_write_bytes))
+        .and_then(|bytes| bytes.checked_add(state_finalize_read_bytes))
+        .ok_or(ProgressiveCommitError::SizeOverflow)?;
+    let legacy_state_total_traffic_bytes = initial_state_rows
+        .checked_add(
+            absorb_state_rows
+                .checked_mul(2)
+                .ok_or(ProgressiveCommitError::SizeOverflow)?,
+        )
+        .and_then(|rows| rows.checked_add(expansion_state_rows.checked_mul(2)?))
+        .and_then(|rows| rows.checked_add(leaf_nodes))
+        .ok_or(ProgressiveCommitError::SizeOverflow)?
+        .checked_mul(LEGACY_PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES)
+        .ok_or(ProgressiveCommitError::SizeOverflow)?;
+    let state_traffic_saved_bytes = legacy_state_total_traffic_bytes
+        .checked_sub(state_total_traffic_bytes)
         .ok_or(ProgressiveCommitError::SizeOverflow)?;
     // Expansion is explicitly non-aliasing: every parent must remain live
     // until all projected children have been written. No in-place traffic or
     // storage saving is claimed.
-    let peak_progressive_state_bytes = state_expansions.iter().try_fold(
-        initial_state_bytes.max(final_state_bytes),
-        |peak, expansion| {
-            let simultaneous_states = expansion
-                .domain
-                .states_before
-                .checked_add(expansion.domain.states_after)
-                .ok_or(ProgressiveCommitError::SizeOverflow)?;
-            let live_bytes = simultaneous_states
-                .checked_mul(PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES)
-                .ok_or(ProgressiveCommitError::SizeOverflow)?;
-            Ok::<_, ProgressiveCommitError>(peak.max(live_bytes))
-        },
-    )?;
+    let peak_for_stride = |stride: usize| {
+        let initial_state_bytes = initial_state_rows
+            .checked_mul(stride)
+            .ok_or(ProgressiveCommitError::SizeOverflow)?;
+        let final_state_bytes = leaf_nodes
+            .checked_mul(stride)
+            .ok_or(ProgressiveCommitError::SizeOverflow)?;
+        state_expansions.iter().try_fold(
+            initial_state_bytes.max(final_state_bytes),
+            |peak, expansion| {
+                let simultaneous_states = expansion
+                    .domain
+                    .states_before
+                    .checked_add(expansion.domain.states_after)
+                    .ok_or(ProgressiveCommitError::SizeOverflow)?;
+                let live_bytes = simultaneous_states
+                    .checked_mul(stride)
+                    .ok_or(ProgressiveCommitError::SizeOverflow)?;
+                Ok::<_, ProgressiveCommitError>(peak.max(live_bytes))
+            },
+        )
+    };
+    let peak_progressive_state_bytes = peak_for_stride(PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES)?;
+    let legacy_peak_progressive_state_bytes =
+        peak_for_stride(LEGACY_PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES)?;
+    let peak_state_saved_bytes = legacy_peak_progressive_state_bytes
+        .checked_sub(peak_progressive_state_bytes)
+        .ok_or(ProgressiveCommitError::SizeOverflow)?;
     let accounting = ProgressiveCommitAccounting {
         leaf_nodes,
         interior_nodes,
@@ -463,7 +525,16 @@ fn canonical_progressive_commit_plan(
         state_expansion_read_bytes,
         state_expansion_write_bytes,
         state_expansion_total_bytes,
+        state_init_write_bytes,
+        state_absorb_read_bytes,
+        state_absorb_write_bytes,
+        state_finalize_read_bytes,
+        state_total_traffic_bytes,
+        legacy_state_total_traffic_bytes,
+        state_traffic_saved_bytes,
         peak_progressive_state_bytes,
+        legacy_peak_progressive_state_bytes,
+        peak_state_saved_bytes,
     };
     let cache_key = progressive_commit_cache_key(mode, &geometry);
     Ok(ProgressiveCommitPlan {
@@ -558,8 +629,9 @@ pub fn progressive_commit_cache_key(
             hash = hash.wrapping_mul(0x100000001b3);
         }
     };
-    feed(b"stwo-progressive-commit-plan-v3\0");
+    feed(b"stwo-progressive-commit-plan-v4\0");
     feed(PROGRESSIVE_LDE_BATCH_POLICY);
+    feed(&(PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES as u64).to_le_bytes());
     feed(&(PROGRESSIVE_LDE_BATCH_MAX_SCRATCH_COLUMNS as u64).to_le_bytes());
     feed(&(PROGRESSIVE_LDE_BATCH_MAX_TOTAL_COLUMNS as u64).to_le_bytes());
     feed(&[mode as u8]);
@@ -634,15 +706,8 @@ fn blake2s_expansion(
         states_before: pow2(from_log_size)?,
         states_after: pow2(to_log_size)?,
     };
-    let absorbed_bytes_per_state = absorbed_columns
-        .checked_mul(FIELD_WORD_BYTES)
-        .ok_or(ProgressiveCommitError::SizeOverflow)?;
-    let pending_block_prefix_bytes = if absorbed_bytes_per_state == 0 {
-        0
-    } else {
-        (absorbed_bytes_per_state - 1) % BLAKE2S_BLOCK_BYTES + 1
-    };
-    let compressed_byte_counter = absorbed_bytes_per_state - pending_block_prefix_bytes;
+    let (absorbed_bytes_per_state, compressed_byte_counter, pending_block_prefix_bytes) =
+        blake2s_prefix_schedule(absorbed_columns)?;
     let read_traffic_bytes = domain
         .states_after
         .checked_mul(PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES)
@@ -664,6 +729,24 @@ fn blake2s_expansion(
             .checked_add(write_traffic_bytes)
             .ok_or(ProgressiveCommitError::SizeOverflow)?,
     })
+}
+
+fn blake2s_prefix_schedule(
+    absorbed_columns: usize,
+) -> Result<(usize, usize, usize), ProgressiveCommitError> {
+    let absorbed_bytes = absorbed_columns
+        .checked_mul(FIELD_WORD_BYTES)
+        .ok_or(ProgressiveCommitError::SizeOverflow)?;
+    let pending_bytes = if absorbed_bytes == 0 {
+        0
+    } else {
+        (absorbed_bytes - 1) % BLAKE2S_BLOCK_BYTES + 1
+    };
+    Ok((
+        absorbed_bytes,
+        absorbed_bytes - pending_bytes,
+        pending_bytes,
+    ))
 }
 
 fn pow2(log_size: u32) -> Result<usize, ProgressiveCommitError> {
@@ -1114,10 +1197,10 @@ mod tests {
                 absorbed_bytes_per_state: 64,
                 compressed_byte_counter: 0,
                 pending_block_prefix_bytes: 64,
-                device_state_stride_bytes: 128,
-                read_traffic_bytes: 64 * 128,
-                write_traffic_bytes: 64 * 128,
-                total_traffic_bytes: 128 * 128,
+                device_state_stride_bytes: PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES,
+                read_traffic_bytes: 64 * PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES,
+                write_traffic_bytes: 64 * PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES,
+                total_traffic_bytes: 128 * PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES,
             }]
         );
         for row in 0..64 {
@@ -1137,10 +1220,57 @@ mod tests {
         assert_eq!(plan.accounting.interior_compressions, 63);
         assert_eq!(plan.accounting.progressive_total_compressions, 191);
         assert_eq!(plan.accounting.full_lifting_total_compressions, 191);
-        assert_eq!(plan.accounting.state_expansion_read_bytes, 64 * 128);
-        assert_eq!(plan.accounting.state_expansion_write_bytes, 64 * 128);
-        assert_eq!(plan.accounting.state_expansion_total_bytes, 128 * 128);
-        assert_eq!(plan.accounting.peak_progressive_state_bytes, 80 * 128);
+        assert_eq!(
+            plan.accounting.state_expansion_read_bytes,
+            64 * PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES
+        );
+        assert_ne!(
+            plan.accounting.state_expansion_read_bytes,
+            16 * PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES,
+            "output-parallel expansion issues one parent load per destination"
+        );
+        assert_eq!(
+            plan.accounting.state_expansion_write_bytes,
+            64 * PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES
+        );
+        assert_eq!(
+            plan.accounting.state_expansion_total_bytes,
+            128 * PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES
+        );
+        assert_eq!(
+            plan.accounting.state_init_write_bytes,
+            16 * PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES
+        );
+        assert_eq!(
+            plan.accounting.state_absorb_read_bytes,
+            80 * PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES
+        );
+        assert_eq!(
+            plan.accounting.state_absorb_write_bytes,
+            80 * PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES
+        );
+        assert_eq!(
+            plan.accounting.state_finalize_read_bytes,
+            64 * PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES
+        );
+        assert_eq!(
+            plan.accounting.state_total_traffic_bytes,
+            368 * PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES
+        );
+        assert_eq!(
+            plan.accounting.legacy_state_total_traffic_bytes,
+            368 * LEGACY_PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES
+        );
+        assert_eq!(plan.accounting.state_traffic_saved_bytes, 368 * 32);
+        assert_eq!(
+            plan.accounting.peak_progressive_state_bytes,
+            80 * PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES
+        );
+        assert_eq!(
+            plan.accounting.legacy_peak_progressive_state_bytes,
+            80 * LEGACY_PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES
+        );
+        assert_eq!(plan.accounting.peak_state_saved_bytes, 80 * 32);
     }
 
     #[test]
@@ -1178,9 +1308,18 @@ mod tests {
             thirty_two.accounting.full_lifting_total_compressions,
             128 + 63
         );
-        assert_eq!(thirty_two.accounting.state_expansion_read_bytes, 64 * 128);
-        assert_eq!(thirty_two.accounting.state_expansion_write_bytes, 64 * 128);
-        assert_eq!(thirty_two.accounting.peak_progressive_state_bytes, 80 * 128);
+        assert_eq!(
+            thirty_two.accounting.state_expansion_read_bytes,
+            64 * PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES
+        );
+        assert_eq!(
+            thirty_two.accounting.state_expansion_write_bytes,
+            64 * PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES
+        );
+        assert_eq!(
+            thirty_two.accounting.peak_progressive_state_bytes,
+            80 * PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES
+        );
 
         let no_expansion = plan_progressive_commit(
             ProgressiveCommitMode::DomainProgressive,
@@ -1190,7 +1329,7 @@ mod tests {
         assert!(no_expansion.state_expansions.is_empty());
         assert_eq!(
             no_expansion.accounting.peak_progressive_state_bytes,
-            64 * 128
+            64 * PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES
         );
     }
 
@@ -1213,6 +1352,11 @@ mod tests {
                 expansion.compressed_byte_counter + expansion.pending_block_prefix_bytes,
                 column_count * 4
             );
+            let values = evaluations(&plan, remainder as u32 ^ 0xa5a5);
+            let progressive = progressive_leaf_oracle(&plan, &values).unwrap();
+            let full = full_lifting_leaf_oracle(&plan, &values).unwrap();
+            assert_eq!(progressive, full, "final-block remainder {remainder}");
+            assert_eq!(merkle_root(progressive), merkle_root(full));
         }
 
         let adjacent = plan_progressive_commit(
@@ -1225,6 +1369,27 @@ mod tests {
         assert_eq!(adjacent.state_expansions[0].pending_block_prefix_bytes, 4);
         assert_eq!(adjacent.state_expansions[1].absorbed_columns, 2);
         assert_eq!(adjacent.state_expansions[1].pending_block_prefix_bytes, 8);
+    }
+
+    #[test]
+    fn launch_scalar_prefix_schedule_covers_empty_every_remainder_and_u32_max() {
+        assert_eq!(blake2s_prefix_schedule(0).unwrap(), (0, 0, 0));
+        for columns in 1usize..=64 {
+            let (absorbed, compressed, pending) = blake2s_prefix_schedule(columns).unwrap();
+            assert_eq!(absorbed, columns * FIELD_WORD_BYTES);
+            assert_eq!(compressed + pending, absorbed);
+            assert_eq!(pending, ((columns - 1) % 16 + 1) * FIELD_WORD_BYTES);
+            assert_eq!(compressed % BLAKE2S_BLOCK_BYTES, 0);
+        }
+        let columns = u32::MAX as usize;
+        let (absorbed, compressed, pending) = blake2s_prefix_schedule(columns).unwrap();
+        assert_eq!(absorbed, columns * FIELD_WORD_BYTES);
+        assert_eq!(pending, 15 * FIELD_WORD_BYTES);
+        assert_eq!(compressed + pending, absorbed);
+        assert_eq!(
+            blake2s_prefix_schedule(usize::MAX),
+            Err(ProgressiveCommitError::SizeOverflow)
+        );
     }
 
     #[test]

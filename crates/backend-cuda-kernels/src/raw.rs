@@ -45,23 +45,48 @@ pub struct LayerIndexPair {
 pub struct Blake2sHash(pub [u8; 32]);
 
 /// Exact device ABI for a clonable domain-progressive Blake2s leaf state.
+/// Counter and pending length are launch-global canonical-prefix scalars.
 /// Keep in sync with `ProgressiveBlake2sState` in `cuda/blake2s.cuh`.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct ProgressiveBlake2sState {
     pub h: [u32; 8],
-    pub t: [u32; 2],
-    pub f: [u32; 2],
-    pub pending: [u8; 64],
-    pub pending_len: u32,
-    pub reserved: [u8; 12],
+    pub pending: [u32; 16],
 }
 
-const _: () = assert!(core::mem::size_of::<ProgressiveBlake2sState>() == 128);
-const _: () = assert!(core::mem::offset_of!(ProgressiveBlake2sState, t) == 32);
-const _: () = assert!(core::mem::offset_of!(ProgressiveBlake2sState, f) == 40);
-const _: () = assert!(core::mem::offset_of!(ProgressiveBlake2sState, pending) == 48);
-const _: () = assert!(core::mem::offset_of!(ProgressiveBlake2sState, pending_len) == 112);
+const _: () = assert!(core::mem::size_of::<ProgressiveBlake2sState>() == 96);
+const _: () = assert!(core::mem::offset_of!(ProgressiveBlake2sState, pending) == 32);
+
+#[cfg(test)]
+mod progressive_blake2s_state_tests {
+    use super::ProgressiveBlake2sState;
+
+    #[test]
+    fn compact_layout_preserves_legacy_hash_and_pending_words_little_endian() {
+        assert!(cfg!(target_endian = "little"));
+        let h = core::array::from_fn(|index| 0x1020_3040u32.wrapping_add(index as u32));
+        let pending = core::array::from_fn(|index| 0x8090_a0b0u32.wrapping_add(index as u32));
+        let state = ProgressiveBlake2sState { h, pending };
+
+        let mut legacy = [0x5au8; 128];
+        for (index, word) in h.into_iter().enumerate() {
+            legacy[4 * index..4 * index + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        for (index, word) in pending.into_iter().enumerate() {
+            legacy[48 + 4 * index..52 + 4 * index].copy_from_slice(&word.to_le_bytes());
+        }
+
+        assert_eq!(core::mem::size_of_val(&state), 96);
+        assert_eq!(core::mem::offset_of!(ProgressiveBlake2sState, pending), 32);
+        for (index, word) in state.h.into_iter().enumerate() {
+            assert_eq!(word.to_ne_bytes(), legacy[4 * index..4 * index + 4]);
+        }
+        for (index, word) in state.pending.into_iter().enumerate() {
+            assert_eq!(word.to_ne_bytes(), legacy[48 + 4 * index..52 + 4 * index]);
+        }
+        assert_eq!(128 - core::mem::size_of_val(&state), 32);
+    }
+}
 
 /// Process-local provenance counters for generated CUDA kernels. Strict
 /// GPU-native admission requires `aot_misses == runtime_loads ==
@@ -561,6 +586,7 @@ extern "C" {
     pub fn stwo_blake2s_progressive_absorb_on(
         size: u32,
         number_of_columns: u32,
+        absorbed_columns_before: u32,
         columns: *const *mut u32,
         states: *mut ProgressiveBlake2sState,
         stream: *mut core::ffi::c_void,
@@ -574,6 +600,7 @@ extern "C" {
     ) -> i32;
     pub fn stwo_blake2s_progressive_finalize_on(
         size: u32,
+        absorbed_columns: u32,
         states: *const ProgressiveBlake2sState,
         result: *mut Blake2sHash,
         stream: *mut core::ffi::c_void,

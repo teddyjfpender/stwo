@@ -7,26 +7,24 @@
 
 const unsigned int BLOCK_SIZE = 256;
 
-// Clonable state for domain-progressive commitment leaves.  This is a public
-// device ABI: Rust sizes arena ping/pong slots from the same 128-byte stride.
-// A full 64-byte pending block is deliberately retained until another word
-// arrives (or finalize), matching Blake2s' lazy-final-block semantics.
+// Clonable state for domain-progressive commitment leaves. This is a public
+// device ABI: Rust sizes arena ping/pong slots from the same 96-byte stride.
+// Every row in a launch has absorbed the same canonical column prefix, so the
+// counter and pending length are launch scalars. Only the per-row chaining
+// value and lazy final block belong in HBM.
 typedef struct {
     uint32_t h[8];
-    uint32_t t[2];
-    uint32_t f[2];
-    uint8_t pending[64];
-    uint32_t pending_len;
-    uint8_t reserved[12];
+    uint32_t pending[16];
 } ProgressiveBlake2sState;
 
-static_assert(sizeof(ProgressiveBlake2sState) == 128,
-              "progressive Blake2s state ABI must be 128 bytes");
-static_assert(offsetof(ProgressiveBlake2sState, t) == 32, "invalid counter offset");
-static_assert(offsetof(ProgressiveBlake2sState, f) == 40, "invalid flags offset");
-static_assert(offsetof(ProgressiveBlake2sState, pending) == 48, "invalid pending offset");
-static_assert(offsetof(ProgressiveBlake2sState, pending_len) == 112,
-              "invalid pending length offset");
+static_assert(sizeof(ProgressiveBlake2sState) == 96,
+              "progressive Blake2s state ABI must be 96 bytes");
+static_assert(offsetof(ProgressiveBlake2sState, pending) == 32,
+              "invalid pending offset");
+#if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__)
+static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__,
+              "progressive pending words require little-endian CUDA targets");
+#endif
 
 // Shared device primitive for the transcript engine.  It is defined by
 // blake2s.cu so the channel and Merkle paths use one compression
@@ -116,6 +114,7 @@ extern "C"
 int stwo_blake2s_progressive_absorb_on(
     uint32_t size,
     uint32_t number_of_columns,
+    uint32_t absorbed_columns_before,
     uint32_t **columns,
     ProgressiveBlake2sState *states,
     void *stream);
@@ -129,6 +128,7 @@ int stwo_blake2s_progressive_expand_on(
 extern "C"
 int stwo_blake2s_progressive_finalize_on(
     uint32_t size,
+    uint32_t absorbed_columns,
     const ProgressiveBlake2sState *states,
     Blake2sHash *result,
     void *stream);

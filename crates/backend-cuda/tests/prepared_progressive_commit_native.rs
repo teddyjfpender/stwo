@@ -7,7 +7,7 @@
 
 use stwo::core::fields::m31::BaseField;
 use stwo::core::poly::circle::CanonicCoset;
-use stwo::core::vcs::blake2_hash::Blake2sHash;
+use stwo::core::vcs::blake2_hash::{Blake2sHash, Blake2sHasherGeneric};
 use stwo::prover::backend::CpuBackend;
 use stwo::prover::poly::circle::{CircleCoefficients, PolyOps};
 use stwo_backend_cuda::{
@@ -463,4 +463,59 @@ fn progressive_lazy_block_boundaries_rises_retention_and_replay_match_cpu() {
         .map(|column| (8..41).contains(&column))
         .collect::<Vec<_>>();
     run_boundary_case(49, None, &retained, &[49], 16 * (1 << 4));
+}
+
+#[test]
+fn empty_message_finalize_matches_conventional_blake2s() {
+    const STATE: ArenaSlotId = ArenaSlotId(1);
+    const HASH: ArenaSlotId = ArenaSlotId(2);
+    let state_words =
+        core::mem::size_of::<stwo_backend_cuda_kernels::raw::ProgressiveBlake2sState>()
+            / core::mem::size_of::<u32>();
+    let layout = ArenaLayout::new(
+        state_words + 8,
+        &[
+            ArenaSlotSpec {
+                id: STATE,
+                offset_words: 0,
+                len_words: state_words,
+                alignment_words: 1,
+            },
+            ArenaSlotSpec {
+                id: HASH,
+                offset_words: state_words,
+                len_words: 8,
+                alignment_words: 1,
+            },
+        ],
+    )
+    .unwrap();
+    let arena = DeviceArena::new(CudaExecContext::new().unwrap(), layout).unwrap();
+    let stream = arena.context().stream_raw().as_ptr();
+    let state = arena.bind(STATE).unwrap();
+    let hash = arena.bind(HASH).unwrap();
+    unsafe {
+        assert_eq!(
+            stwo_backend_cuda_kernels::raw::stwo_blake2s_progressive_init_on(
+                1,
+                state.as_u32_ptr().cast(),
+                stream,
+            ),
+            0
+        );
+        assert_eq!(
+            stwo_backend_cuda_kernels::raw::stwo_blake2s_progressive_finalize_on(
+                1,
+                0,
+                state.as_u32_ptr().cast(),
+                hash.as_u32_ptr().cast(),
+                stream,
+            ),
+            0
+        );
+    }
+    assert_eq!(
+        read_hashes(&arena, hash),
+        vec![Blake2sHasherGeneric::<false>::default().finalize()]
+    );
 }
