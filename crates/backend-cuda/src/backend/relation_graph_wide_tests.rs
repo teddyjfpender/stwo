@@ -17,7 +17,7 @@ fn lookup_use(tuple_words: u32) -> RelationUseDescriptor {
 }
 
 #[test]
-fn audited_sn_wide_shapes_retire_the_exact_sn3_denominator_slab() {
+fn audited_generated_wide_shapes_enter_the_one_read_lane() {
     // Machine-generated `stwo-cairo/.../relation_table.rs` for relation graph
     // 0x73963831c53df4a2 contains exactly these >32-word uses. Keep component
     // labels so regeneration drift becomes an explicit coverage review.
@@ -81,25 +81,6 @@ fn audited_sn_wide_shapes_retire_the_exact_sn3_denominator_slab() {
             .iter()
             .all(|instance| instance.denominator_words == 1),
         "every audited generated-wide instance must use a sentinel, not a slab"
-    );
-
-    // Sealed SN3 preflight facts for this graph: 928 B of claimed sums and
-    // 2,552 B of 11-word geometry independently prove 58 relation instances.
-    // Compact fused mode retains one 4-byte sentinel per instance.
-    const SN3_RELATION_CLAIMED_SUM_BYTES: usize = 928;
-    const SN3_RELATION_FRACTION_GEOMETRY_BYTES: usize = 2_552;
-    const SN3_LEGACY_DENOMINATOR_BYTES: usize = 4_226_842_816;
-    let claimed_sum_instances = SN3_RELATION_CLAIMED_SUM_BYTES / (SECURE_FIELD_WORDS * WORD_BYTES);
-    let geometry_instances =
-        SN3_RELATION_FRACTION_GEOMETRY_BYTES / (INSTANCE_GEOMETRY_WORDS * WORD_BYTES);
-    assert_eq!(claimed_sum_instances, 58);
-    assert_eq!(geometry_instances, claimed_sum_instances);
-    let compact_denominator_bytes = claimed_sum_instances * WORD_BYTES;
-    assert_eq!(compact_denominator_bytes, 232);
-    assert_eq!(
-        SN3_LEGACY_DENOMINATOR_BYTES - compact_denominator_bytes,
-        4_226_842_584,
-        "exact SN3 bytes retired"
     );
 }
 
