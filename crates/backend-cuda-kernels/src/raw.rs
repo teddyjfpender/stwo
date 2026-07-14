@@ -1735,6 +1735,25 @@ extern "C" {
         stream: *mut core::ffi::c_void,
     ) -> bool;
 
+    /// Strict-AOT two-phase witness launch. Resolves both cached phase functions
+    /// before enqueueing phase 0 then phase 1 on the same stream. `phase_scratch`
+    /// may be null only for a plan whose generated kernels never dereference it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stwo_cuda_jit_witness_phase_pair_launch(
+        kernel_names: *const *const core::ffi::c_char,
+        cache_keys: *const u64,
+        input_cols: *const *const u32,
+        table_bases: *const *const u32,
+        table_strides: *const u32,
+        out_cols: *const *mut u32,
+        mult_counts: *const *mut u32,
+        lookup_words: *mut u32,
+        sub_words: *mut u32,
+        phase_scratch: *mut u32,
+        row_count: u32,
+        stream: *mut core::ffi::c_void,
+    ) -> bool;
+
     // Stage B′ fan-out primitives (see cuda_mem_pool.cu). `stwo_fanout_stream`
     // returns pool stream `i` (round-robin) as an opaque handle; `fork`/`join`
     // are the thread-safe (fresh-event) bridges around a lane's stream work.

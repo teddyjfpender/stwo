@@ -2335,6 +2335,25 @@ pub unsafe extern "C" fn stwo_cuda_jit_witness_launch(
 }
 
 #[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn stwo_cuda_jit_witness_phase_pair_launch(
+    _kernel_names: *const *const core::ffi::c_char,
+    _cache_keys: *const u64,
+    _input_cols: *const *const u32,
+    _table_bases: *const *const u32,
+    _table_strides: *const u32,
+    _out_cols: *const *mut u32,
+    _mult_counts: *const *mut u32,
+    _lookup_words: *mut u32,
+    _sub_words: *mut u32,
+    _phase_scratch: *mut u32,
+    _row_count: u32,
+    _stream: *mut core::ffi::c_void,
+) -> bool {
+    no_cuda_symbol("stwo_cuda_jit_witness_phase_pair_launch")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stwo_fanout_stream(_i: i32) -> *mut core::ffi::c_void {
     no_cuda_symbol("stwo_fanout_stream")
 }

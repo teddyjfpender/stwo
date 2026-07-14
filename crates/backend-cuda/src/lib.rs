@@ -135,10 +135,11 @@ pub use backend::prepared_quotient_numerator::{
     QUOTIENT_NUMERATOR_POINTER_ALIGNMENT_WORDS,
 };
 pub use backend::prepared_witness::{
-    blake_g_fusion_program_is_exact, witness_workspace_requirements, PreparedWitnessError,
-    PreparedWitnessGraph, PreparedWitnessLaunchTelemetry, PreparedWitnessMode,
-    WitnessArenaSlotRequirement, WitnessKernelIdentity, WitnessWorkspaceRequirements,
-    WitnessWorkspaceSlots, WITNESS_POINTER_ALIGNMENT_WORDS,
+    blake_g_fusion_program_is_exact, phase_scratch_words, witness_workspace_requirements,
+    PreparedWitnessError, PreparedWitnessGraph, PreparedWitnessLaunchTelemetry,
+    PreparedWitnessMode, PreparedWitnessPhaseProgram, WitnessArenaSlotRequirement,
+    WitnessKernelIdentity, WitnessWorkspaceRequirements, WitnessWorkspaceSlots,
+    WITNESS_POINTER_ALIGNMENT_WORDS,
 };
 pub use backend::prepared_witness_feed::{
     clear_witness_feed_destinations_once, witness_feed_clear_workspace_requirements,

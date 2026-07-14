@@ -296,8 +296,64 @@ pub fn witness_kernel_source(
     })
 }
 
+/// Source-free identity of one kernel in a canonical two-phase witness plan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WitnessPhaseKernelBinding {
+    pub ordinal: u32,
+    pub kernel_name: String,
+    pub cache_key: u64,
+}
+
+/// Exact runtime binding for a canonical two-phase witness plan.
+///
+/// This deliberately carries no CUDA source: the prepared phase runtime is
+/// strict-AOT-only and must resolve both cache keys from the embedded pack
+/// before either phase can be launched.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WitnessPhaseProgramBindings {
+    pub parent_semantic_hash: u64,
+    pub plan_hash: u64,
+    pub scratch_words_per_row: u32,
+    pub phases: [WitnessPhaseKernelBinding; 2],
+}
+
+/// Bind a plan only when it is the exact canonical plan for this program and
+/// cut. Forged or stale hashes, boundary sources, and moved-store schedules all
+/// fail before an AOT lookup or device side effect.
+pub fn witness_phase_program_bindings(
+    program: &super::jit_witness::isa::WitnessProgram,
+    plan: &super::jit_witness::codegen::phase_plan::WitnessPhasePlan,
+) -> Option<WitnessPhaseProgramBindings> {
+    let canonical = super::jit_witness::codegen::phase_plan::WitnessPhasePlan::at_cut(
+        program,
+        plan.cut_instruction,
+    )
+    .ok()?;
+    if canonical != *plan {
+        return None;
+    }
+    let phases = std::array::from_fn(|ordinal| {
+        let ordinal = ordinal as u32;
+        WitnessPhaseKernelBinding {
+            ordinal,
+            kernel_name: plan.phase_kernel_name(ordinal),
+            cache_key: plan.phase_cache_key(ordinal),
+        }
+    });
+    Some(WitnessPhaseProgramBindings {
+        parent_semantic_hash: plan.parent_semantic_hash,
+        plan_hash: plan.plan_hash,
+        scratch_words_per_row: plan.scratch_words_per_row,
+        phases,
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    use super::super::jit_witness::codegen::phase_plan::WitnessPhasePlan;
+    use super::super::jit_witness::recording::WitnessRecorder;
+    use super::*;
+
     #[derive(Default)]
     struct AdmissionModel {
         active: usize,
@@ -367,5 +423,32 @@ mod tests {
                 "closure step {close_before_step}"
             );
         }
+    }
+
+    #[test]
+    fn phase_bindings_are_canonical_source_free_identities() {
+        let mut recorder = WitnessRecorder::new("aot_phase_bindings");
+        let input = recorder.input(0);
+        let constant = recorder.constant(7);
+        let crossing = recorder.m31_add(input, constant);
+        let output = recorder.m31_mul(crossing, input);
+        recorder.col_write(0, output);
+        let program = recorder.finish();
+        let plan = WitnessPhasePlan::at_cut(&program, 3).unwrap();
+
+        let bindings = witness_phase_program_bindings(&program, &plan).unwrap();
+        assert_eq!(bindings.parent_semantic_hash, program.semantic_hash());
+        assert_eq!(bindings.plan_hash, plan.plan_hash);
+        assert_eq!(bindings.scratch_words_per_row, plan.scratch_words_per_row);
+        for (ordinal, phase) in bindings.phases.iter().enumerate() {
+            let ordinal = ordinal as u32;
+            assert_eq!(phase.ordinal, ordinal);
+            assert_eq!(phase.kernel_name, plan.phase_kernel_name(ordinal));
+            assert_eq!(phase.cache_key, plan.phase_cache_key(ordinal));
+        }
+
+        let mut forged = plan.clone();
+        forged.plan_hash ^= 1;
+        assert!(witness_phase_program_bindings(&program, &forged).is_none());
     }
 }

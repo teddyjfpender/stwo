@@ -21,6 +21,9 @@ use super::jit_witness::isa::{WitnessOp, WitnessProgram};
 use super::prepared_execution_tables::PreparedExecutionTablesView;
 use super::{aot, jit_witness};
 
+mod phase_program;
+pub use phase_program::{phase_scratch_words, PreparedWitnessPhaseProgram};
+
 const WORD_BYTES: usize = core::mem::size_of::<u32>();
 const POINTER_WORDS: usize = core::mem::size_of::<*mut u32>().div_ceil(WORD_BYTES);
 const EXECUTION_TABLE_POINTERS: usize = 37;
@@ -184,6 +187,11 @@ impl PreparedWitnessLaunchTelemetry {
         d2d_bytes: 0,
         sync_calls: 0,
         memset_bytes: 0,
+    };
+
+    const PHASE_PAIR: Self = Self {
+        kernel_launches: 2,
+        ..Self::KERNEL
     };
 
     fn clear(bytes: u64) -> Self {
@@ -447,6 +455,15 @@ pub enum PreparedWitnessError {
     CodegenFailed(String),
     InvalidKernelString,
     EmptyAotManifest,
+    PhasePlanMismatch,
+    PhaseProgramMismatch,
+    PhaseRequiresStrictAot,
+    PhaseScratchMissing {
+        required_words: usize,
+    },
+    PhaseScratchUnexpected(ArenaSlotId),
+    PhaseAotPreparationFailed([WitnessKernelIdentity; 2]),
+    PhaseKernelLaunchFailed([WitnessKernelIdentity; 2]),
     StrictAotUnavailable(WitnessKernelIdentity),
     KernelPreparationFailed(WitnessKernelIdentity),
     KernelLaunchFailed(WitnessKernelIdentity),

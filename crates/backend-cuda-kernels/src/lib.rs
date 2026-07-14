@@ -46,6 +46,26 @@ mod tests {
         assert_ne!(raw::stwo_preprocessed_gen_range_checked as usize, 0);
         assert_ne!(raw::stwo_preprocessed_gen_xor_checked as usize, 0);
         assert_ne!(raw::stwo_preprocessed_stream_sync_checked as usize, 0);
+        assert_ne!(raw::stwo_cuda_jit_witness_phase_pair_launch as usize, 0);
+    }
+
+    #[test]
+    fn witness_phase_pair_abi_is_scratch_explicit() {
+        type PhasePairFn = unsafe extern "C" fn(
+            *const *const core::ffi::c_char,
+            *const u64,
+            *const *const u32,
+            *const *const u32,
+            *const u32,
+            *const *mut u32,
+            *const *mut u32,
+            *mut u32,
+            *mut u32,
+            *mut u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> bool;
+        let _: PhasePairFn = raw::stwo_cuda_jit_witness_phase_pair_launch;
     }
 
     #[test]

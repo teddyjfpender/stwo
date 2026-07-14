@@ -1121,3 +1121,56 @@ extern "C" bool stwo_cuda_jit_witness_launch(
     }
     return true;
 }
+
+// Strict-AOT two-phase witness launch. Both functions are resolved before the
+// first output-mutating enqueue, then phase 0 and phase 1 are submitted to the
+// same stream. The ordinary monolithic launch ABI above remains unchanged.
+extern "C" bool stwo_cuda_jit_witness_phase_pair_launch(
+    const char *const *kernel_names,
+    const uint64_t *cache_keys,
+    const uint32_t *const *input_cols,
+    const uint32_t *const *table_bases,
+    const uint32_t *table_strides,
+    uint32_t *const *out_cols,
+    uint32_t *const *mult_counts,
+    uint32_t *lookup_words,
+    uint32_t *sub_words,
+    uint32_t *phase_scratch,
+    uint32_t row_count,
+    void *stream
+) {
+    if (!require_aot().load(std::memory_order_acquire) || kernel_names == nullptr ||
+        cache_keys == nullptr || kernel_names[0] == nullptr || kernel_names[1] == nullptr) {
+        return false;
+    }
+
+    JitOperationAdmission launch_admission;
+    CUfunction functions[2] = {nullptr, nullptr};
+    for (unsigned phase = 0; phase < 2; ++phase) {
+        // Null source plus strict admission forbids disk PTX and NVRTC. Module
+        // loading uses the same get_or_compile path for both phases, including
+        // identical per-module witness table-global configuration.
+        if (!get_or_compile(nullptr, kernel_names[phase], cache_keys[phase], false,
+                            &functions[phase])) {
+            return false;
+        }
+    }
+
+    if (row_count == 0) return true;
+    void *args[] = {
+        (void *)&input_cols,    (void *)&table_bases,  (void *)&table_strides,
+        (void *)&out_cols,      (void *)&mult_counts,  (void *)&lookup_words,
+        (void *)&sub_words,     (void *)&phase_scratch, (void *)&row_count,
+    };
+    const unsigned block = 256;
+    const unsigned grid = 1u + (row_count - 1u) / block;
+    for (unsigned phase = 0; phase < 2; ++phase) {
+        if (cuLaunchKernel(functions[phase], grid, 1, 1, block, 1, 1, 0,
+                           (CUstream)stream, args, nullptr) != CUDA_SUCCESS) {
+            fprintf(stderr, "stwo witness phase: cuLaunchKernel failed for %s\n",
+                    kernel_names[phase]);
+            return false;
+        }
+    }
+    return true;
+}
