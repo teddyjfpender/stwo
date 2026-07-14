@@ -86,11 +86,11 @@ def _bounded_text(value: Any, label: str, maximum: int) -> str:
     return value
 
 
-def _absolute_path(value: Any, label: str, *, allow_root: bool = False) -> str:
+def _absolute_path(value: Any, label: str) -> str:
     path = _bounded_text(value, label, MAX_PATH_CHARS)
     require(path.isascii() and "\\" not in path, f"{label} must be printable ASCII without backslashes")
     parsed = PurePosixPath(path)
-    require(parsed.is_absolute() and (allow_root or path != "/"), f"{label} must be absolute")
+    require(parsed.is_absolute() and path != "/", f"{label} must be absolute")
     require(str(parsed) == path and not path.startswith("//"), f"{label} is not canonical")
     require(all(part not in {"", ".", ".."} for part in parsed.parts[1:]),
             f"{label} contains an ambiguous component")
@@ -287,10 +287,8 @@ def _validate_execution_contract(
             and value["shell"] is False and value["stdin"] == "devnull",
             "PIE adapter direct-execution contract differs")
     bindings = _bindings(value["bindings"], artifacts, output)
-    expected_parent = str(PurePosixPath(output["path"]).parent)
-    _absolute_path(value["working_directory"], "PIE adapter working directory", allow_root=True)
-    require(value["working_directory"] == expected_parent,
-            "PIE adapter working directory differs from the output parent")
+    require(value["working_directory"] == "/",
+            "PIE adapter working directory is not the fixed filesystem root")
     require(value["argv"] == _expected_argv(bindings), "PIE adapter argv differs")
     require(value["environment"] == _expected_environment(bindings),
             "PIE adapter environment differs")

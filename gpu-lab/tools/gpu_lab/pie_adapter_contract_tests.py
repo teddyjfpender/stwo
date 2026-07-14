@@ -168,7 +168,7 @@ def _record() -> dict[str, Any]:
             "contract": "linux-retained-descriptor-exec-v1",
             "shell": False,
             "stdin": "devnull",
-            "working_directory": "/sealed",
+            "working_directory": "/",
             "argv": [
                 bindings["adapter_executable"]["proc_path"], "--pie",
                 bindings["source_pie"]["proc_path"], "--backend", "simd",
@@ -329,8 +329,7 @@ def test_execution_record_contract() -> None:
     _mutate_record("oversized debug executable", lambda value: value[
         "adapter_executable"].__setitem__("byte_length", 268435457))
     _mutate_record("false execution attestation", lambda value: value.__setitem__(
-        "adapter_execution_attested", False
-    ))
+        "adapter_execution_attested", False))
     _mutate_record("false exact equality", lambda value: value.__setitem__("exact_byte_equal", False))
     _mutate_record("bootloader invocation mismatch", lambda value: value[
         "invocation_contract"]["bootloader_program"].__setitem__("sha256", _digest("other")))
@@ -391,6 +390,7 @@ def test_raw_manifest_trust() -> None:
 
 def test_authenticated_execution_fields() -> None:
     _mutate_record("shell execution", lambda value: _contract(value).__setitem__("shell", True))
+    _mutate_record("non-root cwd", lambda value: _contract(value).__setitem__("working_directory", "/sealed"))
     _mutate_record("argv injection", lambda value: _contract(value)["argv"].append("--prove"))
     _mutate_record("environment injection", lambda value: _contract(value)[
         "environment"].__setitem__("LD_PRELOAD", "/tmp/inject.so"))
@@ -476,6 +476,7 @@ def test_schema_documents() -> None:
     for label, mutate in (
         ("nonempty stdout", lambda value: _contract(value)["stdout"].update(
             {"byte_length": 1, "sha256": _digest("stdout")})),
+        ("non-root cwd", lambda value: _contract(value).__setitem__("working_directory", "/sealed")),
         ("relative source trailing slash", lambda value: value[
             "replay_tool_source_closure"]["sources"][0].__setitem__("path", "tools/")),
         ("over-3072-byte path", lambda value: value[

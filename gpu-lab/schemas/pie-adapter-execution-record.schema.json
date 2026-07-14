@@ -131,12 +131,6 @@
       "maxLength": 2048,
       "pattern": "^/(?!/)(?!.*//)(?!.*\\\\)(?!.*(?:/\\.{1,2})(?:/|$))(?!.*\\/$)[\\u0020-\\u007e]+$"
     },
-    "working_directory": {
-      "oneOf": [
-        {"const": "/"},
-        {"$ref": "#/$defs/artifact_path"}
-      ]
-    },
     "relative_path": {
       "type": "string",
       "minLength": 1,
@@ -397,7 +391,7 @@
         "contract": {"const": "linux-retained-descriptor-exec-v1"},
         "shell": {"const": false},
         "stdin": {"const": "devnull"},
-        "working_directory": {"$ref": "#/$defs/working_directory"},
+        "working_directory": {"const": "/"},
         "argv": {
           "type": "array",
           "minItems": 8,
