@@ -21,6 +21,7 @@ const COLUMN_A: ArenaSlotId = ArenaSlotId(50_001);
 const COLUMN_B: ArenaSlotId = ArenaSlotId(50_002);
 const COLUMN_C: ArenaSlotId = ArenaSlotId(50_003);
 const COLUMN_D: ArenaSlotId = ArenaSlotId(50_004);
+const COLUMN_E: ArenaSlotId = ArenaSlotId(50_005);
 
 fn workspace_slots() -> OodsWorkspaceSlots {
     OodsWorkspaceSlots {
@@ -67,6 +68,11 @@ fn arena(requirements: &OodsWorkspaceRequirements, slots: &OodsWorkspaceSlots) -
         OodsArenaSlotRequirement {
             id: COLUMN_D,
             len_words: 1 << 4,
+            alignment_words: 1,
+        },
+        OodsArenaSlotRequirement {
+            id: COLUMN_E,
+            len_words: 1 << 7,
             alignment_words: 1,
         },
     ]);
@@ -154,17 +160,17 @@ fn random_circle_point(parameter: SecureField) -> CirclePoint<SecureField> {
 
 fn expected(
     config: OodsWorkspaceConfig,
-    log_blowup_factor: u32,
     parameter: SecureField,
-    columns: &[(&[u32], u32, &[isize], bool)],
+    columns: &[(&[u32], u32, u32, &[isize])],
 ) -> (Vec<CirclePoint<SecureField>>, Vec<SecureField>) {
     let base = random_circle_point(parameter);
     let step = CanonicCoset::new(config.mask_log_size).step();
     let mut points = Vec::new();
     let mut values = Vec::new();
-    for &(words, log_size, offsets, is_evaluation_source) in columns {
+    for &(words, coefficient_log_size, evaluation_log_size, offsets) in columns {
         // Coefficient sources use CircleCoefficients' FFT basis in bit-reversed
         // order; they are neither monomial coefficients nor domain evaluations.
+        assert_eq!(words.len(), 1 << coefficient_log_size);
         let poly = CpuCirclePoly::new(
             words
                 .iter()
@@ -174,8 +180,6 @@ fn expected(
         );
         for &offset in offsets {
             let point = base + step.mul_signed(offset).into_ef();
-            let evaluation_log_size =
-                log_size + u32::from(!is_evaluation_source) * log_blowup_factor;
             points.push(point);
             values.push(poly.eval_at_point(
                 point.repeated_double(config.lifting_log_size - evaluation_log_size),
@@ -187,8 +191,6 @@ fn expected(
 
 #[test]
 fn exact_points_values_log4_lifting24_and_capture_replay() {
-    const LOG_BLOWUP_FACTOR: u32 = 1;
-
     let config = OodsWorkspaceConfig {
         lifting_log_size: 24,
         mask_log_size: 9,
@@ -202,6 +204,7 @@ fn exact_points_values_log4_lifting24_and_capture_replay() {
         OodsColumnTopology::coefficient_signed_offsets(6, 7, &offsets_a),
         OodsColumnTopology::coefficient_signed_offsets(11, 12, &offsets_b),
         OodsColumnTopology::evaluation_signed_offsets(8, &offsets_c),
+        OodsColumnTopology::evaluation_signed_offsets(7, &offsets_a),
     ];
     let requirements = oods_workspace_requirements(config, &topology).unwrap();
     let slots = workspace_slots();
@@ -226,10 +229,23 @@ fn exact_points_values_log4_lifting24_and_capture_replay() {
     .into_iter()
     .map(|value| value.0)
     .collect();
+    let host_a_evaluations: Vec<u32> = CpuCirclePoly::new(
+        host_a
+            .iter()
+            .copied()
+            .map(BaseField::from_u32_unchecked)
+            .collect(),
+    )
+    .evaluate(CanonicCoset::new(7).circle_domain())
+    .values
+    .into_iter()
+    .map(|value| value.0)
+    .collect();
     upload_words(&arena, COLUMN_D, &host_d);
     upload_words(&arena, COLUMN_A, &host_a);
     upload_words(&arena, COLUMN_B, &host_b);
     upload_words(&arena, COLUMN_C, &host_c_evaluations);
+    upload_words(&arena, COLUMN_E, &host_a_evaluations);
     arena.context().sync().unwrap();
 
     let prepared = PreparedOodsGraph::prepare_mixed(
@@ -252,6 +268,10 @@ fn exact_points_values_log4_lifting24_and_capture_replay() {
                 source: OodsColumnSource::Evaluations(arena.bind(COLUMN_C).unwrap()),
                 topology: topology[3],
             },
+            OodsPolynomialColumn {
+                source: OodsColumnSource::Evaluations(arena.bind(COLUMN_E).unwrap()),
+                topology: topology[4],
+            },
         ],
         arena.bind(PARAMETER).unwrap(),
         &slots,
@@ -263,22 +283,37 @@ fn exact_points_values_log4_lifting24_and_capture_replay() {
     prepared.launch().unwrap();
     let (first_points, first_values) = expected(
         config,
-        LOG_BLOWUP_FACTOR,
         first_parameter,
         &[
-            (&host_d, 4, &offsets_d, false),
-            (&host_a, 6, &offsets_a, false),
-            (&host_b, 11, &offsets_b, false),
-            (&host_c_coefficients, 8, &offsets_c, true),
+            (&host_d, 4, 5, &offsets_d),
+            (&host_a, 6, 7, &offsets_a),
+            (&host_b, 11, 12, &offsets_b),
+            (&host_c_coefficients, 8, 8, &offsets_c),
+            (&host_a, 6, 7, &offsets_a),
         ],
     );
+    let first_actual_points = read_points(&arena, slots.sample_points, requirements.sample_count);
+    let first_actual_values =
+        read_secure_fields(&arena, slots.sampled_values, requirements.sample_count);
+    assert_eq!(first_actual_points, first_points);
+    assert_eq!(first_actual_values, first_values);
+    let coefficient_range = requirements.column_ranges[1];
+    let evaluation_range = requirements.column_ranges[4];
     assert_eq!(
-        read_points(&arena, slots.sample_points, requirements.sample_count),
-        first_points
+        coefficient_range.sample_count,
+        evaluation_range.sample_count
     );
     assert_eq!(
-        read_secure_fields(&arena, slots.sampled_values, requirements.sample_count),
-        first_values
+        &first_actual_points[coefficient_range.first_sample
+            ..coefficient_range.first_sample + coefficient_range.sample_count],
+        &first_actual_points[evaluation_range.first_sample
+            ..evaluation_range.first_sample + evaluation_range.sample_count]
+    );
+    assert_eq!(
+        &first_actual_values[coefficient_range.first_sample
+            ..coefficient_range.first_sample + coefficient_range.sample_count],
+        &first_actual_values[evaluation_range.first_sample
+            ..evaluation_range.first_sample + evaluation_range.sample_count]
     );
 
     let capture = arena.context().capture().unwrap();
@@ -289,13 +324,13 @@ fn exact_points_values_log4_lifting24_and_capture_replay() {
     graph.launch(arena.context()).unwrap();
     let (second_points, second_values) = expected(
         config,
-        LOG_BLOWUP_FACTOR,
         second_parameter,
         &[
-            (&host_d, 4, &offsets_d, false),
-            (&host_a, 6, &offsets_a, false),
-            (&host_b, 11, &offsets_b, false),
-            (&host_c_coefficients, 8, &offsets_c, true),
+            (&host_d, 4, 5, &offsets_d),
+            (&host_a, 6, 7, &offsets_a),
+            (&host_b, 11, 12, &offsets_b),
+            (&host_c_coefficients, 8, 8, &offsets_c),
+            (&host_a, 6, 7, &offsets_a),
         ],
     );
     assert_eq!(
