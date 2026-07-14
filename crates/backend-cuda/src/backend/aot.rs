@@ -90,6 +90,61 @@ pub struct EmittedConstraintProgram {
     pub ext_param_values: Vec<SecureField>,
 }
 
+/// Source-free identity and proof-varying parameter values for one already
+/// installed constraint program. Warm executables use this path to prove that
+/// the current evaluator still lowers to the installed kernel set without
+/// formatting or allocating CUDA source again.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConstraintProgramBindings {
+    pub kernels: Vec<ConstraintKernelBinding>,
+    pub base_param_values: Vec<BaseField>,
+    pub ext_param_values: Vec<SecureField>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConstraintKernelBinding {
+    pub cache_key: u64,
+    pub semantic_hash: u64,
+    pub rc_base: u32,
+}
+
+/// Record and lower only far enough to bind an installed AOT program. Unlike
+/// [`constraint_program`], this deliberately performs no CUDA code generation.
+pub fn constraint_program_bindings<F: FrameworkEval>(
+    eval: &F,
+    n_interactions: u32,
+    claimed_sum: SecureField,
+    log_size: u32,
+    max_kernel_instrs: usize,
+) -> Option<ConstraintProgramBindings> {
+    let (parts, base_param_values, ext_param_values) = lower_framework_eval_to_v1_split(
+        eval,
+        n_interactions,
+        0,
+        0,
+        claimed_sum,
+        log_size,
+        max_kernel_instrs,
+    )
+    .ok()?;
+    let kernels = parts
+        .iter()
+        .map(|part| {
+            let semantic_hash = part.program.header().semantic_hash;
+            ConstraintKernelBinding {
+                cache_key: cuda_codegen::jit_cache_key(semantic_hash),
+                semantic_hash,
+                rc_base: part.rc_base,
+            }
+        })
+        .collect();
+    Some(ConstraintProgramBindings {
+        kernels,
+        base_param_values,
+        ext_param_values,
+    })
+}
+
 /// Emit the complete prepared-program description for one concrete component.
 /// This is the source of truth shared by offline AOT generation and the resident
 /// composition planner; neither side may reconstruct split offsets or parameter
