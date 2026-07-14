@@ -1,0 +1,32 @@
+#!/usr/bin/env python3
+"""Execute one authenticated GPU-free PIE adapter replay."""
+
+import argparse
+import subprocess
+import sys
+from pathlib import Path
+
+from gpu_lab.pie_adapter_contract import ARTIFACT_SPECS
+from gpu_lab.pie_adapter_execution import execute
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    for role in ARTIFACT_SPECS:
+        option = role.replace("_", "-")
+        parser.add_argument(f"--{option}", type=Path, required=True)
+        parser.add_argument(f"--{option}-sha256", dest=f"{role}_sha256", required=True)
+    parser.add_argument("--observed-prover-input", type=Path, required=True)
+    parser.add_argument("--record", type=Path, required=True)
+    args = parser.parse_args()
+    try:
+        execute(args)
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        print(f"pie-adapter-replay: FAIL: {error}", file=sys.stderr)
+        return 2
+    print(f"PIE_ADAPTER_REPLAY=PASS record={args.record} production_admissible=false")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
