@@ -7,21 +7,31 @@ import sys
 from pathlib import Path
 
 from gpu_lab.pie_adapter_receipt import generate, validate_files
+from gpu_lab.pie_adapter_source_closure import generate_source_closure
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("generate", "validate"))
+    parser.add_argument("command", choices=("generate-source", "generate", "validate"))
     parser.add_argument("--inventory", required=True, type=Path)
     parser.add_argument("--inventory-sha256", required=True,
                         help="out-of-band SHA-256 of the exact inventory file bytes")
     parser.add_argument("--source-closure", required=True, type=Path)
-    parser.add_argument("--build-receipt", required=True, type=Path)
+    parser.add_argument("--build-receipt", type=Path)
     args = parser.parse_args()
-    operation = generate if args.command == "generate" else validate_files
     try:
-        operation(args.inventory, args.inventory_sha256,
-                  args.source_closure, args.build_receipt)
+        if args.command == "generate-source":
+            if args.build_receipt is not None:
+                parser.error("--build-receipt is invalid with generate-source")
+            generate_source_closure(
+                args.inventory, args.inventory_sha256, args.source_closure,
+            )
+        else:
+            if args.build_receipt is None:
+                parser.error("--build-receipt is required for generate and validate")
+            operation = generate if args.command == "generate" else validate_files
+            operation(args.inventory, args.inventory_sha256,
+                      args.source_closure, args.build_receipt)
     except (OSError, subprocess.SubprocessError, ValueError) as error:
         print(f"pie-adapter-receipt: FAIL: {error}", file=sys.stderr)
         return 2

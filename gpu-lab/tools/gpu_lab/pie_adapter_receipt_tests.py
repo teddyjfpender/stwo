@@ -27,6 +27,7 @@ from .pie_adapter_receipt import (
     validate_inventory,
     validate_source_closure,
 )
+from .pie_adapter_source_closure import generate_source_closure
 
 
 COMMITS = {"stwo": "1" * 40, "stwo-cairo": "2" * 40}
@@ -159,8 +160,18 @@ def pie_adapter_receipt_self_test(_: Path | None = None) -> None:
         inventory_sha = sha256_bytes(inventory_path.read_bytes())
         closure_path = Path(temporary) / "closure.json"
         receipt_path = Path(temporary) / "receipt.json"
+        executable.unlink()
+        prebuild_closure_path = Path(temporary) / "prebuild-closure.json"
+        prebuild_closure = generate_source_closure(
+            inventory_path, inventory_sha, prebuild_closure_path, root, _commit,
+        )
+        require(prebuild_closure_path.stat().st_mode & 0o777 == 0o400,
+                "PIE adapter prebuild closure is mutable")
+        _write(executable, b"host adapter executable\n", 0o755)
         closure, receipt = generate(inventory_path, inventory_sha, closure_path,
                                     receipt_path, root, _commit)
+        require(prebuild_closure == closure,
+                "PIE adapter prebuild and post-build source closures differ")
         retained = validate_documents(
             inventory_path.read_bytes(), inventory_sha, closure_path.read_bytes(),
             receipt_path.read_bytes(), root, _commit)
