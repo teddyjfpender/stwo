@@ -32,6 +32,7 @@ from .loop import loop_self_test
 from .oracle import validate_oracle_index
 from .pie_adapter_cleanup_tests import pie_adapter_cleanup_self_test
 from .pie_adapter_execution_tests import pie_adapter_execution_self_test
+from .pie_adapter_receipt_tests import pie_adapter_receipt_self_test
 from .result_tests import result_self_test
 from .results import _validate_correctness, _validate_timing
 from .semantics import make_tiny_fixture, validate_fixture
@@ -268,6 +269,7 @@ def self_test(root: Path) -> None:
     fri_round6_execution_self_test(root)
     pie_adapter_execution_self_test(root)
     pie_adapter_cleanup_self_test(root)
+    pie_adapter_receipt_self_test(root)
     for schema in ("semantic-fixture.schema.json", "semantic-fixture-index.schema.json",
                    "execution-manifest.schema.json", "host-oracle-index.schema.json",
                    "host-oracle-artifact-v2.schema.json",
@@ -275,7 +277,10 @@ def self_test(root: Path) -> None:
                    "module-index.schema.json", "environment.schema.json",
                    "loop-result.schema.json", "baseline-envelope.schema.json",
                    "baseline-comparison.schema.json", "pie-adapter-invocation.schema.json",
-                   "pie-adapter-execution-record.schema.json"):
+                   "pie-adapter-execution-record.schema.json",
+                   "pie-adapter-source-inventory-v2.schema.json",
+                   "pie-adapter-source-closure-v2.schema.json",
+                   "pie-adapter-build-receipt-v2.schema.json"):
         require(load_json(root / "schemas" / schema).get("$schema") is not None,
                 f"invalid schema document: {schema}")
     require(len(lab_tool_sha256()) == 64, "lab tool closure hash is invalid")

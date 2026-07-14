@@ -1,0 +1,110 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://stwo.dev/gpu-lab/pie-adapter-build-receipt-v2.schema.json",
+  "title": "Stwo GPU lab non-admitting PIE adapter build receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "build_receipt", "build_receipt_sha256"],
+  "properties": {
+    "schema_version": {"const": "stwo.gpu-lab.pie-adapter-build-receipt.v2"},
+    "build_receipt_sha256": {"$ref": "#/$defs/sha256"},
+    "build_receipt": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "evidence_status", "build_execution_attested", "unattested_build_inputs",
+        "writer_precondition",
+        "attestation_scope", "production_admissible",
+        "correctness_admissible", "performance_admissible", "inventory_sha256",
+        "source_closure_sha256", "repository_commits", "build_inputs",
+        "generated_outputs", "adapter_executable"
+      ],
+      "properties": {
+        "evidence_status": {"const": "declared-build-inputs-live-outputs-no-build-attestation-v2"},
+        "build_execution_attested": {"const": false},
+        "unattested_build_inputs": {"const": "cargo-config-compiler-and-user-environment-not-execution-attested-v1"},
+        "writer_precondition": {"const": "caller-guaranteed-no-concurrent-source-or-output-writers-v1"},
+        "attestation_scope": {"const": "point-in-time-live-identity-observations-v1"},
+        "production_admissible": {"const": false},
+        "correctness_admissible": {"const": false},
+        "performance_admissible": {"const": false},
+        "inventory_sha256": {
+          "$ref": "#/$defs/sha256",
+          "description": "SHA-256 of canonical JSON for the authenticated inventory value; the CLI separately pins exact inventory file bytes."
+        },
+        "source_closure_sha256": {"$ref": "#/$defs/sha256"},
+        "repository_commits": {
+          "type": "object", "additionalProperties": false,
+          "required": ["stwo", "stwo-cairo"],
+          "properties": {"stwo": {"$ref": "#/$defs/commit"}, "stwo-cairo": {"$ref": "#/$defs/commit"}}
+        },
+        "build_inputs": {
+          "type": "object", "additionalProperties": false,
+          "required": [
+            "manifest", "cargo_lock", "rust_toolchain", "profile", "features",
+            "default_features", "target", "target_directory", "working_directory",
+            "environment", "command"
+          ],
+          "properties": {
+            "manifest": {"$ref": "#/$defs/source_identity"},
+            "cargo_lock": {"$ref": "#/$defs/source_identity"},
+            "rust_toolchain": {"$ref": "#/$defs/source_identity"},
+            "profile": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9_-]+(?![\\s\\S])"},
+            "features": {"type": "array", "maxItems": 64, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9_-]+(?![\\s\\S])"}},
+            "default_features": {"type": "boolean"},
+            "target": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9_.-]+(?![\\s\\S])"},
+            "target_directory": {"$ref": "#/$defs/locator"},
+            "working_directory": {"type": "string", "pattern": "^(?![\\s\\S]*[^ -~])<workspace>/(?:stwo|stwo-cairo)/(?!.*//)(?!.*(?:/\\.\\.?)(?:/|$))(?!.*\\\\)(?!.*\/$)[ -~]+$", "maxLength": 1024},
+            "environment": {
+              "type": "object", "additionalProperties": false,
+              "required": ["CARGO_TARGET_DIR"],
+              "properties": {"CARGO_TARGET_DIR": {"type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^(?![\\s\\S]*[^ -~])<workspace>/(?:stwo|stwo-cairo)/(?!.*//)(?!.*(?:/\\.\\.?)(?:/|$))(?!.*\\\\)(?!.*\/$)[ -~]+$"}}
+            },
+            "command": {"type": "array", "minItems": 1, "maxItems": 64, "items": {"type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^(?![\\s\\S]*[^ -~])[ -~]+$"}}
+          }
+        },
+        "generated_outputs": {
+          "type": "array", "minItems": 1, "maxItems": 64, "uniqueItems": true,
+          "items": {"$ref": "#/$defs/output_identity"}
+        },
+        "adapter_executable": {"$ref": "#/$defs/output_identity"}
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}(?![\\s\\S])"},
+    "commit": {"type": "string", "pattern": "^[0-9a-f]{40}(?![\\s\\S])"},
+    "relative_path": {
+      "type": "string", "minLength": 1, "maxLength": 512,
+      "pattern": "^(?![\\s\\S]*[^ -~])(?!/)(?!.*//)(?!.*\\\\)(?!\\.\\.?(?:/|$))(?!.*(?:/\\.\\.?)(?:/|$))(?!.*\/$)[ -~]+$"
+    },
+    "locator": {
+      "type": "object", "additionalProperties": false,
+      "required": ["repository", "path"],
+      "properties": {
+        "repository": {"enum": ["stwo", "stwo-cairo"]},
+        "path": {"$ref": "#/$defs/relative_path"}
+      }
+    },
+    "source_identity": {
+      "type": "object", "additionalProperties": false,
+      "required": ["repository", "path", "byte_length", "sha256"],
+      "properties": {
+        "repository": {"enum": ["stwo", "stwo-cairo"]},
+        "path": {"$ref": "#/$defs/relative_path"},
+        "byte_length": {"type": "integer", "minimum": 1, "maximum": 33554432},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "output_identity": {
+      "type": "object", "additionalProperties": false,
+      "required": ["repository", "path", "byte_length", "sha256", "mode"],
+      "properties": {
+        "repository": {"enum": ["stwo", "stwo-cairo"]},
+        "path": {"$ref": "#/$defs/relative_path"},
+        "byte_length": {"type": "integer", "minimum": 1, "maximum": 536870912},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "mode": {"type": "string", "pattern": "^0[0-7]{3}(?![\\s\\S])"}
+      }
+    }
+  }
+}

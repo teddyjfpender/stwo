@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://stwo.dev/gpu-lab/pie-adapter-source-inventory-v2.schema.json",
+  "title": "Stwo GPU lab PIE adapter explicit source and output inventory",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "repository_roots", "expected_sources", "build",
+    "generated_outputs", "adapter_executable"
+  ],
+  "properties": {
+    "schema_version": {"const": "stwo.gpu-lab.pie-adapter-source-inventory.v2"},
+    "repository_roots": {
+      "const": {"stwo": "stwo", "stwo-cairo": "stwo-cairo"}
+    },
+    "expected_sources": {
+      "type": "array", "minItems": 2, "maxItems": 1024, "uniqueItems": true,
+      "items": {"$ref": "#/$defs/locator"}
+    },
+    "build": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "manifest", "cargo_lock", "rust_toolchain", "profile", "features",
+        "default_features", "target", "target_directory", "working_directory",
+        "environment", "command"
+      ],
+      "properties": {
+        "manifest": {"$ref": "#/$defs/locator"},
+        "cargo_lock": {"$ref": "#/$defs/locator"},
+        "rust_toolchain": {"$ref": "#/$defs/locator"},
+        "profile": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9_-]+(?![\\s\\S])"},
+        "features": {
+          "type": "array", "maxItems": 64, "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9_-]+(?![\\s\\S])"}
+        },
+        "default_features": {"type": "boolean"},
+        "target": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9_.-]+(?![\\s\\S])"},
+        "target_directory": {"$ref": "#/$defs/locator"},
+        "working_directory": {"type": "string", "pattern": "^(?![\\s\\S]*[^ -~])<workspace>/(?:stwo|stwo-cairo)/(?!.*//)(?!.*(?:/\\.\\.?)(?:/|$))(?!.*\\\\)(?!.*\/$)[ -~]+$", "maxLength": 1024},
+        "environment": {
+          "type": "object", "additionalProperties": false,
+          "required": ["CARGO_TARGET_DIR"],
+          "properties": {"CARGO_TARGET_DIR": {"type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^(?![\\s\\S]*[^ -~])<workspace>/(?:stwo|stwo-cairo)/(?!.*//)(?!.*(?:/\\.\\.?)(?:/|$))(?!.*\\\\)(?!.*\/$)[ -~]+$"}}
+        },
+        "command": {
+          "type": "array", "minItems": 1, "maxItems": 64,
+          "items": {"type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^(?![\\s\\S]*[^ -~])[ -~]+$"}
+        }
+      }
+    },
+    "generated_outputs": {
+      "type": "array", "minItems": 1, "maxItems": 64, "uniqueItems": true,
+      "items": {"$ref": "#/$defs/locator"}
+    },
+    "adapter_executable": {"$ref": "#/$defs/locator"}
+  },
+  "$defs": {
+    "relative_path": {
+      "type": "string", "minLength": 1, "maxLength": 512,
+      "pattern": "^(?![\\s\\S]*[^ -~])(?!/)(?!.*//)(?!.*\\\\)(?!\\.\\.?(?:/|$))(?!.*(?:/\\.\\.?)(?:/|$))(?!.*\/$)[ -~]+$"
+    },
+    "locator": {
+      "type": "object", "additionalProperties": false,
+      "required": ["repository", "path"],
+      "properties": {
+        "repository": {"enum": ["stwo", "stwo-cairo"]},
+        "path": {"$ref": "#/$defs/relative_path"}
+      }
+    }
+  }
+}

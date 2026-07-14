@@ -1,0 +1,34 @@
+#!/usr/bin/env python3
+"""Generate or validate the non-admitting PIE adapter source/build receipt."""
+
+import argparse
+import subprocess
+import sys
+from pathlib import Path
+
+from gpu_lab.pie_adapter_receipt import generate, validate_files
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("command", choices=("generate", "validate"))
+    parser.add_argument("--inventory", required=True, type=Path)
+    parser.add_argument("--inventory-sha256", required=True,
+                        help="out-of-band SHA-256 of the exact inventory file bytes")
+    parser.add_argument("--source-closure", required=True, type=Path)
+    parser.add_argument("--build-receipt", required=True, type=Path)
+    args = parser.parse_args()
+    operation = generate if args.command == "generate" else validate_files
+    try:
+        operation(args.inventory, args.inventory_sha256,
+                  args.source_closure, args.build_receipt)
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        print(f"pie-adapter-receipt: FAIL: {error}", file=sys.stderr)
+        return 2
+    print(f"PIE_ADAPTER_RECEIPT=PASS action={args.command} "
+          "build_execution_attested=false production_admissible=false")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
