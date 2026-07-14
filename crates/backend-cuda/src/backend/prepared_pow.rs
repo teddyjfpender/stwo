@@ -305,23 +305,120 @@ mod tests {
 
     use super::*;
 
-    fn reference_valid_pow(
-        channel: &Blake2sChannelGeneric<false>,
-        pow_bits: u32,
-        nonce: u64,
-    ) -> bool {
+    const TEST_POW_IV: [u32; 8] = [
+        0x6A09_E667,
+        0xBB67_AE85,
+        0x3C6E_F372,
+        0xA54F_F53A,
+        0x510E_527F,
+        0x9B05_688C,
+        0x1F83_D9AB,
+        0x5BE0_CD19,
+    ];
+    const TEST_POW_SIGMA: [[usize; 16]; 10] = [
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        [14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3],
+        [11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4],
+        [7, 9, 3, 1, 13, 12, 11, 14, 2, 6, 5, 10, 4, 0, 15, 8],
+        [9, 0, 5, 7, 2, 4, 10, 15, 14, 1, 11, 12, 6, 8, 3, 13],
+        [2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5, 15, 14, 1, 9],
+        [12, 5, 1, 15, 14, 13, 4, 10, 0, 7, 6, 3, 9, 2, 8, 11],
+        [13, 11, 7, 14, 12, 1, 3, 9, 5, 0, 15, 4, 8, 6, 2, 10],
+        [6, 15, 14, 9, 11, 3, 0, 8, 12, 2, 13, 7, 1, 4, 10, 5],
+        [10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0],
+    ];
+
+    fn reference_pow_prefix(channel: &Blake2sChannelGeneric<false>, pow_bits: u32) -> [u8; 32] {
         let mut prefix = Blake2sHasherGeneric::<false>::default();
         prefix.update(&Blake2sChannelGeneric::<false>::POW_PREFIX.to_le_bytes());
         prefix.update(&[0u8; 12]);
         prefix.update(&channel.digest().0);
         prefix.update(&pow_bits.to_le_bytes());
-        let prefixed = prefix.finalize();
+        prefix.finalize().0
+    }
 
+    fn reference_candidate_hash_word(prefix: &[u8; 32], nonce: u64) -> u32 {
         let mut candidate = Blake2sHasherGeneric::<false>::default();
-        candidate.update(prefixed.as_ref());
+        candidate.update(prefix);
         candidate.update(&nonce.to_le_bytes());
         let hash = candidate.finalize();
-        u32::from_le_bytes(hash.0[..4].try_into().unwrap()).trailing_zeros() >= pow_bits
+        u32::from_le_bytes(hash.0[..4].try_into().unwrap())
+    }
+
+    fn test_pow_g(
+        state: &mut [u32; 16],
+        indices: [usize; 4],
+        first_message: u32,
+        second_message: u32,
+    ) {
+        let [a, b, c, d] = indices;
+        let (mut va, mut vb, mut vc, mut vd) = (state[a], state[b], state[c], state[d]);
+        va = va.wrapping_add(vb).wrapping_add(first_message);
+        vd = (vd ^ va).rotate_right(16);
+        vc = vc.wrapping_add(vd);
+        vb = (vb ^ vc).rotate_right(12);
+        va = va.wrapping_add(vb).wrapping_add(second_message);
+        vd = (vd ^ va).rotate_right(8);
+        vc = vc.wrapping_add(vd);
+        vb = (vb ^ vc).rotate_right(7);
+        state[a] = va;
+        state[b] = vb;
+        state[c] = vc;
+        state[d] = vd;
+    }
+
+    fn decoded_candidate_hash_word(prefix: &[u8; 32], nonce: u64) -> u32 {
+        let prefix_words = core::array::from_fn::<_, 8, _>(|word| {
+            u32::from_le_bytes(prefix[4 * word..4 * word + 4].try_into().unwrap())
+        });
+        let message = |index: usize| match index {
+            0..=7 => prefix_words[index],
+            8 => nonce as u32,
+            9 => (nonce >> 32) as u32,
+            _ => 0,
+        };
+        let parameterized_iv = TEST_POW_IV[0] ^ 0x0101_0020;
+        let mut state = [0u32; 16];
+        state[0] = parameterized_iv;
+        state[1..8].copy_from_slice(&TEST_POW_IV[1..]);
+        state[8..].copy_from_slice(&TEST_POW_IV);
+        state[12] ^= 40;
+        state[14] ^= u32::MAX;
+
+        for sigma in TEST_POW_SIGMA {
+            for lane in 0..4 {
+                test_pow_g(
+                    &mut state,
+                    [lane, lane + 4, lane + 8, lane + 12],
+                    message(sigma[2 * lane]),
+                    message(sigma[2 * lane + 1]),
+                );
+            }
+            for lane in 0..4 {
+                test_pow_g(
+                    &mut state,
+                    [
+                        lane,
+                        4 + (lane + 1) % 4,
+                        8 + (lane + 2) % 4,
+                        12 + (lane + 3) % 4,
+                    ],
+                    message(sigma[8 + 2 * lane]),
+                    message(sigma[8 + 2 * lane + 1]),
+                );
+            }
+        }
+        parameterized_iv ^ state[0] ^ state[8]
+    }
+
+    fn reference_valid_pow(
+        channel: &Blake2sChannelGeneric<false>,
+        pow_bits: u32,
+        nonce: u64,
+    ) -> bool {
+        reference_candidate_hash_word(&reference_pow_prefix(channel, pow_bits), nonce)
+            .trailing_zeros()
+            >= pow_bits
     }
 
     #[test]
@@ -373,6 +470,51 @@ mod tests {
                     "pow_bits={pow_bits}, nonce={nonce}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn decoded_candidate_block_matches_independent_hash_on_boundaries_and_mutations() {
+        let mut channel = Blake2sChannelGeneric::<false>::default();
+        channel.mix_u32s(&[0, 1, u32::MAX, 0x1122_3344, 0xaabb_ccdd]);
+        let baseline = reference_pow_prefix(&channel, 19);
+        let mut prefixes = vec![baseline, [0u8; 32], [u8::MAX; 32]];
+        for byte in 0..32 {
+            let mut mutated = baseline;
+            mutated[byte] ^= if byte & 1 == 0 { 1 } else { 0x80 };
+            prefixes.push(mutated);
+        }
+        let last_lattice_index =
+            ((0x7fff_fffeu64) << POW_GRIND_LOW_BITS) | ((1 << POW_GRIND_LOW_BITS) - 1);
+        let mut nonces = vec![
+            0,
+            1,
+            (1 << POW_GRIND_LOW_BITS) - 1,
+            1 << POW_GRIND_LOW_BITS,
+            1 << 32,
+            (1 << 32) | ((1 << POW_GRIND_LOW_BITS) - 1),
+            pow_index_to_nonce(last_lattice_index),
+            u64::MAX,
+        ];
+        nonces.extend((0..64).map(|bit| 1u64 << bit));
+
+        for prefix in &prefixes {
+            for &nonce in &nonces {
+                assert_eq!(
+                    decoded_candidate_hash_word(prefix, nonce),
+                    reference_candidate_hash_word(prefix, nonce),
+                    "prefix={prefix:02x?} nonce={nonce:#018x}"
+                );
+            }
+        }
+
+        let baseline_word = decoded_candidate_hash_word(&baseline, 0x0000_0001_000f_ffff);
+        for byte in 0..32 {
+            assert_ne!(
+                decoded_candidate_hash_word(&prefixes[3 + byte], 0x0000_0001_000f_ffff),
+                baseline_word,
+                "prefix byte {byte} must affect the candidate hash"
+            );
         }
     }
 
@@ -517,6 +659,33 @@ mod tests {
         assert!(source.contains("constexpr int POW_FALLBACK_ROUND_UNROLL = 5;"));
         assert!(source.contains("__launch_bounds__(POW_BLOCK_SIZE, POW_MIN_BLOCKS_PER_SM)"));
         assert_eq!(source.matches("pow_prefix_digest<<<").count(), 1);
+        assert_eq!(source.matches("persistent_pow_search<").count(), 2);
         assert_eq!(source.matches("stwo_blake2s_hash2_device(").count(), 1);
+        assert!(source.contains("pow_message_word("));
+        assert!(source.contains("fixed_candidate_hash_word(prefix, candidate)"));
+        assert!(!source.contains("uint32_t m[16]"));
+
+        let fixed_schedule = source
+            .split("fixed_candidate_hash_word")
+            .nth(1)
+            .expect("fixed candidate definition")
+            .split("template <int ROUND_UNROLL>")
+            .next()
+            .expect("fixed candidate body")
+            .split("POW_FIXED_ROUND(")
+            .skip(1)
+            .map(|tail| {
+                tail.split(')')
+                    .next()
+                    .expect("fixed round arguments")
+                    .split(',')
+                    .map(|word| word.trim().parse::<usize>().expect("numeric word index"))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(fixed_schedule.len(), TEST_POW_SIGMA.len());
+        for (actual, expected) in fixed_schedule.iter().zip(TEST_POW_SIGMA) {
+            assert_eq!(actual, &expected);
+        }
     }
 }

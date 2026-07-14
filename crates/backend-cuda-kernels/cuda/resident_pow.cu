@@ -63,36 +63,97 @@ static __device__ __constant__ uint8_t POW_SIGMA[10][16] = {
     {6, 15, 14, 9, 11, 3, 0, 8, 12, 2, 13, 7, 1, 4, 10, 5},
     {10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0}};
 
+struct PowPrefixWords {
+  uint32_t w0;
+  uint32_t w1;
+  uint32_t w2;
+  uint32_t w3;
+  uint32_t w4;
+  uint32_t w5;
+  uint32_t w6;
+  uint32_t w7;
+};
+
+__device__ __forceinline__ uint32_t pow_message_word(
+    const Blake2sHash &prefix,
+    unsigned long long nonce,
+    uint32_t index) {
+  // Decode the fixed 40-byte block in place. A per-thread m[16] array becomes
+  // local memory under the runtime sigma index. The block-shared prefix plus
+  // two nonce registers keep the candidate loop stack- and local-traffic-free.
+  if (index < 8U) {
+    return prefix.s[index];
+  }
+  if (index == 8U) {
+    return static_cast<uint32_t>(nonce);
+  }
+  if (index == 9U) {
+    return static_cast<uint32_t>(nonce >> 32U);
+  }
+  return 0U;
+}
+
+template <uint32_t INDEX>
+__device__ __forceinline__ uint32_t fixed_message_word(
+    const PowPrefixWords &prefix,
+    unsigned long long nonce) {
+  if constexpr (INDEX == 0U) return prefix.w0;
+  if constexpr (INDEX == 1U) return prefix.w1;
+  if constexpr (INDEX == 2U) return prefix.w2;
+  if constexpr (INDEX == 3U) return prefix.w3;
+  if constexpr (INDEX == 4U) return prefix.w4;
+  if constexpr (INDEX == 5U) return prefix.w5;
+  if constexpr (INDEX == 6U) return prefix.w6;
+  if constexpr (INDEX == 7U) return prefix.w7;
+  if constexpr (INDEX == 8U) return static_cast<uint32_t>(nonce);
+  if constexpr (INDEX == 9U) return static_cast<uint32_t>(nonce >> 32U);
+  return 0U;
+}
+
 #define POW_ROTR32(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
 #define POW_G(r, i, a, b, c, d)                                  \
   do {                                                            \
-    a = a + b + m[POW_SIGMA[r][2 * i + 0]];                      \
+    a = a + b + pow_message_word(                                 \
+                      prefix, nonce,                              \
+                      POW_SIGMA[r][2 * i + 0]);                   \
     d = POW_ROTR32(d ^ a, 16);                                    \
     c = c + d;                                                    \
     b = POW_ROTR32(b ^ c, 12);                                    \
-    a = a + b + m[POW_SIGMA[r][2 * i + 1]];                      \
+    a = a + b + pow_message_word(                                 \
+                      prefix, nonce,                              \
+                      POW_SIGMA[r][2 * i + 1]);                   \
     d = POW_ROTR32(d ^ a, 8);                                     \
     c = c + d;                                                    \
     b = POW_ROTR32(b ^ c, 7);                                     \
   } while (0)
 
-template <int ROUND_UNROLL>
-__device__ __forceinline__ uint32_t candidate_hash_word(
-    const Blake2sHash &prefixed_digest,
-    unsigned long long nonce) {
-  uint32_t m[16];
-#pragma unroll
-  for (uint32_t i = 0; i < 8U; ++i) {
-    m[i] = prefixed_digest.s[i];
-  }
-  m[8] = static_cast<uint32_t>(nonce);
-  m[9] = static_cast<uint32_t>(nonce >> 32U);
-#pragma unroll
-  for (uint32_t i = 10U; i < 16U; ++i) {
-    m[i] = 0U;
-  }
+#define POW_FIXED_G(m0, m1, a, b, c, d)                           \
+  do {                                                            \
+    a = a + b + fixed_message_word<m0>(prefix, nonce);            \
+    d = POW_ROTR32(d ^ a, 16);                                    \
+    c = c + d;                                                    \
+    b = POW_ROTR32(b ^ c, 12);                                    \
+    a = a + b + fixed_message_word<m1>(prefix, nonce);            \
+    d = POW_ROTR32(d ^ a, 8);                                     \
+    c = c + d;                                                    \
+    b = POW_ROTR32(b ^ c, 7);                                     \
+  } while (0)
 
-  uint32_t v[16];
+#define POW_FIXED_ROUND(                                           \
+    m00, m01, m10, m11, m20, m21, m30, m31,                       \
+    m40, m41, m50, m51, m60, m61, m70, m71)                       \
+  do {                                                            \
+    POW_FIXED_G(m00, m01, v[0], v[4], v[8], v[12]);               \
+    POW_FIXED_G(m10, m11, v[1], v[5], v[9], v[13]);               \
+    POW_FIXED_G(m20, m21, v[2], v[6], v[10], v[14]);              \
+    POW_FIXED_G(m30, m31, v[3], v[7], v[11], v[15]);              \
+    POW_FIXED_G(m40, m41, v[0], v[5], v[10], v[15]);              \
+    POW_FIXED_G(m50, m51, v[1], v[6], v[11], v[12]);              \
+    POW_FIXED_G(m60, m61, v[2], v[7], v[8], v[13]);               \
+    POW_FIXED_G(m70, m71, v[3], v[4], v[9], v[14]);               \
+  } while (0)
+
+__device__ __forceinline__ void initialize_candidate_state(uint32_t (&v)[16]) {
   v[0] = POW_IV[0] ^ 0x01010020U;
 #pragma unroll
   for (uint32_t i = 1U; i < 8U; ++i) {
@@ -104,6 +165,55 @@ __device__ __forceinline__ uint32_t candidate_hash_word(
   }
   v[12] ^= 40U;
   v[14] ^= 0xffffffffU;
+}
+
+__device__ __forceinline__ uint32_t fixed_candidate_hash_word(
+    const PowPrefixWords &prefix,
+    unsigned long long nonce) {
+  uint32_t v[16];
+  initialize_candidate_state(v);
+
+  // Five bounded two-round packets keep the sigma schedule compile-time while
+  // preventing ptxas from scheduling all ten rounds as one 255-register body.
+#pragma unroll 1
+  for (uint32_t pair = 0U; pair < 5U; ++pair) {
+    switch (pair) {
+      case 0U:
+        POW_FIXED_ROUND(0, 1, 2, 3, 4, 5, 6, 7,
+                        8, 9, 10, 11, 12, 13, 14, 15);
+        POW_FIXED_ROUND(14, 10, 4, 8, 9, 15, 13, 6,
+                        1, 12, 0, 2, 11, 7, 5, 3); break;
+      case 1U:
+        POW_FIXED_ROUND(11, 8, 12, 0, 5, 2, 15, 13,
+                        10, 14, 3, 6, 7, 1, 9, 4);
+        POW_FIXED_ROUND(7, 9, 3, 1, 13, 12, 11, 14,
+                        2, 6, 5, 10, 4, 0, 15, 8); break;
+      case 2U:
+        POW_FIXED_ROUND(9, 0, 5, 7, 2, 4, 10, 15,
+                        14, 1, 11, 12, 6, 8, 3, 13);
+        POW_FIXED_ROUND(2, 12, 6, 10, 0, 11, 8, 3,
+                        4, 13, 7, 5, 15, 14, 1, 9); break;
+      case 3U:
+        POW_FIXED_ROUND(12, 5, 1, 15, 14, 13, 4, 10,
+                        0, 7, 6, 3, 9, 2, 8, 11);
+        POW_FIXED_ROUND(13, 11, 7, 14, 12, 1, 3, 9,
+                        5, 0, 15, 4, 8, 6, 2, 10); break;
+      default:
+        POW_FIXED_ROUND(6, 15, 14, 9, 11, 3, 0, 8,
+                        12, 2, 13, 7, 1, 4, 10, 5);
+        POW_FIXED_ROUND(10, 2, 8, 4, 7, 6, 1, 5,
+                        15, 11, 9, 14, 3, 12, 13, 0); break;
+    }
+  }
+  return (POW_IV[0] ^ 0x01010020U) ^ v[0] ^ v[8];
+}
+
+template <int ROUND_UNROLL>
+__device__ __forceinline__ uint32_t candidate_hash_word(
+    const Blake2sHash &prefix,
+    unsigned long long nonce) {
+  uint32_t v[16];
+  initialize_candidate_state(v);
 
 #pragma unroll ROUND_UNROLL
   for (uint32_t round = 0U; round < 10U; ++round) {
@@ -166,6 +276,12 @@ void persistent_pow_search(
   }
   __syncthreads();
 
+  const PowPrefixWords prefix{
+      prefixed_digest.s[0], prefixed_digest.s[1],
+      prefixed_digest.s[2], prefixed_digest.s[3],
+      prefixed_digest.s[4], prefixed_digest.s[5],
+      prefixed_digest.s[6], prefixed_digest.s[7]};
+
   const unsigned long long worker =
       static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
   const unsigned long long stride =
@@ -187,9 +303,13 @@ void persistent_pow_search(
       break;
     }
 
-    if (trailing_zeros(
-            candidate_hash_word<ROUND_UNROLL>(prefixed_digest, candidate)) >=
-        pow_bits) {
+    uint32_t hash_word;
+    if constexpr (ROUND_UNROLL == POW_PRIMARY_ROUND_UNROLL) {
+      hash_word = fixed_candidate_hash_word(prefix, candidate);
+    } else {
+      hash_word = candidate_hash_word<ROUND_UNROLL>(prefixed_digest, candidate);
+    }
+    if (trailing_zeros(hash_word) >= pow_bits) {
       atomicMin(best_nonce, candidate);
     }
 
