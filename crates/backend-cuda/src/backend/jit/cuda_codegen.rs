@@ -22,8 +22,13 @@ use super::program::{
 /// (random-coeff power indices are now `rc_base + i`, enabling size-governed kernel
 /// splitting — old fused PTX and new split-aware PTX must never collide on disk);
 /// 4 = shifted trace reads use the kernel's true `log_n_rows` instead of
-/// assuming that every evaluation domain is exactly one bit larger.
-pub const CODEGEN_VERSION: u64 = 4;
+/// assuming that every evaluation domain is exactly one bit larger; 5 = emit the
+/// in-order ext prefix as soon as each SecureCol's base operands are available,
+/// releasing base values instead of retaining the whole base section; 6 = demand-
+/// driven versioned base-cone emission plus folding each ready canonical constraint-
+/// root prefix into `acc` at its final definition, eliminating artificial base/root
+/// lifetimes without changing the ext or coefficient order.
+pub const CODEGEN_VERSION: u64 = 6;
 
 /// Cache key for compiled kernels: the program's content semantic hash mixed (FNV-1a)
 /// with [`CODEGEN_VERSION`]. This is the key for both the in-process function cache
@@ -92,138 +97,303 @@ pub fn compile_v1_to_cuda_source(program: &OwnedMetalEvaluationProgramV1) -> Opt
 }
 
 fn emit_instruction_body(program: &OwnedMetalEvaluationProgramV1, src: &mut String) -> Option<()> {
-    let header = program.header();
-    let mut base_declared = vec![false; header.max_base_regs as usize];
-    let mut ext_declared = vec![false; header.max_ext_regs as usize];
+    let mut ext_declared = vec![false; program.header().max_ext_regs as usize];
+    let base_schedule = BaseDefinitionSchedule::build(program)?;
+    let mut base_states = vec![DefinitionEmissionState::Pending; base_schedule.nodes.len()];
+    let root_final_definitions = constraint_root_final_definitions(program)?;
+    let mut next_root = 0usize;
+    let mut acc_declared = false;
 
-    src.push_str("    // Base instructions.\n");
-    for inst in program.base_insts() {
-        let dst = inst.dst as usize;
-        let decl = if !base_declared[dst] {
-            base_declared[dst] = true;
-            "unsigned "
-        } else {
-            ""
-        };
-        let dst_var = format!("b{dst}");
-        match BaseOp::from_raw(inst.op)? {
-            BaseOp::TraceCol => {
-                let (interaction, column, offset) = (inst.interaction, inst.a, inst.imm);
-                src.push_str(&format!(
-                    "    {decl}{dst_var} = stwo_trace_value(trace_cols, \
-                     interaction_offsets, row_count, log_n_rows, {interaction}u, {column}u, \
-                     row_index, {offset});\n"
-                ));
-            }
-            // The recorder routes preprocessed columns through TraceCol interaction 0;
-            // a program carrying this opcode came from another lowering path.
-            BaseOp::PreprocessedCol => return None,
-            BaseOp::Param => {
-                let slot = inst.a;
-                src.push_str(&format!("    {decl}{dst_var} = base_params[{slot}u];\n"));
-            }
-            BaseOp::Const => {
-                let value = inst.a;
-                src.push_str(&format!("    {decl}{dst_var} = {value}u;\n"));
-            }
-            BaseOp::Add => {
-                let (a, b) = (inst.a, inst.b);
-                src.push_str(&format!(
-                    "    {decl}{dst_var} = stwo_m31_add(b{a}, b{b});\n"
-                ));
-            }
-            BaseOp::Sub => {
-                let (a, b) = (inst.a, inst.b);
-                src.push_str(&format!(
-                    "    {decl}{dst_var} = stwo_m31_sub(b{a}, b{b});\n"
-                ));
-            }
-            BaseOp::Mul => {
-                let (a, b) = (inst.a, inst.b);
-                src.push_str(&format!(
-                    "    {decl}{dst_var} = stwo_m31_mul(b{a}, b{b});\n"
-                ));
-            }
-            BaseOp::Neg => {
-                let a = inst.a;
-                src.push_str(&format!("    {decl}{dst_var} = stwo_m31_neg(b{a});\n"));
-            }
-            BaseOp::Inv => {
-                let a = inst.a;
-                src.push_str(&format!("    {decl}{dst_var} = stwo_m31_inv(b{a});\n"));
+    src.push_str("    // Canonical ext stream with demand-driven, versioned base cones.\n");
+    for (ext_i, inst) in program.ext_insts().iter().enumerate() {
+        if ExtOp::from_raw(inst.op)? == ExtOp::SecureCol {
+            for register in [inst.a, inst.b, inst.c, inst.d] {
+                emit_base_definition(
+                    base_schedule.final_definition(register)?,
+                    &base_schedule,
+                    &mut base_states,
+                    src,
+                )?;
             }
         }
+        emit_ext_instruction(
+            inst,
+            &base_schedule.final_definitions,
+            &mut ext_declared,
+            src,
+        )?;
+        emit_ready_root_prefix(
+            program,
+            &root_final_definitions,
+            ext_i,
+            &mut next_root,
+            &mut acc_declared,
+            src,
+        );
     }
     src.push('\n');
 
-    src.push_str("    // Ext instructions.\n");
-    for inst in program.ext_insts() {
-        let dst = inst.dst as usize;
-        let decl = if !ext_declared[dst] {
-            ext_declared[dst] = true;
-            "StwoCudaQm31 "
-        } else {
-            ""
-        };
-        let dst_var = format!("e{dst}");
-        match ExtOp::from_raw(inst.op)? {
-            ExtOp::SecureCol => {
-                let (a, b, c, d) = (inst.a, inst.b, inst.c, inst.d);
-                src.push_str(&format!(
-                    "    {decl}{dst_var} = StwoCudaQm31{{ b{a}, b{b}, b{c}, b{d} }};\n"
-                ));
+    // Unreached base definitions are dead pure expressions. Deliberately omit
+    // them: TraceCol, Param, Const, and field arithmetic have no side effects.
+    if !acc_declared || next_root != program.constraint_roots().len() {
+        return None;
+    }
+    Some(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DefinitionEmissionState {
+    Pending,
+    Visiting,
+    Emitted,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BaseDefinitionNode {
+    inst: super::program::MetalEvaluationProgramBaseInstV1,
+    dependencies: [Option<usize>; 2],
+}
+
+struct BaseDefinitionSchedule {
+    nodes: Vec<BaseDefinitionNode>,
+    final_definitions: Vec<Option<usize>>,
+}
+
+impl BaseDefinitionSchedule {
+    fn build(program: &OwnedMetalEvaluationProgramV1) -> Option<Self> {
+        let mut final_definitions = vec![None; program.header().max_base_regs as usize];
+        let mut nodes = Vec::with_capacity(program.base_insts().len());
+        for &inst in program.base_insts() {
+            let dependencies = match BaseOp::from_raw(inst.op)? {
+                BaseOp::TraceCol | BaseOp::Param | BaseOp::Const => [None, None],
+                BaseOp::Add | BaseOp::Sub | BaseOp::Mul => [
+                    *final_definitions.get(inst.a as usize)?,
+                    *final_definitions.get(inst.b as usize)?,
+                ],
+                BaseOp::Neg | BaseOp::Inv => [*final_definitions.get(inst.a as usize)?, None],
+                BaseOp::PreprocessedCol => return None,
+            };
+            let required_dependencies = match BaseOp::from_raw(inst.op)? {
+                BaseOp::Add | BaseOp::Sub | BaseOp::Mul => 2,
+                BaseOp::Neg | BaseOp::Inv => 1,
+                _ => 0,
+            };
+            if dependencies[..required_dependencies]
+                .iter()
+                .any(Option::is_none)
+            {
+                return None;
             }
-            ExtOp::Param => {
-                let slot = inst.a;
-                src.push_str(&format!(
-                    "    {decl}{dst_var} = stwo_load_qm31(ext_params, {slot}u);\n"
-                ));
+            let definition = nodes.len();
+            *final_definitions.get_mut(inst.dst as usize)? = Some(definition);
+            nodes.push(BaseDefinitionNode { inst, dependencies });
+        }
+        Some(Self {
+            nodes,
+            final_definitions,
+        })
+    }
+
+    fn final_definition(&self, register: u32) -> Option<usize> {
+        *self.final_definitions.get(register as usize)?
+    }
+}
+
+fn emit_base_definition(
+    definition: usize,
+    schedule: &BaseDefinitionSchedule,
+    states: &mut [DefinitionEmissionState],
+    src: &mut String,
+) -> Option<()> {
+    // Production AIRs contain dependency cones deep enough to overflow a host
+    // worker stack. Keep the same post-order traversal, but put its frames in a
+    // bounded heap vector instead of recursive Rust calls.
+    let mut stack = vec![(definition, false)];
+    while let Some((definition, dependencies_visited)) = stack.pop() {
+        if dependencies_visited {
+            if *states.get(definition)? != DefinitionEmissionState::Visiting {
+                return None;
             }
-            ExtOp::Const => {
-                let (a, b, c, d) = (inst.a, inst.b, inst.c, inst.d);
-                src.push_str(&format!(
-                    "    {decl}{dst_var} = StwoCudaQm31{{ {a}u, {b}u, {c}u, {d}u }};\n"
-                ));
-            }
-            ExtOp::Add => {
-                let (a, b) = (inst.a, inst.b);
-                src.push_str(&format!(
-                    "    {decl}{dst_var} = stwo_qm31_add(e{a}, e{b});\n"
-                ));
-            }
-            ExtOp::Sub => {
-                let (a, b) = (inst.a, inst.b);
-                src.push_str(&format!(
-                    "    {decl}{dst_var} = stwo_qm31_sub(e{a}, e{b});\n"
-                ));
-            }
-            ExtOp::Mul => {
-                let (a, b) = (inst.a, inst.b);
-                src.push_str(&format!(
-                    "    {decl}{dst_var} = stwo_qm31_mul(e{a}, e{b});\n"
-                ));
-            }
-            ExtOp::Neg => {
-                let a = inst.a;
-                src.push_str(&format!(
-                    "    {decl}{dst_var} = stwo_qm31_sub(StwoCudaQm31{{0u,0u,0u,0u}}, e{a});\n"
-                ));
-            }
+            emit_base_definition_node(definition, schedule, src)?;
+            states[definition] = DefinitionEmissionState::Emitted;
+            continue;
+        }
+        match *states.get(definition)? {
+            DefinitionEmissionState::Emitted => continue,
+            DefinitionEmissionState::Visiting => return None,
+            DefinitionEmissionState::Pending => {}
+        }
+        states[definition] = DefinitionEmissionState::Visiting;
+        stack.push((definition, true));
+        let node = schedule.nodes.get(definition)?;
+        for dependency in node.dependencies.into_iter().flatten().rev() {
+            stack.push((dependency, false));
         }
     }
-    src.push('\n');
+    Some(())
+}
 
-    src.push_str("    // Constraint accumulation. rc_base is the global index of this\n");
-    src.push_str("    // kernel's first constraint within the component's random-coeff\n");
-    src.push_str("    // powers (non-zero only for split kernels).\n");
-    src.push_str("    StwoCudaQm31 acc = StwoCudaQm31{0u, 0u, 0u, 0u};\n");
-    for (i, &root) in program.constraint_roots().iter().enumerate() {
+fn emit_base_definition_node(
+    definition: usize,
+    schedule: &BaseDefinitionSchedule,
+    src: &mut String,
+) -> Option<()> {
+    let node = *schedule.nodes.get(definition)?;
+    let dst = format!("b{definition}");
+    match BaseOp::from_raw(node.inst.op)? {
+        BaseOp::TraceCol => {
+            let (interaction, column, offset) = (node.inst.interaction, node.inst.a, node.inst.imm);
+            src.push_str(&format!(
+                "    unsigned {dst} = stwo_trace_value(trace_cols, interaction_offsets, \
+                 row_count, log_n_rows, {interaction}u, {column}u, row_index, {offset});\n"
+            ));
+        }
+        BaseOp::Param => src.push_str(&format!(
+            "    unsigned {dst} = base_params[{}u];\n",
+            node.inst.a
+        )),
+        BaseOp::Const => src.push_str(&format!("    unsigned {dst} = {}u;\n", node.inst.a)),
+        BaseOp::Add | BaseOp::Sub | BaseOp::Mul => {
+            let [Some(a), Some(b)] = node.dependencies else {
+                return None;
+            };
+            let operation = match BaseOp::from_raw(node.inst.op)? {
+                BaseOp::Add => "stwo_m31_add",
+                BaseOp::Sub => "stwo_m31_sub",
+                BaseOp::Mul => "stwo_m31_mul",
+                _ => unreachable!(),
+            };
+            src.push_str(&format!("    unsigned {dst} = {operation}(b{a}, b{b});\n"));
+        }
+        BaseOp::Neg | BaseOp::Inv => {
+            let [Some(a), None] = node.dependencies else {
+                return None;
+            };
+            let operation = match BaseOp::from_raw(node.inst.op)? {
+                BaseOp::Neg => "stwo_m31_neg",
+                BaseOp::Inv => "stwo_m31_inv",
+                _ => unreachable!(),
+            };
+            src.push_str(&format!("    unsigned {dst} = {operation}(b{a});\n"));
+        }
+        BaseOp::PreprocessedCol => return None,
+    }
+    Some(())
+}
+
+fn constraint_root_final_definitions(
+    program: &OwnedMetalEvaluationProgramV1,
+) -> Option<Vec<usize>> {
+    let mut final_definitions = vec![None; program.header().max_ext_regs as usize];
+    for (ext_i, inst) in program.ext_insts().iter().enumerate() {
+        *final_definitions.get_mut(inst.dst as usize)? = Some(ext_i);
+    }
+    program
+        .constraint_roots()
+        .iter()
+        .map(|&root| *final_definitions.get(root as usize)?)
+        .collect()
+}
+
+fn emit_ready_root_prefix(
+    program: &OwnedMetalEvaluationProgramV1,
+    final_definitions: &[usize],
+    emitted_ext: usize,
+    next_root: &mut usize,
+    acc_declared: &mut bool,
+    src: &mut String,
+) {
+    while final_definitions
+        .get(*next_root)
+        .is_some_and(|&definition| definition <= emitted_ext)
+    {
+        if !*acc_declared {
+            src.push_str("    // Canonical root accumulation begins at first readiness.\n");
+            src.push_str("    StwoCudaQm31 acc = StwoCudaQm31{0u, 0u, 0u, 0u};\n");
+            *acc_declared = true;
+        }
+        let root = program.constraint_roots()[*next_root];
         src.push_str(&format!(
             "    acc = stwo_qm31_add(acc, stwo_qm31_mul(e{root}, \
-             stwo_load_qm31(random_coeff_powers, rc_base + {i}u)));\n"
+             stwo_load_qm31(random_coeff_powers, rc_base + {next_root}u)));\n"
         ));
+        *next_root += 1;
     }
-    src.push('\n');
+}
+
+fn emit_ext_instruction(
+    inst: &super::program::MetalEvaluationProgramExtInstV1,
+    base_final_definitions: &[Option<usize>],
+    declared: &mut [bool],
+    src: &mut String,
+) -> Option<()> {
+    let opcode = ExtOp::from_raw(inst.op)?;
+    let dst = inst.dst as usize;
+    let inputs = match opcode {
+        ExtOp::Add | ExtOp::Sub | ExtOp::Mul => &[inst.a, inst.b][..],
+        ExtOp::Neg => &[inst.a][..],
+        ExtOp::SecureCol | ExtOp::Param | ExtOp::Const => &[],
+    };
+    if inputs
+        .iter()
+        .any(|&input| declared.get(input as usize).copied() != Some(true))
+    {
+        return None;
+    }
+    let was_declared = *declared.get(dst)?;
+    *declared.get_mut(dst)? = true;
+    let decl = if !was_declared { "StwoCudaQm31 " } else { "" };
+    let dst_var = format!("e{dst}");
+    match opcode {
+        ExtOp::SecureCol => {
+            let definition = |register: u32| *base_final_definitions.get(register as usize)?;
+            let (a, b, c, d) = (
+                definition(inst.a)?,
+                definition(inst.b)?,
+                definition(inst.c)?,
+                definition(inst.d)?,
+            );
+            src.push_str(&format!(
+                "    {decl}{dst_var} = StwoCudaQm31{{ b{a}, b{b}, b{c}, b{d} }};\n"
+            ));
+        }
+        ExtOp::Param => {
+            let slot = inst.a;
+            src.push_str(&format!(
+                "    {decl}{dst_var} = stwo_load_qm31(ext_params, {slot}u);\n"
+            ));
+        }
+        ExtOp::Const => {
+            let (a, b, c, d) = (inst.a, inst.b, inst.c, inst.d);
+            src.push_str(&format!(
+                "    {decl}{dst_var} = StwoCudaQm31{{ {a}u, {b}u, {c}u, {d}u }};\n"
+            ));
+        }
+        ExtOp::Add => {
+            let (a, b) = (inst.a, inst.b);
+            src.push_str(&format!(
+                "    {decl}{dst_var} = stwo_qm31_add(e{a}, e{b});\n"
+            ));
+        }
+        ExtOp::Sub => {
+            let (a, b) = (inst.a, inst.b);
+            src.push_str(&format!(
+                "    {decl}{dst_var} = stwo_qm31_sub(e{a}, e{b});\n"
+            ));
+        }
+        ExtOp::Mul => {
+            let (a, b) = (inst.a, inst.b);
+            src.push_str(&format!(
+                "    {decl}{dst_var} = stwo_qm31_mul(e{a}, e{b});\n"
+            ));
+        }
+        ExtOp::Neg => {
+            let a = inst.a;
+            src.push_str(&format!(
+                "    {decl}{dst_var} = stwo_qm31_sub(StwoCudaQm31{{0u,0u,0u,0u}}, e{a});\n"
+            ));
+        }
+    }
     Some(())
 }
 
@@ -361,58 +531,5 @@ __device__ __forceinline__ unsigned stwo_trace_value(
 }
 
 #[cfg(test)]
-mod tests {
-    use stwo::core::utils::offset_bit_reversed_circle_domain_index;
-
-    use super::*;
-    use crate::backend::jit::program::{
-        MetalEvaluationProgramBaseInstV1, MetalEvaluationProgramExtInstV1,
-        MetalEvaluationProgramHeaderV1,
-    };
-
-    #[test]
-    fn shifted_trace_codegen_threads_the_true_trace_log() {
-        let header = MetalEvaluationProgramHeaderV1::new(0, 0x1234, 0, 1, 0, 0, 1, 1, 1);
-        let program = OwnedMetalEvaluationProgramV1::from_parts(
-            header,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            vec![MetalEvaluationProgramBaseInstV1::trace_col(0, 0, 0, -1)],
-            vec![MetalEvaluationProgramExtInstV1::secure_col(0, 0, 0, 0, 0)],
-            vec![0],
-        );
-        let source = compile_v1_to_cuda_source(&program).unwrap();
-        assert!(
-            source.contains("interaction_offsets, row_count, log_n_rows, 0u, 0u, row_index, -1);")
-        );
-        assert!(source.contains(
-            "unsigned log_n_rows, unsigned interaction, unsigned column, unsigned row_index"
-        ));
-        assert!(!source.contains("domain_log_size = eval_log_size - 1u"));
-    }
-
-    #[test]
-    fn two_bit_expansion_disproves_the_legacy_shifted_index() {
-        const TRACE_LOG_SIZE: u32 = 6;
-        const EVALUATION_LOG_SIZE: u32 = 8;
-        let first_difference = (0..1usize << EVALUATION_LOG_SIZE)
-            .find_map(|row| {
-                let expected = offset_bit_reversed_circle_domain_index(
-                    row,
-                    TRACE_LOG_SIZE,
-                    EVALUATION_LOG_SIZE,
-                    -1,
-                );
-                let legacy = offset_bit_reversed_circle_domain_index(
-                    row,
-                    EVALUATION_LOG_SIZE - 1,
-                    EVALUATION_LOG_SIZE,
-                    -1,
-                );
-                (expected != legacy).then_some((row, expected, legacy))
-            })
-            .expect("two-bit expansion must distinguish the true trace domain");
-        assert_eq!(first_difference, (0, 126, 254));
-    }
-}
+#[path = "cuda_codegen_tests.rs"]
+mod tests;
