@@ -1,9 +1,9 @@
 //! Capture-safe native CUDA writer for Cairo's `ec_op_builtin`.
 //!
 //! The graph writes the component's committed base columns and word-major
-//! lookup inputs, then writes all 252 `partial_ec_mul_generic` states directly
-//! into that consumer's final padded input columns.  No host/sub-input staging
-//! buffer exists on the launch path.
+//! lookup inputs, keeps the 252-round EC chain projective, then batch-normalizes
+//! each saved state in the consumer's final padded input columns. Dead consumer
+//! columns are the only scratch; no host/sub-input staging allocation exists.
 
 use std::collections::BTreeSet;
 
@@ -224,8 +224,8 @@ pub struct PreparedEcOpIngestTelemetry {
 }
 
 impl PreparedEcOpLaunchTelemetry {
-    const TWO_KERNELS: Self = Self {
-        kernel_launches: 2,
+    const THREE_KERNELS: Self = Self {
+        kernel_launches: 3,
         allocations: 0,
         h2d_bytes: 0,
         d2h_bytes: 0,
@@ -418,7 +418,7 @@ impl<'a> PreparedEcOpGraph<'a> {
             )
         };
         check_cuda("ec_op_builtin_witness_on", code)?;
-        Ok(PreparedEcOpLaunchTelemetry::TWO_KERNELS)
+        Ok(PreparedEcOpLaunchTelemetry::THREE_KERNELS)
     }
 
     pub fn trace_columns(&self) -> &[ArenaSlice] {
@@ -517,7 +517,236 @@ fn validate_slot_shape(
 
 #[cfg(test)]
 mod tests {
+    use core::ops::{Add, Mul, Sub};
+
     use super::*;
+
+    const TEST_MODULUS: u64 = (1u64 << 61) - 1;
+    const TEST_BETA: TestField = TestField(TEST_MODULUS - 1);
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct TestField(u64);
+
+    impl TestField {
+        const ZERO: Self = Self(0);
+        const ONE: Self = Self(1);
+
+        fn inverse(self) -> Self {
+            assert_ne!(self, Self::ZERO);
+            let mut result = Self::ONE;
+            let mut base = self;
+            let mut exponent = TEST_MODULUS - 2;
+            while exponent != 0 {
+                if exponent & 1 != 0 {
+                    result = result * base;
+                }
+                base = base * base;
+                exponent >>= 1;
+            }
+            result
+        }
+    }
+
+    impl From<u64> for TestField {
+        fn from(value: u64) -> Self {
+            Self(value % TEST_MODULUS)
+        }
+    }
+
+    impl Add for TestField {
+        type Output = Self;
+
+        fn add(self, rhs: Self) -> Self::Output {
+            Self::from(self.0 + rhs.0)
+        }
+    }
+
+    impl Sub for TestField {
+        type Output = Self;
+
+        fn sub(self, rhs: Self) -> Self::Output {
+            Self::from(TEST_MODULUS + self.0 - rhs.0)
+        }
+    }
+
+    impl Mul for TestField {
+        type Output = Self;
+
+        fn mul(self, rhs: Self) -> Self::Output {
+            Self(((self.0 as u128 * rhs.0 as u128) % TEST_MODULUS as u128) as u64)
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct TestAffine {
+        x: TestField,
+        y: TestField,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct TestProjective {
+        x: TestField,
+        y: TestField,
+        z: TestField,
+    }
+
+    fn affine_double(point: TestAffine) -> Option<TestAffine> {
+        let denominator = point.y + point.y;
+        if denominator == TestField::ZERO {
+            return None;
+        }
+        let x_squared = point.x * point.x;
+        let lambda = (x_squared + x_squared + x_squared + TestField::ONE) * denominator.inverse();
+        let x = lambda * lambda - point.x - point.x;
+        let y = lambda * (point.x - x) - point.y;
+        Some(TestAffine { x, y })
+    }
+
+    fn is_on_test_curve(point: TestAffine) -> bool {
+        point.y * point.y == point.x * point.x * point.x + point.x + TEST_BETA
+    }
+
+    fn affine_add(left: TestAffine, right: TestAffine) -> Option<TestAffine> {
+        if left.x == right.x {
+            if left.y != right.y {
+                return None;
+            }
+            return affine_double(left);
+        }
+        let lambda = (right.y - left.y) * (right.x - left.x).inverse();
+        let x = lambda * lambda - left.x - right.x;
+        let y = lambda * (left.x - x) - left.y;
+        Some(TestAffine { x, y })
+    }
+
+    fn projective_from_affine_scaled(point: TestAffine, scale: TestField) -> TestProjective {
+        assert_ne!(scale, TestField::ZERO);
+        TestProjective {
+            x: point.x * scale,
+            y: point.y * scale,
+            z: scale,
+        }
+    }
+
+    fn projective_to_affine(point: TestProjective) -> Option<TestAffine> {
+        if point.z == TestField::ZERO {
+            return None;
+        }
+        let inverse = point.z.inverse();
+        Some(TestAffine {
+            x: point.x * inverse,
+            y: point.y * inverse,
+        })
+    }
+
+    fn projective_double(point: TestProjective) -> Option<TestProjective> {
+        let xx = point.x * point.x;
+        let zz = point.z * point.z;
+        let w = xx + xx + xx + zz;
+        let yz = point.y * point.z;
+        let s = yz + yz;
+        let ss = s * s;
+        let r = point.y * s;
+        let rr = r * r;
+        let b = (point.x + r) * (point.x + r) - xx - rr;
+        let h = w * w - b - b;
+        let result = TestProjective {
+            x: h * s,
+            y: w * (b - h) - rr - rr,
+            z: s * ss,
+        };
+        (result.z != TestField::ZERO).then_some(result)
+    }
+
+    fn projective_add(left: TestProjective, right: TestProjective) -> Option<TestProjective> {
+        let x1z2 = left.x * right.z;
+        let x2z1 = right.x * left.z;
+        let y1z2 = left.y * right.z;
+        let y2z1 = right.y * left.z;
+        let v = x2z1 - x1z2;
+        let u = y2z1 - y1z2;
+        if v == TestField::ZERO {
+            if u != TestField::ZERO {
+                return None;
+            }
+            return projective_double(left);
+        }
+        let uu = u * u;
+        let vv = v * v;
+        let vvv = v * vv;
+        let z1z2 = left.z * right.z;
+        let r = vv * left.x * right.z;
+        let a = uu * z1z2 - vvv - r - r;
+        let result = TestProjective {
+            x: v * a,
+            y: u * (r - a) - vvv * left.y * right.z,
+            z: vvv * z1z2,
+        };
+        (result.z != TestField::ZERO).then_some(result)
+    }
+
+    fn batch_inverse_nonzero(values: &[TestField]) -> Option<Vec<TestField>> {
+        if values.is_empty() || values.contains(&TestField::ZERO) {
+            return None;
+        }
+        let mut prefixes = Vec::with_capacity(values.len());
+        for &value in values {
+            prefixes.push(prefixes.last().copied().unwrap_or(TestField::ONE) * value);
+        }
+        let mut inverse_product = prefixes.last().unwrap().inverse();
+        let mut result = vec![TestField::ZERO; values.len()];
+        for index in (1..values.len()).rev() {
+            result[index] = inverse_product * prefixes[index - 1];
+            inverse_product = inverse_product * values[index];
+        }
+        result[0] = inverse_product;
+        Some(result)
+    }
+
+    fn assert_projective_chain_matches_affine(
+        mut affine_accumulator: TestAffine,
+        mut affine_q: TestAffine,
+        accumulator_scale: TestField,
+        q_scale: TestField,
+        bits: &[bool],
+    ) {
+        assert!(is_on_test_curve(affine_accumulator));
+        assert!(is_on_test_curve(affine_q));
+        let mut projective_accumulator =
+            projective_from_affine_scaled(affine_accumulator, accumulator_scale);
+        let mut projective_q = projective_from_affine_scaled(affine_q, q_scale);
+        for (round, &bit) in bits.iter().enumerate() {
+            assert!(is_on_test_curve(affine_q), "affine q at round {round}");
+            assert!(
+                is_on_test_curve(affine_accumulator),
+                "affine accumulator at round {round}"
+            );
+            assert_eq!(
+                projective_to_affine(projective_q),
+                Some(affine_q),
+                "pre-update q at round {round}"
+            );
+            assert_eq!(
+                projective_to_affine(projective_accumulator),
+                Some(affine_accumulator),
+                "pre-update accumulator at round {round}"
+            );
+            if bit {
+                affine_accumulator = affine_add(affine_accumulator, affine_q).unwrap();
+                projective_accumulator =
+                    projective_add(projective_accumulator, projective_q).unwrap();
+            }
+            affine_q = affine_double(affine_q).unwrap();
+            projective_q = projective_double(projective_q).unwrap();
+        }
+        assert!(is_on_test_curve(affine_q));
+        assert!(is_on_test_curve(affine_accumulator));
+        assert_eq!(projective_to_affine(projective_q), Some(affine_q));
+        assert_eq!(
+            projective_to_affine(projective_accumulator),
+            Some(affine_accumulator)
+        );
+    }
 
     fn slots() -> EcOpWorkspaceSlots {
         let mut next = 1u32;
@@ -545,6 +774,267 @@ mod tests {
             small_count_words: 64,
             range_check_8_count_words: 256,
         }
+    }
+
+    #[test]
+    fn projective_chain_matches_independent_affine_pre_update_and_final_states() {
+        let p = TestAffine {
+            x: TestField::from(2),
+            y: TestField::from(3),
+        };
+        let q = affine_double(p).unwrap();
+        let r = affine_add(p, q).unwrap();
+        let s = affine_double(q).unwrap();
+        let mixed = (0..252)
+            .map(|round| (round * 73 + round * round + 19) % 11 < 5)
+            .collect::<Vec<_>>();
+        let alternating = (0..252).map(|round| round & 1 == 0).collect::<Vec<_>>();
+        let zero = [false; 252];
+        for (accumulator, q, accumulator_scale, q_scale, bits) in [
+            (
+                p,
+                q,
+                TestField::from(1),
+                TestField::from(1),
+                mixed.as_slice(),
+            ),
+            (
+                r,
+                s,
+                TestField::from(7),
+                TestField::from(29),
+                alternating.as_slice(),
+            ),
+            (
+                s,
+                p,
+                TestField::from(101),
+                TestField::from(3),
+                zero.as_slice(),
+            ),
+        ] {
+            assert_projective_chain_matches_affine(
+                accumulator,
+                q,
+                accumulator_scale,
+                q_scale,
+                bits,
+            );
+        }
+
+        // Deterministic adversarial bit patterns exercise every pre-update
+        // state under unrelated projective scales. The affine oracle has its
+        // own per-step inversions and does not share the production formulas.
+        let points = [p, q, r, s];
+        for seed in 0..8usize {
+            let bits = (0..252)
+                .map(|round| {
+                    let mixed = round * 0x9e37 + seed * 0x79b9 + round * round * 17;
+                    (mixed ^ (mixed >> 3) ^ (seed << (round & 3))) & 7 < 3
+                })
+                .collect::<Vec<_>>();
+            assert_projective_chain_matches_affine(
+                points[seed & 3],
+                points[(seed * 3 + 1) & 3],
+                TestField::from((seed * 37 + 5) as u64),
+                TestField::from((seed * 53 + 11) as u64),
+                &bits,
+            );
+        }
+
+        // Equal accumulator/q exercises the exact projective doubling branch
+        // on every enabled round.
+        assert_projective_chain_matches_affine(
+            q,
+            q,
+            TestField::from(5),
+            TestField::from(41),
+            &[true; 252],
+        );
+
+        let opposite_q = TestAffine {
+            x: q.x,
+            y: TestField::ZERO - q.y,
+        };
+        assert_eq!(affine_add(q, opposite_q), None);
+        assert_eq!(
+            projective_add(
+                projective_from_affine_scaled(q, TestField::from(7)),
+                projective_from_affine_scaled(opposite_q, TestField::from(13)),
+            ),
+            None
+        );
+
+        let zero_y = TestAffine {
+            x: TestField::from(19),
+            y: TestField::ZERO,
+        };
+        assert_eq!(affine_double(zero_y), None);
+        assert_eq!(affine_add(zero_y, zero_y), None);
+        let zero_y_projective = projective_from_affine_scaled(zero_y, TestField::from(23));
+        assert_eq!(projective_double(zero_y_projective), None);
+        assert_eq!(projective_add(zero_y_projective, zero_y_projective), None);
+    }
+
+    #[test]
+    fn tiled_projective_normalization_matches_elementwise_and_rejects_zero_z() {
+        let affine = TestAffine {
+            x: TestField::from(2),
+            y: TestField::from(3),
+        };
+        for rounds_per_tile in [1, 2, 4] {
+            let points = (0..2 * rounds_per_tile)
+                .map(|index| {
+                    let scale = TestField::from((index * 17 + 3) as u64);
+                    TestProjective {
+                        x: affine.x * scale,
+                        y: affine.y * scale,
+                        z: scale,
+                    }
+                })
+                .collect::<Vec<_>>();
+            let inverses =
+                batch_inverse_nonzero(&points.iter().map(|point| point.z).collect::<Vec<_>>())
+                    .unwrap();
+            for (point, inverse) in points.into_iter().zip(inverses) {
+                assert_eq!(
+                    TestAffine {
+                        x: point.x * inverse,
+                        y: point.y * inverse,
+                    },
+                    affine
+                );
+            }
+        }
+        assert_eq!(
+            batch_inverse_nonzero(&[TestField::ONE, TestField::ZERO]),
+            None
+        );
+    }
+
+    #[test]
+    fn projective_scratch_is_fully_overwritten_before_padding_or_consumption() {
+        let source = include_str!("../../../backend-cuda-kernels/cuda/ec_op_witness.cu");
+        assert!(source.contains("constexpr uint32_t EC_OP_CHAIN_BLOCK = 16;"));
+        assert!(source.contains("constexpr uint32_t EC_OP_NORMALIZE_ROUND_TILE = 4;"));
+        assert!(source.contains("constexpr uint32_t SCRATCH_Q_X = 12;"));
+        assert!(source.contains("constexpr uint32_t SCRATCH_ACC_Z = 52;"));
+        assert!(source.contains("felt_is_zero(q_z) || felt_is_zero(accumulator_z)"));
+        assert!(source.contains("asm volatile(\"trap;\")"));
+        assert!(source.contains("partial.columns[125][row] = 0;"));
+        assert!(source.contains("partial.columns[125][row] != 1u"));
+        assert!(source.contains("store_affine_point_columns(partial, destination, 68, 96"));
+        assert!(source.contains("store_affine_point_columns(partial, destination, 12, 40"));
+        assert!(source.contains("felt252_to_m31_limbs(value, reinterpret_cast<m31 *>(limbs))"));
+        assert_eq!(source.matches("store_partial_lookup(").count(), 3);
+
+        let compact = source.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(compact.contains(
+            "store_partial_lookup( lookup, rows, row, 169, row, 0, m, q_affine, accumulator_affine, counter)"
+        ));
+        assert!(
+            compact.contains("295, row, PARTIAL_ROUNDS, m, q_affine, accumulator_affine, counter)")
+        );
+        for first_word in [0, 33, 66, 99, 132, 421, 454] {
+            assert!(compact.contains(&format!(
+                "store_memory_address_lookup(lookup, rows, row, {first_word},"
+            )));
+        }
+        for first_word in [3, 36, 69, 102, 135, 424, 457] {
+            assert!(compact.contains(&format!(
+                "store_memory_big_lookup(lookup, rows, row, {first_word},"
+            )));
+        }
+
+        let chain = source.find("ec_op_projective_chain_kernel<<<").unwrap();
+        let normalize = source
+            .find("ec_op_normalize_round_tiles_kernel<<<")
+            .unwrap();
+        let padding = source.find("partial_input_padding_kernel<<<").unwrap();
+        assert!(chain < normalize && normalize < padding);
+        assert_eq!(source.matches("<<<").count(), 3);
+        assert_eq!(compact.matches("0, stream>>>").count(), 3);
+        assert!(!source.contains("cudaMalloc"));
+
+        let chain_definition = source.find("ec_op_projective_chain_kernel(").unwrap();
+        let chain_end = source
+            .find("__device__ __forceinline__ void normalize_saved_projective(")
+            .unwrap();
+        let normalize_definition = source.find("ec_op_normalize_round_tiles_kernel(").unwrap();
+        let chain_body = &source[chain_definition..chain_end];
+        assert!(!chain_body.contains("load_projective_coordinate("));
+        assert!(!chain_body.contains("load_projective_point("));
+        let save = chain_body.find("store_partial_projective_input(").unwrap();
+        let add = chain_body.find("if ((m[0] & 1u) != 0)").unwrap();
+        let double = chain_body
+            .find("ec_double_projective_exact(q, doubled)")
+            .unwrap();
+        let advance = chain_body.find("if (counter == 0)").unwrap();
+        let final_normalize = chain_body.find("projective_pair_to_affine(").unwrap();
+        let final_trace = chain_body.find("trace.columns[148u + word]").unwrap();
+        assert!(save < add && add < double && double < advance);
+        assert!(advance < final_normalize && final_normalize < final_trace);
+        for canonical_store in [
+            "store_trace_limbs(trace, 158",
+            "store_trace_limbs(trace, 186",
+            "store_trace_limbs(trace, 214",
+            "store_trace_limbs(trace, 242",
+            "trace.columns[270][row] = counter",
+            "trace.columns[271][row] = result_x_id",
+            "trace.columns[272][row] = result_y_id",
+        ] {
+            assert!(chain_body.contains(canonical_store));
+        }
+
+        let normalization = &source[normalize_definition..padding];
+        assert!(normalization.contains("for (int index = POINTS_PER_TILE - 1; index > 0; --index)"));
+        assert!(normalization.contains("const bool accumulator = (point_index & 1u) != 0"));
+        let accumulator_store = source
+            .find("store_affine_point_columns(partial, destination, 68, 96")
+            .unwrap();
+        let q_store = source
+            .find("store_affine_point_columns(partial, destination, 12, 40")
+            .unwrap();
+        assert!(accumulator_store < q_store);
+        for rounds_per_tile in [1usize, 2, 4] {
+            let mut recovery_order = (1..2 * rounds_per_tile)
+                .rev()
+                .map(|index| (index >> 1, index & 1 != 0))
+                .collect::<Vec<_>>();
+            recovery_order.push((0, false));
+            for round in 0..rounds_per_tile {
+                let accumulator = recovery_order
+                    .iter()
+                    .position(|&point| point == (round, true))
+                    .unwrap();
+                let q = recovery_order
+                    .iter()
+                    .position(|&point| point == (round, false))
+                    .unwrap();
+                assert!(accumulator < q, "round {round} scratch overwrite order");
+            }
+        }
+
+        let scratch = 12..60;
+        let normalized_points = 12..124;
+        assert!(scratch
+            .clone()
+            .all(|column| normalized_points.contains(&column)));
+        let mut final_written = [false; EC_OP_PARTIAL_INPUT_COLUMNS];
+        for column in 0..12 {
+            final_written[column] = true;
+        }
+        for column in normalized_points {
+            final_written[column] = true;
+        }
+        for column in 124..127 {
+            final_written[column] = true;
+        }
+        assert!(final_written.into_iter().all(|written| written));
+        assert_eq!(
+            PreparedEcOpLaunchTelemetry::THREE_KERNELS.kernel_launches,
+            3
+        );
     }
 
     #[test]
