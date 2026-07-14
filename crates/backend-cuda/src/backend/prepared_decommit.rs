@@ -1786,6 +1786,102 @@ fn u32_bytes(values: &[u32]) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct WalkLayout {
+        hash_witness: Vec<(u32, u32)>,
+        aux_nodes: Vec<(u32, u32)>,
+        root: u32,
+    }
+
+    fn serial_walk_layout(mut current: Vec<u32>, leaf_log: u32) -> WalkLayout {
+        let mut hash_witness = Vec::new();
+        let mut aux_nodes = Vec::new();
+        let mut next = Vec::with_capacity(current.len());
+        for layer in (0..leaf_log).rev() {
+            let previous_level = layer + 1;
+            next.clear();
+            let mut i = 0;
+            while i < current.len() {
+                let first = current[i];
+                let pair = i + 1 < current.len() && current[i + 1] == (first ^ 1);
+                if !pair {
+                    hash_witness.push((previous_level, first ^ 1));
+                }
+                let parent = first >> 1;
+                next.push(parent);
+                aux_nodes.extend([
+                    (previous_level, 2 * parent),
+                    (previous_level, 2 * parent + 1),
+                ]);
+                i += if pair { 2 } else { 1 };
+            }
+            core::mem::swap(&mut current, &mut next);
+        }
+        assert_eq!(current.len(), 1);
+        WalkLayout {
+            hash_witness,
+            aux_nodes,
+            root: current[0],
+        }
+    }
+
+    fn prefix_scatter_walk_layout(mut current: Vec<u32>, leaf_log: u32) -> WalkLayout {
+        const CUDA_BLOCK: usize = 256;
+        let mut hash_witness = Vec::new();
+        let mut aux_nodes = Vec::new();
+        let mut next = vec![0; current.len()];
+        for layer in (0..leaf_log).rev() {
+            let previous_level = layer + 1;
+            let mut group_base = 0;
+            for base in (0..current.len()).step_by(CUDA_BLOCK) {
+                let end = (base + CUDA_BLOCK).min(current.len());
+                let starts: Vec<_> = (base..end)
+                    .filter(|&i| i == 0 || current[i - 1] != (current[i] ^ 1))
+                    .collect();
+                for (chunk_group, &i) in starts.iter().enumerate() {
+                    let first = current[i];
+                    let pair = i + 1 < current.len() && current[i + 1] == (first ^ 1);
+                    if !pair {
+                        hash_witness.push((previous_level, first ^ 1));
+                    }
+                    let parent = first >> 1;
+                    next[group_base + chunk_group] = parent;
+                    aux_nodes.extend([
+                        (previous_level, 2 * parent),
+                        (previous_level, 2 * parent + 1),
+                    ]);
+                }
+                group_base += starts.len();
+            }
+            current.clear();
+            current.extend_from_slice(&next[..group_base]);
+        }
+        assert_eq!(current.len(), 1);
+        WalkLayout {
+            hash_witness,
+            aux_nodes,
+            root: current[0],
+        }
+    }
+
+    fn encoded_walk_layout(layout: &WalkLayout) -> Vec<u32> {
+        let mut words = Vec::new();
+        for &(level, index) in &layout.hash_witness {
+            words.extend(
+                (0..HASH_WORDS as u32)
+                    .map(|word| level.rotate_left(word) ^ index.wrapping_mul(0x9e37_79b9) ^ word),
+            );
+        }
+        for &(level, index) in &layout.aux_nodes {
+            words.extend([level, index]);
+            words.extend(
+                (0..HASH_WORDS as u32)
+                    .map(|word| level.rotate_left(word) ^ index.wrapping_mul(0x9e37_79b9) ^ word),
+            );
+        }
+        words
+    }
+
     fn trace(role: TraceTreeRole, tree_log: u32, columns: usize) -> DecommitTreeGeometry {
         DecommitTreeGeometry::Trace(TraceDecommitGeometry {
             role,
@@ -2044,5 +2140,57 @@ mod tests {
             DecommitAssembly::decode(words),
             Err(PreparedDecommitError::AssemblyCorrupt("used words"))
         ));
+    }
+
+    #[test]
+    fn parallel_count_prefix_scatter_is_byte_identical_across_chunk_boundaries() {
+        // Exhaust every non-empty query topology of a four-level tree. This
+        // closes the sibling/singleton grouping proof independently of the
+        // larger adversarial cases below.
+        for mask in 1u32..(1 << 16) {
+            let queries = (0..16)
+                .filter(|index| mask & (1 << index) != 0)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                prefix_scatter_walk_layout(queries.clone(), 4),
+                serial_walk_layout(queries, 4)
+            );
+        }
+
+        let mut pseudo_random = (0..700)
+            .map(|i| (i * 73 + 19) & ((1 << 12) - 1))
+            .collect::<Vec<_>>();
+        pseudo_random.sort_unstable();
+        pseudo_random.dedup();
+        let cases = [
+            vec![0],
+            vec![1, 2],
+            (0..513).collect(),
+            (0..1 << 12).filter(|index| index % 7 != 3).collect(),
+            pseudo_random,
+        ];
+        for queries in cases {
+            let serial = serial_walk_layout(queries.clone(), 12);
+            let parallel = prefix_scatter_walk_layout(queries, 12);
+            assert_eq!(parallel, serial);
+            assert_eq!(encoded_walk_layout(&parallel), encoded_walk_layout(&serial));
+            assert_eq!(parallel.root, 0);
+        }
+    }
+
+    #[test]
+    fn compiled_decommit_tail_contract_is_parallel_and_resource_bounded() {
+        let source = include_str!("../../../backend-cuda-kernels/cuda/decommit.cu");
+        assert!(source.contains("constexpr uint32_t ASSEMBLY_MIN_BLOCKS_PER_SM = 4;"));
+        assert_eq!(
+            source
+                .matches("__launch_bounds__(BLOCK, ASSEMBLY_MIN_BLOCKS_PER_SM)")
+                .count(),
+            2
+        );
+        assert!(source.contains("assemble_trace_kernel<<<1, BLOCK"));
+        assert!(source.contains("assemble_fri_kernel<<<1, BLOCK"));
+        assert!(!source.contains("assemble_trace_kernel<<<1, 1"));
+        assert!(!source.contains("assemble_fri_kernel<<<1, 1"));
     }
 }

@@ -10,6 +10,11 @@ namespace {
 constexpr uint32_t POW_PREFIX = 0x12345678U;
 constexpr uint32_t POW_BLOCK_SIZE = 256U;
 constexpr uint32_t POW_GRID_SIZE = 1024U;
+constexpr uint32_t POW_MIN_BLOCKS_PER_SM = 6U;
+constexpr int POW_PRIMARY_ROUND_UNROLL = 2;
+constexpr int POW_FALLBACK_ROUND_UNROLL = 5;
+static_assert(POW_PRIMARY_ROUND_UNROLL < POW_FALLBACK_ROUND_UNROLL,
+              "PoW u2 must remain the compiled primary");
 
 // SIMD grind lattice (crates/stwo/src/prover/backend/simd/grind.rs). The
 // reference scans nonces of the form (hi << 32) | low with 0 <= low < 2^20,
@@ -71,6 +76,7 @@ static __device__ __constant__ uint8_t POW_SIGMA[10][16] = {
     b = POW_ROTR32(b ^ c, 7);                                     \
   } while (0)
 
+template <int ROUND_UNROLL>
 __device__ __forceinline__ uint32_t candidate_hash_word(
     const Blake2sHash &prefixed_digest,
     unsigned long long nonce) {
@@ -99,7 +105,7 @@ __device__ __forceinline__ uint32_t candidate_hash_word(
   v[12] ^= 40U;
   v[14] ^= 0xffffffffU;
 
-#pragma unroll 1
+#pragma unroll ROUND_UNROLL
   for (uint32_t round = 0U; round < 10U; ++round) {
     POW_G(round, 0, v[0], v[4], v[8], v[12]);
     POW_G(round, 1, v[1], v[5], v[9], v[13]);
@@ -146,7 +152,9 @@ __global__ void pow_prefix_digest(
   }
 }
 
-__global__ void persistent_pow_search(
+template <int ROUND_UNROLL>
+__global__ __launch_bounds__(POW_BLOCK_SIZE, POW_MIN_BLOCKS_PER_SM)
+void persistent_pow_search(
     const uint32_t *prefix_digest_words,
     uint32_t pow_bits,
     unsigned long long *best_nonce,
@@ -179,7 +187,8 @@ __global__ void persistent_pow_search(
       break;
     }
 
-    if (trailing_zeros(candidate_hash_word(prefixed_digest, candidate)) >=
+    if (trailing_zeros(
+            candidate_hash_word<ROUND_UNROLL>(prefixed_digest, candidate)) >=
         pow_bits) {
       atomicMin(best_nonce, candidate);
     }
@@ -227,8 +236,21 @@ extern "C" int stwo_blake2s_pow_persistent_on(
   if (error != cudaSuccess) {
     return static_cast<int>(error);
   }
-  persistent_pow_search<<<POW_GRID_SIZE, POW_BLOCK_SIZE, 0,
-                          reinterpret_cast<cudaStream_t>(stream_raw)>>>(
+  const cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_raw);
+  persistent_pow_search<POW_PRIMARY_ROUND_UNROLL>
+      <<<POW_GRID_SIZE, POW_BLOCK_SIZE, 0, stream>>>(
+      prefix_digest, pow_bits, best_nonce, completed_blocks,
+      transcript_nonce);
+  error = cudaGetLastError();
+  if (error != cudaErrorLaunchOutOfResources) {
+    return static_cast<int>(error);
+  }
+
+  // The u5 body is compiled into the same artifact as a conservative fallback.
+  // Both instantiations execute identical operations and share the same ordered
+  // completed-block publication proof; only compiler scheduling differs.
+  persistent_pow_search<POW_FALLBACK_ROUND_UNROLL>
+      <<<POW_GRID_SIZE, POW_BLOCK_SIZE, 0, stream>>>(
       prefix_digest, pow_bits, best_nonce, completed_blocks,
       transcript_nonce);
   return static_cast<int>(cudaGetLastError());

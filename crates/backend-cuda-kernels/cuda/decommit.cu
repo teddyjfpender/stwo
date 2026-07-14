@@ -6,6 +6,7 @@
 namespace {
 
 constexpr uint32_t BLOCK = 256;
+constexpr uint32_t ASSEMBLY_MIN_BLOCKS_PER_SM = 4;
 constexpr uint32_t HASH_WORDS = 8;
 constexpr uint32_t AUX_NODE_WORDS = 10; // level, index, hash[8]
 constexpr uint32_t M31_P = 0x7fffffffu;
@@ -158,6 +159,210 @@ __device__ void write_hash(uint32_t *destination, const Blake2sHash &hash) {
     for (uint32_t i = 0; i < HASH_WORDS; ++i) destination[i] = hash.s[i];
 }
 
+struct TraceNodeSource {
+    uint32_t leaf_log_size;
+    uint32_t first_retained_log_size;
+    const Blake2sHash *const *retained;
+    const uint32_t *sparse_indices;
+    const Blake2sHash *sparse_hashes;
+    const uint32_t *sparse_offsets;
+    const uint32_t *sparse_counts;
+    uint32_t sparse_level_count;
+
+    __device__ const Blake2sHash *get(uint32_t level, uint32_t index) const {
+        return node_hash(level, index, leaf_log_size, first_retained_log_size,
+                         retained, sparse_indices, sparse_hashes, sparse_offsets,
+                         sparse_counts, sparse_level_count);
+    }
+};
+
+struct RetainedNodeSource {
+    const Blake2sHash *const *retained;
+
+    __device__ const Blake2sHash *get(uint32_t level, uint32_t index) const {
+        return &retained[level][index];
+    }
+};
+
+struct MerkleWalkShared {
+    uint32_t group_scan[BLOCK];
+    uint32_t hash_scan[BLOCK];
+    uint32_t current_count;
+    uint32_t layer_groups;
+    uint32_t prior_groups;
+    uint32_t hash_count;
+    uint32_t failed;
+    uint32_t *current;
+    uint32_t *next;
+};
+
+__device__ void inclusive_scan(uint32_t *values) {
+    for (uint32_t offset = 1; offset < BLOCK; offset <<= 1) {
+        const uint32_t addend = threadIdx.x >= offset
+            ? values[threadIdx.x - offset]
+            : 0;
+        __syncthreads();
+        values[threadIdx.x] += addend;
+        __syncthreads();
+    }
+}
+
+template <typename NodeSource>
+__device__ bool parallel_merkle_walk(
+    uint32_t leaf_log,
+    uint32_t max_initial_count,
+    uint32_t *walk,
+    uint32_t *scratch,
+    const uint32_t *walk_count_ptr,
+    NodeSource source,
+    uint32_t *assembly,
+    uint32_t capacity,
+    MerkleWalkShared &state,
+    uint32_t *hash_offset_out,
+    uint32_t *hash_count_out,
+    uint32_t *aux_offset_out,
+    uint32_t *aux_count_out) {
+    const uint32_t tid = threadIdx.x;
+    if (tid == 0) {
+        state.current_count = min(*walk_count_ptr, max_initial_count);
+        state.layer_groups = 0;
+        state.prior_groups = 0;
+        state.hash_count = 0;
+        state.failed = state.current_count == 0;
+        state.current = walk;
+        state.next = scratch;
+
+        const unsigned long long max_groups =
+            static_cast<unsigned long long>(leaf_log) * state.current_count;
+        const unsigned long long reserve =
+            max_groups * (HASH_WORDS + 2U * AUX_NODE_WORDS);
+        const unsigned long long aux_offset =
+            static_cast<unsigned long long>(assembly[H_USED_WORDS]) +
+            max_groups * HASH_WORDS;
+        uint32_t ignored = 0;
+        if (reserve > 0xffffffffULL || aux_offset > 0xffffffffULL ||
+            !reserve_words(assembly, capacity, static_cast<uint32_t>(reserve),
+                           &ignored)) {
+            state.failed = 1;
+        }
+        *hash_offset_out = ignored;
+        *aux_offset_out = static_cast<uint32_t>(aux_offset);
+    }
+    __syncthreads();
+    if (state.failed) {
+        if (tid == 0) assembly[H_USED_WORDS] = 0;
+        return false;
+    }
+
+    const uint32_t hash_offset = *hash_offset_out;
+    const uint32_t aux_staging_offset = *aux_offset_out;
+    for (int32_t layer = static_cast<int32_t>(leaf_log) - 1; layer >= 0; --layer) {
+        const uint32_t count = state.current_count;
+        const uint32_t previous_level = static_cast<uint32_t>(layer) + 1U;
+        if (tid == 0) state.layer_groups = 0;
+        __syncthreads();
+
+        for (uint32_t base = 0; base < count; base += BLOCK) {
+            const uint32_t i = base + tid;
+            const bool valid = i < count;
+            const uint32_t value = valid ? state.current[i] : 0;
+            const bool right_of_pair = valid && i != 0 &&
+                state.current[i - 1] == (value ^ 1U);
+            const bool group_start = valid && !right_of_pair;
+            const bool pair = group_start && i + 1 < count &&
+                state.current[i + 1] == (value ^ 1U);
+            state.group_scan[tid] = group_start;
+            state.hash_scan[tid] = group_start && !pair;
+            __syncthreads();
+            inclusive_scan(state.group_scan);
+            inclusive_scan(state.hash_scan);
+
+            const uint32_t group_base = state.layer_groups;
+            const uint32_t hash_base = state.hash_count;
+            if (group_start) {
+                const uint32_t group = group_base + state.group_scan[tid] - 1U;
+                const uint32_t parent = value >> 1U;
+                state.next[group] = parent;
+
+                if (!pair) {
+                    const Blake2sHash *hash = source.get(previous_level, value ^ 1U);
+                    if (hash == nullptr) {
+                        atomicExch(&state.failed, 1U);
+                    } else {
+                        const uint32_t hash_index =
+                            hash_base + state.hash_scan[tid] - 1U;
+                        write_hash(assembly + hash_offset + hash_index * HASH_WORDS,
+                                   *hash);
+                    }
+                }
+                for (uint32_t child = 2U * parent; child <= 2U * parent + 1U;
+                     ++child) {
+                    const Blake2sHash *hash = source.get(previous_level, child);
+                    if (hash == nullptr) {
+                        atomicExch(&state.failed, 1U);
+                    } else {
+                        const uint32_t aux_index =
+                            2U * (state.prior_groups + group) + (child & 1U);
+                        uint32_t *entry = assembly + aux_staging_offset +
+                            aux_index * AUX_NODE_WORDS;
+                        entry[0] = previous_level;
+                        entry[1] = child;
+                        write_hash(entry + 2, *hash);
+                    }
+                }
+            }
+            __syncthreads();
+            if (state.failed) {
+                if (tid == 0) assembly[H_USED_WORDS] = 0;
+                return false;
+            }
+            if (tid == 0) {
+                const uint32_t valid_count = min(BLOCK, count - base);
+                state.layer_groups += state.group_scan[valid_count - 1U];
+                state.hash_count += state.hash_scan[valid_count - 1U];
+            }
+            __syncthreads();
+        }
+
+        if (tid == 0) {
+            state.prior_groups += state.layer_groups;
+            state.current_count = state.layer_groups;
+            uint32_t *swap = state.current;
+            state.current = state.next;
+            state.next = swap;
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0 && state.current_count != 1U) state.failed = 1;
+    __syncthreads();
+    if (state.failed) {
+        if (tid == 0) assembly[H_USED_WORDS] = 0;
+        return false;
+    }
+
+    const uint32_t aux_count = 2U * state.prior_groups;
+    const uint32_t compact_aux = hash_offset + state.hash_count * HASH_WORDS;
+    const uint32_t aux_words = aux_count * AUX_NODE_WORDS;
+    // memmove towards lower addresses in shared-memory tiles. The ordered tile
+    // loop prevents one block from overwriting a later tile before it is read.
+    for (uint32_t base = 0; base < aux_words; base += BLOCK) {
+        const uint32_t i = base + tid;
+        if (i < aux_words) state.group_scan[tid] = assembly[aux_staging_offset + i];
+        __syncthreads();
+        if (i < aux_words) assembly[compact_aux + i] = state.group_scan[tid];
+        __syncthreads();
+    }
+    if (tid == 0) {
+        assembly[H_USED_WORDS] = compact_aux + aux_words;
+        *hash_count_out = state.hash_count;
+        *aux_offset_out = compact_aux;
+        *aux_count_out = aux_count;
+    }
+    __syncthreads();
+    return true;
+}
+
 __global__ void normalize_queries_kernel(
     const uint32_t *raw,
     uint32_t raw_count,
@@ -273,7 +478,8 @@ __global__ void sparse_parent_kernel(
         &parent_hashes[parent]);
 }
 
-__global__ void assemble_trace_kernel(
+__global__ __launch_bounds__(BLOCK, ASSEMBLY_MIN_BLOCKS_PER_SM)
+void assemble_trace_kernel(
     uint32_t tree_index,
     uint32_t role,
     uint32_t leaf_log,
@@ -294,91 +500,77 @@ __global__ void assemble_trace_kernel(
     uint32_t sparse_level_count,
     uint32_t *assembly,
     uint32_t capacity) {
-    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    if (blockIdx.x != 0) return;
+    const uint32_t tid = threadIdx.x;
     uint32_t *meta = tree_meta(assembly, tree_index);
-    const uint32_t tree_start = assembly[H_USED_WORDS];
-    const uint32_t mapped_count = min(*mapped_count_ptr, max_queries);
+    __shared__ uint32_t tree_start;
+    __shared__ uint32_t query_offset;
+    __shared__ uint32_t value_offset;
+    __shared__ uint32_t mapped_count;
+    __shared__ uint32_t failed;
+    if (tid == 0) {
+        tree_start = assembly[H_USED_WORDS];
+        mapped_count = min(*mapped_count_ptr, max_queries);
+        failed = !reserve_words(assembly, capacity, mapped_count, &query_offset);
+        const unsigned long long value_words =
+            static_cast<unsigned long long>(column_count) * mapped_count;
+        if (!failed && (value_words > 0xffffffffULL ||
+            !reserve_words(assembly, capacity, static_cast<uint32_t>(value_words),
+                           &value_offset))) {
+            failed = 1;
+        }
+    }
+    __syncthreads();
+    if (failed) {
+        if (tid == 0) assembly[H_USED_WORDS] = 0;
+        return;
+    }
 
-    uint32_t offset = 0;
-    if (!reserve_words(assembly, capacity, mapped_count, &offset)) return;
-    meta[M_QUERY_OFFSET] = offset;
-    meta[M_QUERY_COUNT] = mapped_count;
-    for (uint32_t i = 0; i < mapped_count; ++i) assembly[offset + i] = mapped[i];
-
+    for (uint32_t i = tid; i < mapped_count; i += BLOCK) {
+        assembly[query_offset + i] = mapped[i];
+    }
     const uint32_t value_words = column_count * mapped_count;
-    if (!reserve_words(assembly, capacity, value_words, &offset)) return;
-    meta[M_VALUES_OFFSET] = offset;
-    meta[M_VALUES_COUNT] = value_words;
-    for (uint32_t c = 0; c < column_count; ++c) {
-        for (uint32_t q = 0; q < mapped_count; ++q) {
-            assembly[offset + c * mapped_count + q] = values[(size_t)c * max_queries + q];
+    for (uint32_t column = 0; column < column_count; ++column) {
+        for (uint32_t query = tid; query < mapped_count; query += BLOCK) {
+            assembly[value_offset + column * mapped_count + query] =
+                values[(size_t)column * max_queries + query];
         }
     }
+    __syncthreads();
 
-    uint32_t current_count = min(*walk_count_ptr, max_queries);
-    uint32_t *current = walk;
-    uint32_t *next = scratch;
-    const uint32_t hash_offset = assembly[H_USED_WORDS];
-    uint32_t hash_count = 0;
-    const uint32_t aux_offset = hash_offset + leaf_log * current_count * HASH_WORDS;
-    // Reserve conservative bounds once; compact the aux region after the walk.
-    const uint32_t reserve = leaf_log * current_count * (HASH_WORDS + 2 * AUX_NODE_WORDS);
-    if (!reserve_words(assembly, capacity, reserve, &offset)) return;
-    uint32_t aux_count = 0;
-    for (int32_t layer = (int32_t)leaf_log - 1; layer >= 0; --layer) {
-        const uint32_t previous_level = (uint32_t)layer + 1;
-        uint32_t next_count = 0;
-        for (uint32_t i = 0; i < current_count;) {
-            const uint32_t first = current[i];
-            const bool pair = i + 1 < current_count && current[i + 1] == (first ^ 1u);
-            if (!pair) {
-                const Blake2sHash *hash = node_hash(
-                    previous_level, first ^ 1u, leaf_log, first_retained_log,
-                    retained, sparse_indices, sparse_hashes, sparse_offsets, sparse_counts,
-                    sparse_level_count);
-                if (hash == nullptr) { assembly[H_USED_WORDS] = 0; return; }
-                write_hash(assembly + hash_offset + hash_count * HASH_WORDS, *hash);
-                ++hash_count;
-            }
-            const uint32_t parent = first >> 1;
-            next[next_count++] = parent;
-            for (uint32_t child = 2 * parent; child <= 2 * parent + 1; ++child) {
-                const Blake2sHash *hash = node_hash(
-                    previous_level, child, leaf_log, first_retained_log,
-                    retained, sparse_indices, sparse_hashes, sparse_offsets, sparse_counts,
-                    sparse_level_count);
-                if (hash == nullptr) { assembly[H_USED_WORDS] = 0; return; }
-                uint32_t *entry = assembly + aux_offset + aux_count * AUX_NODE_WORDS;
-                entry[0] = previous_level;
-                entry[1] = child;
-                write_hash(entry + 2, *hash);
-                ++aux_count;
-            }
-            i += pair ? 2 : 1;
-        }
-        uint32_t *swap = current; current = next; next = swap;
-        current_count = next_count;
+    __shared__ MerkleWalkShared walk_state;
+    __shared__ uint32_t hash_offset;
+    __shared__ uint32_t hash_count;
+    __shared__ uint32_t aux_offset;
+    __shared__ uint32_t aux_count;
+    const TraceNodeSource source{
+        leaf_log, first_retained_log, retained, sparse_indices, sparse_hashes,
+        sparse_offsets, sparse_counts, sparse_level_count};
+    if (!parallel_merkle_walk(
+            leaf_log, max_queries, walk, scratch, walk_count_ptr, source,
+            assembly, capacity, walk_state, &hash_offset, &hash_count,
+            &aux_offset, &aux_count)) {
+        return;
     }
 
-    // Move aux immediately after the exact hash witness, eliminating the
-    // conservative gap before publishing offsets and cursor.
-    const uint32_t compact_aux = hash_offset + hash_count * HASH_WORDS;
-    for (uint32_t i = 0; i < aux_count * AUX_NODE_WORDS; ++i) {
-        assembly[compact_aux + i] = assembly[aux_offset + i];
+    if (tid == 0) {
+        meta[M_KIND] = 0;
+        meta[M_ROLE] = role;
+        meta[M_QUERY_OFFSET] = query_offset;
+        meta[M_QUERY_COUNT] = mapped_count;
+        meta[M_VALUES_OFFSET] = value_offset;
+        meta[M_VALUES_COUNT] = value_words;
+        meta[M_FRI_WITNESS_OFFSET] = 0;
+        meta[M_FRI_WITNESS_COUNT] = 0;
+        meta[M_HASH_WITNESS_OFFSET] = hash_offset;
+        meta[M_HASH_WITNESS_COUNT] = hash_count;
+        meta[M_AUX_OFFSET] = aux_offset;
+        meta[M_AUX_COUNT] = aux_count;
+        meta[M_ALL_VALUES_OFFSET] = 0;
+        meta[M_ALL_VALUES_COUNT] = 0;
+        meta[M_LEAF_LOG_SIZE] = leaf_log;
+        meta[M_USED_WORDS] = assembly[H_USED_WORDS] - tree_start;
     }
-    assembly[H_USED_WORDS] = compact_aux + aux_count * AUX_NODE_WORDS;
-    meta[M_KIND] = 0;
-    meta[M_ROLE] = role;
-    meta[M_FRI_WITNESS_OFFSET] = 0;
-    meta[M_FRI_WITNESS_COUNT] = 0;
-    meta[M_HASH_WITNESS_OFFSET] = hash_offset;
-    meta[M_HASH_WITNESS_COUNT] = hash_count;
-    meta[M_AUX_OFFSET] = compact_aux;
-    meta[M_AUX_COUNT] = aux_count;
-    meta[M_ALL_VALUES_OFFSET] = 0;
-    meta[M_ALL_VALUES_COUNT] = 0;
-    meta[M_LEAF_LOG_SIZE] = leaf_log;
-    meta[M_USED_WORDS] = assembly[H_USED_WORDS] - tree_start;
 }
 
 __global__ void prepare_fri_queries_kernel(
@@ -440,7 +632,8 @@ __device__ bool contains_sorted(const uint32_t *values, uint32_t count, uint32_t
     return lo < count && values[lo] == target;
 }
 
-__global__ void assemble_fri_kernel(
+__global__ __launch_bounds__(BLOCK, ASSEMBLY_MIN_BLOCKS_PER_SM)
+void assemble_fri_kernel(
     uint32_t tree_index,
     uint32_t leaf_log,
     const uint32_t *tree_queries,
@@ -454,90 +647,134 @@ __global__ void assemble_fri_kernel(
     const Blake2sHash *const *retained,
     uint32_t *assembly,
     uint32_t capacity) {
-    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    if (blockIdx.x != 0) return;
+    const uint32_t tid = threadIdx.x;
     uint32_t *meta = tree_meta(assembly, tree_index);
-    const uint32_t tree_start = assembly[H_USED_WORDS];
+    __shared__ MerkleWalkShared walk_state;
+    __shared__ uint32_t tree_start;
+    __shared__ uint32_t query_offset;
+    __shared__ uint32_t witness_offset;
+    __shared__ uint32_t witness_count;
+    __shared__ uint32_t prefix_base;
+    __shared__ uint32_t failed;
     const uint32_t query_count = *tree_count_ptr;
     const uint32_t expanded_count = *expanded_count_ptr;
-    uint32_t offset = 0;
-    if (!reserve_words(assembly, capacity, query_count, &offset)) return;
-    meta[M_QUERY_OFFSET] = offset;
-    meta[M_QUERY_COUNT] = query_count;
-    for (uint32_t i = 0; i < query_count; ++i) assembly[offset + i] = tree_queries[i];
-
-    uint32_t witness_count = 0;
-    for (uint32_t i = 0; i < expanded_count; ++i) {
-        if (!contains_sorted(tree_queries, query_count, expanded[i])) ++witness_count;
+    if (tid == 0) {
+        tree_start = assembly[H_USED_WORDS];
+        witness_count = 0;
+        failed = !reserve_words(assembly, capacity, query_count, &query_offset);
     }
-    if (!reserve_words(assembly, capacity, 4 * witness_count, &offset)) return;
-    meta[M_FRI_WITNESS_OFFSET] = offset;
-    meta[M_FRI_WITNESS_COUNT] = witness_count;
-    uint32_t witness = 0;
-    for (uint32_t i = 0; i < expanded_count; ++i) {
-        if (!contains_sorted(tree_queries, query_count, expanded[i])) {
+    __syncthreads();
+    if (failed) {
+        if (tid == 0) assembly[H_USED_WORDS] = 0;
+        return;
+    }
+    for (uint32_t i = tid; i < query_count; i += BLOCK) {
+        assembly[query_offset + i] = tree_queries[i];
+    }
+
+    // Count proof-visible FRI witness values in parallel before reserving their
+    // exact compact range.
+    for (uint32_t base = 0; base < expanded_count; base += BLOCK) {
+        const uint32_t i = base + tid;
+        const bool emit = i < expanded_count &&
+            !contains_sorted(tree_queries, query_count, expanded[i]);
+        if (i < expanded_count) scratch[i] = emit;
+        walk_state.group_scan[tid] = emit;
+        __syncthreads();
+        inclusive_scan(walk_state.group_scan);
+        if (tid == 0) {
+            const uint32_t valid_count = min(BLOCK, expanded_count - base);
+            witness_count += walk_state.group_scan[valid_count - 1U];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        const unsigned long long words = 4ULL * witness_count;
+        failed = words > 0xffffffffULL ||
+            !reserve_words(assembly, capacity, static_cast<uint32_t>(words),
+                           &witness_offset);
+        prefix_base = 0;
+    }
+    __syncthreads();
+    if (failed) {
+        if (tid == 0) assembly[H_USED_WORDS] = 0;
+        return;
+    }
+
+    // Prefix/scatter preserves expanded-position order exactly.
+    for (uint32_t base = 0; base < expanded_count; base += BLOCK) {
+        const uint32_t i = base + tid;
+        const bool emit = i < expanded_count && scratch[i] != 0;
+        walk_state.group_scan[tid] = emit;
+        __syncthreads();
+        inclusive_scan(walk_state.group_scan);
+        if (emit) {
+            const uint32_t destination =
+                prefix_base + walk_state.group_scan[tid] - 1U;
             #pragma unroll
-            for (uint32_t c = 0; c < 4; ++c) assembly[offset + 4 * witness + c] = values[4 * i + c];
-            ++witness;
+            for (uint32_t c = 0; c < 4; ++c) {
+                assembly[witness_offset + 4U * destination + c] = values[4U * i + c];
+            }
         }
+        __syncthreads();
+        if (tid == 0) {
+            const uint32_t valid_count = min(BLOCK, expanded_count - base);
+            prefix_base += walk_state.group_scan[valid_count - 1U];
+        }
+        __syncthreads();
     }
 
-    uint32_t current_count = *walk_count_ptr;
-    uint32_t *current = walk;
-    uint32_t *next = scratch;
-    const uint32_t hash_offset = assembly[H_USED_WORDS];
-    const uint32_t aux_offset = hash_offset + leaf_log * current_count * HASH_WORDS;
-    const uint32_t reserve = leaf_log * current_count * (HASH_WORDS + 2 * AUX_NODE_WORDS);
-    if (!reserve_words(assembly, capacity, reserve, &offset)) return;
-    uint32_t hash_count = 0, aux_count = 0;
-    for (int32_t layer = (int32_t)leaf_log - 1; layer >= 0; --layer) {
-        const uint32_t previous_level = (uint32_t)layer + 1;
-        uint32_t next_count = 0;
-        for (uint32_t i = 0; i < current_count;) {
-            const uint32_t first = current[i];
-            const bool pair = i + 1 < current_count && current[i + 1] == (first ^ 1u);
-            if (!pair) {
-                write_hash(assembly + hash_offset + hash_count * HASH_WORDS,
-                           retained[previous_level][first ^ 1u]);
-                ++hash_count;
-            }
-            const uint32_t parent = first >> 1;
-            next[next_count++] = parent;
-            for (uint32_t child = 2 * parent; child <= 2 * parent + 1; ++child) {
-                uint32_t *entry = assembly + aux_offset + aux_count * AUX_NODE_WORDS;
-                entry[0] = previous_level;
-                entry[1] = child;
-                write_hash(entry + 2, retained[previous_level][child]);
-                ++aux_count;
-            }
-            i += pair ? 2 : 1;
-        }
-        uint32_t *swap = current; current = next; next = swap;
-        current_count = next_count;
+    __shared__ uint32_t hash_offset;
+    __shared__ uint32_t hash_count;
+    __shared__ uint32_t aux_offset;
+    __shared__ uint32_t aux_count;
+    const RetainedNodeSource source{retained};
+    if (!parallel_merkle_walk(
+            leaf_log, expanded_count, walk, scratch, walk_count_ptr, source,
+            assembly, capacity, walk_state, &hash_offset, &hash_count,
+            &aux_offset, &aux_count)) {
+        return;
     }
-    const uint32_t compact_aux = hash_offset + hash_count * HASH_WORDS;
-    for (uint32_t i = 0; i < aux_count * AUX_NODE_WORDS; ++i) {
-        assembly[compact_aux + i] = assembly[aux_offset + i];
-    }
-    assembly[H_USED_WORDS] = compact_aux + aux_count * AUX_NODE_WORDS;
 
-    if (!reserve_words(assembly, capacity, expanded_count * 5, &offset)) return;
-    meta[M_ALL_VALUES_OFFSET] = offset;
-    meta[M_ALL_VALUES_COUNT] = expanded_count;
-    for (uint32_t i = 0; i < expanded_count; ++i) {
-        assembly[offset + 5 * i] = expanded[i];
+    __shared__ uint32_t all_values_offset;
+    if (tid == 0) {
+        const unsigned long long words = 5ULL * expanded_count;
+        failed = words > 0xffffffffULL ||
+            !reserve_words(assembly, capacity, static_cast<uint32_t>(words),
+                           &all_values_offset);
+    }
+    __syncthreads();
+    if (failed) {
+        if (tid == 0) assembly[H_USED_WORDS] = 0;
+        return;
+    }
+    for (uint32_t i = tid; i < expanded_count; i += BLOCK) {
+        assembly[all_values_offset + 5U * i] = expanded[i];
         #pragma unroll
-        for (uint32_t c = 0; c < 4; ++c) assembly[offset + 5 * i + 1 + c] = values[4 * i + c];
+        for (uint32_t c = 0; c < 4; ++c) {
+            assembly[all_values_offset + 5U * i + 1U + c] = values[4U * i + c];
+        }
     }
-    meta[M_KIND] = 1;
-    meta[M_ROLE] = tree_index;
-    meta[M_VALUES_OFFSET] = 0;
-    meta[M_VALUES_COUNT] = 0;
-    meta[M_HASH_WITNESS_OFFSET] = hash_offset;
-    meta[M_HASH_WITNESS_COUNT] = hash_count;
-    meta[M_AUX_OFFSET] = compact_aux;
-    meta[M_AUX_COUNT] = aux_count;
-    meta[M_LEAF_LOG_SIZE] = leaf_log;
-    meta[M_USED_WORDS] = assembly[H_USED_WORDS] - tree_start;
+    __syncthreads();
+    if (tid == 0) {
+        meta[M_KIND] = 1;
+        meta[M_ROLE] = tree_index;
+        meta[M_QUERY_OFFSET] = query_offset;
+        meta[M_QUERY_COUNT] = query_count;
+        meta[M_VALUES_OFFSET] = 0;
+        meta[M_VALUES_COUNT] = 0;
+        meta[M_FRI_WITNESS_OFFSET] = witness_offset;
+        meta[M_FRI_WITNESS_COUNT] = witness_count;
+        meta[M_HASH_WITNESS_OFFSET] = hash_offset;
+        meta[M_HASH_WITNESS_COUNT] = hash_count;
+        meta[M_AUX_OFFSET] = aux_offset;
+        meta[M_AUX_COUNT] = aux_count;
+        meta[M_ALL_VALUES_OFFSET] = all_values_offset;
+        meta[M_ALL_VALUES_COUNT] = expanded_count;
+        meta[M_LEAF_LOG_SIZE] = leaf_log;
+        meta[M_USED_WORDS] = assembly[H_USED_WORDS] - tree_start;
+    }
 }
 
 } // namespace
@@ -609,7 +846,7 @@ extern "C" int stwo_decommit_assemble_trace_on(
         !mapped_count || max_queries == 0 || !walk || !walk_scratch || !walk_count ||
         !values || !retained || !sparse_indices || !sparse_hashes || !sparse_offsets ||
         !sparse_counts || !assembly || !stream) return cudaErrorInvalidValue;
-    assemble_trace_kernel<<<1, 1, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
+    assemble_trace_kernel<<<1, BLOCK, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
         tree_index, role, leaf_log, first_retained_log, column_count, mapped, mapped_count,
         max_queries, walk, walk_scratch, walk_count, values, retained, sparse_indices,
         sparse_hashes, sparse_offsets, sparse_counts, sparse_level_count, assembly, capacity);
@@ -650,7 +887,7 @@ extern "C" int stwo_decommit_assemble_fri_on(
     if (leaf_log >= 31 || !tree_queries || !tree_count || !expanded || !expanded_count ||
         !values || !walk || !walk_scratch || !walk_count || !retained || !assembly || !stream)
         return cudaErrorInvalidValue;
-    assemble_fri_kernel<<<1, 1, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
+    assemble_fri_kernel<<<1, BLOCK, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
         tree_index, leaf_log, tree_queries, tree_count, expanded, expanded_count, values,
         walk, walk_scratch, walk_count, retained, assembly, capacity);
     return cudaGetLastError();

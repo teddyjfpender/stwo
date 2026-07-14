@@ -24,6 +24,16 @@ pub const POW_U64_ALIGNMENT_WORDS: usize = core::mem::align_of::<u64>() / WORD_B
 /// Low-bit width of the SIMD grind lattice (GRIND_LOW_BITS in
 /// `stwo::prover::backend::simd::grind`).
 pub const POW_GRIND_LOW_BITS: u32 = 20;
+/// Compiled search contract. The source-level unroll sweep selected u2 as the
+/// primary and u5 as the identical fallback. `__launch_bounds__(256, 6)` caps
+/// the compiler at the 75%-occupancy register envelope on SM90; the release
+/// resource gate additionally rejects any ptxas spill.
+#[cfg(test)]
+const POW_PRIMARY_ROUND_UNROLL: u32 = 2;
+#[cfg(test)]
+const POW_FALLBACK_ROUND_UNROLL: u32 = 5;
+#[cfg(test)]
+const POW_MIN_BLOCKS_PER_SM: u32 = 6;
 
 /// Host mirror of the kernel's monotone index -> nonce map
 /// (`pow_index_to_nonce` in `cuda/resident_pow.cu`): linear search index `i`
@@ -424,6 +434,32 @@ mod tests {
     }
 
     #[test]
+    fn varied_salts_pin_exact_lowest_nonce_and_attempt_count() {
+        let cases: &[(&[u32], u64, u64)] = &[
+            (&[], 0x154f, 5_456),
+            (&[0], 0x01c8, 457),
+            (&[1], 0x0726, 1_831),
+            (&[42, 77, 99], 0x19fc, 6_653),
+            (&[0x1122_3344, 0xaabb_ccdd, 9], 0x0c7f, 3_200),
+            (&[u32::MAX, 0, 0xdead_beef], 0x0197, 408),
+        ];
+        for &(salt, expected_nonce, expected_attempts) in cases {
+            let mut channel = Blake2sChannelGeneric::<false>::default();
+            if !salt.is_empty() {
+                channel.mix_u32s(salt);
+            }
+            assert_eq!(SimdBackend::grind(&channel, 12), expected_nonce);
+            let expected_index = ((expected_nonce >> 32) << POW_GRIND_LOW_BITS)
+                | (expected_nonce & ((1 << POW_GRIND_LOW_BITS) - 1));
+            assert_eq!(expected_index + 1, expected_attempts);
+            assert!((0..expected_index)
+                .map(pow_index_to_nonce)
+                .all(|nonce| !reference_valid_pow(&channel, 12, nonce)));
+            assert!(reference_valid_pow(&channel, 12, expected_nonce));
+        }
+    }
+
+    #[test]
     fn lattice_enumeration_skips_dense_nonces_outside_the_simd_search_space() {
         // Synthetic qualifying set reproducing the divergence scenario: the
         // dense-u64 minimum 0x30_0000 has low-32 bits >= 2^20, so the SIMD
@@ -468,5 +504,19 @@ mod tests {
         );
         assert_eq!(validate_pow_bits(32), Ok(()));
         assert_eq!(validate_pow_bits(26), Ok(()));
+    }
+
+    #[test]
+    fn compiled_pow_variant_contract_is_pinned() {
+        assert_eq!(POW_PRIMARY_ROUND_UNROLL, 2);
+        assert_eq!(POW_FALLBACK_ROUND_UNROLL, 5);
+        assert_eq!(POW_MIN_BLOCKS_PER_SM, 6);
+
+        let source = include_str!("../../../backend-cuda-kernels/cuda/resident_pow.cu");
+        assert!(source.contains("constexpr int POW_PRIMARY_ROUND_UNROLL = 2;"));
+        assert!(source.contains("constexpr int POW_FALLBACK_ROUND_UNROLL = 5;"));
+        assert!(source.contains("__launch_bounds__(POW_BLOCK_SIZE, POW_MIN_BLOCKS_PER_SM)"));
+        assert_eq!(source.matches("pow_prefix_digest<<<").count(), 1);
+        assert_eq!(source.matches("stwo_blake2s_hash2_device(").count(), 1);
     }
 }
