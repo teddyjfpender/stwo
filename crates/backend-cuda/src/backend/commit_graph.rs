@@ -44,6 +44,32 @@ impl RetainedLdeHashMode {
     }
 }
 
+/// Source-level implementation selected for a materialized streaming leaf
+/// update. The mode is sealed into each launch node during preparation so an
+/// eager launch and its captured replay cannot silently select different
+/// kernels from ambient state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommitLeafUpdateMode {
+    Scalar,
+    Ilp2,
+    Quad,
+    /// The input is stopped before its final N2B butterfly and is consumed by
+    /// the producer-fused kernel. This is compiler-selected, never ambient.
+    FromLde,
+}
+
+impl CommitLeafUpdateMode {
+    pub fn from_env() -> Self {
+        if std::env::var("STWO_CUDA_BLAKE2S_LEAF_QUAD").as_deref() == Ok("1") {
+            Self::Quad
+        } else if super::blake2s::blake2s_leaf_ilp2_enabled() {
+            Self::Ilp2
+        } else {
+            Self::Scalar
+        }
+    }
+}
+
 /// `STWO_CUDA_NTT_LEAF_FUSED=1` opts retained full-lifting 16-column groups
 /// into the LDE-write + leaf-absorb fused lane (Step 3.1). Default OFF until
 /// the pod byte-identity and bandwidth gates pass.
@@ -127,6 +153,7 @@ pub enum CommitLaunchKind {
         group: u32,
         first_column: u32,
         columns: u32,
+        mode: CommitLeafUpdateMode,
     },
     LeafFinalize {
         group: u32,
@@ -220,6 +247,7 @@ pub enum CommitGraphError {
         group: u32,
         batch: u32,
     },
+    InvalidLeafUpdateMode,
     SizeOverflow,
     Cuda(CudaRuntimeError),
 }
@@ -268,12 +296,12 @@ enum CommitLaunch {
         group: u32,
         first_column: u32,
         columns: u32,
+        mode: CommitLeafUpdateMode,
         column_ptrs: ArenaSlice,
         column_log_sizes: ArenaSlice,
         lifting_log_size: u32,
         twiddles: ArenaSlice,
         twiddle_words: u32,
-        from_lde: bool,
         state: ArenaSlice,
     },
     LeafFinalize {
@@ -337,11 +365,13 @@ impl CommitLaunch {
                 group,
                 first_column,
                 columns,
+                mode,
                 ..
             } => CommitLaunchKind::LeafUpdate {
                 group,
                 first_column,
                 columns,
+                mode,
             },
             Self::LeafFinalize {
                 group,
@@ -478,6 +508,7 @@ impl CommitGraphPlan {
             tail,
             interior_fused,
             RetainedLdeHashMode::from_env(),
+            CommitLeafUpdateMode::from_env(),
         )
     }
 
@@ -501,7 +532,11 @@ impl CommitGraphPlan {
         tail: Option<CommitTailPlan>,
         interior_fused: bool,
         retained_lde_hash: RetainedLdeHashMode,
+        leaf_update_mode: CommitLeafUpdateMode,
     ) -> Result<Self, CommitGraphError> {
+        if leaf_update_mode == CommitLeafUpdateMode::FromLde {
+            return Err(CommitGraphError::InvalidLeafUpdateMode);
+        }
         if lifting_log_size >= 31 {
             return Err(CommitGraphError::InvalidLiftingLogSize(lifting_log_size));
         }
@@ -709,12 +744,16 @@ impl CommitGraphPlan {
                         group: group_index,
                         first_column: cols_done,
                         columns: group.column_count,
+                        mode: if prefix_fused {
+                            CommitLeafUpdateMode::FromLde
+                        } else {
+                            leaf_update_mode
+                        },
                         column_ptrs: group.column_ptrs,
                         column_log_sizes: group.column_log_sizes,
                         lifting_log_size,
                         twiddles,
                         twiddle_words,
-                        from_lde: prefix_fused,
                         state: leaf_state,
                     }
                 };
@@ -916,54 +955,69 @@ impl CommitGraphPlan {
                         lifting_log_size,
                         twiddles,
                         twiddle_words,
-                        from_lde,
+                        mode,
                         first_column,
                         state,
                         ..
                     } => {
-                        let code = if from_lde {
-                            raw::stwo_blake2s_leaf_group_from_lde_on(
-                                1u32 << lifting_log_size,
-                                columns,
-                                column_ptrs.as_u32_ptr().cast(),
-                                column_log_sizes.as_u32_ptr(),
-                                lifting_log_size,
-                                first_column,
-                                0,
-                                twiddles.as_u32_ptr(),
-                                twiddle_words,
-                                state.as_u32_ptr().cast(),
-                                stream,
-                            )
-                        } else if super::blake2s::blake2s_leaf_ilp2_enabled() {
-                            // Opt-in ILP lane (STWO_CUDA_BLAKE2S_LEAF_ILP=1):
-                            // two adjacent rows per thread, halved grid,
-                            // byte-identical digests. The env is a process
-                            // OnceLock, so capture and eager replay always
-                            // select the same kernel.
-                            raw::stwo_blake2s_leaf_update_ilp2_on(
-                                1u32 << lifting_log_size,
-                                columns,
-                                column_ptrs.as_u32_ptr().cast(),
-                                column_log_sizes.as_u32_ptr(),
-                                lifting_log_size,
-                                first_column,
-                                state.as_u32_ptr().cast(),
-                                stream,
-                            )
-                        } else {
-                            raw::stwo_blake2s_leaf_update_on(
-                                1u32 << lifting_log_size,
-                                columns,
-                                column_ptrs.as_u32_ptr().cast(),
-                                column_log_sizes.as_u32_ptr(),
-                                lifting_log_size,
-                                first_column,
-                                state.as_u32_ptr().cast(),
-                                stream,
-                            )
+                        let (operation, code) = match mode {
+                            CommitLeafUpdateMode::FromLde => (
+                                "commit_leaf_update_from_lde",
+                                raw::stwo_blake2s_leaf_group_from_lde_on(
+                                    1u32 << lifting_log_size,
+                                    columns,
+                                    column_ptrs.as_u32_ptr().cast(),
+                                    column_log_sizes.as_u32_ptr(),
+                                    lifting_log_size,
+                                    first_column,
+                                    0,
+                                    twiddles.as_u32_ptr(),
+                                    twiddle_words,
+                                    state.as_u32_ptr().cast(),
+                                    stream,
+                                ),
+                            ),
+                            CommitLeafUpdateMode::Ilp2 => (
+                                "commit_leaf_update_ilp2",
+                                raw::stwo_blake2s_leaf_update_ilp2_on(
+                                    1u32 << lifting_log_size,
+                                    columns,
+                                    column_ptrs.as_u32_ptr().cast(),
+                                    column_log_sizes.as_u32_ptr(),
+                                    lifting_log_size,
+                                    first_column,
+                                    state.as_u32_ptr().cast(),
+                                    stream,
+                                ),
+                            ),
+                            CommitLeafUpdateMode::Quad => (
+                                "commit_leaf_update_quad",
+                                raw::stwo_blake2s_leaf_update_quad_on(
+                                    1u32 << lifting_log_size,
+                                    columns,
+                                    column_ptrs.as_u32_ptr().cast(),
+                                    column_log_sizes.as_u32_ptr(),
+                                    lifting_log_size,
+                                    first_column,
+                                    state.as_u32_ptr().cast(),
+                                    stream,
+                                ),
+                            ),
+                            CommitLeafUpdateMode::Scalar => (
+                                "commit_leaf_update",
+                                raw::stwo_blake2s_leaf_update_on(
+                                    1u32 << lifting_log_size,
+                                    columns,
+                                    column_ptrs.as_u32_ptr().cast(),
+                                    column_log_sizes.as_u32_ptr(),
+                                    lifting_log_size,
+                                    first_column,
+                                    state.as_u32_ptr().cast(),
+                                    stream,
+                                ),
+                            ),
                         };
-                        ("commit_leaf_update", code)
+                        (operation, code)
                     }
                     CommitLaunch::LeafFinalize {
                         columns,
@@ -1385,6 +1439,7 @@ mod tests {
                 Some(tail.clone()),
                 interior_fused,
                 RetainedLdeHashMode::Separate,
+                CommitLeafUpdateMode::Scalar,
             )
             .unwrap();
             let suffix = CommitGraphPlan::new_merkle_from_leaves_with_mode(
@@ -1470,6 +1525,7 @@ mod tests {
                     group: 0,
                     first_column: 0,
                     columns: 16,
+                    mode: CommitLeafUpdateMode::FromLde,
                 },
                 CommitLaunchKind::Lde {
                     group: 1,
@@ -1496,6 +1552,52 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn materialized_leaf_mode_is_sealed_into_the_launch_topology() {
+        for mode in [
+            CommitLeafUpdateMode::Scalar,
+            CommitLeafUpdateMode::Ilp2,
+            CommitLeafUpdateMode::Quad,
+        ] {
+            let mut leaf_groups = groups();
+            // Retention prevents the small-log producer-fused lane, exposing
+            // the materialized update implementation selected by the caller.
+            leaf_groups[0].retain_evaluations = true;
+            let plan = CommitGraphPlan::new_pruned_with_modes(
+                6,
+                0,
+                slice(1, 64 * HASH_WORDS),
+                leaf_groups,
+                (0..6)
+                    .map(|level| slice(100 + level, (32usize >> level) * HASH_WORDS))
+                    .collect(),
+                None,
+                false,
+                RetainedLdeHashMode::Separate,
+                mode,
+            )
+            .unwrap();
+            assert!(plan.launch_sequence().any(|launch| {
+                matches!(launch, CommitLaunchKind::LeafUpdate { mode: actual, .. } if actual == mode)
+            }));
+        }
+
+        assert!(matches!(
+            CommitGraphPlan::new_pruned_with_modes(
+                6,
+                0,
+                slice(1, 64 * HASH_WORDS),
+                groups(),
+                Vec::new(),
+                None,
+                false,
+                RetainedLdeHashMode::Separate,
+                CommitLeafUpdateMode::FromLde,
+            ),
+            Err(CommitGraphError::InvalidLeafUpdateMode)
+        ));
     }
 
     #[test]
@@ -1574,6 +1676,7 @@ mod tests {
                 None,
                 false,
                 mode,
+                CommitLeafUpdateMode::Scalar,
             )
             .unwrap()
         };
@@ -1670,6 +1773,7 @@ mod tests {
             None,
             false,
             RetainedLdeHashMode::Fused,
+            CommitLeafUpdateMode::Scalar,
         )
         .unwrap();
 
@@ -1687,6 +1791,7 @@ mod tests {
                     group: 0,
                     first_column: 0,
                     columns: 16,
+                    mode: CommitLeafUpdateMode::Scalar,
                 },
                 CommitLaunchKind::NttHash {
                     group: 1,

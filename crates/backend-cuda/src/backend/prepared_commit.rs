@@ -12,7 +12,7 @@ use stwo::core::vcs::blake2_hash::Blake2sHash;
 
 use super::commit_graph::{
     CommitGraphError, CommitGraphPlan, CommitHashFromTileTelemetry, CommitLaunchKind,
-    CommitLdeBatch, CommitLeafGroup, CommitTailPlan, RetainedLdeHashMode,
+    CommitLdeBatch, CommitLeafGroup, CommitLeafUpdateMode, CommitTailPlan, RetainedLdeHashMode,
 };
 use super::exec_context::{
     check_cuda, ArenaError, ArenaSlice, ArenaSlotId, CudaRuntimeError, DeviceArena,
@@ -802,6 +802,7 @@ impl<'a> PreparedCommitGraph<'a> {
             None,
             super::blake2s::blake2s_interior_fused_enabled(),
             RetainedLdeHashMode::from_env(),
+            CommitLeafUpdateMode::from_env(),
         )
     }
 
@@ -825,6 +826,7 @@ impl<'a> PreparedCommitGraph<'a> {
             Some(output_groups),
             super::blake2s::blake2s_interior_fused_enabled(),
             RetainedLdeHashMode::from_env(),
+            CommitLeafUpdateMode::from_env(),
         )
     }
 
@@ -845,6 +847,31 @@ impl<'a> PreparedCommitGraph<'a> {
         output_groups: &[Option<CommitEvaluationGroup>],
         retained_lde_hash: RetainedLdeHashMode,
     ) -> Result<Self, PreparedCommitError> {
+        Self::prepare_with_retained_evaluations_and_modes(
+            arena,
+            config,
+            groups,
+            twiddles,
+            slots,
+            output_groups,
+            retained_lde_hash,
+            CommitLeafUpdateMode::from_env(),
+        )
+    }
+
+    /// Fully explicit commitment implementation selection used by native
+    /// cross-mode gates. Both choices are sealed into the prepared topology.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_with_retained_evaluations_and_modes(
+        arena: &'a DeviceArena,
+        config: CommitWorkspaceConfig,
+        groups: &[CommitCoefficientGroup],
+        twiddles: ArenaSlice,
+        slots: &CommitWorkspaceSlots,
+        output_groups: &[Option<CommitEvaluationGroup>],
+        retained_lde_hash: RetainedLdeHashMode,
+        leaf_update_mode: CommitLeafUpdateMode,
+    ) -> Result<Self, PreparedCommitError> {
         Self::prepare_inner(
             arena,
             config,
@@ -854,6 +881,7 @@ impl<'a> PreparedCommitGraph<'a> {
             Some(output_groups),
             super::blake2s::blake2s_interior_fused_enabled(),
             retained_lde_hash,
+            leaf_update_mode,
         )
     }
 
@@ -880,6 +908,31 @@ impl<'a> PreparedCommitGraph<'a> {
             None,
             interior_fused,
             RetainedLdeHashMode::from_env(),
+            CommitLeafUpdateMode::from_env(),
+        )
+    }
+
+    /// Prepare with an explicit materialized leaf-update implementation. This
+    /// is the correctness/A-B entry point for the cooperative quad kernel;
+    /// the selected mode is sealed into the launch topology before capture.
+    pub fn prepare_with_leaf_update_mode(
+        arena: &'a DeviceArena,
+        config: CommitWorkspaceConfig,
+        groups: &[CommitCoefficientGroup],
+        twiddles: ArenaSlice,
+        slots: &CommitWorkspaceSlots,
+        leaf_update_mode: CommitLeafUpdateMode,
+    ) -> Result<Self, PreparedCommitError> {
+        Self::prepare_inner(
+            arena,
+            config,
+            groups,
+            twiddles,
+            slots,
+            None,
+            super::blake2s::blake2s_interior_fused_enabled(),
+            RetainedLdeHashMode::from_env(),
+            leaf_update_mode,
         )
     }
 
@@ -893,6 +946,7 @@ impl<'a> PreparedCommitGraph<'a> {
         output_groups: Option<&[Option<CommitEvaluationGroup>]>,
         interior_fused: bool,
         retained_lde_hash: RetainedLdeHashMode,
+        leaf_update_mode: CommitLeafUpdateMode,
     ) -> Result<Self, PreparedCommitError> {
         let grouped_logs: Vec<Vec<u32>> = groups
             .iter()
@@ -1200,6 +1254,7 @@ impl<'a> PreparedCommitGraph<'a> {
             tail,
             interior_fused,
             retained_lde_hash,
+            leaf_update_mode,
         )?;
 
         // Dynamic shared-memory opt-in is a setup operation and therefore must

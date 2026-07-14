@@ -1296,6 +1296,20 @@ pub unsafe extern "C" fn stwo_blake2s_leaf_update_ilp2_on(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_blake2s_leaf_update_quad_on(
+    _size: u32,
+    _group_n_cols: u32,
+    _columns: *const *mut u32,
+    _column_log_sizes: *const u32,
+    _lifting_log_size: u32,
+    _cols_done: u32,
+    _state: *mut Blake2sHash,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_blake2s_leaf_update_quad_on")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stwo_blake2s_leaf_finalize_on(
     _size: u32,
     _rem_cols: u32,

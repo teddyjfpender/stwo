@@ -138,6 +138,12 @@ int stwo_blake2s_leaf_update_on(uint32_t size, uint32_t group_n_cols, uint32_t *
 // two rows per thread, halved grid; byte-identical digests).
 extern "C"
 int stwo_blake2s_leaf_update_ilp2_on(uint32_t size, uint32_t group_n_cols, uint32_t **columns, const uint32_t *column_log_sizes, uint32_t lifting_log_size, uint32_t cols_done, Blake2sHash *state, void *stream);
+// Four-lane cooperative update. One warp owns eight independent leaves; each
+// quad distributes one Blake2s compression across four lanes and exchanges
+// diagonal words with warp shuffles. The byte stream and state ABI are
+// identical to stwo_blake2s_leaf_update_on.
+extern "C"
+int stwo_blake2s_leaf_update_quad_on(uint32_t size, uint32_t group_n_cols, uint32_t **columns, const uint32_t *column_log_sizes, uint32_t lifting_log_size, uint32_t cols_done, Blake2sHash *state, void *stream);
 extern "C"
 int stwo_blake2s_leaf_finalize_on(uint32_t size, uint32_t rem_cols, uint32_t **columns, const uint32_t *column_log_sizes, uint32_t lifting_log_size, uint32_t cols_done, Blake2sHash *result, void *stream);
 // Consume columns stopped immediately before their final circle butterfly.

@@ -9,7 +9,7 @@ mod backend;
 pub use backend::aot;
 pub use backend::commit_graph::{
     CommitGraphError, CommitGraphPlan, CommitHashFromTileTelemetry, CommitLaunchKind,
-    CommitLdeBatch, CommitLeafGroup, CommitTailPlan, RetainedLdeHashMode,
+    CommitLdeBatch, CommitLeafGroup, CommitLeafUpdateMode, CommitTailPlan, RetainedLdeHashMode,
 };
 pub use backend::decommit_gather::{
     column_row_gather_requirements, gather_column_rows_host, ColumnRowGatherError,

@@ -600,6 +600,18 @@ extern "C" {
         state: *mut Blake2sHash,
         stream: *mut core::ffi::c_void,
     ) -> i32;
+    /// Four-lane cooperative twin of `stwo_blake2s_leaf_update_on`. One quad
+    /// owns one leaf and distributes the Blake2s G functions across lanes.
+    pub fn stwo_blake2s_leaf_update_quad_on(
+        size: u32,
+        group_n_cols: u32,
+        columns: *const *mut u32,
+        column_log_sizes: *const u32,
+        lifting_log_size: u32,
+        cols_done: u32,
+        state: *mut Blake2sHash,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
     pub fn stwo_blake2s_leaf_finalize_on(
         size: u32,
         rem_cols: u32,

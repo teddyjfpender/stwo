@@ -15,9 +15,9 @@ use stwo::prover::vcs_lifted::ops::MerkleOpsLifted;
 use stwo_backend_cuda::{
     commit_workspace_requirements, ArenaLayout, ArenaSlice, ArenaSlotId, ArenaSlotSpec,
     CommitArenaSlotRequirement, CommitBatchSlots, CommitCoefficientColumn, CommitCoefficientGroup,
-    CommitEvaluationGroup, CommitGroupSlots, CommitLaunchKind, CommitWorkspaceConfig,
-    CommitWorkspaceRequirements, CommitWorkspaceSlots, CudaExecContext, DeviceArena,
-    PreparedCommitGraph, RetainedLdeHashMode, COMMIT_HASH_ALIGNMENT_WORDS,
+    CommitEvaluationGroup, CommitGroupSlots, CommitLaunchKind, CommitLeafUpdateMode,
+    CommitWorkspaceConfig, CommitWorkspaceRequirements, CommitWorkspaceSlots, CudaExecContext,
+    DeviceArena, PreparedCommitGraph, RetainedLdeHashMode, COMMIT_HASH_ALIGNMENT_WORDS,
     COMMIT_POINTER_ALIGNMENT_WORDS,
 };
 
@@ -537,9 +537,9 @@ fn mixed_log_commit_eager_and_capture_match_cpu_leaf_and_every_layer() {
     drop(prepared);
 
     // Step 3.1 retained LDE-write + leaf-absorb gate: the SAME retained
-    // commitment runs with BOTH retained topologies pinned explicitly in this
-    // one invocation (the STWO_CUDA_NTT_LEAF_FUSED switch is a process-global
-    // OnceLock). The fused plan replaces the retained group's Lde + LeafUpdate
+    // commitment runs with scalar, cooperative-quad, and retained-fused
+    // topologies pinned explicitly in one invocation. The fused plan replaces
+    // the retained group's Lde + LeafUpdate
     // launch pair with one RetainedNttHash node and must reproduce the
     // Separate plan's retained evaluations, every retained layer, and the
     // root byte-for-byte — eagerly and through mutated graph replay. Both
@@ -569,15 +569,20 @@ fn mixed_log_commit_eager_and_capture_match_cpu_leaf_and_every_layer() {
         upload(&arena, ArenaSlotId(SOURCE_BASE + index as u32), words);
     }
     let mut launch_counts = Vec::new();
-    for mode in [RetainedLdeHashMode::Separate, RetainedLdeHashMode::Fused] {
-        let prepared = PreparedCommitGraph::prepare_with_retained_evaluations_and_mode(
+    for (retained_mode, leaf_mode) in [
+        (RetainedLdeHashMode::Separate, CommitLeafUpdateMode::Scalar),
+        (RetainedLdeHashMode::Separate, CommitLeafUpdateMode::Quad),
+        (RetainedLdeHashMode::Fused, CommitLeafUpdateMode::Scalar),
+    ] {
+        let prepared = PreparedCommitGraph::prepare_with_retained_evaluations_and_modes(
             &arena,
             config,
             &groups,
             arena.bind(TWIDDLES).unwrap(),
             &slots,
             &retained_outputs,
-            mode,
+            retained_mode,
+            leaf_mode,
         )
         .unwrap();
         launch_counts.push(prepared.launch_sequence().len());
@@ -587,7 +592,7 @@ fn mixed_log_commit_eager_and_capture_match_cpu_leaf_and_every_layer() {
             .filter(|kind| matches!(kind, CommitLaunchKind::RetainedNttHash { .. }))
             .count();
         let telemetry = prepared.hash_from_tile_telemetry();
-        if mode == RetainedLdeHashMode::Fused {
+        if retained_mode == RetainedLdeHashMode::Fused {
             assert_eq!(
                 retained_ntt_nodes, 1,
                 "the retained group must take the fused write+hash lane"
@@ -598,6 +603,9 @@ fn mixed_log_commit_eager_and_capture_match_cpu_leaf_and_every_layer() {
             assert_eq!(retained_ntt_nodes, 0);
             assert_eq!(telemetry.retained_fused_groups, 0);
             assert_eq!(telemetry.unfused_groups, 1);
+            assert!(prepared.launch_sequence().any(|launch| {
+                matches!(launch, CommitLaunchKind::LeafUpdate { mode, .. } if mode == leaf_mode)
+            }));
         }
 
         scramble_outputs();
@@ -605,9 +613,9 @@ fn mixed_log_commit_eager_and_capture_match_cpu_leaf_and_every_layer() {
         assert_all_retained_layers(&arena, &prepared, &cpu_layers(config, &logs, &third));
         assert_retained_evaluations(&arena, &prepared, config, &logs, &third);
 
-        // Graph capture replays the fused topology byte-for-byte on
-        // mutated coefficients.
-        if mode == RetainedLdeHashMode::Fused {
+        // Graph capture replays each new topology byte-for-byte on mutated
+        // coefficients.
+        if retained_mode == RetainedLdeHashMode::Fused || leaf_mode == CommitLeafUpdateMode::Quad {
             let capture = arena.context().capture().unwrap();
             prepared.launch().unwrap();
             let graph = capture.finish().unwrap();
@@ -622,5 +630,6 @@ fn mixed_log_commit_eager_and_capture_match_cpu_leaf_and_every_layer() {
     }
     // Capture node budget: the fused plan carries exactly one fewer launch —
     // the retained group's Lde + LeafUpdate pair became one RetainedNttHash.
-    assert_eq!(launch_counts[1] + 1, launch_counts[0]);
+    assert_eq!(launch_counts[0], launch_counts[1]);
+    assert_eq!(launch_counts[2] + 1, launch_counts[0]);
 }
