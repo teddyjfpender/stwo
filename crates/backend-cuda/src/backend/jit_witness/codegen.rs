@@ -1,19 +1,16 @@
 //! CUDA source emitter for witness-JIT programs.
 //!
-//! Emits one `__global__` kernel, one thread per row: read the packed inputs, replay
-//! the recorded instruction stream in registers, write committed columns, atomic-add
-//! multiplicities, and store lookup words. The M31 field helpers are the *same*
-//! formulas as the constraint lane's preamble (`super::super::jit::cuda_codegen`), which
-//! are byte-equal-proven against the CPU reference by the Metal/CUDA conformance gate —
-//! so reusing them keeps the witness kernel's field arithmetic on the same proven
-//! footing. Integer ops map to native CUDA `unsigned` arithmetic.
-//!
-//! The kernel ABI is explicit C (pointer/scalar parameters only) — no Rust struct
-//! layouts crossing the boundary, the same discipline that makes the constraint JIT
-//! kernels portable across AIR/compiler revisions.
+//! Emits one row-thread `__global__` kernel that replays the recorded instruction
+//! stream, writes columns, accumulates multiplicities, and stores lookup words. M31
+//! helpers match the byte-equal-proven constraint lane; integer ops are native CUDA
+//! `unsigned`. The ABI contains only explicit C pointer/scalar parameters.
 
 use super::isa::{DeduceKind, WitnessOp, WitnessProgram};
 
+#[path = "codegen_phase_plan.rs"]
+pub mod phase_plan;
+#[path = "codegen_phases.rs"]
+pub mod phases;
 #[path = "codegen_schedule.rs"]
 mod schedule;
 use schedule::{emit_scheduled_outputs, OutputSchedule};
@@ -44,15 +41,23 @@ pub fn witness_kernel_name(semantic_hash: u64) -> String {
 /// Compile a witness program into CUDA C source. Returns `None` if the program carries
 /// an opcode this emitter does not handle (the caller then falls back to the host lane).
 pub fn compile_witness_to_cuda_source(program: &WitnessProgram) -> Option<String> {
+    compile_witness_to_cuda_source_inner(program, false)
+}
+
+fn compile_witness_to_marked_cuda_source(program: &WitnessProgram) -> Option<String> {
+    compile_witness_to_cuda_source_inner(program, true)
+}
+
+fn compile_witness_to_cuda_source_inner(
+    program: &WitnessProgram,
+    instruction_markers: bool,
+) -> Option<String> {
     let name = witness_kernel_name(program.semantic_hash());
     let mut src = String::with_capacity(8192);
     emit_preamble(&mut src);
 
-    // ISA-V3 computed deduces: embed the needed __device__ functions (transcribed
-    // 1:1 from the host fast_deduction routines; validated by the truth-oracle legs
-    // + the component differential on hardware). Blake kinds embed small inline
-    // functions; the fp256/EC kinds pull in the kernels crate's fp256 chain +
-    // `stwo_wit_deduce.cuh` (see `emit_fp256_deduce_support`).
+    // Embed only the ISA-V3 device deduces used by this program. Blake is inline;
+    // fp256/EC uses the kernels crate's proven chain and shim.
     let mut kinds_used: Vec<DeduceKind> = Vec::new();
     for inst in &program.insts {
         if WitnessOp::from_raw(inst.op) == Some(WitnessOp::DeduceCall) {
@@ -125,13 +130,8 @@ pub fn compile_witness_to_cuda_source(program: &WitnessProgram) -> Option<String
         );
     }
 
-    // Value-limb deduce with the encoded-id tag dispatch (semantics proven by the
-    // exec_deduce_output differential over real PIE memories). Table pointer layout:
-    // [0]=addr_to_id, [1..29]=big limb columns, [29..37]=small limb columns;
-    // strides carry the table lengths [n_addrs, n_big, n_small] for clamping.
-    // x^(P-2) by square-and-multiply over the fixed exponent 2^31 - 3
-    // (binary: thirty-one bits, all ones except bit 1). Total function —
-    // inverse(0) = 0 — matching the CPU `FieldExpOps::inverse` power semantics.
+    // Encoded-id table layout: addr-to-id, 28 big limbs, then 8 small limbs.
+    // Inversion uses fixed x^(2^31-3), total at zero like the CPU semantics.
     src.push_str(
         "static __device__ __forceinline__ unsigned stwo_m31_inverse(unsigned a) {\n\
          \x20   unsigned result = a;                 // consumes exponent bit 30\n\
@@ -167,18 +167,25 @@ pub fn compile_witness_to_cuda_source(program: &WitnessProgram) -> Option<String
          \x20   if (row >= row_count) {{ return; }}\n\n"
     ));
 
-    emit_body(program, &mut src)?;
+    emit_body_inner(program, &mut src, instruction_markers)?;
 
     src.push_str("}\n");
     Some(src)
 }
 
-fn emit_body(program: &WitnessProgram, src: &mut String) -> Option<()> {
+fn emit_body_inner(
+    program: &WitnessProgram,
+    src: &mut String,
+    instruction_markers: bool,
+) -> Option<()> {
     let schedule = OutputSchedule::build(program)?;
     let mut deduce_args: Vec<u32> = Vec::new();
     let mut deduce_seq = 0usize;
 
     for (index, inst) in program.insts.iter().enumerate() {
+        if instruction_markers {
+            src.push_str(&format!("    // STWO_WIT_INST_{index}\n"));
+        }
         let op = WitnessOp::from_raw(inst.op)?;
         let (a, b, imm) = (inst.a, inst.b, inst.imm);
 

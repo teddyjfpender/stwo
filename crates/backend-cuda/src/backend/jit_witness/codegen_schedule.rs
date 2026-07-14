@@ -19,7 +19,7 @@ pub(super) struct ScheduledOutput {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum StoreAnchor {
+pub(super) enum StoreAnchor {
     AfterInstruction(usize),
     AfterDeduceArguments(usize),
     AfterDeduceRegister {
@@ -30,7 +30,7 @@ enum StoreAnchor {
 }
 
 impl StoreAnchor {
-    fn rank(self) -> (usize, usize) {
+    pub(super) fn rank(self) -> (usize, usize) {
         match self {
             Self::AfterInstruction(instruction) => (instruction, usize::MAX),
             Self::AfterDeduceArguments(instruction) => (instruction, 0),
@@ -44,9 +44,46 @@ impl StoreAnchor {
 }
 
 #[derive(Clone, Copy)]
-struct RegisterDefinition {
-    instruction: usize,
-    deduce_bank_offset: Option<usize>,
+pub(super) struct RegisterDefinition {
+    pub(super) instruction: usize,
+    pub(super) deduce_bank_offset: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
+pub(super) enum OutputTarget {
+    Column(u32),
+    LookupWord(u32),
+    SubWord(u32),
+}
+
+impl ScheduledOutput {
+    pub(super) fn target(self) -> OutputTarget {
+        match self.op {
+            WitnessOp::ColWrite => OutputTarget::Column(self.ordinal),
+            WitnessOp::LookupWord => OutputTarget::LookupWord(self.ordinal),
+            WitnessOp::SubWord => OutputTarget::SubWord(self.ordinal),
+            _ => unreachable!("scheduled output is always a value store"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct StoreEvent {
+    pub(super) anchor: StoreAnchor,
+    pub(super) order: usize,
+    pub(super) output: ScheduledOutput,
+}
+
+/// One validated SSA/output analysis shared by monolithic scheduling and the
+/// experimental phase planner. `uses` includes computational uses plus the
+/// schedule's actual output-store anchors; phase boundaries therefore cannot
+/// silently strand a value referenced only by a delayed duplicate store.
+pub(super) struct ProgramAnalysis {
+    pub(super) schedule: OutputSchedule,
+    pub(super) definitions: Vec<Option<RegisterDefinition>>,
+    pub(super) computational_uses: Vec<Vec<usize>>,
+    pub(super) legal_cuts: Vec<bool>,
+    pub(super) stores: Vec<StoreEvent>,
 }
 
 pub(super) struct OutputSchedule {
@@ -58,6 +95,10 @@ pub(super) struct OutputSchedule {
 impl OutputSchedule {
     /// Build the earliest legal store schedule, rejecting malformed or non-SSA input.
     pub(super) fn build(program: &WitnessProgram) -> Option<Self> {
+        Some(Self::analyze(program)?.schedule)
+    }
+
+    pub(super) fn analyze(program: &WitnessProgram) -> Option<ProgramAnalysis> {
         let n_regs = program.n_regs as usize;
         let mut definitions = vec![None; n_regs];
         let mut last_use = vec![None; n_regs];
@@ -171,6 +212,16 @@ impl OutputSchedule {
         }
         pending_deduce_args.is_empty().then_some(())?;
 
+        let computational_uses = collect_instruction_uses(program, n_regs)?;
+        for register in 0..n_regs {
+            let definition = definitions[register]?;
+            let expected_last = computational_uses[register]
+                .last()
+                .copied()
+                .unwrap_or(definition.instruction);
+            (last_use[register] == Some(expected_last)).then_some(())?;
+        }
+
         let mut schedule = Self {
             after_instruction: vec![Vec::new(); program.insts.len()],
             after_deduce_arguments: vec![Vec::new(); program.insts.len()],
@@ -214,8 +265,122 @@ impl OutputSchedule {
                 }
             }
         }
-        Some(schedule)
+        let mut stores = Vec::new();
+        for instruction in 0..program.insts.len() {
+            for (order, output) in schedule.after_deduce_arguments[instruction]
+                .iter()
+                .copied()
+                .enumerate()
+            {
+                stores.push(StoreEvent {
+                    anchor: StoreAnchor::AfterDeduceArguments(instruction),
+                    order,
+                    output,
+                });
+            }
+            for (order, output) in schedule.after_instruction[instruction]
+                .iter()
+                .copied()
+                .enumerate()
+            {
+                stores.push(StoreEvent {
+                    anchor: StoreAnchor::AfterInstruction(instruction),
+                    order,
+                    output,
+                });
+            }
+        }
+        for (register, outputs) in schedule.after_deduce_register.iter().enumerate() {
+            if outputs.is_empty() {
+                continue;
+            }
+            let definition = definitions[register]?;
+            let bank_offset = definition.deduce_bank_offset?;
+            for (order, output) in outputs.iter().copied().enumerate() {
+                stores.push(StoreEvent {
+                    anchor: StoreAnchor::AfterDeduceRegister {
+                        instruction: definition.instruction,
+                        register,
+                        bank_offset,
+                    },
+                    order,
+                    output,
+                });
+            }
+        }
+        stores.sort_by_key(|event| (event.anchor.rank(), event.order));
+        let legal_cuts = legal_cuts(program)?;
+        Some(ProgramAnalysis {
+            schedule,
+            definitions,
+            computational_uses,
+            legal_cuts,
+            stores,
+        })
     }
+}
+
+fn collect_instruction_uses(program: &WitnessProgram, n_regs: usize) -> Option<Vec<Vec<usize>>> {
+    let mut uses = vec![Vec::new(); n_regs];
+    let mut pending_deduce_args = Vec::new();
+    let mut push = |register: u32, instruction: usize| -> Option<()> {
+        uses.get_mut(register as usize)?.push(instruction);
+        Some(())
+    };
+    for (instruction, inst) in program.insts.iter().enumerate() {
+        match WitnessOp::from_raw(inst.op)? {
+            WitnessOp::Input | WitnessOp::Const => {}
+            WitnessOp::M31Add
+            | WitnessOp::M31Sub
+            | WitnessOp::M31Mul
+            | WitnessOp::U16Add
+            | WitnessOp::U32Add
+            | WitnessOp::U32Sub
+            | WitnessOp::U32Mul
+            | WitnessOp::U32Xor
+            | WitnessOp::M31Eq => {
+                push(inst.a, instruction)?;
+                push(inst.b, instruction)?;
+            }
+            WitnessOp::M31Neg
+            | WitnessOp::U16Shl
+            | WitnessOp::U16Shr
+            | WitnessOp::U16And
+            | WitnessOp::U32Shl
+            | WitnessOp::U32Shr
+            | WitnessOp::U32And
+            | WitnessOp::AsM31
+            | WitnessOp::Trunc16
+            | WitnessOp::TableLimb
+            | WitnessOp::M31Inverse
+            | WitnessOp::MultPush => push(inst.a, instruction)?,
+            WitnessOp::DeduceArg => pending_deduce_args.push(inst.a),
+            WitnessOp::DeduceCall => {
+                for register in pending_deduce_args.drain(..) {
+                    push(register, instruction)?;
+                }
+            }
+            WitnessOp::ColWrite | WitnessOp::LookupWord | WitnessOp::SubWord => {
+                // Actual output uses are added from the validated schedule below.
+            }
+        }
+    }
+    pending_deduce_args.is_empty().then_some(uses)
+}
+
+fn legal_cuts(program: &WitnessProgram) -> Option<Vec<bool>> {
+    let mut cuts = vec![false; program.insts.len() + 1];
+    cuts[0] = true;
+    let mut pending = 0usize;
+    for (instruction, inst) in program.insts.iter().enumerate() {
+        match WitnessOp::from_raw(inst.op)? {
+            WitnessOp::DeduceArg => pending += 1,
+            WitnessOp::DeduceCall => pending = 0,
+            _ => {}
+        }
+        cuts[instruction + 1] = pending == 0;
+    }
+    Some(cuts)
 }
 
 pub(super) fn emit_scheduled_outputs(src: &mut String, outputs: &[ScheduledOutput]) -> Option<()> {
