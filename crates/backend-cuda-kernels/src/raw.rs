@@ -105,6 +105,28 @@ extern "C" {
         n_segments: u32,
     );
     pub fn gen_bitwise_xor_columns_on_gpu(output_columns: *const *mut u32, n_bits: u32);
+    /// Fail-closed resident preprocessed-column lane. Every function returns a
+    /// CUDA status (zero is success). Allocation requires the admitted default
+    /// pool and never falls back to an untracked `cudaMalloc`; the legacy void
+    /// entry points above retain their abort-on-error contract.
+    pub fn stwo_preprocessed_alloc_u32_checked(count: usize, output: *mut *mut u32) -> i32;
+    pub fn stwo_preprocessed_copy_h2d_checked(
+        host: *const u32,
+        device: *mut u32,
+        count: usize,
+    ) -> i32;
+    pub fn stwo_preprocessed_gen_seq_checked(output: *mut u32, log_size: u32) -> i32;
+    pub fn stwo_preprocessed_gen_range_checked(
+        output_columns: *const *mut u32,
+        n_columns: u32,
+        bits_per_segment: *const u32,
+        n_segments: u32,
+    ) -> i32;
+    pub fn stwo_preprocessed_gen_xor_checked(
+        output_columns: *const *mut u32,
+        n_bits: u32,
+    ) -> i32;
+    pub fn stwo_preprocessed_stream_sync_checked() -> i32;
     /// JIT-compile (NVRTC; cached by the CONTENT semantic hash, never pointers) and
     /// launch a generated fused constraint kernel. `rc_base` is the kernel's first
     /// constraint's global index into `random_coeff_powers` (non-zero only for split

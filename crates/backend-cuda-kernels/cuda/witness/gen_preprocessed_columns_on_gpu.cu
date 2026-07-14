@@ -7,8 +7,93 @@
 #include "fields.cuh"
 #include "utils.cuh"
 #include "timer.cuh"
+#include <climits>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
+
+namespace {
+
+constexpr uint32_t PREPROCESSED_BLOCK_SIZE = 256;
+
+template <typename T>
+cudaError_t allocate_from_default_pool_checked(size_t count, T** output) {
+    if (output == nullptr || count == 0 || count > SIZE_MAX / sizeof(T)) {
+        return cudaErrorInvalidValue;
+    }
+    *output = nullptr;
+    cudaError_t status = cuda_mem_pool_init();
+    if (status != cudaSuccess) {
+        return status;
+    }
+    cudaMemPool_t pool = stwo_default_mem_pool();
+    if (pool == nullptr) {
+        return cudaErrorNotSupported;
+    }
+    return cudaMallocFromPoolAsync(
+        reinterpret_cast<void**>(output), sizeof(T) * count, pool, 0);
+}
+
+template <typename T>
+cudaError_t clone_to_device_checked(const T* host, uint32_t count, T** output) {
+    if (host == nullptr || output == nullptr || count == 0) {
+        return cudaErrorInvalidValue;
+    }
+    T* device = nullptr;
+    cudaError_t status = allocate_from_default_pool_checked(count, &device);
+    if (status != cudaSuccess) {
+        return status;
+    }
+    status = cudaMemcpy(
+        device, host, sizeof(T) * static_cast<size_t>(count), cudaMemcpyHostToDevice);
+    if (status != cudaSuccess) {
+        // Preserve the copy failure as the primary diagnosis; cudaFreeAsync is
+        // best-effort rollback when the CUDA context is already unhealthy.
+        cudaFreeAsync(device, 0);
+        return status;
+    }
+    *output = device;
+    return cudaSuccess;
+}
+
+template <typename T>
+cudaError_t release_scratch(T* ptr) {
+    return ptr == nullptr ? cudaSuccess : cudaFreeAsync(ptr, 0);
+}
+
+uint32_t block_count(uint32_t elements) {
+    return static_cast<uint32_t>(
+        (static_cast<uint64_t>(elements) + PREPROCESSED_BLOCK_SIZE - 1) /
+        PREPROCESSED_BLOCK_SIZE);
+}
+
+}  // namespace
+
+extern "C" cudaError_t stwo_preprocessed_alloc_u32_checked(
+    size_t count,
+    uint32_t** output
+) {
+    if (output == nullptr || count == 0 || count > SIZE_MAX / sizeof(uint32_t)) {
+        return cudaErrorInvalidValue;
+    }
+    return allocate_from_default_pool_checked(count, output);
+}
+
+extern "C" cudaError_t stwo_preprocessed_copy_h2d_checked(
+    const uint32_t* host,
+    uint32_t* device,
+    size_t count
+) {
+    if (host == nullptr || device == nullptr || count == 0 ||
+        count > SIZE_MAX / sizeof(uint32_t)) {
+        return cudaErrorInvalidValue;
+    }
+    return cudaMemcpy(device, host, count * sizeof(uint32_t), cudaMemcpyHostToDevice);
+}
+
+extern "C" cudaError_t stwo_preprocessed_stream_sync_checked() {
+    return cudaStreamSynchronize(0);
+}
 
 // ============================================================================
 // Seq Column Generation
@@ -25,16 +110,22 @@ __global__ void gen_seq_column_kernel(
     output[idx] = {idx};
 }
 
-extern "C" void gen_seq_column_on_gpu(
+extern "C" cudaError_t stwo_preprocessed_gen_seq_checked(
     m31* output,
     uint32_t log_size
 ) {
-    const uint32_t BLOCK_SIZE = 256;
+    if (output == nullptr || log_size >= 32) {
+        return cudaErrorInvalidValue;
+    }
     uint32_t n_elements = 1u << log_size;
-    uint32_t num_blocks = (n_elements + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    uint32_t num_blocks = block_count(n_elements);
 
-    gen_seq_column_kernel<<<num_blocks, BLOCK_SIZE>>>(output, n_elements);
-    ASSERT_CUDA_SUCCESS(cudaGetLastError());
+    gen_seq_column_kernel<<<num_blocks, PREPROCESSED_BLOCK_SIZE>>>(output, n_elements);
+    return cudaGetLastError();
+}
+
+extern "C" void gen_seq_column_on_gpu(m31* output, uint32_t log_size) {
+    ASSERT_CUDA_SUCCESS(stwo_preprocessed_gen_seq_checked(output, log_size));
 }
 
 // ============================================================================
@@ -66,36 +157,66 @@ __global__ void gen_range_check_columns_kernel(
     }
 }
 
+extern "C" cudaError_t stwo_preprocessed_gen_range_checked(
+    m31** output_columns,
+    uint32_t n_columns,
+    const uint32_t* bits_per_segment,
+    uint32_t n_segments
+) {
+    if (output_columns == nullptr || bits_per_segment == nullptr || n_columns == 0 ||
+        n_columns != n_segments || n_segments > static_cast<uint32_t>(INT_MAX)) {
+        return cudaErrorInvalidValue;
+    }
+
+    uint32_t total_bits = 0;
+    for (uint32_t i = 0; i < n_segments; i++) {
+        if (output_columns[i] == nullptr || bits_per_segment[i] >= 32 ||
+            total_bits >= 32 - bits_per_segment[i]) {
+            return cudaErrorInvalidValue;
+        }
+        total_bits += bits_per_segment[i];
+    }
+    uint32_t n_elements = 1u << total_bits;
+    uint32_t num_blocks = block_count(n_elements);
+
+    uint32_t* d_bits_per_segment = nullptr;
+    cudaError_t status = clone_to_device_checked(
+        bits_per_segment, n_segments, &d_bits_per_segment);
+    if (status != cudaSuccess) {
+        return status;
+    }
+
+    m31** d_columns = nullptr;
+    status = clone_to_device_checked(output_columns, n_columns, &d_columns);
+    if (status != cudaSuccess) {
+        // Keep the allocation failure as the primary diagnosis. The rollback
+        // free is best effort when that failure may already reflect a damaged
+        // context; the caller's checked fence drains any successful free.
+        (void)release_scratch(d_bits_per_segment);
+        return status;
+    }
+
+    gen_range_check_columns_kernel<<<num_blocks, PREPROCESSED_BLOCK_SIZE>>>(
+        d_columns, n_columns, d_bits_per_segment, n_segments, n_elements
+    );
+    status = cudaGetLastError();
+
+    cudaError_t bits_cleanup = release_scratch(d_bits_per_segment);
+    cudaError_t columns_cleanup = release_scratch(d_columns);
+    if (status == cudaSuccess) {
+        status = bits_cleanup != cudaSuccess ? bits_cleanup : columns_cleanup;
+    }
+    return status;
+}
+
 extern "C" void gen_range_check_columns_on_gpu(
     m31** output_columns,
     uint32_t n_columns,
     const uint32_t* bits_per_segment,
     uint32_t n_segments
 ) {
-    const uint32_t BLOCK_SIZE = 256;
-
-    // Calculate total bits to determine number of elements
-    uint32_t total_bits = 0;
-    for (uint32_t i = 0; i < n_segments; i++) {
-        total_bits += bits_per_segment[i];
-    }
-    uint32_t n_elements = 1u << total_bits;
-    uint32_t num_blocks = (n_elements + BLOCK_SIZE - 1) / BLOCK_SIZE;
-
-    // Copy bits_per_segment to device (const_cast needed as clone_to_device requires non-const)
-    uint32_t* d_bits_per_segment = clone_to_device<uint32_t>(
-        const_cast<uint32_t*>(bits_per_segment), n_segments);
-
-    // Copy column pointers to device
-    m31** d_columns = clone_to_device<m31*>(output_columns, n_columns);
-
-    gen_range_check_columns_kernel<<<num_blocks, BLOCK_SIZE>>>(
-        d_columns, n_columns, d_bits_per_segment, n_segments, n_elements
-    );
-    ASSERT_CUDA_SUCCESS(cudaGetLastError());
-
-    cuda_free_memory(d_bits_per_segment);
-    cuda_free_memory(d_columns);
+    ASSERT_CUDA_SUCCESS(stwo_preprocessed_gen_range_checked(
+        output_columns, n_columns, bits_per_segment, n_segments));
 }
 
 // ============================================================================
@@ -123,25 +244,38 @@ __global__ void gen_bitwise_xor_columns_kernel(
     output_columns[2][idx] = {a ^ b};
 }
 
-extern "C" void gen_bitwise_xor_columns_on_gpu(
+extern "C" cudaError_t stwo_preprocessed_gen_xor_checked(
     m31** output_columns,
     uint32_t n_bits
 ) {
-    const uint32_t BLOCK_SIZE = 256;
+    if (output_columns == nullptr || n_bits >= 16 || output_columns[0] == nullptr ||
+        output_columns[1] == nullptr || output_columns[2] == nullptr) {
+        return cudaErrorInvalidValue;
+    }
 
-    // Total elements = (2^n_bits)^2 = 2^(2*n_bits)
     uint32_t n_elements = 1u << (2 * n_bits);
-    uint32_t num_blocks = (n_elements + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    uint32_t num_blocks = block_count(n_elements);
 
-    // Copy column pointers to device
-    m31** d_columns = clone_to_device<m31*>(output_columns, 3);
+    m31** d_columns = nullptr;
+    cudaError_t status = clone_to_device_checked(output_columns, 3, &d_columns);
+    if (status != cudaSuccess) {
+        return status;
+    }
 
-    gen_bitwise_xor_columns_kernel<<<num_blocks, BLOCK_SIZE>>>(
+    gen_bitwise_xor_columns_kernel<<<num_blocks, PREPROCESSED_BLOCK_SIZE>>>(
         d_columns, n_bits, n_elements
     );
-    ASSERT_CUDA_SUCCESS(cudaGetLastError());
+    status = cudaGetLastError();
 
-    cuda_free_memory(d_columns);
+    cudaError_t cleanup = release_scratch(d_columns);
+    if (status == cudaSuccess) {
+        status = cleanup;
+    }
+    return status;
+}
+
+extern "C" void gen_bitwise_xor_columns_on_gpu(m31** output_columns, uint32_t n_bits) {
+    ASSERT_CUDA_SUCCESS(stwo_preprocessed_gen_xor_checked(output_columns, n_bits));
 }
 
 // ============================================================================

@@ -7,6 +7,8 @@ use core::ffi::c_void;
 
 use crate::raw::{Blake2sHash, CirclePointBaseField, CudaSecureField, LayerIndexPair};
 
+const CUDA_ERROR_NOT_SUPPORTED: i32 = 801;
+
 #[cold]
 fn no_cuda_symbol(symbol: &str) -> ! {
     panic!(
@@ -2191,6 +2193,57 @@ pub unsafe extern "C" fn gen_bitwise_xor_columns_on_gpu(
     _n_bits: u32,
 ) {
     no_cuda_symbol("gen_bitwise_xor_columns_on_gpu")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_preprocessed_alloc_u32_checked(
+    _count: usize,
+    output: *mut *mut u32,
+) -> i32 {
+    if let Some(output) = unsafe { output.as_mut() } {
+        *output = core::ptr::null_mut();
+    }
+    CUDA_ERROR_NOT_SUPPORTED
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_preprocessed_copy_h2d_checked(
+    _host: *const u32,
+    _device: *mut u32,
+    _count: usize,
+) -> i32 {
+    CUDA_ERROR_NOT_SUPPORTED
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_preprocessed_gen_seq_checked(
+    _output: *mut u32,
+    _log_size: u32,
+) -> i32 {
+    CUDA_ERROR_NOT_SUPPORTED
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_preprocessed_gen_range_checked(
+    _output_columns: *const *mut u32,
+    _n_columns: u32,
+    _bits_per_segment: *const u32,
+    _n_segments: u32,
+) -> i32 {
+    CUDA_ERROR_NOT_SUPPORTED
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_preprocessed_gen_xor_checked(
+    _output_columns: *const *mut u32,
+    _n_bits: u32,
+) -> i32 {
+    CUDA_ERROR_NOT_SUPPORTED
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_preprocessed_stream_sync_checked() -> i32 {
+    CUDA_ERROR_NOT_SUPPORTED
 }
 
 #[unsafe(no_mangle)]
