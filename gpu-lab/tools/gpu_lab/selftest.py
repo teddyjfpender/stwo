@@ -31,6 +31,7 @@ from .fri_round6_loop_tests import fri_round6_loop_self_test
 from .loop import loop_self_test
 from .oracle import validate_oracle_index
 from .pie_adapter_cleanup_tests import pie_adapter_cleanup_self_test
+from .pie_adapter_contract_tests import pie_adapter_contract_self_test
 from .pie_adapter_execution_tests import pie_adapter_execution_self_test
 from .pie_adapter_receipt_tests import pie_adapter_receipt_self_test
 from .result_tests import result_self_test
@@ -267,6 +268,7 @@ def self_test(root: Path) -> None:
     fri_module_self_test(root)
     fri_round6_loop_self_test(root)
     fri_round6_execution_self_test(root)
+    pie_adapter_contract_self_test(root)
     pie_adapter_execution_self_test(root)
     pie_adapter_cleanup_self_test(root)
     pie_adapter_receipt_self_test(root)

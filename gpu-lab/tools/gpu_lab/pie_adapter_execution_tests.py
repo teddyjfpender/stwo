@@ -20,13 +20,20 @@ from .common import LAB_ROOT, canonical_bytes, require, sha256_bytes, sha256_fil
 from .pie_adapter_contract import (ARTIFACT_SPECS, EXECUTION_HONESTY, INVOCATION_SCHEMA,
                                    OUTPUT_ENCODING, PROTOCOL, invocation_bytes)
 from .pie_adapter_contract import validate_execution_record
-from .pie_adapter_execution import _execute as execute
+from .pie_adapter_execution import _execute
 from .pie_adapter_execution import _install_limits
+from .pie_adapter_receipt import generate
+from .pie_adapter_receipt_tests import _commit, _workspace
 from .retained_fs import RetainedDirectory
 from .sealed_process import run_bounded_child
 
 
 EXPECTED = b"exact-prover-input\x00\x01"
+
+
+def execute(args: SimpleNamespace, **kwargs: Any) -> dict[str, Any]:
+    return _execute(args, _workspace_root=args._workspace_root,
+                    _commit_reader=_commit, **kwargs)
 
 
 def _write(path: Path, payload: bytes, mode: int = 0o600) -> Path:
@@ -53,34 +60,6 @@ def _identity(role: str, path: Path) -> dict[str, Any]:
             "byte_length": path.stat().st_size, "sha256": sha256_file(path)}
 
 
-def _seal(role: str, path: Path) -> dict[str, Any]:
-    value = _identity(role, path)
-    value["path"] = path.name
-    return value
-
-
-def _unused_seal(kind: str, name: str) -> dict[str, Any]:
-    return {"kind": kind, "path": name, "byte_length": 1, "sha256": sha256_bytes(name.encode())}
-
-
-def _proof_shape() -> dict[str, Any]:
-    shape = {
-        "schema_version": "stwo.gpu-lab.cairo-proof-shape.v1",
-        "pcs": {"pow_bits": 26, "log_blowup_factor": 1,
-                "log_last_layer_degree_bound": 0, "n_queries": 3,
-                "fold_step": 1, "lifting_log_size": None},
-        "channel_salt": 0, "preprocessed_trace_variant_sha256": "1" * 64,
-        "component_slots": 1, "component_enable_bits_sha256": "2" * 64,
-        "component_log_sizes": [1], "trace_column_log_sizes": [[1]],
-        "public_data_word_counts": [0, 0, 0], "interaction_claim_felts": 0,
-        "commitment_trees": 1, "sampled_value_counts": [[1]],
-        "decommitment_trees": 1, "queried_value_counts": [[1]],
-        "fri_inner_layers": 1, "fri_witness_counts": [1],
-        "fri_last_layer_coefficients": 1, "unsorted_query_locations": 1,
-    }
-    return {"sha256": sha256_bytes(canonical_bytes(shape)), "shape": shape}
-
-
 def _fake_executable(payload: bytes = EXPECTED) -> bytes:
     literal = "".join(f"\\{byte:03o}" for byte in payload)
     return (
@@ -93,11 +72,12 @@ def _fake_executable(payload: bytes = EXPECTED) -> bytes:
 
 def _fixture(root: Path) -> tuple[SimpleNamespace, tuple[Path, ...]]:
     root.mkdir()
+    workspace_root = root / "workspace"
+    inventory_value, executable = _workspace(workspace_root)
+    _write(executable, _fake_executable(), 0o755)
     source = _write(root / "source.zip", b"sealed PIE")
     bootloader = _write(root / "bootloader.json", b'{"program":"sealed"}\n')
     expected = _write(root / "expected.bin", EXPECTED)
-    executable = _write(root / "adapter", _fake_executable(), 0o700)
-    source_closure = _write(root / "adapter-sources.json", b'{"sealed":true}\n')
     bootloader_identity = _identity("bootloader_program", bootloader)
     invocation_value = {
         "schema_version": INVOCATION_SCHEMA, "protocol": PROTOCOL,
@@ -105,33 +85,25 @@ def _fixture(root: Path) -> tuple[SimpleNamespace, tuple[Path, ...]]:
         "backend": "simd", "engine": "legacy", "output_encoding": OUTPUT_ENCODING,
     }
     invocation = _write(root / "invocation.json", invocation_bytes(invocation_value))
-    legacy = {"kind": "adapter-run-json-v1", "path": "legacy-run.json",
-              "byte_length": 17, "sha256": sha256_bytes(b"legacy")}
-    manifest = {
-        "schema_version": "stwo.gpu-lab.fri-round6-provenance.v1",
-        "status": "captured-unsealed", "production_admissible": False,
-        "source_pie": _seal("source_pie", source),
-        "adapted_prover_input": _seal("expected_prover_input", expected),
-        "adapter": {"run_record": legacy, "invocation": _seal("adapter_invocation", invocation),
-                    "executable": _seal("adapter_executable", executable),
-                    "source_closure": _seal("adapter_source_closure", source_closure)},
-        "extended_cairo_proof_bincode": _unused_seal(
-            "extended-cairo-proof-bincode-v1", "proof.bin"),
-        "canonical_cairo_transport": _unused_seal(
-            "canonical-cairo-proof-felts-be32-v1", "transport.bin"),
-        "verifier_source_closure": _unused_seal(
-            "verifier-source-closure-json-v1", "verifier-sources.json"),
-        "proof_shape": _proof_shape(),
-    }
-    provenance = _write(root / "provenance.json", canonical_bytes(manifest) + b"\n")
+    inventory = _write(
+        root / "adapter-source-inventory.json",
+        json.dumps(inventory_value, indent=2, sort_keys=True).encode() + b"\n",
+    )
+    closure = root / "adapter-source-closure.json"
+    receipt = root / "adapter-build-receipt.json"
+    generate(inventory, sha256_file(inventory), closure, receipt,
+             workspace_root, _commit)
     paths = {
-        "provenance_manifest": provenance, "source_pie": source,
+        "source_pie": source,
         "bootloader_program": bootloader, "expected_prover_input": expected,
         "adapter_executable": executable, "adapter_invocation": invocation,
-        "adapter_source_closure": source_closure,
+        "adapter_source_inventory": inventory,
+        "adapter_source_closure": closure,
+        "adapter_build_receipt": receipt,
     }
     args = SimpleNamespace(observed_prover_input=root / "observed.bin",
-                           record=root / "execution.json")
+                           record=root / "execution.json",
+                           _workspace_root=workspace_root)
     for role, path in paths.items():
         setattr(args, role, path)
         setattr(args, f"{role}_sha256", sha256_file(path))
@@ -186,7 +158,9 @@ def _runner(args: SimpleNamespace, behavior: str) -> Callable[..., subprocess.Co
         if behavior.endswith("-rebind") and behavior != "output-rebind":
             role = {"source": "source_pie", "bootloader": "bootloader_program",
                     "executable": "adapter_executable", "invocation": "adapter_invocation",
-                    "closure": "adapter_source_closure", "manifest": "provenance_manifest"}[
+                    "inventory": "adapter_source_inventory",
+                    "closure": "adapter_source_closure",
+                    "receipt": "adapter_build_receipt"}[
                         behavior.removesuffix("-rebind")]
             path = getattr(args, role)
             path.rename(path.with_suffix(path.suffix + ".bound"))
@@ -237,7 +211,7 @@ def _input_boundary_cases(parent: Path) -> None:
     sentinel: Path | None = None
     def replace_before_open(leaf, flags, mode=0o777):
         nonlocal moved, sentinel
-        if moved is None and leaf.label == "provenance_manifest":
+        if moved is None and leaf.label == "adapter_source_inventory":
             moved, sentinel = _replace_parent(leaf.path)
         return real_open(leaf, flags, mode)
     with patch.object(execution_module.RetainedLeaf, "open", new=replace_before_open):
@@ -245,7 +219,8 @@ def _input_boundary_cases(parent: Path) -> None:
             args, _runner=_runner(args, "success"), _tool_paths=tools
         ))
     require(moved is not None and sentinel is not None and sentinel.read_bytes() == b"untouched"
-            and (moved / "provenance.json").exists() and not args.record.exists(),
+            and (moved / "adapter-source-inventory.json").exists()
+            and not args.record.exists(),
             "input parent replacement escaped anchoring or touched attacker state")
 
     args, tools = _fixture(parent / "invocation-mutation")
@@ -257,29 +232,35 @@ def _input_boundary_cases(parent: Path) -> None:
         args, _runner=_runner(args, "success"), _tool_paths=tools
     ))
 
-    args, tools = _fixture(parent / "manifest-mutation")
-    args.provenance_manifest.write_text('{"schema_version":"wrong"}\n')
-    args.provenance_manifest_sha256 = sha256_file(args.provenance_manifest)
-    _expect_rejection("manifest mutation", lambda: execute(
-        args, _runner=_runner(args, "success"), _tool_paths=tools
-    ))
-
-    for label, mutate in (
-        ("manifest float size", lambda value: value["source_pie"].__setitem__(
-            "byte_length", float(value["source_pie"]["byte_length"]))),
-        ("manifest backslash path", lambda value: value["source_pie"].__setitem__(
-            "path", "hostile\\source.zip")),
+    for label, role, body, hash_name, chain_key in (
+        ("inventory-closure mismatch", "adapter_source_closure", "source_closure",
+         "source_closure_sha256", "inventory_sha256"),
+        ("closure-receipt mismatch", "adapter_build_receipt", "build_receipt",
+         "build_receipt_sha256", "source_closure_sha256"),
     ):
-        args, tools = _fixture(parent / label.replace(" ", "-"))
-        manifest = json.loads(args.provenance_manifest.read_text())
-        mutate(manifest)
-        args.provenance_manifest.write_bytes(canonical_bytes(manifest) + b"\n")
-        args.provenance_manifest_sha256 = sha256_file(args.provenance_manifest)
+        args, tools = _fixture(parent / label)
+        path = getattr(args, role)
+        document = json.loads(path.read_text())
+        document[body][chain_key] = "0" * 64
+        document[hash_name] = sha256_bytes(canonical_bytes(document[body]))
+        path.chmod(0o600)
+        path.write_bytes(canonical_bytes(document) + b"\n")
+        setattr(args, f"{role}_sha256", sha256_file(path))
         def must_not_run(*_):
             raise AssertionError(f"{label} reached the adapter child")
         _expect_rejection(label, lambda args=args, tools=tools: execute(
             args, _runner=must_not_run, _tool_paths=tools
         ))
+
+    args, tools = _fixture(parent / "alternate-designated-executable")
+    alternate = _write(parent / "alternate-adapter", args.adapter_executable.read_bytes(), 0o755)
+    args.adapter_executable = alternate
+    args.adapter_executable_sha256 = sha256_file(alternate)
+    _expect_rejection("same bytes at non-designated executable path", lambda: execute(
+        args, _runner=lambda *_: (_ for _ in ()).throw(
+            AssertionError("non-designated executable reached the child")),
+        _tool_paths=tools,
+    ))
 
     args, tools = _fixture(parent / "leaf-symlink")
     real = args.source_pie.rename(args.source_pie.with_name("real-source.zip"))
@@ -517,23 +498,40 @@ def _record_rebinding_cases(parent: Path) -> None:
 
 def _post_publication_mutation_cases(parent: Path) -> None:
     real_link = execution_module._link_record
-    for behavior in ("source", "output"):
+    roles = {
+        "source": "source_pie", "output": "observed_prover_input",
+        "inventory": "adapter_source_inventory", "closure": "adapter_source_closure",
+        "receipt": "adapter_build_receipt",
+    }
+    for behavior, role in roles.items():
         args, tools = _fixture(parent / f"post-publication-{behavior}-mutation")
         def mutate(destination, temporary):
             real_link(destination, temporary)
-            target = (args.source_pie if behavior == "source"
-                      else args.observed_prover_input)
+            target = getattr(args, role)
             if behavior == "output":
                 os.chmod(target, 0o600)
                 target.write_bytes(b"x" * len(EXPECTED))
             else:
-                target.write_bytes(b"hostilePIE")
+                os.chmod(target, 0o600)
+                target.write_bytes(b"x" * target.stat().st_size)
         with patch("gpu_lab.pie_adapter_execution._link_record", side_effect=mutate):
             _expect_rejection(f"post-publication {behavior} mutation", lambda: execute(
                 args, _runner=_runner(args, "success"), _tool_paths=tools
             ))
         require(not args.record.exists() and not args.observed_prover_input.exists(),
                 f"post-publication {behavior} mutation left authenticated artifacts")
+
+    args, tools = _fixture(parent / "live-source-mutation-after-preflight")
+    real_runner = _runner(args, "success")
+    source = args._workspace_root / "stwo/Cargo.toml"
+    def mutate_live_source(*runner_args):
+        source.write_bytes(source.read_bytes() + b"# mutation\n")
+        return real_runner(*runner_args)
+    _expect_rejection("live source mutation after preflight", lambda: execute(
+        args, _runner=mutate_live_source, _tool_paths=tools
+    ))
+    require(not args.record.exists() and not args.observed_prover_input.exists(),
+            "live source mutation after preflight left authenticated artifacts")
 
     args, tools = _fixture(parent / "output-mutation-after-content-sweep")
     real_verify = execution_module._verify_bound
@@ -556,30 +554,36 @@ def _post_publication_mutation_cases(parent: Path) -> None:
 
 
 def _record_mutations(record: dict[str, Any], args: SimpleNamespace) -> None:
+    validation_context = {
+        "adapter_source_inventory_bytes": args.adapter_source_inventory.read_bytes(),
+        "expected_adapter_source_inventory_sha256": args.adapter_source_inventory_sha256,
+        "adapter_source_closure_bytes": args.adapter_source_closure.read_bytes(),
+        "expected_adapter_source_closure_sha256": args.adapter_source_closure_sha256,
+        "adapter_build_receipt_bytes": args.adapter_build_receipt.read_bytes(),
+        "expected_adapter_build_receipt_sha256": args.adapter_build_receipt_sha256,
+        "workspace_root": args._workspace_root,
+        "_commit_reader": _commit,
+    }
     for label, mutate in (
         ("admission", lambda value: value.__setitem__("production_admissible", True)),
         ("bool inode", lambda value: value["execution_contract"]["bindings"]
          ["source_pie"].__setitem__("inode", True)),
         ("output lifecycle", lambda value: value["output_lifecycle"]
          ["pre_launch"].__setitem__("byte_length", 1)),
-        ("provenance trust", lambda value: value["provenance_binding"]
-         .__setitem__("trust_root", "self-declared")),
+        ("receipt trust", lambda value: value["receipt_binding"]
+         .__setitem__("inventory_trust_root", "self-declared")),
     ):
         hostile = copy.deepcopy(record)
         mutate(hostile)
         _expect_rejection(label, lambda hostile=hostile: validate_execution_record(
-            hostile, provenance_manifest_bytes=args.provenance_manifest.read_bytes(),
-            expected_provenance_manifest_sha256=args.provenance_manifest_sha256,
+            hostile, **validation_context,
         ))
-    manifest = json.loads(args.provenance_manifest.read_text())
-    manifest["extended_cairo_proof_bincode"]["sha256"] = "f" * 64
-    substituted = canonical_bytes(manifest) + b"\n"
+    substituted = args.adapter_source_closure.read_bytes() + b" "
     hostile = copy.deepcopy(record)
-    hostile["provenance_manifest"]["byte_length"] = len(substituted)
-    hostile["provenance_manifest"]["sha256"] = sha256_bytes(substituted)
-    _expect_rejection("self-consistent manifest substitution", lambda: validate_execution_record(
-        hostile, provenance_manifest_bytes=substituted,
-        expected_provenance_manifest_sha256=args.provenance_manifest_sha256,
+    hostile["adapter_source_closure"]["byte_length"] = len(substituted)
+    hostile["adapter_source_closure"]["sha256"] = sha256_bytes(substituted)
+    _expect_rejection("self-consistent receipt substitution", lambda: validate_execution_record(
+        hostile, **{**validation_context, "adapter_source_closure_bytes": substituted},
     ))
 
 
@@ -623,6 +627,10 @@ def pie_adapter_execution_self_test(lab_root: Path) -> None:
         require(all(record["execution_contract"].get(key) == value
                     for key, value in EXECUTION_HONESTY.items()),
                 "execution honesty fields did not survive exact record parsing")
+        for role in ("adapter_source_inventory", "adapter_source_closure",
+                     "adapter_build_receipt"):
+            require(record[role] == _identity(role, getattr(args, role)),
+                    f"execution record does not retain raw {role} identity")
         _record_mutations(record, args)
         with patch.dict(os.environ, {"LD_PRELOAD": "/tmp/hostile.so", "STWO_ADAPT_ONLY": "1"}):
             inherited_record, _ = _run(parent / "hostile-parent-environment")
@@ -630,8 +638,8 @@ def pie_adapter_execution_self_test(lab_root: Path) -> None:
         for behavior in (
             "wrong-byte", "truncated", "oversized", "nonzero", "stdout", "stderr", "timeout",
             "source-rebind", "bootloader-rebind", "executable-rebind", "invocation-rebind",
-            "closure-rebind", "manifest-rebind", "output-rebind", "expected-mutation",
-            "parent-symlink",
+            "inventory-rebind", "closure-rebind", "receipt-rebind", "output-rebind",
+            "expected-mutation", "parent-symlink",
         ):
             _failure_case(parent, behavior, behavior)
         _input_boundary_cases(parent)

@@ -15,22 +15,24 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from .common import LAB_ROOT, canonical_bytes, require
+from .common import LAB_ROOT, WORKSPACE_ROOT, canonical_bytes, require
 from .common import require_sha256, sha256_bytes
+from . import pie_adapter_receipt
 from .retained_fs import RetainedLeaf
 from .sealed_process import run_bounded_child
 from .pie_adapter_contract import (
     ADDRESS_SPACE_LIMIT_BYTES, ARTIFACT_SPECS, CPU_LIMIT_SECONDS, DATA_LIMIT_BYTES,
-    EMPTY_SHA256, EXECUTION_HONESTY, INVOCATION_SCHEMA, MAX_EXECUTION_RECORD_BYTES,
-    MAX_STREAM_BYTES,
+    EMPTY_SHA256, EXECUTABLE_POLICY, EXECUTION_HONESTY, INVOCATION_SCHEMA,
+    MAX_EXECUTION_RECORD_BYTES,
+    MAX_STREAM_BYTES, RECEIPT_TRUST,
     OUTPUT_ENCODING, PROTOCOL, WALL_TIMEOUT_SECONDS, invocation_bytes, parse_execution_record_bytes,
-    parse_invocation_bytes, validate_adapter_provenance_projection, validate_execution_record,
+    parse_invocation_bytes, validate_adapter_receipt_projection, validate_execution_record,
 )
 
-EXECUTABLE_POLICY = "release-or-stripped-provenance-compatible-max-256mib-v1"
 TOOL_RELATIVE_PATHS = tuple(f"tools/{path}" for path in (
     "pie-adapter-replay", "gpu_lab/__init__.py", "gpu_lab/common.py",
     "gpu_lab/pie_adapter_contract.py", "gpu_lab/pie_adapter_execution.py",
+    "gpu_lab/pie_adapter_receipt.py", "gpu_lab/immutable_output.py",
     "gpu_lab/retained_fs.py", "gpu_lab/sealed_process.py",
 ))
 INHERITED_ROLES = {
@@ -124,7 +126,7 @@ def _bind(path: Path, digest: str | None, role: str, kind: str, maximum: int) ->
         require(0 < metadata.st_size <= maximum, f"{role} byte length is out of bounds")
         if role == "adapter_executable":
             require(metadata.st_size <= ARTIFACT_SPECS[role][1], "adapter executable exceeds "
-                    "the provenance-compatible 256 MiB policy")
+                    "the receipt-bound 256 MiB policy")
             require(metadata.st_mode & 0o111, "adapter executable is not executable")
         fingerprint = _fingerprint(metadata)
         observed_digest = _sha256_descriptor(descriptor, metadata.st_size)
@@ -378,7 +380,10 @@ Runner = Callable[[list[str], Path, tuple[int, ...], dict[str, str], int],
 def execute(args: Any) -> dict[str, Any]:
     return _execute(args)
 def _execute(args: Any, *, _runner: Runner | None = None,
-             _tool_paths: tuple[Path, ...] | None = None) -> dict[str, Any]:
+             _tool_paths: tuple[Path, ...] | None = None,
+             _workspace_root: Path = WORKSPACE_ROOT,
+             _commit_reader: pie_adapter_receipt.CommitReader =
+             pie_adapter_receipt._git_commit) -> dict[str, Any]:
     require(sys.platform == "linux" or _runner is not None,
             "PIE adapter replay requires Linux /proc descriptor execution")
     require(_runner is not None or Path("/proc/self/fd").is_dir(),
@@ -393,13 +398,29 @@ def _execute(args: Any, *, _runner: Runner | None = None,
             path = getattr(args, role)
             digest = getattr(args, f"{role}_sha256")
             inputs[role] = _bind(path, digest, role, kind, maximum)
-        manifest_bytes = _read_descriptor(
-            inputs["provenance_manifest"], ARTIFACT_SPECS["provenance_manifest"][1]
-        )
         artifacts = {role: bound.artifact() for role, bound in inputs.items()}
-        validate_adapter_provenance_projection(
-            manifest_bytes, args.provenance_manifest_sha256, artifacts
-        )
+        receipt_bytes = {
+            role: _read_descriptor(inputs[role], ARTIFACT_SPECS[role][1])
+            for role in (
+                "adapter_source_inventory", "adapter_source_closure",
+                "adapter_build_receipt",
+            )
+        }
+        def validate_receipt_chain() -> dict[str, Any]:
+            receipt = validate_adapter_receipt_projection(
+                receipt_bytes["adapter_source_inventory"],
+                args.adapter_source_inventory_sha256,
+                receipt_bytes["adapter_source_closure"],
+                args.adapter_source_closure_sha256,
+                receipt_bytes["adapter_build_receipt"],
+                args.adapter_build_receipt_sha256,
+                artifacts, _workspace_root, _commit_reader,
+            )
+            mode = receipt["build_receipt"]["adapter_executable"]["mode"]
+            require(stat.S_IMODE(os.fstat(inputs["adapter_executable"].descriptor).st_mode)
+                    == int(mode, 8),
+                    "PIE adapter executable mode differs from its build receipt")
+            return receipt
         invocation = parse_invocation_bytes(_read_descriptor(
             inputs["adapter_invocation"], ARTIFACT_SPECS["adapter_invocation"][1]
         ))
@@ -429,6 +450,8 @@ def _execute(args: Any, *, _runner: Runner | None = None,
                 "observed ProverInput aliases the execution record")
         for bound in [*inputs.values(), *tools]:
             _verify_bound(bound, content=False)
+        receipt = validate_receipt_chain()
+        executable_mode = receipt["build_receipt"]["adapter_executable"]["mode"]
         bindings = {role: _binding(bound, inherited=role in INHERITED_ROLES)
                     for role, bound in inputs.items()}
         bindings["observed_prover_input"] = _output_binding(output)
@@ -458,21 +481,21 @@ def _execute(args: Any, *, _runner: Runner | None = None,
         observed = output.artifact()
         # The contract validator is the sole authority for whether this checked state is a PASS.
         record = {
-            "schema_version": "stwo.gpu-lab.pie-adapter-execution-record.v1",
+            "schema_version": "stwo.gpu-lab.pie-adapter-execution-record.v2",
             "evidence_mode": "authenticated-pie-adapter-replay",
             "passed": True, "adapter_execution_attested": True,
-            "source_closure_status": "identity-only",
+            "source_closure_status": pie_adapter_receipt.SOURCE_STATUS,
+            "build_receipt_status": pie_adapter_receipt.RECEIPT_STATUS,
+            "build_execution_attested": False,
             "adapter_executable_policy": EXECUTABLE_POLICY,
             "production_admissible": False, "correctness_admissible": False,
             "performance_admissible": False,
             **{role: bound.artifact() for role, bound in inputs.items()},
             "replay_tool_source_closure": tool_closure,
             "invocation_contract": invocation,
-            "provenance_binding": {
-                "contract": "fri-round6-provenance-v1-external-raw-binding-v1",
-                "trust_root": "required-out-of-band-sha256-v1",
-                "output_relation": "manifest-expected-equals-observed-byte-for-byte-v1",
-                "bootloader_coverage": "separate-required-semantic-live-in-v1",
+            "receipt_binding": {
+                **RECEIPT_TRUST,
+                "adapter_executable_mode": executable_mode,
             },
             "execution_contract": {
                 **EXECUTION_HONESTY,
@@ -515,26 +538,33 @@ def _execute(args: Any, *, _runner: Runner | None = None,
             "observed_prover_input": observed,
             "exact_byte_equal": True,
         }
-        validated = validate_execution_record(
-            record, provenance_manifest_bytes=manifest_bytes,
-            expected_provenance_manifest_sha256=args.provenance_manifest_sha256,
-        )
+        validation_context = {
+            "adapter_source_inventory_bytes": receipt_bytes["adapter_source_inventory"],
+            "expected_adapter_source_inventory_sha256":
+                args.adapter_source_inventory_sha256,
+            "adapter_source_closure_bytes": receipt_bytes["adapter_source_closure"],
+            "expected_adapter_source_closure_sha256": args.adapter_source_closure_sha256,
+            "adapter_build_receipt_bytes": receipt_bytes["adapter_build_receipt"],
+            "expected_adapter_build_receipt_sha256": args.adapter_build_receipt_sha256,
+            "workspace_root": _workspace_root,
+            "_commit_reader": _commit_reader,
+        }
+        validated = validate_execution_record(record, **validation_context)
         payload = canonical_bytes(record) + b"\n"
         require(len(payload) <= MAX_EXECUTION_RECORD_BYTES, "PIE adapter record is too large")
-        installed = parse_execution_record_bytes(
-            payload, provenance_manifest_bytes=manifest_bytes,
-            expected_provenance_manifest_sha256=args.provenance_manifest_sha256,
-        )
+        installed = parse_execution_record_bytes(payload, **validation_context)
         require(installed == validated, "serialized PIE adapter execution record differs")
         def before_publish() -> None:
             for bound in all_bounds:
                 _verify_bound(bound, content=False)
+            validate_receipt_chain()
             output.leaf.verify()
             require(output.leaf.same(output.initial),
                     "observed ProverInput changed before publication")
         def after_publish() -> None:
             for bound in all_bounds:
                 _verify_bound(bound, content=True)
+            validate_receipt_chain()
             sealed_output = _compare_output(
                 output, inputs["expected_prover_input"], sealed=True
             )

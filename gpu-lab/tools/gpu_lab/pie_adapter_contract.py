@@ -5,20 +5,22 @@
 from __future__ import annotations
 
 import json
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any
 
-from .common import (canonical_bytes, require, require_exact_keys, require_int,
-                     require_sha256, sha256_bytes)
+from . import pie_adapter_receipt
+from .common import (WORKSPACE_ROOT, canonical_bytes, require, require_exact_keys,
+                     require_int, require_sha256, sha256_bytes)
 
 
 INVOCATION_SCHEMA = "stwo.gpu-lab.pie-adapter-invocation.v1"
-EXECUTION_RECORD_SCHEMA = "stwo.gpu-lab.pie-adapter-execution-record.v1"
+EXECUTION_RECORD_SCHEMA = "stwo.gpu-lab.pie-adapter-execution-record.v2"
 PROTOCOL = "stwo-cairo.gpu-bench.pie-adapt-only.v1"
 EVIDENCE_MODE = "authenticated-pie-adapter-replay"
-SOURCE_CLOSURE_STATUS = "identity-only"
+SOURCE_CLOSURE_STATUS = pie_adapter_receipt.SOURCE_STATUS
+BUILD_RECEIPT_STATUS = pie_adapter_receipt.RECEIPT_STATUS
 OUTPUT_ENCODING = "bincode-v1-fixed-int"
-EXECUTABLE_POLICY = "release-or-stripped-provenance-compatible-max-256mib-v1"
+EXECUTABLE_POLICY = "release-or-stripped-receipt-bound-max-256mib-v2"
 EMPTY_SHA256 = sha256_bytes(b"")
 EXECUTION_HONESTY = {
     "writer_precondition": "caller-guaranteed-no-concurrent-artifact-tree-writers-v1",
@@ -40,13 +42,14 @@ ADDRESS_SPACE_LIMIT_BYTES = 16 * GIB
 DATA_LIMIT_BYTES = 12 * GIB
 CPU_LIMIT_SECONDS = 240
 ARTIFACT_SPECS = {
-    "provenance_manifest": ("fri-round6-provenance-json-v1", MIB),
     "source_pie": ("cairo-pie-zip", GIB),
     "bootloader_program": ("cairo-compiled-program-json-v1", 256 * MIB),
     "expected_prover_input": ("stwo-prover-input-bincode-v1", 256 * MIB),
     "adapter_executable": ("adapter-executable", 256 * MIB),
     "adapter_invocation": ("adapter-invocation-json-v1", MIB),
-    "adapter_source_closure": ("adapter-source-closure-json-v1", 4 * MIB),
+    "adapter_source_inventory": ("adapter-source-inventory-json-v2", 4 * MIB),
+    "adapter_source_closure": ("adapter-source-closure-json-v2", 4 * MIB),
+    "adapter_build_receipt": ("adapter-build-receipt-json-v2", 4 * MIB),
 }
 BINDING_ROLES = (*ARTIFACT_SPECS, "observed_prover_input")
 INVOCATION_KEYS = {
@@ -55,11 +58,19 @@ INVOCATION_KEYS = {
 }
 RECORD_KEYS = {
     "schema_version", "evidence_mode", "passed", "adapter_execution_attested",
-    "source_closure_status", "production_admissible", "correctness_admissible",
-    "performance_admissible", "adapter_executable_policy",
+    "source_closure_status", "build_receipt_status", "build_execution_attested",
+    "production_admissible", "correctness_admissible", "performance_admissible",
+    "adapter_executable_policy",
     *ARTIFACT_SPECS,
-    "replay_tool_source_closure", "invocation_contract", "provenance_binding",
+    "replay_tool_source_closure", "invocation_contract", "receipt_binding",
     "execution_contract", "output_lifecycle", "observed_prover_input", "exact_byte_equal",
+}
+RECEIPT_TRUST = {
+    "contract": "pie-adapter-receipt-v2-external-raw-binding-v1",
+    "inventory_trust_root": "required-out-of-band-exact-raw-sha256-v1",
+    "source_closure_trust_root": "required-out-of-band-exact-raw-sha256-v1",
+    "build_receipt_trust_root": "required-out-of-band-exact-raw-sha256-v1",
+    "build_execution_attested": False,
 }
 
 
@@ -127,7 +138,7 @@ def _artifact(value: Any, role: str) -> dict[str, Any]:
     _absolute_path(value["path"], f"PIE adapter {role} path")
     size = require_int(value["byte_length"], f"PIE adapter {role} byte length", 1)
     diagnostic = (
-        "adapter executable exceeds the provenance-compatible 256 MiB policy; "
+        "adapter executable exceeds the receipt-bound 256 MiB policy; "
         "use an exact release/stripped or host-only adapter"
         if role == "adapter_executable" else f"PIE adapter {role} is too large"
     )
@@ -331,77 +342,49 @@ def _validate_execution_contract(
     return bindings
 
 
-def validate_adapter_provenance_projection(payload: bytes, expected_sha256: str,
-    artifacts: dict[str, dict[str, Any]]) -> dict[str, Any]:
+def validate_adapter_receipt_projection(
+    inventory_bytes: bytes,
+    expected_inventory_sha256: str,
+    closure_bytes: bytes,
+    expected_closure_sha256: str,
+    receipt_bytes: bytes,
+    expected_receipt_sha256: str,
+    artifacts: dict[str, dict[str, Any]],
+    workspace_root: Path = WORKSPACE_ROOT,
+    _commit_reader: pie_adapter_receipt.CommitReader = pie_adapter_receipt._git_commit,
+) -> dict[str, Any]:
+    """Authenticate retained raw v2 receipts and project their executable identity."""
     require(isinstance(artifacts, dict) and set(artifacts) == set(ARTIFACT_SPECS),
-            "PIE adapter provenance artifacts differ")
-    artifacts = {role: _artifact(artifacts[role], role) for role in ARTIFACT_SPECS}
-    require(type(payload) is bytes and 0 < len(payload) <= MIB,
-            "PIE adapter raw provenance manifest bytes are out of bounds")
-    require_sha256(expected_sha256, "expected PIE adapter provenance manifest sha256")
-    identity = artifacts["provenance_manifest"]
-    require(len(payload) == identity["byte_length"]
-            and sha256_bytes(payload) == expected_sha256 == identity["sha256"],
-            "PIE adapter raw manifest identity differs")
-    manifest = _parse_json(payload, "PIE adapter raw provenance manifest", MIB)
-    require_exact_keys(manifest, {
-        "schema_version", "status", "production_admissible", "source_pie",
-        "adapted_prover_input", "adapter", "extended_cairo_proof_bincode",
-        "canonical_cairo_transport", "verifier_source_closure", "proof_shape",
-    }, "PIE adapter raw provenance manifest")
-    require(manifest["schema_version"] == "stwo.gpu-lab.fri-round6-provenance.v1"
-            and manifest["status"] == "captured-unsealed"
-            and manifest["production_admissible"] is False,
-            "PIE adapter raw provenance manifest status differs")
-    root = PurePosixPath(artifacts["provenance_manifest"]["path"]).parent
-    def seal(value: Any, label: str, kind: str, maximum: int,
-             artifact: dict[str, Any] | None = None) -> None:
-        require(isinstance(value, dict), f"PIE adapter manifest {label} must be an object")
-        require_exact_keys(value, {"kind", "path", "byte_length", "sha256"}, f"PIE adapter manifest {label}")
-        relative = _relative_source_path(value["path"], f"PIE adapter manifest {label} path")
-        size = require_int(value["byte_length"], f"PIE adapter manifest {label} bytes", 1)
-        require(value["kind"] == kind and size <= maximum,
-                f"PIE adapter manifest {label} kind or size differs")
-        require_sha256(value["sha256"], f"PIE adapter manifest {label} sha256")
-        if artifact is not None:
-            require(str(root / relative) == artifact["path"]
-                    and value["kind"] == artifact["kind"]
-                    and size == artifact["byte_length"] and value["sha256"] == artifact["sha256"],
-                    f"PIE adapter manifest {label} does not bind the executed artifact")
-    adapter = manifest["adapter"]
-    require(isinstance(adapter, dict), "PIE adapter raw-manifest adapter binding must be an object")
-    require_exact_keys(adapter, {"run_record", "invocation", "executable", "source_closure"}, "PIE adapter raw-manifest adapter binding")
-    for item, label, kind, maximum, artifact in (
-        (manifest["source_pie"], "source PIE", "cairo-pie-zip", GIB, artifacts["source_pie"]),
-        (manifest["adapted_prover_input"], "adapted input", "stwo-prover-input-bincode-v1", 256 * MIB, artifacts["expected_prover_input"]),
-        (adapter["invocation"], "invocation", "adapter-invocation-json-v1", MIB, artifacts["adapter_invocation"]),
-        (adapter["executable"], "executable", "adapter-executable", 256 * MIB, artifacts["adapter_executable"]),
-        (adapter["source_closure"], "source closure", "adapter-source-closure-json-v1", 4 * MIB, artifacts["adapter_source_closure"]),
-        (adapter["run_record"], "legacy run record", "adapter-run-json-v1", 4 * MIB, None),
-        (manifest["extended_cairo_proof_bincode"], "proof", "extended-cairo-proof-bincode-v1", 256 * MIB, None),
-        (manifest["canonical_cairo_transport"], "transport", "canonical-cairo-proof-felts-be32-v1", 256 * MIB, None),
-        (manifest["verifier_source_closure"], "verifier closure", "verifier-source-closure-json-v1", 4 * MIB, None),
-    ):
-        seal(item, label, kind, maximum, artifact)
-    proof_shape = manifest["proof_shape"]
-    require(isinstance(proof_shape, dict), "PIE adapter manifest proof shape must be an object")
-    require_exact_keys(proof_shape, {"sha256", "shape"}, "PIE adapter manifest proof shape")
-    require_sha256(proof_shape["sha256"], "PIE adapter manifest proof-shape sha256")
-    shape = proof_shape["shape"]
-    require(isinstance(shape, dict), "PIE adapter manifest proof shape body must be an object")
-    require_exact_keys(shape, {
-        "schema_version", "pcs", "channel_salt", "preprocessed_trace_variant_sha256",
-        "component_slots", "component_enable_bits_sha256", "component_log_sizes",
-        "trace_column_log_sizes", "public_data_word_counts", "interaction_claim_felts",
-        "commitment_trees", "sampled_value_counts", "decommitment_trees",
-        "queried_value_counts", "fri_inner_layers", "fri_witness_counts",
-        "fri_last_layer_coefficients", "unsorted_query_locations",
-    }, "PIE adapter manifest proof shape body")
-    require(shape["schema_version"] == "stwo.gpu-lab.cairo-proof-shape.v1"
-            and isinstance(shape["pcs"], dict), "PIE adapter manifest proof shape differs")
-    require_exact_keys(shape["pcs"], {"pow_bits", "log_blowup_factor", "log_last_layer_degree_bound",
-        "n_queries", "fold_step", "lifting_log_size"}, "PIE adapter manifest proof-shape PCS")
-    return manifest
+            "PIE adapter receipt artifacts differ")
+    checked = {role: _artifact(artifacts[role], role) for role in ARTIFACT_SPECS}
+    raw_documents = (
+        ("adapter_source_inventory", inventory_bytes, expected_inventory_sha256),
+        ("adapter_source_closure", closure_bytes, expected_closure_sha256),
+        ("adapter_build_receipt", receipt_bytes, expected_receipt_sha256),
+    )
+    for role, payload, expected_sha256 in raw_documents:
+        require(type(payload) is bytes and 0 < len(payload) <= ARTIFACT_SPECS[role][1],
+                f"PIE adapter raw {role} bytes are out of bounds")
+        require_sha256(expected_sha256, f"expected PIE adapter {role} sha256")
+        identity = checked[role]
+        require(len(payload) == identity["byte_length"]
+                and sha256_bytes(payload) == expected_sha256 == identity["sha256"],
+                f"PIE adapter raw {role} identity differs")
+
+    _, receipt = pie_adapter_receipt.validate_documents(
+        inventory_bytes, expected_inventory_sha256, closure_bytes, receipt_bytes,
+        workspace_root, _commit_reader,
+    )
+    executable = receipt["build_receipt"]["adapter_executable"]
+    absolute_path = workspace_root / executable["repository"] / executable["path"]
+    require(workspace_root.is_absolute(), "PIE adapter workspace root must be absolute")
+    require(checked["adapter_executable"] == {
+        "kind": ARTIFACT_SPECS["adapter_executable"][0],
+        "path": str(absolute_path),
+        "byte_length": executable["byte_length"],
+        "sha256": executable["sha256"],
+    }, "PIE adapter receipt executable does not bind the executed artifact")
+    return receipt
 
 
 def _output_lifecycle(value: Any, output: dict[str, Any], bindings: dict[str, Any]) -> None:
@@ -443,8 +426,18 @@ def _output_lifecycle(value: Any, output: dict[str, Any], bindings: dict[str, An
             "sha256": output["sha256"]}, "PIE adapter final output inode differs")
 
 
-def validate_execution_record(value: Any, *, provenance_manifest_bytes: bytes,
-                              expected_provenance_manifest_sha256: str) -> dict[str, Any]:
+def validate_execution_record(
+    value: Any,
+    *,
+    adapter_source_inventory_bytes: bytes,
+    expected_adapter_source_inventory_sha256: str,
+    adapter_source_closure_bytes: bytes,
+    expected_adapter_source_closure_sha256: str,
+    adapter_build_receipt_bytes: bytes,
+    expected_adapter_build_receipt_sha256: str,
+    workspace_root: Path = WORKSPACE_ROOT,
+    _commit_reader: pie_adapter_receipt.CommitReader = pie_adapter_receipt._git_commit,
+) -> dict[str, Any]:
     require(isinstance(value, dict), "PIE adapter execution record must be an object")
     require_exact_keys(value, RECORD_KEYS, "PIE adapter execution record")
     require(value["schema_version"] == EXECUTION_RECORD_SCHEMA,
@@ -455,6 +448,9 @@ def validate_execution_record(value: Any, *, provenance_manifest_bytes: bytes,
             "PIE adapter execution is not structurally attested")
     require(value["source_closure_status"] == SOURCE_CLOSURE_STATUS,
             "PIE adapter source-closure status overclaims its evidence")
+    require(value["build_receipt_status"] == BUILD_RECEIPT_STATUS
+            and value["build_execution_attested"] is False,
+            "PIE adapter build-receipt status overclaims execution")
     require(value["production_admissible"] is False
             and value["correctness_admissible"] is False
             and value["performance_admissible"] is False,
@@ -483,27 +479,49 @@ def validate_execution_record(value: Any, *, provenance_manifest_bytes: bytes,
             and output["sha256"] == expected["sha256"]
             and value["exact_byte_equal"] is True,
             "observed ProverInput is not attested byte-for-byte equal")
-    provenance = value["provenance_binding"]
-    require(isinstance(provenance, dict), "PIE adapter provenance binding must be an object")
-    require_exact_keys(provenance, {"contract", "trust_root", "output_relation",
-        "bootloader_coverage"}, "PIE adapter provenance binding")
-    require(provenance == {
-        "contract": "fri-round6-provenance-v1-external-raw-binding-v1",
-        "trust_root": "required-out-of-band-sha256-v1",
-        "output_relation": "manifest-expected-equals-observed-byte-for-byte-v1",
-        "bootloader_coverage": "separate-required-semantic-live-in-v1",
-    }, "PIE adapter provenance trust-root contract differs")
-    validate_adapter_provenance_projection(provenance_manifest_bytes,
-                                           expected_provenance_manifest_sha256, artifacts)
+    receipt_binding = value["receipt_binding"]
+    require(isinstance(receipt_binding, dict), "PIE adapter receipt binding must be an object")
+    require_exact_keys(receipt_binding, {*RECEIPT_TRUST, "adapter_executable_mode"},
+                       "PIE adapter receipt binding")
+    receipt = validate_adapter_receipt_projection(
+        adapter_source_inventory_bytes,
+        expected_adapter_source_inventory_sha256,
+        adapter_source_closure_bytes,
+        expected_adapter_source_closure_sha256,
+        adapter_build_receipt_bytes,
+        expected_adapter_build_receipt_sha256,
+        artifacts,
+        workspace_root,
+        _commit_reader,
+    )
+    executable_mode = receipt["build_receipt"]["adapter_executable"]["mode"]
+    require(receipt_binding == {**RECEIPT_TRUST, "adapter_executable_mode": executable_mode},
+            "PIE adapter receipt trust-root contract differs")
     bindings = _validate_execution_contract(value["execution_contract"], artifacts, output)
     _output_lifecycle(value["output_lifecycle"], output, bindings)
     return value
 
 
-def parse_execution_record_bytes(payload: bytes, *, provenance_manifest_bytes: bytes,
-    expected_provenance_manifest_sha256: str) -> dict[str, Any]:
+def parse_execution_record_bytes(
+    payload: bytes,
+    *,
+    adapter_source_inventory_bytes: bytes,
+    expected_adapter_source_inventory_sha256: str,
+    adapter_source_closure_bytes: bytes,
+    expected_adapter_source_closure_sha256: str,
+    adapter_build_receipt_bytes: bytes,
+    expected_adapter_build_receipt_sha256: str,
+    workspace_root: Path = WORKSPACE_ROOT,
+    _commit_reader: pie_adapter_receipt.CommitReader = pie_adapter_receipt._git_commit,
+) -> dict[str, Any]:
     return validate_execution_record(
         _parse_json(payload, "PIE adapter execution record", MAX_EXECUTION_RECORD_BYTES),
-        provenance_manifest_bytes=provenance_manifest_bytes,
-        expected_provenance_manifest_sha256=expected_provenance_manifest_sha256,
+        adapter_source_inventory_bytes=adapter_source_inventory_bytes,
+        expected_adapter_source_inventory_sha256=expected_adapter_source_inventory_sha256,
+        adapter_source_closure_bytes=adapter_source_closure_bytes,
+        expected_adapter_source_closure_sha256=expected_adapter_source_closure_sha256,
+        adapter_build_receipt_bytes=adapter_build_receipt_bytes,
+        expected_adapter_build_receipt_sha256=expected_adapter_build_receipt_sha256,
+        workspace_root=workspace_root,
+        _commit_reader=_commit_reader,
     )

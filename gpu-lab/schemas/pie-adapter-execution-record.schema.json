@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://stwo.dev/gpu-lab/pie-adapter-execution-record-v1.schema.json",
+  "$id": "https://stwo.dev/gpu-lab/pie-adapter-execution-record-v2.schema.json",
   "title": "Stwo GPU lab authenticated PIE adapter execution record",
-  "$comment": "JSON Schema closes local shape/type/constant bounds. The mandatory Python validator additionally enforces out-of-band raw-manifest hash trust, cross-object artifact equality, canonical invocation hashing, fd/inode/path uniqueness, argv/environment fd relationships, dynamic file-size/stderr identities, source-closure hashing, and same-inode output transition; JSON Schema 2020-12 has no standard data-reference operator for those relations.",
+  "$comment": "JSON Schema closes local shape/type/constant bounds. The mandatory Python validator additionally authenticates all three exact raw v2 receipt documents against caller-pinned hashes, revalidates their live source/output chain, binds the exact executable identity and mode, and enforces cross-object artifact, descriptor, invocation, and output-lifecycle relations.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -11,45 +11,41 @@
     "passed",
     "adapter_execution_attested",
     "source_closure_status",
+    "build_receipt_status",
+    "build_execution_attested",
     "production_admissible",
     "correctness_admissible",
     "performance_admissible",
     "adapter_executable_policy",
-    "provenance_manifest",
     "source_pie",
     "bootloader_program",
     "expected_prover_input",
     "adapter_executable",
     "adapter_invocation",
+    "adapter_source_inventory",
     "adapter_source_closure",
+    "adapter_build_receipt",
     "replay_tool_source_closure",
     "invocation_contract",
-    "provenance_binding",
+    "receipt_binding",
     "execution_contract",
     "output_lifecycle",
     "observed_prover_input",
     "exact_byte_equal"
   ],
   "properties": {
-    "schema_version": {"const": "stwo.gpu-lab.pie-adapter-execution-record.v1"},
+    "schema_version": {"const": "stwo.gpu-lab.pie-adapter-execution-record.v2"},
     "evidence_mode": {"const": "authenticated-pie-adapter-replay"},
     "passed": {"const": true},
     "adapter_execution_attested": {"const": true},
-    "source_closure_status": {"const": "identity-only"},
+    "source_closure_status": {"const": "live-explicit-inventory-identity-only-v2"},
+    "build_receipt_status": {"const": "declared-build-inputs-live-outputs-no-build-attestation-v2"},
+    "build_execution_attested": {"const": false},
     "production_admissible": {"const": false},
     "correctness_admissible": {"const": false},
     "performance_admissible": {"const": false},
     "adapter_executable_policy": {
-      "const": "release-or-stripped-provenance-compatible-max-256mib-v1"
-    },
-    "provenance_manifest": {
-      "allOf": [
-        {"$ref": "#/$defs/artifact"},
-        {"properties": {
-          "kind": {"const": "fri-round6-provenance-json-v1"},
-          "byte_length": {"maximum": 1048576}
-        }}
-      ]
+      "const": "release-or-stripped-receipt-bound-max-256mib-v2"
     },
     "source_pie": {
       "allOf": [
@@ -96,11 +92,29 @@
         }}
       ]
     },
+    "adapter_source_inventory": {
+      "allOf": [
+        {"$ref": "#/$defs/artifact"},
+        {"properties": {
+          "kind": {"const": "adapter-source-inventory-json-v2"},
+          "byte_length": {"maximum": 4194304}
+        }}
+      ]
+    },
     "adapter_source_closure": {
       "allOf": [
         {"$ref": "#/$defs/artifact"},
         {"properties": {
-          "kind": {"const": "adapter-source-closure-json-v1"},
+          "kind": {"const": "adapter-source-closure-json-v2"},
+          "byte_length": {"maximum": 4194304}
+        }}
+      ]
+    },
+    "adapter_build_receipt": {
+      "allOf": [
+        {"$ref": "#/$defs/artifact"},
+        {"properties": {
+          "kind": {"const": "adapter-build-receipt-json-v2"},
           "byte_length": {"maximum": 4194304}
         }}
       ]
@@ -109,7 +123,7 @@
     "invocation_contract": {
       "$ref": "#/$defs/invocation_contract"
     },
-    "provenance_binding": {"$ref": "#/$defs/provenance_binding"},
+    "receipt_binding": {"$ref": "#/$defs/receipt_binding"},
     "execution_contract": {"$ref": "#/$defs/execution_contract"},
     "output_lifecycle": {"$ref": "#/$defs/output_lifecycle"},
     "observed_prover_input": {
@@ -243,23 +257,25 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "provenance_manifest",
         "source_pie",
         "bootloader_program",
         "expected_prover_input",
         "adapter_executable",
         "adapter_invocation",
+        "adapter_source_inventory",
         "adapter_source_closure",
+        "adapter_build_receipt",
         "observed_prover_input"
       ],
       "properties": {
-        "provenance_manifest": {"$ref": "#/$defs/parent_input_binding"},
         "source_pie": {"$ref": "#/$defs/child_input_binding"},
         "bootloader_program": {"$ref": "#/$defs/child_input_binding"},
         "expected_prover_input": {"$ref": "#/$defs/parent_input_binding"},
         "adapter_executable": {"$ref": "#/$defs/child_input_binding"},
         "adapter_invocation": {"$ref": "#/$defs/parent_input_binding"},
+        "adapter_source_inventory": {"$ref": "#/$defs/parent_input_binding"},
         "adapter_source_closure": {"$ref": "#/$defs/parent_input_binding"},
+        "adapter_build_receipt": {"$ref": "#/$defs/parent_input_binding"},
         "observed_prover_input": {"$ref": "#/$defs/output_binding"}
       }
     },
@@ -308,17 +324,21 @@
         "sha256": {"const": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}
       }
     },
-    "provenance_binding": {
+    "receipt_binding": {
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "contract", "trust_root", "output_relation", "bootloader_coverage"
+        "contract", "inventory_trust_root", "source_closure_trust_root",
+        "build_receipt_trust_root", "adapter_executable_mode",
+        "build_execution_attested"
       ],
       "properties": {
-        "contract": {"const": "fri-round6-provenance-v1-external-raw-binding-v1"},
-        "trust_root": {"const": "required-out-of-band-sha256-v1"},
-        "output_relation": {"const": "manifest-expected-equals-observed-byte-for-byte-v1"},
-        "bootloader_coverage": {"const": "separate-required-semantic-live-in-v1"}
+        "contract": {"const": "pie-adapter-receipt-v2-external-raw-binding-v1"},
+        "inventory_trust_root": {"const": "required-out-of-band-exact-raw-sha256-v1"},
+        "source_closure_trust_root": {"const": "required-out-of-band-exact-raw-sha256-v1"},
+        "build_receipt_trust_root": {"const": "required-out-of-band-exact-raw-sha256-v1"},
+        "adapter_executable_mode": {"type": "string", "pattern": "^0[0-7]{3}$"},
+        "build_execution_attested": {"const": false}
       }
     },
     "pre_launch_output": {

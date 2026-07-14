@@ -6,8 +6,10 @@ from __future__ import annotations
 
 import copy
 import json
+import tempfile
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from .common import LAB_ROOT, canonical_bytes, require, sha256_bytes
 from .pie_adapter_contract import (
@@ -15,6 +17,7 @@ from .pie_adapter_contract import (
     ARTIFACT_SPECS,
     CPU_LIMIT_SECONDS,
     DATA_LIMIT_BYTES,
+    BUILD_RECEIPT_STATUS,
     EMPTY_SHA256,
     EVIDENCE_MODE,
     EXECUTION_HONESTY,
@@ -25,25 +28,29 @@ from .pie_adapter_contract import (
     MAX_INVOCATION_BYTES,
     OUTPUT_ENCODING,
     PROTOCOL,
+    RECEIPT_TRUST,
     SOURCE_CLOSURE_STATUS,
     WALL_TIMEOUT_SECONDS,
     invocation_bytes,
     parse_execution_record_bytes,
     parse_invocation_bytes,
+    validate_adapter_receipt_projection,
     validate_execution_record,
     validate_invocation,
-    validate_adapter_provenance_projection,
 )
+from .pie_adapter_receipt import generate
+from .pie_adapter_receipt_tests import _commit, _inventory_bytes, _workspace
 
 
 def _digest(label: str) -> str:
     return sha256_bytes(label.encode())
 
 
-def _artifact(role: str, filename: str, size: int = 17) -> dict[str, Any]:
+def _artifact(role: str, filename: str, size: int = 17,
+              sha256: str | None = None) -> dict[str, Any]:
     kind, _ = ARTIFACT_SPECS[role]
     return {"kind": kind, "path": f"/sealed/{filename}",
-            "byte_length": size, "sha256": _digest(role)}
+            "byte_length": size, "sha256": sha256 or _digest(role)}
 
 
 def _invocation() -> dict[str, Any]:
@@ -55,68 +62,35 @@ def _invocation() -> dict[str, Any]:
     }
 
 
-def _seal(kind: str, path: str, size: int, label: str) -> dict[str, Any]:
-    return {"kind": kind, "path": path, "byte_length": size, "sha256": _digest(label)}
-
-
-def _manifest_bytes(artifacts: dict[str, dict[str, Any]]) -> bytes:
-    def bound(role: str) -> dict[str, Any]:
-        value = artifacts[role]
-        return {**value, "path": Path(value["path"]).name}
-
-    shape = {
-        "schema_version": "stwo.gpu-lab.cairo-proof-shape.v1",
-        "pcs": {"pow_bits": 0, "log_blowup_factor": 1, "log_last_layer_degree_bound": 2,
-                "n_queries": 3, "fold_step": 1, "lifting_log_size": None},
-        "channel_salt": 0, "preprocessed_trace_variant_sha256": _digest("variant"),
-        "component_slots": 0, "component_enable_bits_sha256": _digest("enable"),
-        "component_log_sizes": [], "trace_column_log_sizes": [],
-        "public_data_word_counts": [0, 0, 0], "interaction_claim_felts": 0,
-        "commitment_trees": 0, "sampled_value_counts": [], "decommitment_trees": 0,
-        "queried_value_counts": [], "fri_inner_layers": 0, "fri_witness_counts": [],
-        "fri_last_layer_coefficients": 0, "unsorted_query_locations": 0,
+def _retained_artifact(role: str, path: Path, payload: bytes) -> dict[str, Any]:
+    return {
+        "kind": ARTIFACT_SPECS[role][0], "path": str(path),
+        "byte_length": len(payload), "sha256": sha256_bytes(payload),
     }
-    manifest = {
-        "schema_version": "stwo.gpu-lab.fri-round6-provenance.v1",
-        "status": "captured-unsealed", "production_admissible": False,
-        "source_pie": bound("source_pie"),
-        "adapted_prover_input": bound("expected_prover_input"),
-        "adapter": {
-            "run_record": _seal("adapter-run-json-v1", "legacy-run.json", 17, "run"),
-            "invocation": bound("adapter_invocation"),
-            "executable": bound("adapter_executable"),
-            "source_closure": bound("adapter_source_closure"),
-        },
-        "extended_cairo_proof_bincode": _seal(
-            "extended-cairo-proof-bincode-v1", "proof.bin", 19, "proof"),
-        "canonical_cairo_transport": _seal(
-            "canonical-cairo-proof-felts-be32-v1", "transport.bin", 23, "transport"),
-        "verifier_source_closure": _seal(
-            "verifier-source-closure-json-v1", "verifier.json", 29, "verifier"),
-        "proof_shape": {"sha256": _digest("shape"), "shape": shape},
-    }
-    return canonical_bytes(manifest) + b"\n"
 
 
-def _record() -> dict[str, Any]:
+def _record(executable: Path, inventory_path: Path, inventory_bytes: bytes,
+            closure_path: Path, closure_bytes: bytes, receipt_path: Path,
+            receipt_bytes: bytes) -> dict[str, Any]:
     invocation = _invocation()
     invocation_bytes = canonical_bytes(invocation) + b"\n"
     artifacts = {
         "source_pie": _artifact("source_pie", "source.zip", 103),
         "bootloader_program": copy.deepcopy(invocation["bootloader_program"]),
         "expected_prover_input": _artifact("expected_prover_input", "expected.bin", 107),
-        "adapter_executable": _artifact("adapter_executable", "adapter", 109),
+        "adapter_executable": _retained_artifact(
+            "adapter_executable", executable, executable.read_bytes()),
         "adapter_invocation": {
             "kind": ARTIFACT_SPECS["adapter_invocation"][0], "path": "/sealed/invocation.json",
             "byte_length": len(invocation_bytes), "sha256": sha256_bytes(invocation_bytes),
         },
-        "adapter_source_closure": _artifact("adapter_source_closure", "adapter-sources.json", 113),
+        "adapter_source_inventory": _retained_artifact(
+            "adapter_source_inventory", inventory_path, inventory_bytes),
+        "adapter_source_closure": _retained_artifact(
+            "adapter_source_closure", closure_path, closure_bytes),
+        "adapter_build_receipt": _retained_artifact(
+            "adapter_build_receipt", receipt_path, receipt_bytes),
     }
-    manifest = _manifest_bytes(artifacts)
-    artifacts = {"provenance_manifest": {
-        "kind": ARTIFACT_SPECS["provenance_manifest"][0], "path": "/sealed/provenance.json",
-        "byte_length": len(manifest), "sha256": sha256_bytes(manifest),
-    }, **artifacts}
     sources = [
         {"path": "tools/pie-adapter-replay", "sha256": _digest("launcher")},
         {"path": "tools/gpu_lab/pie_adapter_contract.py", "sha256": _digest("contract")},
@@ -152,7 +126,9 @@ def _record() -> dict[str, Any]:
     return {
         "schema_version": EXECUTION_RECORD_SCHEMA, "evidence_mode": EVIDENCE_MODE,
         "passed": True, "adapter_execution_attested": True,
-        "source_closure_status": SOURCE_CLOSURE_STATUS, "production_admissible": False,
+        "source_closure_status": SOURCE_CLOSURE_STATUS,
+        "build_receipt_status": BUILD_RECEIPT_STATUS,
+        "build_execution_attested": False, "production_admissible": False,
         "correctness_admissible": False, "performance_admissible": False,
         "adapter_executable_policy": EXECUTABLE_POLICY,
         **artifacts,
@@ -161,12 +137,7 @@ def _record() -> dict[str, Any]:
             "closure_sha256": sha256_bytes(canonical_bytes(sources)),
         },
         "invocation_contract": invocation,
-        "provenance_binding": {
-            "contract": "fri-round6-provenance-v1-external-raw-binding-v1",
-            "trust_root": "required-out-of-band-sha256-v1",
-            "output_relation": "manifest-expected-equals-observed-byte-for-byte-v1",
-            "bootloader_coverage": "separate-required-semantic-live-in-v1",
-        },
+        "receipt_binding": {**RECEIPT_TRUST, "adapter_executable_mode": "0755"},
         "execution_contract": {
             "contract": "linux-retained-descriptor-exec-v1",
             "shell": False,
@@ -235,26 +206,56 @@ def _reject(label: str, callback: Callable[[], Any]) -> None:
     raise AssertionError(f"hostile case was accepted: {label}")
 
 
-def _validate(record: dict[str, Any], manifest: bytes, expected: str) -> dict[str, Any]:
-    return validate_execution_record(
-        record, provenance_manifest_bytes=manifest,
-        expected_provenance_manifest_sha256=expected,
-    )
+Case = tuple[dict[str, Any], dict[str, Any]]
 
 
-def _rebind_manifest(record: dict[str, Any], manifest: bytes) -> str:
-    digest = sha256_bytes(manifest)
-    for identity in (record["provenance_manifest"], _binding(record, "provenance_manifest")):
-        identity.update({"byte_length": len(manifest), "sha256": digest})
-    return digest
+@contextmanager
+def _case() -> Iterator[Case]:
+    with tempfile.TemporaryDirectory(prefix="gpu-lab-adapter-contract-") as temporary:
+        base = Path(temporary)
+        workspace = base / "workspace"
+        inventory, executable = _workspace(workspace)
+        inventory_path = base / "inventory.json"
+        inventory_path.write_bytes(_inventory_bytes(inventory))
+        inventory_bytes = inventory_path.read_bytes()
+        closure_path, receipt_path = base / "closure.json", base / "receipt.json"
+        generate(inventory_path, sha256_bytes(inventory_bytes), closure_path,
+                 receipt_path, workspace, _commit)
+        closure_bytes, receipt_bytes = closure_path.read_bytes(), receipt_path.read_bytes()
+        record = _record(executable, inventory_path, inventory_bytes, closure_path,
+                         closure_bytes, receipt_path, receipt_bytes)
+        arguments = {
+            "adapter_source_inventory_bytes": inventory_bytes,
+            "expected_adapter_source_inventory_sha256": sha256_bytes(inventory_bytes),
+            "adapter_source_closure_bytes": closure_bytes,
+            "expected_adapter_source_closure_sha256": sha256_bytes(closure_bytes),
+            "adapter_build_receipt_bytes": receipt_bytes,
+            "expected_adapter_build_receipt_sha256": sha256_bytes(receipt_bytes),
+            "workspace_root": workspace,
+            "_commit_reader": _commit,
+        }
+        yield record, arguments
 
 
-def _mutate_record(label: str, mutate: Callable[[dict[str, Any]], None]) -> None:
-    hostile = _record()
-    manifest = _manifest_bytes(hostile)
-    expected = sha256_bytes(manifest)
+def _validate(record: dict[str, Any], arguments: dict[str, Any]) -> dict[str, Any]:
+    return validate_execution_record(record, **arguments)
+
+
+def _rebind_raw(record: dict[str, Any], arguments: dict[str, Any], role: str,
+                payload: bytes) -> None:
+    digest = sha256_bytes(payload)
+    for identity in (record[role], _binding(record, role)):
+        identity.update({"byte_length": len(payload), "sha256": digest})
+    stem = role.removeprefix("adapter_")
+    arguments[f"adapter_{stem}_bytes"] = payload
+    arguments[f"expected_adapter_{stem}_sha256"] = digest
+
+
+def _mutate_record(case: Case, label: str,
+                   mutate: Callable[[dict[str, Any]], None]) -> None:
+    hostile = copy.deepcopy(case[0])
     mutate(hostile)
-    _reject(label, lambda: _validate(hostile, manifest, expected))
+    _reject(label, lambda: _validate(hostile, case[1]))
 
 
 def _contract(record: dict[str, Any]) -> dict[str, Any]:
@@ -304,159 +305,170 @@ def test_invocation_contract() -> None:
 
 
 def test_execution_record_contract() -> None:
-    record = _record()
-    manifest = _manifest_bytes(record)
-    expected = sha256_bytes(manifest)
-    require(_validate(record, manifest, expected) is record, "valid execution record was not retained")
-    require(parse_execution_record_bytes(
-        canonical_bytes(record), provenance_manifest_bytes=manifest,
-        expected_provenance_manifest_sha256=expected) == record,
-            "execution record byte parser differs")
+    with _case() as case:
+        record, arguments = case
+        require(_validate(record, arguments) is record,
+                "valid execution record was not retained")
+        require(parse_execution_record_bytes(canonical_bytes(record), **arguments) == record,
+                "execution record byte parser differs")
+        require(not ({"provenance_manifest", "proof_shape", "fri_capture"} & set(record)),
+                "adapter-only record retained proof or FRI metadata")
+        _reject("run-record hash alone", lambda: validate_execution_record({
+            "schema_version": EXECUTION_RECORD_SCHEMA, "sha256": _digest("run")
+        }, **arguments))
+        for key in (
+            "adapter_execution_attested", "build_execution_attested",
+            "execution_contract", "invocation_contract", "receipt_binding",
+            "adapter_source_inventory", "adapter_source_closure",
+            "adapter_build_receipt", "output_lifecycle", "bootloader_program",
+            "observed_prover_input", "exact_byte_equal",
+        ):
+            _mutate_record(case, f"missing authenticated field {key}",
+                           lambda value, key=key: value.pop(key))
+        _mutate_record(case, "unknown record field",
+                       lambda value: value.__setitem__("extra", False))
+        for key in ("production_admissible", "correctness_admissible",
+                    "performance_admissible"):
+            _mutate_record(case, f"overclaimed {key}",
+                           lambda value, key=key: value.__setitem__(key, True))
+        _mutate_record(case, "overclaimed build execution", lambda value: value.__setitem__(
+            "build_execution_attested", True))
+        _mutate_record(case, "overclaimed source closure", lambda value: value.__setitem__(
+            "source_closure_status", "verified-build"))
+        _mutate_record(case, "wrong receipt status", lambda value: value.__setitem__(
+            "build_receipt_status", "build-attested"))
+        _mutate_record(case, "wrong executable policy", lambda value: value.__setitem__(
+            "adapter_executable_policy", "debug-allowed"))
+        _mutate_record(case, "false execution attestation", lambda value: value.__setitem__(
+            "adapter_execution_attested", False))
+        _mutate_record(case, "false exact equality", lambda value: value.__setitem__(
+            "exact_byte_equal", False))
+        _mutate_record(case, "bootloader invocation mismatch", lambda value: value[
+            "invocation_contract"]["bootloader_program"].__setitem__("sha256", _digest("other")))
+        _mutate_record(case, "invocation artifact mismatch", lambda value: value[
+            "adapter_invocation"].__setitem__("sha256", _digest("other")))
+        _mutate_record(case, "observed hash mismatch", lambda value: value[
+            "observed_prover_input"].__setitem__("sha256", _digest("other")))
+        _mutate_record(case, "observed input alias", lambda value: value[
+            "observed_prover_input"].__setitem__("path", value["expected_prover_input"]["path"]))
+        _mutate_record(case, "input artifact alias", lambda value: value[
+            "adapter_source_closure"].__setitem__("path", value["adapter_source_inventory"]["path"]))
+        _mutate_record(case, "wrong receipt executable mode", lambda value: value[
+            "receipt_binding"].__setitem__("adapter_executable_mode", "0750"))
 
-    _reject("run-record hash alone", lambda: validate_execution_record({
-        "schema_version": EXECUTION_RECORD_SCHEMA, "sha256": _digest("run")
-    }, provenance_manifest_bytes=manifest, expected_provenance_manifest_sha256=expected))
-    for key in (
-        "adapter_execution_attested", "execution_contract", "invocation_contract",
-        "provenance_binding", "output_lifecycle", "bootloader_program",
-        "observed_prover_input", "exact_byte_equal",
-    ):
-        _mutate_record(f"missing authenticated field {key}", lambda value, key=key: value.pop(key))
-    _mutate_record("unknown record field", lambda value: value.__setitem__("extra", False))
-    for key in ("production_admissible", "correctness_admissible", "performance_admissible"):
-        _mutate_record(f"overclaimed {key}", lambda value, key=key: value.__setitem__(key, True))
-    _mutate_record("overclaimed source closure", lambda value: value.__setitem__(
-        "source_closure_status", "verified-build"
-    ))
-    _mutate_record("wrong executable policy", lambda value: value.__setitem__(
-        "adapter_executable_policy", "debug-allowed"))
-    _mutate_record("oversized debug executable", lambda value: value[
-        "adapter_executable"].__setitem__("byte_length", 268435457))
-    _mutate_record("false execution attestation", lambda value: value.__setitem__(
-        "adapter_execution_attested", False))
-    _mutate_record("false exact equality", lambda value: value.__setitem__("exact_byte_equal", False))
-    _mutate_record("bootloader invocation mismatch", lambda value: value[
-        "invocation_contract"]["bootloader_program"].__setitem__("sha256", _digest("other")))
-    _mutate_record("invocation artifact mismatch", lambda value: value[
-        "adapter_invocation"].__setitem__("sha256", _digest("other")))
-    _mutate_record("observed hash mismatch", lambda value: value[
-        "observed_prover_input"].__setitem__("sha256", _digest("other")))
-    _mutate_record("observed input alias", lambda value: value[
-        "observed_prover_input"].__setitem__("path", value["expected_prover_input"]["path"]))
-    _mutate_record("input artifact alias", lambda value: value[
-        "adapter_source_closure"].__setitem__("path", value["adapter_invocation"]["path"]))
-    _mutate_record("bootloader smuggled into manifest", lambda value: value[
-        "provenance_binding"].__setitem__("bootloader_coverage", "manifest-covered"))
 
+def test_raw_receipt_trust() -> None:
+    with _case() as case:
+        record, arguments = case
+        artifacts = {role: record[role] for role in ARTIFACT_SPECS}
+        receipt = validate_adapter_receipt_projection(
+            arguments["adapter_source_inventory_bytes"],
+            arguments["expected_adapter_source_inventory_sha256"],
+            arguments["adapter_source_closure_bytes"],
+            arguments["expected_adapter_source_closure_sha256"],
+            arguments["adapter_build_receipt_bytes"],
+            arguments["expected_adapter_build_receipt_sha256"],
+            artifacts, arguments["workspace_root"], arguments["_commit_reader"])
+        require(receipt["build_receipt"]["build_execution_attested"] is False,
+                "public receipt validator overclaimed build execution")
+        for role in ("adapter_source_inventory", "adapter_source_closure",
+                     "adapter_build_receipt"):
+            hostile = dict(arguments)
+            stem = role.removeprefix("adapter_")
+            hostile[f"expected_adapter_{stem}_sha256"] = "0" * 64
+            _reject(f"wrong raw {role} pin", lambda hostile=hostile:
+                    _validate(record, hostile))
+            rebound = copy.deepcopy(record)
+            for identity in (rebound[role], _binding(rebound, role)):
+                identity["sha256"] = _digest(f"substituted-{role}")
+            _reject(f"self-consistent {role} record substitution",
+                    lambda rebound=rebound: _validate(rebound, arguments))
 
-def test_raw_manifest_trust() -> None:
-    record = _record(); manifest = _manifest_bytes(record); expected = sha256_bytes(manifest)
-    artifacts = {role: record[role] for role in ARTIFACT_SPECS}
-    require(validate_adapter_provenance_projection(manifest, expected, artifacts)["status"]
-            == "captured-unsealed", "public manifest validator differs")
-    document = json.loads(manifest)
-    pretty = (json.dumps(dict(reversed(list(document.items()))), indent=2) + "\n").encode()
-    record = _record(); pretty_digest = _rebind_manifest(record, pretty)
-    require(_validate(record, pretty, pretty_digest) is record,
-            "exact pretty/key-reordered manifest bytes were not accepted")
-    canonical = canonical_bytes(document) + b"\n"
-    _reject("canonical reserialization against original raw pin",
-            lambda: _validate(record, canonical, pretty_digest))
-    unrelated = manifest.replace(b"proof.bin", b"other.bin")
-    _rebind_manifest(record, unrelated)
-    _reject("consistent unrelated manifest substitution",
-            lambda: _validate(record, unrelated, expected))
-    for label, hostile in (
-        ("duplicate manifest key", b'{"schema_version":"a","schema_version":"b"}'),
-        ("unknown manifest key", canonical_bytes({**json.loads(manifest), "extra": False})),
-    ):
-        record = _record(); digest = _rebind_manifest(record, hostile)
-        _reject(label, lambda record=record, hostile=hostile, digest=digest:
-                _validate(record, hostile, digest))
-    record = _record(); document = json.loads(manifest)
-    document["source_pie"]["sha256"] = _digest("substituted")
-    hostile = canonical_bytes(document); digest = _rebind_manifest(record, hostile)
-    _reject("manifest-to-executed-PIE substitution", lambda: _validate(record, hostile, digest))
-    for label, key, bad in (("seal bool size", "byte_length", True),
-                            ("seal float size", "byte_length", 103.0),
-                            ("seal backslash path", "path", "bad\\path"),
-                            ("seal trailing path", "path", "bad/")):
-        document = json.loads(manifest); document["source_pie"][key] = bad
-        hostile = canonical_bytes(document); record = _record(); digest = _rebind_manifest(record, hostile)
-        _reject(label, lambda record=record, hostile=hostile, digest=digest:
-                _validate(record, hostile, digest))
-    for label, hostile in (("non-UTF8 manifest", b"\xff"),
-                           ("oversized manifest", b"{" + b" " * (1 << 20))):
-        record = _record(); digest = _rebind_manifest(record, hostile)
-        _reject(label, lambda record=record, hostile=hostile, digest=digest:
-                _validate(record, hostile, digest))
+        reordered = copy.deepcopy(record)
+        reordered_arguments = dict(arguments)
+        document = json.loads(arguments["adapter_source_inventory_bytes"])
+        pretty = (json.dumps(dict(reversed(list(document.items()))), indent=1) + "\n").encode()
+        _rebind_raw(reordered, reordered_arguments, "adapter_source_inventory", pretty)
+        require(_validate(reordered, reordered_arguments) is reordered,
+                "caller-pinned key-reordered inventory bytes were rejected")
+        _reject("original inventory pin after exact-byte reserialization",
+                lambda: _validate(reordered, arguments))
+
+        mutated = copy.deepcopy(record)
+        mutated_arguments = dict(arguments)
+        receipt_document = json.loads(arguments["adapter_build_receipt_bytes"])
+        receipt_document["build_receipt"]["build_execution_attested"] = True
+        receipt_document["build_receipt_sha256"] = sha256_bytes(
+            canonical_bytes(receipt_document["build_receipt"]))
+        payload = canonical_bytes(receipt_document)
+        _rebind_raw(mutated, mutated_arguments, "adapter_build_receipt", payload)
+        _reject("self-consistent build-attestation overclaim",
+                lambda: _validate(mutated, mutated_arguments))
 
 
 def test_authenticated_execution_fields() -> None:
-    _mutate_record("shell execution", lambda value: _contract(value).__setitem__("shell", True))
-    _mutate_record("non-root cwd", lambda value: _contract(value).__setitem__("working_directory", "/sealed"))
-    for field in EXECUTION_HONESTY:
-        _mutate_record(f"missing honesty field {field}", lambda value, field=field:
-                       _contract(value).pop(field))
-        _mutate_record(f"wrong honesty field {field}", lambda value, field=field:
-                       _contract(value).__setitem__(field, "wrong"))
-    _mutate_record("argv injection", lambda value: _contract(value)["argv"].append("--prove"))
-    _mutate_record("environment injection", lambda value: _contract(value)[
-        "environment"].__setitem__("LD_PRELOAD", "/tmp/inject.so"))
-    _mutate_record("descriptor as bool", lambda value: _binding(
-        value, "source_pie").__setitem__("fd", True))
-    def reuse_descriptor(value: dict[str, Any]) -> None:
-        descriptor = _binding(value, "adapter_executable")["fd"]
-        _binding(value, "source_pie").update({
-            "fd": descriptor, "proc_path": f"/proc/self/fd/{descriptor}",
-        })
+    with _case() as case:
+        mutate = lambda label, callback: _mutate_record(case, label, callback)
+        mutate("shell execution", lambda value: _contract(value).__setitem__("shell", True))
+        mutate("non-root cwd", lambda value: _contract(value).__setitem__(
+            "working_directory", "/sealed"))
+        for field in EXECUTION_HONESTY:
+            mutate(f"missing honesty field {field}", lambda value, field=field:
+                   _contract(value).pop(field))
+            mutate(f"wrong honesty field {field}", lambda value, field=field:
+                   _contract(value).__setitem__(field, "wrong"))
+        mutate("argv injection", lambda value: _contract(value)["argv"].append("--prove"))
+        mutate("environment injection", lambda value: _contract(value)[
+            "environment"].__setitem__("LD_PRELOAD", "/tmp/inject.so"))
+        mutate("descriptor as bool", lambda value: _binding(
+            value, "source_pie").__setitem__("fd", True))
 
-    _mutate_record("descriptor reuse", reuse_descriptor)
-    _mutate_record("golden inode used as output", lambda value: _binding(
-        value, "observed_prover_input").update({key: _binding(
-            value, "expected_prover_input")[key] for key in ("device", "inode")}))
-    _mutate_record("golden inheritance as int", lambda value: _binding(
-        value, "expected_prover_input").__setitem__("child_inherited", 1))
-    for size in (True, 103.0):
-        _mutate_record(f"binding size {size!r}", lambda value, size=size: _binding(
-            value, "source_pie").__setitem__("byte_length", size))
-    _mutate_record("stdout injection", lambda value: _contract(value)["stdout"].update({
-        "byte_length": 1, "sha256": _digest("stdout")
-    }))
-    _mutate_record("preexisting output", lambda value: _lifecycle(value)[
-        "pre_launch"].__setitem__("byte_length", 1))
-    _mutate_record("hardlinked fresh output", lambda value: _lifecycle(value)[
-        "pre_launch"].__setitem__("link_count", 2))
-    _mutate_record("output inode substitution", lambda value: _lifecycle(value)[
-        "post_launch"].__setitem__("inode", 999))
+        def reuse_descriptor(value: dict[str, Any]) -> None:
+            descriptor = _binding(value, "adapter_executable")["fd"]
+            _binding(value, "source_pie").update({
+                "fd": descriptor, "proc_path": f"/proc/self/fd/{descriptor}",
+            })
+
+        mutate("descriptor reuse", reuse_descriptor)
+        mutate("golden inode used as output", lambda value: _binding(
+            value, "observed_prover_input").update({key: _binding(
+                value, "expected_prover_input")[key] for key in ("device", "inode")}))
+        mutate("golden inheritance as int", lambda value: _binding(
+            value, "expected_prover_input").__setitem__("child_inherited", 1))
+        for size in (True, 103.0):
+            mutate(f"binding size {size!r}", lambda value, size=size: _binding(
+                value, "source_pie").__setitem__("byte_length", size))
+        mutate("stdout injection", lambda value: _contract(value)["stdout"].update({
+            "byte_length": 1, "sha256": _digest("stdout")}))
+        mutate("preexisting output", lambda value: _lifecycle(value)[
+            "pre_launch"].__setitem__("byte_length", 1))
+        mutate("hardlinked fresh output", lambda value: _lifecycle(value)[
+            "pre_launch"].__setitem__("link_count", 2))
+        mutate("output inode substitution", lambda value: _lifecycle(value)[
+            "post_launch"].__setitem__("inode", 999))
 
 
 def test_tool_closure_and_strict_json() -> None:
-    record = _record(); manifest = _manifest_bytes(record); expected = sha256_bytes(manifest)
-    _mutate_record("tool closure digest mismatch", lambda value: value[
-        "replay_tool_source_closure"].__setitem__("closure_sha256", _digest("other")))
-    _mutate_record("tool source path alias", lambda value: value[
-        "replay_tool_source_closure"]["sources"][1].__setitem__(
-            "path", value["replay_tool_source_closure"]["sources"][0]["path"]
-        ))
-    _mutate_record("tool source traversal", lambda value: value[
-        "replay_tool_source_closure"]["sources"][0].__setitem__("path", "../escape.py"))
+    with _case() as case:
+        mutate = lambda label, callback: _mutate_record(case, label, callback)
+        mutate("tool closure digest mismatch", lambda value: value[
+            "replay_tool_source_closure"].__setitem__("closure_sha256", _digest("other")))
+        mutate("tool source path alias", lambda value: value[
+            "replay_tool_source_closure"]["sources"][1].__setitem__(
+                "path", value["replay_tool_source_closure"]["sources"][0]["path"]))
+        mutate("tool source traversal", lambda value: value[
+            "replay_tool_source_closure"]["sources"][0].__setitem__("path", "../escape.py"))
 
-    _reject("duplicate invocation JSON key", lambda: parse_invocation_bytes(
-        b'{"schema_version":"a","schema_version":"b"}'
-    ))
-    _reject("nonfinite invocation JSON", lambda: parse_invocation_bytes(b'{"pie_copies":NaN}'))
-    _reject("oversized invocation JSON", lambda: parse_invocation_bytes(
-        b"{" + b" " * MAX_INVOCATION_BYTES
-    ))
-    _reject("duplicate execution JSON key", lambda: parse_execution_record_bytes(
-        b'{"schema_version":"a","schema_version":"b"}',
-        provenance_manifest_bytes=manifest, expected_provenance_manifest_sha256=expected,
-    ))
-    _reject("oversized execution JSON", lambda: parse_execution_record_bytes(
-        b"{" + b" " * MAX_EXECUTION_RECORD_BYTES,
-        provenance_manifest_bytes=manifest, expected_provenance_manifest_sha256=expected,
-    ))
+        _reject("duplicate invocation JSON key", lambda: parse_invocation_bytes(
+            b'{"schema_version":"a","schema_version":"b"}'))
+        _reject("nonfinite invocation JSON",
+                lambda: parse_invocation_bytes(b'{"pie_copies":NaN}'))
+        _reject("oversized invocation JSON", lambda: parse_invocation_bytes(
+            b"{" + b" " * MAX_INVOCATION_BYTES))
+        _reject("duplicate execution JSON key", lambda: parse_execution_record_bytes(
+            b'{"schema_version":"a","schema_version":"b"}', **case[1]))
+        _reject("oversized execution JSON", lambda: parse_execution_record_bytes(
+            b"{" + b" " * MAX_EXECUTION_RECORD_BYTES, **case[1]))
 
 
 def test_schema_documents() -> None:
@@ -471,8 +483,9 @@ def test_schema_documents() -> None:
             "invocation schema omits bootloader semantic live-in")
     execution = json.loads(execution_path.read_text())
     required = set(execution["required"])
-    require({"adapter_execution_attested", "provenance_binding", "execution_contract",
-             "output_lifecycle", "exact_byte_equal"} <= required,
+    require({"adapter_execution_attested", "build_execution_attested", "receipt_binding",
+             "adapter_source_inventory", "adapter_source_closure", "adapter_build_receipt",
+             "execution_contract", "output_lifecycle", "exact_byte_equal"} <= required,
             "execution schema permits a hash-only success record")
     contract_schema = execution["$defs"]["execution_contract"]
     require(set(EXECUTION_HONESTY) <= set(contract_schema["required"]),
@@ -484,32 +497,53 @@ def test_schema_documents() -> None:
     jsonschema.Draft202012Validator.check_schema(execution)
     jsonschema.Draft202012Validator(invocation).validate(_invocation())
     validator = jsonschema.Draft202012Validator(execution)
-    validator.validate(_record())
-    for field in EXECUTION_HONESTY:
-        hostile = _record(); _contract(hostile).pop(field)
-        require(not validator.is_valid(hostile), f"full schema accepted missing {field}")
-        hostile = _record(); _contract(hostile)[field] = "wrong"
-        require(not validator.is_valid(hostile), f"full schema accepted wrong {field}")
-    for label, mutate in (
-        ("nonempty stdout", lambda value: _contract(value)["stdout"].update(
-            {"byte_length": 1, "sha256": _digest("stdout")})),
-        ("non-root cwd", lambda value: _contract(value).__setitem__("working_directory", "/sealed")),
-        ("relative source trailing slash", lambda value: value[
-            "replay_tool_source_closure"]["sources"][0].__setitem__("path", "tools/")),
-        ("over-3072-byte path", lambda value: value[
-            "source_pie"].__setitem__("path", "/sealed/" + "é" * 1600)),
-    ):
-        hostile = _record(); mutate(hostile)
-        require(not validator.is_valid(hostile), f"full schema accepted {label}")
+    with _case() as case:
+        validator.validate(case[0])
+        for field in EXECUTION_HONESTY:
+            hostile = copy.deepcopy(case[0]); _contract(hostile).pop(field)
+            require(not validator.is_valid(hostile), f"full schema accepted missing {field}")
+            hostile = copy.deepcopy(case[0]); _contract(hostile)[field] = "wrong"
+            require(not validator.is_valid(hostile), f"full schema accepted wrong {field}")
+        for label, mutate in (
+            ("nonempty stdout", lambda value: _contract(value)["stdout"].update(
+                {"byte_length": 1, "sha256": _digest("stdout")})),
+            ("non-root cwd", lambda value: _contract(value).__setitem__(
+                "working_directory", "/sealed")),
+            ("relative source trailing slash", lambda value: value[
+                "replay_tool_source_closure"]["sources"][0].__setitem__("path", "tools/")),
+            ("over-3072-byte path", lambda value: value[
+                "source_pie"].__setitem__("path", "/sealed/" + "é" * 1600)),
+            ("receipt executable mode", lambda value: value[
+                "receipt_binding"].__setitem__("adapter_executable_mode", "755")),
+            ("legacy provenance manifest", lambda value: value.__setitem__(
+                "provenance_manifest", _artifact("source_pie", "legacy.json"))),
+            ("legacy provenance binding", lambda value: value.__setitem__(
+                "provenance_binding", {"contract": "legacy"})),
+            ("legacy source-closure kind", lambda value: value[
+                "adapter_source_closure"].__setitem__(
+                    "kind", "adapter-source-closure-json-v1")),
+            ("overclaimed production admission", lambda value: value.__setitem__(
+                "production_admissible", True)),
+            ("overclaimed correctness admission", lambda value: value.__setitem__(
+                "correctness_admissible", True)),
+            ("overclaimed performance admission", lambda value: value.__setitem__(
+                "performance_admissible", True)),
+        ):
+            hostile = copy.deepcopy(case[0]); mutate(hostile)
+            require(not validator.is_valid(hostile), f"full schema accepted {label}")
 
 
-def main() -> None:
+def pie_adapter_contract_self_test(_: Path | None = None) -> None:
     test_invocation_contract()
     test_execution_record_contract()
-    test_raw_manifest_trust()
+    test_raw_receipt_trust()
     test_authenticated_execution_fields()
     test_tool_closure_and_strict_json()
     test_schema_documents()
+
+
+def main() -> None:
+    pie_adapter_contract_self_test()
     print("pie_adapter_contract_tests: PASS")
 
 
