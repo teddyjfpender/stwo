@@ -262,6 +262,7 @@ pub struct PreparedExecutionTablesView<'a> {
     arena: &'a DeviceArena,
     table_pointers: ArenaSlice,
     table_strides: ArenaSlice,
+    table_data: [ArenaSlice; EXECUTION_TABLE_POINTERS],
     n_addrs: usize,
     n_big: usize,
     n_small: usize,
@@ -276,6 +277,12 @@ impl PreparedExecutionTablesView<'_> {
         self.table_strides
     }
 
+    /// Exact data ranges dereferenced through `table_pointers` by every witness
+    /// launch. Admission uses this inventory to reject stale arena reuse masks.
+    pub(crate) fn table_data(self) -> [ArenaSlice; EXECUTION_TABLE_POINTERS] {
+        self.table_data
+    }
+
     pub fn shape(self) -> (usize, usize, usize) {
         (self.n_addrs, self.n_big, self.n_small)
     }
@@ -284,6 +291,10 @@ impl PreparedExecutionTablesView<'_> {
         core::ptr::eq(self.arena, arena)
             && self.table_pointers.context_token() == arena.context().identity_token()
             && self.table_strides.context_token() == arena.context().identity_token()
+            && self
+                .table_data
+                .iter()
+                .all(|slice| slice.context_token() == arena.context().identity_token())
     }
 }
 
@@ -535,10 +546,18 @@ impl<'a> PreparedExecutionTablesGraph<'a> {
         if !self.initialized.get() {
             return Err(PreparedExecutionTablesError::NotIngested);
         }
+        let table_data: [ArenaSlice; EXECUTION_TABLE_POINTERS] =
+            core::iter::once(self.raw_addr_to_id)
+                .chain(self.big_limbs.iter().copied())
+                .chain(self.small_limbs.iter().copied())
+                .collect::<Vec<_>>()
+                .try_into()
+                .expect("execution-table pointer geometry is fixed");
         Ok(PreparedExecutionTablesView {
             arena: self.arena,
             table_pointers: self.table_pointers,
             table_strides: self.table_strides,
+            table_data,
             n_addrs: self.requirements.n_addrs,
             n_big: self.requirements.n_big,
             n_small: self.requirements.n_small,

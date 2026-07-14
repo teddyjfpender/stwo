@@ -430,6 +430,10 @@ pub enum PreparedWitnessError {
         actual: usize,
     },
     DuplicateSlot(ArenaSlotId),
+    PhysicalAlias {
+        first: ArenaSlotId,
+        second: ArenaSlotId,
+    },
     SlotTooSmall {
         slot: ArenaSlotId,
         required_words: usize,
@@ -764,6 +768,34 @@ impl<'a> PreparedWitnessGraph<'a> {
                 ))?
             }
         };
+        let prepared_table_data = match tables {
+            WitnessExecutionTables::Legacy(_) => None,
+            WitnessExecutionTables::Prepared(view) => Some(view.table_data()),
+        };
+
+        // `ArenaLayout::new_reused` proves only the caller-declared epoch masks.
+        // Re-establish the stronger kernel-local fact after binding: every range
+        // observed by this prepared launch is physically disjoint. This makes a
+        // stale or incomplete lifetime mask fail closed before descriptor upload
+        // or graph capture. Blake-G's retired sub destination is the one exact
+        // authorized alias; it is represented by `multiplicity_dummy` only once.
+        let bound_ranges = input_columns
+            .iter()
+            .copied()
+            .chain(output_columns.iter().copied())
+            .chain(multiplicity_columns.iter().copied())
+            .chain([
+                input_pointers,
+                execution_table_pointers,
+                execution_table_strides,
+                output_pointers,
+                multiplicity_pointers,
+                lookup_words,
+            ])
+            .chain(multiplicity_dummy)
+            .chain((launch_contract == WitnessLaunchContract::Recorded).then_some(sub_words))
+            .chain(prepared_table_data.into_iter().flatten());
+        ensure_physically_disjoint(bound_ranges)?;
 
         let manifest_hash = aot::loaded_manifest_hash();
         let material = witness_kernel_material(program, mode, manifest_hash)?;
@@ -933,24 +965,17 @@ impl<'a> PreparedWitnessGraph<'a> {
             ));
         }
         // Every operand is live for the entire launch. Reject a bad arena
-        // coloring even if the logical planner admitted it: input, trace,
-        // lookup, LUT, and count storage may not alias across this kernel.
-        let mut live_ids = BTreeSet::new();
+        // coloring by bound address range, not merely logical slot identity:
+        // epoch-disjoint IDs may still have been assigned overlapping bytes.
         let live_slices = self
             .input_columns
             .iter()
-            .chain(&self.output_columns)
-            .chain(core::iter::once(&self.lookup_words))
-            .chain(luts.iter())
-            .chain(counts.iter());
-        if live_slices
-            .into_iter()
-            .any(|slice| !live_ids.insert(slice.id()))
-        {
-            return Err(PreparedWitnessError::BlakeGFusionShape(
-                "live fused blake_g operands alias each other",
-            ));
-        }
+            .copied()
+            .chain(self.output_columns.iter().copied())
+            .chain(core::iter::once(self.lookup_words))
+            .chain(luts)
+            .chain(counts);
+        ensure_physically_disjoint(live_slices)?;
 
         let inputs: [*const u32; BG_N_DATA_INPUTS] =
             std::array::from_fn(|column| self.input_columns[column].as_u32_ptr().cast_const());
@@ -1213,8 +1238,37 @@ fn ensure_distinct(ids: &[ArenaSlotId]) -> Result<(), PreparedWitnessError> {
     Ok(())
 }
 
+/// Reject overlap by bound device address, independently of logical slot IDs.
+///
+/// The check is setup-only. Sorting makes the admission O(n log n), while the
+/// captured launch retains no range metadata or runtime branch.
+fn ensure_physically_disjoint(
+    slices: impl IntoIterator<Item = ArenaSlice>,
+) -> Result<(), PreparedWitnessError> {
+    let mut ranges = slices
+        .into_iter()
+        .map(|slice| {
+            let start = slice.as_u32_ptr() as usize;
+            let end = start
+                .checked_add(slice.len_bytes())
+                .ok_or(PreparedWitnessError::SizeOverflow)?;
+            Ok((start, end, slice.id()))
+        })
+        .collect::<Result<Vec<_>, PreparedWitnessError>>()?;
+    ranges.sort_unstable_by_key(|&(start, end, id)| (start, end, id));
+    for pair in ranges.windows(2) {
+        let (_, first_end, first) = pair[0];
+        let (second_start, _, second) = pair[1];
+        if second_start < first_end {
+            return Err(PreparedWitnessError::PhysicalAlias { first, second });
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use super::super::exec_context::{ArenaLayout, ArenaRangeSpec, ArenaSlotSpec};
     use super::super::jit_witness::recording::WitnessRecorder;
     use super::*;
 
@@ -1233,6 +1287,62 @@ mod tests {
             truncate_bound_slot(ArenaSlice::dangling_for_test(8, 32), 64, 1),
             Err(PreparedWitnessError::SlotTooSmall { .. })
         ));
+    }
+
+    #[test]
+    fn reused_layout_cannot_hide_a_bound_physical_alias() {
+        const FIRST: ArenaSlotId = ArenaSlotId(41);
+        const SECOND: ArenaSlotId = ArenaSlotId(42);
+        let reused = [
+            ArenaRangeSpec {
+                slot: ArenaSlotSpec {
+                    id: FIRST,
+                    offset_words: 0,
+                    len_words: 32,
+                    alignment_words: 1,
+                },
+                live_mask: 0b01,
+            },
+            ArenaRangeSpec {
+                slot: ArenaSlotSpec {
+                    id: SECOND,
+                    offset_words: 16,
+                    len_words: 32,
+                    alignment_words: 1,
+                },
+                live_mask: 0b10,
+            },
+        ];
+        // The generic reuse contract admits these distinct declared epochs.
+        let layout = unsafe { ArenaLayout::new_reused(64, &reused) }.unwrap();
+        let slices = [FIRST, SECOND].map(|id| {
+            let spec = layout.slot(id).unwrap();
+            ArenaSlice::dangling_at_for_test(id.0, spec.offset_words, spec.len_words)
+        });
+        // A prepared witness launch observes both ranges simultaneously and
+        // therefore rejects the stale epoch coloring by physical address.
+        assert_eq!(
+            ensure_physically_disjoint(slices).unwrap_err(),
+            PreparedWitnessError::PhysicalAlias {
+                first: FIRST,
+                second: SECOND,
+            }
+        );
+    }
+
+    #[test]
+    fn execution_table_data_cannot_alias_a_witness_destination() {
+        const OUTPUT: ArenaSlotId = ArenaSlotId(51);
+        const TABLE_DATA: ArenaSlotId = ArenaSlotId(52);
+        let output = ArenaSlice::dangling_at_for_test(OUTPUT.0, 0, 64);
+        let table_data = ArenaSlice::dangling_at_for_test(TABLE_DATA.0, 32, 64);
+        assert_eq!(
+            ensure_physically_disjoint([output, table_data]).unwrap_err(),
+            PreparedWitnessError::PhysicalAlias {
+                first: OUTPUT,
+                second: TABLE_DATA,
+            }
+        );
     }
 
     fn program() -> WitnessProgram {

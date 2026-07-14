@@ -981,11 +981,17 @@ impl ArenaSlice {
 
     #[cfg(test)]
     pub(crate) fn dangling_for_test(id: u32, len_words: usize) -> Self {
+        Self::dangling_at_for_test(id, id as usize * 16, len_words)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dangling_at_for_test(id: u32, offset_words: usize, len_words: usize) -> Self {
         Self {
             id: ArenaSlotId(id),
-            // Distinct, pointer-aligned sentinel addresses. Tests only inspect
-            // plan geometry; they never dereference these pointers.
-            ptr: NonNull::new((32 + id as usize * 64) as *mut u32).unwrap(),
+            // Pointer-aligned sentinel address. Tests only inspect plan geometry;
+            // they never dereference it.
+            ptr: NonNull::new((32 + offset_words * core::mem::size_of::<u32>()) as *mut u32)
+                .unwrap(),
             len_words,
             context_token: NonNull::dangling(),
         }
