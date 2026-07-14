@@ -60,26 +60,56 @@ docker_run() {
 
 if [[ "$MODE" == "symbols" ]]; then
   # Instant symbol-coherence audit: every extern "C" declaration in raw.rs
-  # must have a definition in some .cu, and vice versa for stwo_-prefixed
-  # exports. Catches the class the macOS stubs mask (missing/renamed symbol
-  # discovered only at pod link time) without compiling anything.
+  # must have a definition in some hand-written .cu and a no-CUDA stub. Catches
+  # the class the macOS stubs mask (missing/renamed symbol discovered only at
+  # pod link time) without compiling anything. The real --link gate remains
+  # authoritative for C linkage and signatures.
   python3 - "$KERNELS_DIR" <<'PY'
-import re, sys, glob
+import pathlib, re, sys
+
 kd = sys.argv[1]
-raw = open(f"{kd}/src/raw.rs").read()
-declared = set(re.findall(r'pub fn (stwo_[a-z_0-9]+)', raw))
-defined = set()
-for f in glob.glob(f"{kd}/cuda/**/*.cu", recursive=True):
-    defined |= set(re.findall(r'(?:extern "C"[^\n]*?|^)\b(stwo_[a-z_0-9]+)\s*\(', open(f).read(), re.M))
-stubs = set(re.findall(r'pub extern "C" fn (stwo_[a-z_0-9]+)|fn (stwo_[a-z_0-9]+)', open(f"{kd}/src/stubs.rs").read()))
-stubs = {x for pair in stubs for x in pair if x}
+root = pathlib.Path(kd)
+
+def without_comments(text):
+    text = re.sub(r'/\*.*?\*/', '', text, flags=re.S)
+    return re.sub(r'//.*', '', text)
+
+raw = without_comments((root / "src/raw.rs").read_text())
+extern_blocks = re.findall(r'(?ms)^extern\s+"C"\s*\{(.*?)^\}', raw)
+declared = set(re.findall(
+    r'\bpub\s+fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(', "\n".join(extern_blocks)
+))
+sources = [
+    without_comments(path.read_text(errors="replace"))
+    for path in (root / "cuda").glob("**/*.cu")
+    if "generated" not in path.parts
+]
+
+def has_definition(name):
+    signature = re.compile(
+        rf'\b{re.escape(name)}\s*\('
+        rf'(?:[^(){{}};]|\([^(){{}};]*\))*\)\s*'
+        rf'(?:noexcept\s*)?\{{',
+        re.S,
+    )
+    return any(signature.search(source) for source in sources)
+
+defined = {name for name in declared if has_definition(name)}
+stubs_source = without_comments((root / "src/stubs.rs").read_text())
+stubs = set(re.findall(
+    r'\bpub\s+unsafe\s+extern\s+"C"\s+fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(',
+    stubs_source,
+))
 missing_def = sorted(declared - defined)
 missing_stub = sorted(declared - stubs)
+extra_stub = sorted(stubs - declared)
 ok = True
 if missing_def:
     print(f"FAIL: declared in raw.rs but no .cu definition: {missing_def}"); ok = False
 if missing_stub:
     print(f"FAIL: declared in raw.rs but no stub: {missing_stub}"); ok = False
+if extra_stub:
+    print(f"FAIL: stub has no raw.rs declaration: {extra_stub}"); ok = False
 print(f"[cuda_compile_check] symbols: {len(declared)} declared, {len(defined)} defined, "
       + ("PASS" if ok else "FAIL"))
 sys.exit(0 if ok else 1)
@@ -167,9 +197,11 @@ if [[ "$MODE" == "changed" ]]; then
 fi
 
 if [[ "$MODE" == "all" ]]; then
-  mapfile -t FILES < <(ls "${KERNELS_DIR}"/cuda/*.cu)
+  mapfile -t FILES < <(find "${KERNELS_DIR}/cuda" -type f -name '*.cu' \
+    ! -path '*/generated/*' -print | sort)
   if [[ "$INCLUDE_GENERATED" == "1" ]]; then
-    mapfile -t -O "${#FILES[@]}" FILES < <(ls "${KERNELS_DIR}"/cuda/generated/*.cu)
+    mapfile -t -O "${#FILES[@]}" FILES < <(find "${KERNELS_DIR}/cuda/generated" \
+      -maxdepth 1 -type f -name '*.cu' -print | sort)
   fi
 fi
 
