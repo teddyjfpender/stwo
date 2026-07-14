@@ -8,10 +8,10 @@
 //! would compile: same codegen, same cache keys — a prove-time cache-key lookup
 //! that misses the AOT table simply falls back to NVRTC (the drift check).
 //!
-//! Constraint kernels are lowered UNCAPPED here (one fused kernel per
-//! component): the 512/2048-instruction governor exists for load-time driver
-//! ptxas, which the AOT path never runs. `force_relax` falsified -O0 at 2.6×
-//! worse — AOT gives fused AND -O3, which no runtime option could.
+//! Constraint kernels use the same instruction and compacted-live-lane split
+//! policy as the runtime lowerer. The exact policy is sealed into the pack
+//! identity, while per-key strict lookup proves complete source/shape coverage;
+//! a matching policy tag alone never admits a partial or stale pack.
 
 /// Stable identity of the AOT semantic-key/architecture set embedded in this
 /// binary. Zero means no AOT pack is present and is never a valid graph key.
