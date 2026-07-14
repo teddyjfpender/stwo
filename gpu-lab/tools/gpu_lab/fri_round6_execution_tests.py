@@ -239,13 +239,41 @@ def _process_boundary_test(directory: Path) -> None:
             timeout_seconds=timeout,
         )
 
-    _expect_rejection("bounded stdout", lambda: run(
+    def reject_exact(expected: str, operation) -> None:
+        try:
+            operation()
+        except ValueError as error:
+            require(str(error) == expected,
+                    f"sealed process error wording differs: {error}")
+            return
+        raise ValueError(f"hostile sealed process input was accepted: {expected}")
+
+    inherited_path = directory / "sealed-process-input"
+    inherited_path.write_bytes(b"sealed")
+    marker = directory / "shell-must-not-run"
+    literal_argument = f"; touch {marker}"
+    descriptor = os.open(inherited_path, os.O_RDONLY)
+    try:
+        direct = run_bounded_process(
+            [sys.executable, "-c", (
+                "import os,sys; os.write(1, os.pread(int(sys.argv[1]), 6, 0)"
+                " + sys.argv[2].encode())"
+            ), str(descriptor), literal_argument],
+            directory, (descriptor,), environment, timeout_seconds=2.0,
+        )
+    finally:
+        os.close(descriptor)
+    require(direct.stdout == b"sealed" + literal_argument.encode() and not marker.exists(),
+            "sealed process did not preserve direct argv and inherited descriptors")
+
+    reject_exact("FRI runner stdout exceeded the 1 MiB bound", lambda: run(
         f"import os; os.write(1, b'x' * {MAX_RESULT_BYTES + 1})"
     ))
-    _expect_rejection("fail-closed stderr", lambda: run(
+    reject_exact("FRI runner emitted unexpected stderr", lambda: run(
         "import os; os.write(2, b'x')"
     ))
-    _expect_rejection("bounded wall timeout", lambda: run("while True: pass", 0.05))
+    reject_exact("FRI runner exceeded 0.05s execution timeout",
+                 lambda: run("while True: pass", 0.05))
 
 
 def _record_type_mutation_test(record: dict) -> None:

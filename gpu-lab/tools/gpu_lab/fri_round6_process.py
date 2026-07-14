@@ -4,16 +4,14 @@ from __future__ import annotations
 
 import os
 import re
-import selectors
-import signal
 import stat
 import subprocess
 import sys
-import time
 from pathlib import Path
 from typing import Any, Mapping
 
 from .common import require, require_exact_keys
+from .sealed_process import run_bounded_child
 
 
 MAX_RESULT_BYTES = 1 << 20
@@ -71,80 +69,19 @@ def validate_environment_contract(value: Any) -> dict[str, Any]:
     return value
 
 
-def _kill_group(process: subprocess.Popen[bytes]) -> None:
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    try:
-        process.wait(timeout=1)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait()
-
-
 def run_bounded_process(
     command: list[str], working_directory: Path, descriptors: tuple[int, ...],
     environment: dict[str, Any], *, timeout_seconds: float = RUNNER_TIMEOUT_SECONDS,
 ) -> subprocess.CompletedProcess[bytes]:
     contract = validate_environment_contract(environment)
     require(timeout_seconds > 0, "FRI runner timeout must be positive")
-    process = subprocess.Popen(
-        command,
-        executable=command[0],
-        cwd=working_directory,
-        env=contract["variables"],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=False,
-        shell=False,
-        close_fds=True,
-        pass_fds=descriptors,
-        start_new_session=True,
-        bufsize=0,
+    return run_bounded_child(
+        command, working_directory, descriptors, contract["variables"],
+        timeout_seconds=timeout_seconds,
+        max_stdout_bytes=MAX_RESULT_BYTES,
+        process_name="FRI runner",
+        stdout_bound_name="the 1 MiB bound",
     )
-    require(process.stdout is not None and process.stderr is not None,
-            "FRI runner pipes are unavailable")
-    selector = selectors.DefaultSelector()
-    stdout = bytearray()
-    deadline = time.monotonic() + timeout_seconds
-    try:
-        for stream, role in ((process.stdout, "stdout"), (process.stderr, "stderr")):
-            os.set_blocking(stream.fileno(), False)
-            selector.register(stream, selectors.EVENT_READ, role)
-        while selector.get_map():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise ValueError(f"FRI runner exceeded {timeout_seconds}s execution timeout")
-            for key, _ in selector.select(min(remaining, 0.1)):
-                try:
-                    chunk = os.read(key.fileobj.fileno(), 64 * 1024)
-                except BlockingIOError:
-                    continue
-                if not chunk:
-                    selector.unregister(key.fileobj)
-                elif key.data == "stderr":
-                    raise ValueError("FRI runner emitted unexpected stderr")
-                elif len(stdout) + len(chunk) > MAX_RESULT_BYTES:
-                    raise ValueError("FRI runner stdout exceeded the 1 MiB bound")
-                else:
-                    stdout.extend(chunk)
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise ValueError(f"FRI runner exceeded {timeout_seconds}s execution timeout")
-        try:
-            status = process.wait(timeout=remaining)
-        except subprocess.TimeoutExpired as error:
-            raise ValueError(f"FRI runner exceeded {timeout_seconds}s execution timeout") from error
-    except BaseException:
-        _kill_group(process)
-        raise
-    finally:
-        selector.close()
-        process.stdout.close()
-        process.stderr.close()
-    return subprocess.CompletedProcess(command, status, bytes(stdout), b"")
 
 
 def run_linux(
