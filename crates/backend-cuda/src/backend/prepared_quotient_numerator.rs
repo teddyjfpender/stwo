@@ -6,6 +6,8 @@
 //! periodicity terms, and writes the exact lifted partial numerators expected
 //! by [`super::prepared_quotient::PreparedQuotientGraph`].
 
+mod single_write;
+
 use core::ffi::c_void;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -120,6 +122,9 @@ pub struct QuotientNumeratorGroupRequirements {
     pub shape_point: CirclePoint<SecureField>,
     pub log_size: u32,
     pub value_words: usize,
+    /// Distinct sampled coefficient columns contributing to this output.
+    /// Zero means the group can consume retained evaluations exclusively.
+    pub coefficient_source_count: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -276,21 +281,21 @@ struct PlannedTerm {
     group: usize,
 }
 
-struct PlannedBatch {
-    evaluation_log_size: u32,
-    columns: Vec<usize>,
-    coefficient_columns: Vec<usize>,
-    group_offsets: Vec<u32>,
-    terms: Vec<u32>,
+pub(super) struct PlannedBatch {
+    pub(super) evaluation_log_size: u32,
+    pub(super) columns: Vec<usize>,
+    pub(super) coefficient_columns: Vec<usize>,
+    pub(super) group_offsets: Vec<u32>,
+    pub(super) terms: Vec<u32>,
     lde_words: usize,
 }
 
-struct NumeratorPlan {
-    requirements: QuotientNumeratorWorkspaceRequirements,
+pub(super) struct NumeratorPlan {
+    pub(super) requirements: QuotientNumeratorWorkspaceRequirements,
     terms: Vec<PlannedTerm>,
     group_term_indices: Vec<u32>,
-    group_offsets: Vec<u32>,
-    batches: Vec<PlannedBatch>,
+    pub(super) group_offsets: Vec<u32>,
+    pub(super) batches: Vec<PlannedBatch>,
 }
 
 pub fn quotient_numerator_workspace_requirements(
@@ -380,7 +385,7 @@ fn slot(
     }
 }
 
-fn build_plan(
+pub(super) fn build_plan(
     config: QuotientNumeratorWorkspaceConfig,
     columns: &[QuotientNumeratorColumnTopology],
 ) -> Result<NumeratorPlan, PreparedQuotientNumeratorError> {
@@ -477,13 +482,21 @@ fn build_plan(
     for term in &mut terms {
         term.group = group_indices[&(term.shape_point.x, term.shape_point.y)];
     }
+    let mut coefficient_sources_by_group = vec![BTreeSet::new(); point_logs.len()];
+    for term in &terms {
+        if columns[term.column].source_kind == QuotientNumeratorSourceKind::Coefficients {
+            coefficient_sources_by_group[term.group].insert(term.column);
+        }
+    }
     let groups = point_logs
         .iter()
-        .map(|(&(x, y), &log_size)| {
+        .enumerate()
+        .map(|(group, (&(x, y), &log_size))| {
             Ok(QuotientNumeratorGroupRequirements {
                 shape_point: CirclePoint { x, y },
                 log_size,
                 value_words: pow2(log_size)?,
+                coefficient_source_count: coefficient_sources_by_group[group].len(),
             })
         })
         .collect::<Result<Vec<_>, PreparedQuotientNumeratorError>>()?;
@@ -697,6 +710,12 @@ struct PreparedBatch {
     group_offset: usize,
 }
 
+#[derive(Clone, Copy)]
+enum PreparedNumeratorSchedule {
+    LegacyBatches,
+    SingleWriteCandidate,
+}
+
 enum HostDescriptor {
     U32(Vec<u32>),
     Pointers(Vec<usize>),
@@ -745,6 +764,7 @@ pub struct PreparedQuotientNumeratorGraph<'a> {
     coefficient_sizes: Option<ArenaSlice>,
     coefficient_output_ptrs: Option<ArenaSlice>,
     batches: Vec<PreparedBatch>,
+    schedule: PreparedNumeratorSchedule,
 }
 
 impl<'a> PreparedQuotientNumeratorGraph<'a> {
@@ -1088,6 +1108,7 @@ impl<'a> PreparedQuotientNumeratorGraph<'a> {
             coefficient_sizes,
             coefficient_output_ptrs,
             batches: prepared_batches,
+            schedule: PreparedNumeratorSchedule::LegacyBatches,
         })
     }
 
@@ -1159,6 +1180,13 @@ impl<'a> PreparedQuotientNumeratorGraph<'a> {
                 .cast::<*mut u32>()
                 .add(coordinate * self.requirements.groups.len())
         };
+        if matches!(
+            self.schedule,
+            PreparedNumeratorSchedule::SingleWriteCandidate
+        ) {
+            self.launch_single_write_candidate(group_count, max_output_size, stream)?;
+            return Ok(());
+        }
         let code = unsafe {
             stwo_backend_cuda_kernels::raw::stwo_zero_quotient_numerator_outputs_on(
                 self.output_log_sizes.as_u32_ptr(),
@@ -1444,6 +1472,62 @@ mod tests {
         assert!(plan.terms[0].period.is_some());
         assert_eq!(plan.terms[1].shape_point, sample(0, 7).shape_point);
         assert_eq!(plan.terms[2].shape_point, repeated.shape_point);
+    }
+
+    #[test]
+    fn groups_count_distinct_coefficient_sources_and_zero_means_evaluation_only() {
+        let shared = sample(0, 3);
+        let evaluation_only = sample(3, 5);
+        let columns = vec![
+            QuotientNumeratorColumnTopology {
+                coefficient_log_size: 4,
+                source_kind: QuotientNumeratorSourceKind::Evaluation,
+                samples: vec![shared, evaluation_only],
+            },
+            QuotientNumeratorColumnTopology {
+                coefficient_log_size: 4,
+                source_kind: QuotientNumeratorSourceKind::Coefficients,
+                // Two terms from one column still count as one source.
+                samples: vec![sample(1, 3), sample(2, 3)],
+            },
+            QuotientNumeratorColumnTopology {
+                coefficient_log_size: 4,
+                source_kind: QuotientNumeratorSourceKind::Coefficients,
+                samples: vec![sample(4, 3)],
+            },
+            QuotientNumeratorColumnTopology {
+                coefficient_log_size: 25,
+                source_kind: QuotientNumeratorSourceKind::Coefficients,
+                samples: vec![],
+            },
+        ];
+        let plan = build_plan(config(), &columns).unwrap();
+
+        let shared_group = plan
+            .requirements
+            .groups
+            .iter()
+            .find(|group| group.shape_point == shared.shape_point)
+            .unwrap();
+        assert_eq!(shared_group.coefficient_source_count, 2);
+        let evaluation_only_group = plan
+            .requirements
+            .groups
+            .iter()
+            .find(|group| group.shape_point == evaluation_only.shape_point)
+            .unwrap();
+        assert_eq!(evaluation_only_group.coefficient_source_count, 0);
+
+        for (group, requirements) in plan.requirements.groups.iter().enumerate() {
+            let evaluation_only =
+                plan.terms
+                    .iter()
+                    .filter(|term| term.group == group)
+                    .all(|term| {
+                        columns[term.column].source_kind == QuotientNumeratorSourceKind::Evaluation
+                    });
+            assert_eq!(requirements.coefficient_source_count == 0, evaluation_only);
+        }
     }
 
     #[test]

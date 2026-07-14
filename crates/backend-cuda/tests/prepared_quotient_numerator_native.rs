@@ -1,12 +1,11 @@
 //! Native CUDA correctness and capture gate for prepared quotient numerators.
+//! gpu-lab-cohesion-review: one fixture must compare legacy, candidate, host oracle, eager, and
+//! graph state under the same topology so no shared setup can hide an ABI or replay mismatch.
 
 #![cfg(stwo_cuda_link)]
 
-use stwo::core::constraints::complex_conjugate_line_coeffs;
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
-use stwo::core::fields::FieldExpOps;
-use stwo::core::pcs::quotients::PointSample;
 use stwo::core::poly::circle::CanonicCoset;
 use stwo::prover::backend::CpuBackend;
 use stwo::prover::poly::circle::{CircleCoefficients, PolyOps};
@@ -17,6 +16,10 @@ use stwo_backend_cuda::{
     QuotientNumeratorSourceKind, QuotientNumeratorWorkspaceConfig, QuotientNumeratorWorkspaceSlots,
     QuotientOodsSample,
 };
+
+#[path = "support/quotient_numerator_oracle.rs"]
+mod quotient_numerator_oracle;
+use quotient_numerator_oracle::{expected_group, OracleTerm};
 
 const OODS_POINTS: ArenaSlotId = ArenaSlotId(50_000);
 const OODS_VALUES: ArenaSlotId = ArenaSlotId(50_001);
@@ -436,51 +439,6 @@ fn from_words(words: &[u32]) -> SecureField {
     SecureField::from_u32_unchecked(words[0], words[1], words[2], words[3])
 }
 
-fn expected_group(
-    group_point: stwo::core::circle::CirclePoint<SecureField>,
-    group_log: u32,
-    alpha: SecureField,
-    terms: &[(
-        usize,
-        u32,
-        SecureField,
-        stwo::core::circle::CirclePoint<SecureField>,
-        &[u32],
-    )],
-) -> (SecureField, [Vec<u32>; 4]) {
-    let matching = terms
-        .iter()
-        .filter(|(_, _, _, point, _)| *point == group_point)
-        .collect::<Vec<_>>();
-    let coefficients = matching
-        .iter()
-        .map(|(exponent, _, value, point, _)| {
-            complex_conjugate_line_coeffs(
-                &PointSample {
-                    point: *point,
-                    value: *value,
-                },
-                alpha.pow(*exponent as u128),
-            )
-        })
-        .collect::<Vec<_>>();
-    let first = coefficients.iter().map(|(a, ..)| *a).sum();
-    let size = 1usize << group_log;
-    let mut output: [Vec<u32>; 4] = std::array::from_fn(|_| vec![0; size]);
-    for row in 0..size {
-        let mut numerator = SecureField::from(0u32);
-        for ((_, source_log, _, _, source), (_, b, c)) in matching.iter().zip(&coefficients) {
-            let ratio = group_log - *source_log;
-            let source_row = (row >> (ratio + 1) << 1) + (row & 1);
-            numerator += BaseField::from_u32_unchecked(source[source_row]) * *c - *b;
-        }
-        for (coordinate, value) in numerator.to_m31_array().into_iter().enumerate() {
-            output[coordinate][row] = value.0;
-        }
-    }
-    (first, output)
-}
-
 #[test]
 fn eager_and_capture_replay_match_reference_grouping_and_lifting() {
     use stwo::core::circle::SECURE_FIELD_CIRCLE_GEN;
@@ -490,7 +448,8 @@ fn eager_and_capture_replay_match_reference_grouping_and_lifting() {
         max_lde_tile_words: 1,
     };
     let slots = slots();
-    let arena = arena(&slots);
+    let legacy_arena = arena(&slots);
+    let candidate_arena = arena(&slots);
     let p0 = SECURE_FIELD_CIRCLE_GEN.mul(3);
     let p1 = SECURE_FIELD_CIRCLE_GEN.mul(7);
     let values = [
@@ -504,86 +463,137 @@ fn eager_and_capture_replay_match_reference_grouping_and_lifting() {
     let eval_b = (0..32)
         .map(|index| (29 * index + 5) as u32)
         .collect::<Vec<_>>();
-    upload(&arena, OODS_POINTS, &point_words(&[p0, p1, p1]));
-    upload(&arena, OODS_VALUES, &secure_words(&values));
-    upload(&arena, EVAL_A, &eval_a);
-    upload(&arena, EVAL_B, &eval_b);
-
-    let columns = vec![
-        QuotientNumeratorColumn {
-            coefficient_log_size: 4,
-            source: QuotientNumeratorColumnSource::Evaluation(arena.bind(EVAL_A).unwrap()),
-            samples: vec![
-                QuotientOodsSample {
-                    input_index: 0,
-                    shape_point: p0,
-                },
-                QuotientOodsSample {
-                    input_index: 1,
+    for arena in [&legacy_arena, &candidate_arena] {
+        upload(arena, OODS_POINTS, &point_words(&[p0, p1, p1]));
+        upload(arena, OODS_VALUES, &secure_words(&values));
+        upload(arena, EVAL_A, &eval_a);
+        upload(arena, EVAL_B, &eval_b);
+    }
+    let columns = |arena: &DeviceArena| {
+        vec![
+            QuotientNumeratorColumn {
+                coefficient_log_size: 4,
+                source: QuotientNumeratorColumnSource::Evaluation(arena.bind(EVAL_A).unwrap()),
+                samples: vec![
+                    QuotientOodsSample {
+                        input_index: 0,
+                        shape_point: p0,
+                    },
+                    QuotientOodsSample {
+                        input_index: 1,
+                        shape_point: p1,
+                    },
+                ],
+            },
+            QuotientNumeratorColumn {
+                coefficient_log_size: 3,
+                source: QuotientNumeratorColumnSource::Evaluation(arena.bind(EVAL_B).unwrap()),
+                samples: vec![QuotientOodsSample {
+                    input_index: 2,
                     shape_point: p1,
-                },
-            ],
-        },
-        QuotientNumeratorColumn {
-            coefficient_log_size: 3,
-            source: QuotientNumeratorColumnSource::Evaluation(arena.bind(EVAL_B).unwrap()),
-            samples: vec![QuotientOodsSample {
-                input_index: 2,
-                shape_point: p1,
-            }],
-        },
-    ];
-    let topology = columns
+                }],
+            },
+        ]
+    };
+    let legacy_columns = columns(&legacy_arena);
+    let candidate_columns = columns(&candidate_arena);
+    let topology = legacy_columns
         .iter()
         .map(QuotientNumeratorColumnTopology::from)
         .collect::<Vec<_>>();
     let requirements = quotient_numerator_workspace_requirements(config, &topology).unwrap();
-    let destinations = requirements
-        .groups
-        .iter()
-        .enumerate()
-        .map(|(group, requirement)| QuotientNumeratorDestination {
-            log_size: requirement.log_size,
-            coordinates: std::array::from_fn(|coordinate| {
-                arena.bind(output_id(group, coordinate)).unwrap()
-            }),
-        })
-        .collect::<Vec<_>>();
-    let prepared = PreparedQuotientNumeratorGraph::prepare(
-        &arena,
+    assert!(requirements.batches.len() > 1);
+    let destinations = |arena: &DeviceArena| {
+        requirements
+            .groups
+            .iter()
+            .enumerate()
+            .map(|(group, requirement)| QuotientNumeratorDestination {
+                log_size: requirement.log_size,
+                coordinates: std::array::from_fn(|coordinate| {
+                    arena.bind(output_id(group, coordinate)).unwrap()
+                }),
+            })
+            .collect::<Vec<_>>()
+    };
+    let legacy_destinations = destinations(&legacy_arena);
+    let candidate_destinations = destinations(&candidate_arena);
+    let legacy = PreparedQuotientNumeratorGraph::prepare(
+        &legacy_arena,
         config,
-        &columns,
-        arena.bind(OODS_POINTS).unwrap(),
-        arena.bind(OODS_VALUES).unwrap(),
-        arena.bind(RANDOM_COEFFICIENT).unwrap(),
-        arena.bind(SAMPLE_POINTS_OUTPUT).unwrap(),
-        arena.bind(FIRST_TERMS_OUTPUT).unwrap(),
-        &destinations,
-        arena.bind(TWIDDLES).unwrap(),
+        &legacy_columns,
+        legacy_arena.bind(OODS_POINTS).unwrap(),
+        legacy_arena.bind(OODS_VALUES).unwrap(),
+        legacy_arena.bind(RANDOM_COEFFICIENT).unwrap(),
+        legacy_arena.bind(SAMPLE_POINTS_OUTPUT).unwrap(),
+        legacy_arena.bind(FIRST_TERMS_OUTPUT).unwrap(),
+        &legacy_destinations,
+        legacy_arena.bind(TWIDDLES).unwrap(),
+        &slots,
+    )
+    .unwrap();
+    let candidate = PreparedQuotientNumeratorGraph::prepare_single_write_candidate(
+        &candidate_arena,
+        config,
+        &candidate_columns,
+        candidate_arena.bind(OODS_POINTS).unwrap(),
+        candidate_arena.bind(OODS_VALUES).unwrap(),
+        candidate_arena.bind(RANDOM_COEFFICIENT).unwrap(),
+        candidate_arena.bind(SAMPLE_POINTS_OUTPUT).unwrap(),
+        candidate_arena.bind(FIRST_TERMS_OUTPUT).unwrap(),
+        &candidate_destinations,
+        candidate_arena.bind(TWIDDLES).unwrap(),
         &slots,
     )
     .unwrap();
 
-    let check = |alpha: SecureField| {
+    let check = |arena: &DeviceArena,
+                 destinations: &[QuotientNumeratorDestination],
+                 alpha: SecureField| {
         let point_words = read_words(
-            &arena,
+            arena,
             arena.bind(SAMPLE_POINTS_OUTPUT).unwrap(),
             8 * requirements.groups.len(),
         );
         let first_words = read_words(
-            &arena,
+            arena,
             arena.bind(FIRST_TERMS_OUTPUT).unwrap(),
             4 * requirements.groups.len(),
         );
+        let mut snapshot = vec![point_words.clone(), first_words.clone()];
         let period = CanonicCoset::new(config.lifting_log_size)
             .step()
             .repeated_double(6);
         let periodic_point = p1 + period.into_ef();
         let terms = [
-            (0usize, 4u32, values[1], periodic_point, eval_a.as_slice()),
-            (1, 4, values[0], p0, eval_a.as_slice()),
-            (2, 4, values[1], p1, eval_a.as_slice()),
-            (3, 3, values[2], p1, eval_b.as_slice()),
+            OracleTerm {
+                exponent: 0,
+                source_log: 4,
+                value: values[1],
+                point: periodic_point,
+                source: &eval_a,
+            },
+            OracleTerm {
+                exponent: 1,
+                source_log: 4,
+                value: values[0],
+                point: p0,
+                source: &eval_a,
+            },
+            OracleTerm {
+                exponent: 2,
+                source_log: 4,
+                value: values[1],
+                point: p1,
+                source: &eval_a,
+            },
+            OracleTerm {
+                exponent: 3,
+                source_log: 3,
+                value: values[2],
+                point: p1,
+                source: &eval_b,
+            },
         ];
         for (group_index, group) in requirements.groups.iter().enumerate() {
             let point = &point_words[8 * group_index..8 * group_index + 8];
@@ -600,30 +610,90 @@ fn eager_and_capture_replay_match_reference_grouping_and_lifting() {
                 first
             );
             for coordinate in 0..4 {
-                assert_eq!(
-                    read_words(
-                        &arena,
-                        destinations[group_index].coordinates[coordinate],
-                        1usize << group.log_size,
-                    ),
-                    output[coordinate]
+                let actual = read_words(
+                    arena,
+                    destinations[group_index].coordinates[coordinate],
+                    1usize << group.log_size,
                 );
+                assert_eq!(actual, output[coordinate]);
+                snapshot.push(actual);
             }
         }
+        snapshot
     };
 
     let eager_alpha = SecureField::from_u32_unchecked(41, 43, 47, 53);
-    upload(&arena, RANDOM_COEFFICIENT, &secure_words(&[eager_alpha]));
-    arena.context().sync().unwrap();
-    prepared.launch().unwrap();
-    arena.context().sync().unwrap();
-    check(eager_alpha);
-    let capture = arena.context().capture().unwrap();
-    prepared.launch().unwrap();
-    let graph = capture.finish().unwrap();
+    for arena in [&legacy_arena, &candidate_arena] {
+        upload(arena, RANDOM_COEFFICIENT, &secure_words(&[eager_alpha]));
+        arena.context().sync().unwrap();
+        arena.context().reset_telemetry();
+    }
+    for destination in &candidate_destinations {
+        for coordinate in destination.coordinates {
+            unsafe {
+                candidate_arena
+                    .context()
+                    .fill_u32_async(
+                        coordinate.as_u32_ptr(),
+                        0xdead_beef,
+                        1usize << destination.log_size,
+                    )
+                    .unwrap();
+            }
+        }
+    }
+    candidate_arena.context().sync().unwrap();
+    candidate_arena.context().reset_telemetry();
+    legacy.launch().unwrap();
+    candidate.launch().unwrap();
+    for arena in [&legacy_arena, &candidate_arena] {
+        let telemetry = arena.context().telemetry();
+        assert_eq!(telemetry.allocations, 0);
+        assert_eq!(telemetry.h2d_bytes, 0);
+        assert_eq!(telemetry.d2h_bytes, 0);
+        arena.context().sync().unwrap();
+    }
+    let eager_legacy = check(&legacy_arena, &legacy_destinations, eager_alpha);
+    let eager_candidate = check(&candidate_arena, &candidate_destinations, eager_alpha);
+    assert_eq!(eager_candidate, eager_legacy);
+
+    let capture = legacy_arena.context().capture().unwrap();
+    legacy.launch().unwrap();
+    let legacy_graph = capture.finish().unwrap();
+    let capture = candidate_arena.context().capture().unwrap();
+    candidate.launch().unwrap();
+    let candidate_graph = capture.finish().unwrap();
+    assert_eq!(
+        legacy_graph.kernel_nodes(),
+        3 + requirements.batches.len() as u64
+    );
+    assert_eq!(candidate_graph.kernel_nodes(), 3);
     let replay_alpha = SecureField::from_u32_unchecked(59, 61, 67, 71);
-    upload(&arena, RANDOM_COEFFICIENT, &secure_words(&[replay_alpha]));
-    graph.launch(arena.context()).unwrap();
-    arena.context().sync().unwrap();
-    check(replay_alpha);
+    for arena in [&legacy_arena, &candidate_arena] {
+        upload(arena, RANDOM_COEFFICIENT, &secure_words(&[replay_alpha]));
+    }
+    legacy_graph.launch(legacy_arena.context()).unwrap();
+    candidate_graph.launch(candidate_arena.context()).unwrap();
+    legacy_arena.context().sync().unwrap();
+    candidate_arena.context().sync().unwrap();
+    let replay_legacy = check(&legacy_arena, &legacy_destinations, replay_alpha);
+    let replay_candidate = check(&candidate_arena, &candidate_destinations, replay_alpha);
+    assert_eq!(replay_candidate, replay_legacy);
+    assert_ne!(replay_candidate, eager_candidate);
+    assert_eq!(
+        read_words(
+            &candidate_arena,
+            candidate_arena.bind(EVAL_A).unwrap(),
+            eval_a.len(),
+        ),
+        eval_a
+    );
+    assert_eq!(
+        read_words(
+            &candidate_arena,
+            candidate_arena.bind(EVAL_B).unwrap(),
+            eval_b.len(),
+        ),
+        eval_b
+    );
 }

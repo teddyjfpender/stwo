@@ -1579,6 +1579,24 @@ pub unsafe extern "C" fn stwo_accumulate_quotient_numerator_batch_on(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_accumulate_quotient_numerator_single_write_on(
+    _group_offsets: *const u32,
+    _term_descriptors: *const u32,
+    _group_count: u32,
+    _max_output_size: u32,
+    _source_evaluations: *const *const u32,
+    _line_coefficients: *const CudaSecureField,
+    _group_log_sizes: *const u32,
+    _outputs_0: *const *mut u32,
+    _outputs_1: *const *mut u32,
+    _outputs_2: *const *mut u32,
+    _outputs_3: *const *mut u32,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_accumulate_quotient_numerator_single_write_on")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stwo_oods_derive_points_on(
     _oods_parameter: *const CudaSecureField,
     _offset_points: *const CirclePointBaseField,

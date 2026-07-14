@@ -173,6 +173,12 @@ pub use backend::proof_assembly::{
     assemble_blake2s_stark_proof, Blake2sFriAssemblyShape, Blake2sProofAssemblyError,
     Blake2sProofAssemblyInput, Blake2sProofAssemblyShape, Blake2sTraceAssemblyShape,
 };
+pub use backend::quotient_numerator_single_write::{
+    quotient_numerator_single_write_plan, quotient_numerator_single_write_report,
+    QuotientNumeratorSingleWriteEligibility, QuotientNumeratorSingleWriteError,
+    QuotientNumeratorSingleWritePlan, QuotientNumeratorSingleWriteReport,
+    QUOTIENT_NUMERATOR_SINGLE_WRITE_TERM_WORDS,
+};
 pub use backend::relation_graph::{
     relation_batch_fused_eligible, relation_graph_requirements, PreparedRelationGraph,
     PreparedRelationOutput, RelationArenaSlotRequirement, RelationBatchProgram, RelationChallenges,

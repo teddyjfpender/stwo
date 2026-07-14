@@ -39,6 +39,10 @@ mod tests {
         assert_ne!(raw::stwo_finalize_quotient_numerator_groups_on as usize, 0);
         assert_ne!(raw::stwo_zero_quotient_numerator_outputs_on as usize, 0);
         assert_ne!(raw::stwo_accumulate_quotient_numerator_batch_on as usize, 0);
+        assert_ne!(
+            raw::stwo_accumulate_quotient_numerator_single_write_on as usize,
+            0
+        );
         assert_ne!(raw::stwo_ntt_b2n_columns_on as usize, 0);
         assert_ne!(raw::stwo_lde_n2b_columns_on as usize, 0);
     }
