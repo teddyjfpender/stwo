@@ -182,7 +182,10 @@ void evaluate_columns(const int *eval_domain_sizes, m31 **values, m31 *twiddles_
 
 
 template <unsigned LOG_VALS_PER_THREAD>
-__global__ void n2b_nofinal_block_batch(m31** input, m31** output,
+__global__ __launch_bounds__(
+    1u << (LOG_WARP + LOG_VALS_PER_THREAD),
+    LOG_VALS_PER_THREAD == 3 ? 6 : 2)
+void n2b_nofinal_block_batch(m31** input, m31** output,
                                   const unsigned log_n, const unsigned num_poly,
                                   unsigned min_stage, unsigned max_stage, m31 *g_twiddles) {
 
