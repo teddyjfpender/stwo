@@ -382,6 +382,7 @@
         "adapter_process_precondition",
         "process_group_role",
         "caller_trust_boundary",
+        "post_commit_cleanup",
         "argv",
         "environment",
         "bindings",
@@ -411,6 +412,9 @@
         },
         "caller_trust_boundary": {
           "const": "cooperative-local-diagnostic-not-hostile-local-caller-security-v1"
+        },
+        "post_commit_cleanup": {
+          "const": "best-effort-non-status-bearing-after-pass-publication-v1"
         },
         "argv": {
           "type": "array",

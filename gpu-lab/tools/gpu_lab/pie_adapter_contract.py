@@ -26,6 +26,7 @@ EXECUTION_HONESTY = {
     "adapter_process_precondition": "trusted-exact-adapter-no-surviving-descendants-v1",
     "process_group_role": "defense-in-depth-not-hostile-containment-v1",
     "caller_trust_boundary": "cooperative-local-diagnostic-not-hostile-local-caller-security-v1",
+    "post_commit_cleanup": "best-effort-non-status-bearing-after-pass-publication-v1",
 }
 
 MIB, GIB = 1 << 20, 1 << 30
