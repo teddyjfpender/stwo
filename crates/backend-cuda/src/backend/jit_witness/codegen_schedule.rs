@@ -75,9 +75,8 @@ pub(super) struct StoreEvent {
 }
 
 /// One validated SSA/output analysis shared by monolithic scheduling and the
-/// experimental phase planner. `uses` includes computational uses plus the
-/// schedule's actual output-store anchors; phase boundaries therefore cannot
-/// silently strand a value referenced only by a delayed duplicate store.
+/// experimental phase planner. Computational uses and scheduled stores remain
+/// explicit, so the planner can account for both at every phase boundary.
 pub(super) struct ProgramAnalysis {
     pub(super) schedule: OutputSchedule,
     pub(super) definitions: Vec<Option<RegisterDefinition>>,
