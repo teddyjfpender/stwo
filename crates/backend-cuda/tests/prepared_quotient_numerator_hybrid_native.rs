@@ -11,7 +11,7 @@ use stwo::prover::backend::CpuBackend;
 use stwo::prover::poly::circle::{CircleCoefficients, PolyOps};
 use stwo_backend_cuda::{
     quotient_numerator_hybrid_plan, quotient_numerator_workspace_requirements, ArenaLayout,
-    ArenaSlice, ArenaSlotId, ArenaSlotSpec, CudaExecContext, DeviceArena,
+    ArenaSlice, ArenaSlotId, ArenaSlotSpec, CudaExecContext, CudaGraphExec, DeviceArena,
     PreparedQuotientNumeratorGraph, QuotientNumeratorColumn, QuotientNumeratorColumnSource,
     QuotientNumeratorColumnTopology, QuotientNumeratorDestination, QuotientNumeratorSourceKind,
     QuotientNumeratorWorkspaceConfig, QuotientNumeratorWorkspaceSlots, QuotientOodsSample,
@@ -87,31 +87,26 @@ fn mixed_hybrid_is_byte_identical_warm_capture_safe_and_source_immutable() {
         coefficient_batches[1].evaluation_log_size
     );
 
-    let coefficient_slots = slots_for(&coefficient_requirements);
-    let mixed_slots = slots_for(&mixed_requirements);
-    let coefficient_arena = arena(&coefficient_slots);
-    let legacy_arena = arena(&mixed_slots);
-    let hybrid_arena = arena(&mixed_slots);
+    // External mixed inputs and outputs are shared. The live A/B schedules are not: hybrid setup
+    // rewrites schedule descriptors, so both prepared graphs need independently owned workspaces.
+    let coefficient_slots = slots_for(&coefficient_requirements, 1);
+    let legacy_slots = slots_for(&mixed_requirements, 1);
+    let hybrid_slots = slots_for(&mixed_requirements, 100);
+    let coefficient_arena = arena(&[&coefficient_slots]);
+    let mixed_arena = arena(&[&legacy_slots, &hybrid_slots]);
     let coefficient_destinations = destinations(&coefficient_arena, &coefficient_requirements);
-    let legacy_destinations = destinations(&legacy_arena, &mixed_requirements);
-    let hybrid_destinations = destinations(&hybrid_arena, &mixed_requirements);
+    let mixed_destinations = destinations(&mixed_arena, &mixed_requirements);
     let coefficient_columns = columns(
         &coefficient_topology,
         QuotientNumeratorColumnSource::Coefficients(coefficient_arena.bind(COEFF_A).unwrap()),
         QuotientNumeratorColumnSource::Coefficients(coefficient_arena.bind(COEFF_B).unwrap()),
         QuotientNumeratorColumnSource::Coefficients(coefficient_arena.bind(COEFF_C).unwrap()),
     );
-    let legacy_columns = columns(
+    let mixed_columns = columns(
         &mixed_topology,
-        QuotientNumeratorColumnSource::Evaluation(legacy_arena.bind(EVAL_A).unwrap()),
-        QuotientNumeratorColumnSource::Coefficients(legacy_arena.bind(COEFF_B).unwrap()),
-        QuotientNumeratorColumnSource::Coefficients(legacy_arena.bind(COEFF_C).unwrap()),
-    );
-    let hybrid_columns = columns(
-        &mixed_topology,
-        QuotientNumeratorColumnSource::Evaluation(hybrid_arena.bind(EVAL_A).unwrap()),
-        QuotientNumeratorColumnSource::Coefficients(hybrid_arena.bind(COEFF_B).unwrap()),
-        QuotientNumeratorColumnSource::Coefficients(hybrid_arena.bind(COEFF_C).unwrap()),
+        QuotientNumeratorColumnSource::Evaluation(mixed_arena.bind(EVAL_A).unwrap()),
+        QuotientNumeratorColumnSource::Coefficients(mixed_arena.bind(COEFF_B).unwrap()),
+        QuotientNumeratorColumnSource::Coefficients(mixed_arena.bind(COEFF_C).unwrap()),
     );
 
     let coefficient = PreparedQuotientNumeratorGraph::prepare(
@@ -129,31 +124,31 @@ fn mixed_hybrid_is_byte_identical_warm_capture_safe_and_source_immutable() {
     )
     .unwrap();
     let legacy = PreparedQuotientNumeratorGraph::prepare(
-        &legacy_arena,
+        &mixed_arena,
         config,
-        &legacy_columns,
-        legacy_arena.bind(OODS_POINTS).unwrap(),
-        legacy_arena.bind(OODS_VALUES).unwrap(),
-        legacy_arena.bind(RANDOM_COEFFICIENT).unwrap(),
-        legacy_arena.bind(SAMPLE_POINTS_OUTPUT).unwrap(),
-        legacy_arena.bind(FIRST_TERMS_OUTPUT).unwrap(),
-        &legacy_destinations,
-        legacy_arena.bind(TWIDDLES).unwrap(),
-        &mixed_slots,
+        &mixed_columns,
+        mixed_arena.bind(OODS_POINTS).unwrap(),
+        mixed_arena.bind(OODS_VALUES).unwrap(),
+        mixed_arena.bind(RANDOM_COEFFICIENT).unwrap(),
+        mixed_arena.bind(SAMPLE_POINTS_OUTPUT).unwrap(),
+        mixed_arena.bind(FIRST_TERMS_OUTPUT).unwrap(),
+        &mixed_destinations,
+        mixed_arena.bind(TWIDDLES).unwrap(),
+        &legacy_slots,
     )
     .unwrap();
     let hybrid = PreparedQuotientNumeratorGraph::prepare_hybrid_candidate(
-        &hybrid_arena,
+        &mixed_arena,
         config,
-        &hybrid_columns,
-        hybrid_arena.bind(OODS_POINTS).unwrap(),
-        hybrid_arena.bind(OODS_VALUES).unwrap(),
-        hybrid_arena.bind(RANDOM_COEFFICIENT).unwrap(),
-        hybrid_arena.bind(SAMPLE_POINTS_OUTPUT).unwrap(),
-        hybrid_arena.bind(FIRST_TERMS_OUTPUT).unwrap(),
-        &hybrid_destinations,
-        hybrid_arena.bind(TWIDDLES).unwrap(),
-        &mixed_slots,
+        &mixed_columns,
+        mixed_arena.bind(OODS_POINTS).unwrap(),
+        mixed_arena.bind(OODS_VALUES).unwrap(),
+        mixed_arena.bind(RANDOM_COEFFICIENT).unwrap(),
+        mixed_arena.bind(SAMPLE_POINTS_OUTPUT).unwrap(),
+        mixed_arena.bind(FIRST_TERMS_OUTPUT).unwrap(),
+        &mixed_destinations,
+        mixed_arena.bind(TWIDDLES).unwrap(),
+        &hybrid_slots,
     )
     .unwrap();
 
@@ -186,50 +181,62 @@ fn mixed_hybrid_is_byte_identical_warm_capture_safe_and_source_immutable() {
         &coefficient_c,
         None,
     );
-    for arena in [&legacy_arena, &hybrid_arena] {
-        upload_inputs(
-            arena,
-            &twiddle_words,
-            &[p0, p1, p1],
-            &values,
-            &coefficient_a,
-            &coefficient_b,
-            &coefficient_c,
-            Some(&evaluation_a),
-        );
-    }
+    upload_inputs(
+        &mixed_arena,
+        &twiddle_words,
+        &[p0, p1, p1],
+        &values,
+        &coefficient_a,
+        &coefficient_b,
+        &coefficient_c,
+        Some(&evaluation_a),
+    );
 
     let eager_alpha = SecureField::from_u32_unchecked(41, 43, 47, 53);
-    for (arena, destinations) in [
-        (&coefficient_arena, &coefficient_destinations),
-        (&legacy_arena, &legacy_destinations),
-        (&hybrid_arena, &hybrid_destinations),
-    ] {
-        upload(arena, RANDOM_COEFFICIENT, &secure_words(&[eager_alpha]));
-        poison_outputs(arena, destinations, &mixed_requirements, 0xdead_beef);
-        arena.context().sync().unwrap();
-        arena.context().reset_telemetry();
-    }
+    upload(
+        &coefficient_arena,
+        RANDOM_COEFFICIENT,
+        &secure_words(&[eager_alpha]),
+    );
+    poison_outputs(
+        &coefficient_arena,
+        &coefficient_destinations,
+        &mixed_requirements,
+        0xdead_beef,
+    );
+    coefficient_arena.context().sync().unwrap();
+    coefficient_arena.context().reset_telemetry();
     coefficient.launch().unwrap();
-    legacy.launch().unwrap();
-    hybrid.launch().unwrap();
-    for arena in [&coefficient_arena, &legacy_arena, &hybrid_arena] {
-        arena.context().sync().unwrap();
-        assert_warm(arena);
-    }
+    coefficient_arena.context().sync().unwrap();
+    assert_warm(&coefficient_arena);
     let eager = snapshot(
         &coefficient_arena,
         &coefficient_destinations,
         &mixed_requirements,
     );
-    assert_eq!(
-        snapshot(&legacy_arena, &legacy_destinations, &mixed_requirements),
-        eager
+    upload(
+        &mixed_arena,
+        RANDOM_COEFFICIENT,
+        &secure_words(&[eager_alpha]),
     );
-    assert_eq!(
-        snapshot(&hybrid_arena, &hybrid_destinations, &mixed_requirements),
-        eager
+    let legacy_eager = run_prepared(
+        &legacy,
+        &mixed_arena,
+        &mixed_destinations,
+        &mixed_requirements,
+        0xdead_beef,
     );
+    assert_eq!(legacy_eager, eager);
+    let hybrid_eager = run_prepared(
+        &hybrid,
+        &mixed_arena,
+        &mixed_destinations,
+        &mixed_requirements,
+        0xa5a5_5a5a,
+    );
+    assert_eq!(hybrid_eager, eager);
+    assert_ne!(legacy_eager[2][0], 0xdead_beef);
+    assert_ne!(hybrid_eager[2][0], 0xa5a5_5a5a);
     assert_sources(
         &coefficient_arena,
         &coefficient_a,
@@ -238,14 +245,7 @@ fn mixed_hybrid_is_byte_identical_warm_capture_safe_and_source_immutable() {
         None,
     );
     assert_sources(
-        &legacy_arena,
-        &coefficient_a,
-        &coefficient_b,
-        &coefficient_c,
-        Some(&evaluation_a),
-    );
-    assert_sources(
-        &hybrid_arena,
+        &mixed_arena,
         &coefficient_a,
         &coefficient_b,
         &coefficient_c,
@@ -255,10 +255,10 @@ fn mixed_hybrid_is_byte_identical_warm_capture_safe_and_source_immutable() {
     let capture = coefficient_arena.context().capture().unwrap();
     coefficient.launch().unwrap();
     let coefficient_graph = capture.finish().unwrap();
-    let capture = legacy_arena.context().capture().unwrap();
+    let capture = mixed_arena.context().capture().unwrap();
     legacy.launch().unwrap();
     let legacy_graph = capture.finish().unwrap();
-    let capture = hybrid_arena.context().capture().unwrap();
+    let capture = mixed_arena.context().capture().unwrap();
     hybrid.launch().unwrap();
     let hybrid_graph = capture.finish().unwrap();
 
@@ -282,50 +282,49 @@ fn mixed_hybrid_is_byte_identical_warm_capture_safe_and_source_immutable() {
         &replay_coefficient_c,
         None,
     );
-    for arena in [&legacy_arena, &hybrid_arena] {
-        upload_inputs(
-            arena,
-            &twiddle_words,
-            &[p0, p1, p1],
-            &replay_values,
-            &replay_coefficient_a,
-            &replay_coefficient_b,
-            &replay_coefficient_c,
-            Some(&replay_evaluation_a),
-        );
-    }
-    for (arena, destinations) in [
-        (&coefficient_arena, &coefficient_destinations),
-        (&legacy_arena, &legacy_destinations),
-        (&hybrid_arena, &hybrid_destinations),
-    ] {
-        upload(arena, RANDOM_COEFFICIENT, &secure_words(&[replay_alpha]));
-        poison_outputs(arena, destinations, &mixed_requirements, 0xa5a5_5a5a);
-        arena.context().sync().unwrap();
-        arena.context().reset_telemetry();
-    }
-    coefficient_graph
-        .launch(coefficient_arena.context())
-        .unwrap();
-    legacy_graph.launch(legacy_arena.context()).unwrap();
-    hybrid_graph.launch(hybrid_arena.context()).unwrap();
-    for arena in [&coefficient_arena, &legacy_arena, &hybrid_arena] {
-        arena.context().sync().unwrap();
-        assert_warm(arena);
-    }
-    let replay = snapshot(
+    upload_inputs(
+        &mixed_arena,
+        &twiddle_words,
+        &[p0, p1, p1],
+        &replay_values,
+        &replay_coefficient_a,
+        &replay_coefficient_b,
+        &replay_coefficient_c,
+        Some(&replay_evaluation_a),
+    );
+    upload(
+        &coefficient_arena,
+        RANDOM_COEFFICIENT,
+        &secure_words(&[replay_alpha]),
+    );
+    let replay = run_graph(
+        &coefficient_graph,
         &coefficient_arena,
         &coefficient_destinations,
         &mixed_requirements,
+        0x1357_9bdf,
     );
-    assert_eq!(
-        snapshot(&legacy_arena, &legacy_destinations, &mixed_requirements),
-        replay
+    upload(
+        &mixed_arena,
+        RANDOM_COEFFICIENT,
+        &secure_words(&[replay_alpha]),
     );
-    assert_eq!(
-        snapshot(&hybrid_arena, &hybrid_destinations, &mixed_requirements),
-        replay
+    let legacy_replay = run_graph(
+        &legacy_graph,
+        &mixed_arena,
+        &mixed_destinations,
+        &mixed_requirements,
+        0x2468_ace0,
     );
+    let hybrid_replay = run_graph(
+        &hybrid_graph,
+        &mixed_arena,
+        &mixed_destinations,
+        &mixed_requirements,
+        0x0bad_f00d,
+    );
+    assert_eq!(legacy_replay, replay);
+    assert_eq!(hybrid_replay, replay);
     assert_ne!(replay, eager);
     assert_sources(
         &coefficient_arena,
@@ -335,14 +334,7 @@ fn mixed_hybrid_is_byte_identical_warm_capture_safe_and_source_immutable() {
         None,
     );
     assert_sources(
-        &legacy_arena,
-        &replay_coefficient_a,
-        &replay_coefficient_b,
-        &replay_coefficient_c,
-        Some(&replay_evaluation_a),
-    );
-    assert_sources(
-        &hybrid_arena,
+        &mixed_arena,
         &replay_coefficient_a,
         &replay_coefficient_b,
         &replay_coefficient_c,
@@ -385,8 +377,9 @@ fn columns(
 
 fn slots_for(
     requirements: &stwo_backend_cuda::QuotientNumeratorWorkspaceRequirements,
+    base: u32,
 ) -> QuotientNumeratorWorkspaceSlots {
-    let mut next = 1u32;
+    let mut next = base;
     let mut id = || {
         let result = ArenaSlotId(next);
         next += 1;
@@ -403,26 +396,38 @@ fn slots_for(
         batch_source_ptrs: id(),
         output_ptrs: id(),
         output_log_sizes: id(),
-        coefficient_ptrs: (requirements.coefficient_pointer_words != 0).then_some(ArenaSlotId(100)),
-        coefficient_sizes: (requirements.coefficient_size_words != 0).then_some(ArenaSlotId(101)),
+        coefficient_ptrs: (requirements.coefficient_pointer_words != 0).then_some(id()),
+        coefficient_sizes: (requirements.coefficient_size_words != 0).then_some(id()),
         coefficient_output_ptrs: (requirements.coefficient_output_pointer_words != 0)
-            .then_some(ArenaSlotId(102)),
-        lde_tile: (requirements.lde_tile_words != 0).then_some(ArenaSlotId(103)),
+            .then_some(id()),
+        lde_tile: (requirements.lde_tile_words != 0).then_some(id()),
     }
 }
 
-fn arena(slots: &QuotientNumeratorWorkspaceSlots) -> DeviceArena {
-    let mut ids = vec![
-        slots.runtime_terms,
-        slots.group_term_indices,
-        slots.group_offsets,
-        slots.line_coefficients,
-        slots.term_points,
-        slots.batch_terms,
-        slots.batch_group_offsets,
-        slots.batch_source_ptrs,
-        slots.output_ptrs,
-        slots.output_log_sizes,
+fn arena(workspaces: &[&QuotientNumeratorWorkspaceSlots]) -> DeviceArena {
+    let mut ids = workspaces
+        .iter()
+        .flat_map(|slots| {
+            [
+                Some(slots.runtime_terms),
+                Some(slots.group_term_indices),
+                Some(slots.group_offsets),
+                Some(slots.line_coefficients),
+                Some(slots.term_points),
+                Some(slots.batch_terms),
+                Some(slots.batch_group_offsets),
+                Some(slots.batch_source_ptrs),
+                Some(slots.output_ptrs),
+                Some(slots.output_log_sizes),
+                slots.coefficient_ptrs,
+                slots.coefficient_sizes,
+                slots.coefficient_output_ptrs,
+                slots.lde_tile,
+            ]
+        })
+        .flatten()
+        .collect::<Vec<_>>();
+    ids.extend([
         OODS_POINTS,
         OODS_VALUES,
         RANDOM_COEFFICIENT,
@@ -433,17 +438,7 @@ fn arena(slots: &QuotientNumeratorWorkspaceSlots) -> DeviceArena {
         COEFF_A,
         COEFF_B,
         COEFF_C,
-    ];
-    ids.extend(
-        [
-            slots.coefficient_ptrs,
-            slots.coefficient_sizes,
-            slots.coefficient_output_ptrs,
-            slots.lde_tile,
-        ]
-        .into_iter()
-        .flatten(),
-    );
+    ]);
     for group in 0..8 {
         for coordinate in 0..4 {
             ids.push(output_id(group, coordinate));
@@ -481,6 +476,38 @@ fn destinations(
             }),
         })
         .collect()
+}
+
+fn run_prepared(
+    graph: &PreparedQuotientNumeratorGraph<'_>,
+    arena: &DeviceArena,
+    destinations: &[QuotientNumeratorDestination],
+    requirements: &stwo_backend_cuda::QuotientNumeratorWorkspaceRequirements,
+    poison: u32,
+) -> Vec<Vec<u32>> {
+    poison_outputs(arena, destinations, requirements, poison);
+    arena.context().sync().unwrap();
+    arena.context().reset_telemetry();
+    graph.launch().unwrap();
+    arena.context().sync().unwrap();
+    assert_warm(arena);
+    snapshot(arena, destinations, requirements)
+}
+
+fn run_graph(
+    graph: &CudaGraphExec,
+    arena: &DeviceArena,
+    destinations: &[QuotientNumeratorDestination],
+    requirements: &stwo_backend_cuda::QuotientNumeratorWorkspaceRequirements,
+    poison: u32,
+) -> Vec<Vec<u32>> {
+    poison_outputs(arena, destinations, requirements, poison);
+    arena.context().sync().unwrap();
+    arena.context().reset_telemetry();
+    graph.launch(arena.context()).unwrap();
+    arena.context().sync().unwrap();
+    assert_warm(arena);
+    snapshot(arena, destinations, requirements)
 }
 
 fn upload_inputs(

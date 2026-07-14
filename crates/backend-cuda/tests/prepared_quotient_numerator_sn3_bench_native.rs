@@ -21,7 +21,7 @@ use sn3_quotient_topology_fixture::load_sn3_topology_fixture;
 use stwo::core::circle::CirclePoint;
 use stwo::core::fields::qm31::SecureField;
 use stwo_backend_cuda::{
-    ArenaLayout, ArenaSlotId, ArenaSlotSpec, CudaExecContext, DeviceArena,
+    gpu_memory_info, ArenaLayout, ArenaSlotId, ArenaSlotSpec, CudaExecContext, DeviceArena,
     PreparedQuotientNumeratorGraph, QuotientNumeratorColumn, QuotientNumeratorColumnSource,
     QuotientNumeratorColumnTopology, QuotientNumeratorDestination, QuotientNumeratorSourceKind,
     QuotientNumeratorWorkspaceConfig, QuotientNumeratorWorkspaceRequirements,
@@ -46,7 +46,10 @@ const COEFFICIENT_BATCHES: usize = 71;
 const TERMS: usize = 6_341;
 const LEGACY_LOGICAL_OUTPUT_BYTES: u64 = 59_993_989_376;
 const HYBRID_LOGICAL_OUTPUT_BYTES: u64 = 20_266_867_968;
-const EXPECTED_SN3_SHARED_ARENA_BYTES: u64 = 41_821_220_224;
+const EXPECTED_SN3_SINGLE_WORKSPACE_ARENA_BYTES: u64 = 41_821_220_224;
+const EXPECTED_SN3_DUAL_WORKSPACE_ARENA_BYTES: u64 = 41_889_121_376;
+const EXPECTED_SN3_WORKSPACE_SPAN_BYTES: u64 = 67_901_168;
+const EXPECTED_SN3_SECOND_WORKSPACE_ARENA_DELTA_BYTES: u64 = 67_901_152;
 const MAX_BENCHMARK_ARENA_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const DEFAULT_WARMUPS: usize = 3;
 const DEFAULT_ITERATIONS: usize = 20;
@@ -71,9 +74,11 @@ const FIRST_TERMS_OUTPUT: ArenaSlotId = ArenaSlotId(104);
 const TWIDDLES: ArenaSlotId = ArenaSlotId(105);
 const SOURCE_BASE: u32 = 1_000;
 const OUTPUT_BASE: u32 = 10_000;
+const LEGACY_WORKSPACE_BASE: u32 = 1;
+const HYBRID_WORKSPACE_BASE: u32 = 20;
 
 #[test]
-#[ignore = "requires a CUDA GPU with at least the reported shared arena bytes"]
+#[ignore = "requires CUDA and the reported 39.02 GiB dual-workspace arena"]
 fn sn3_hybrid_graph_host_wall_benchmark() {
     let sn3 = load_sn3_topology_fixture(EXPECTED_SN3_TOPOLOGY_FIXTURE_BLAKE3);
     assert_sn3_shape(sn3.config, &sn3.topology, &sn3.requirements, &sn3.hybrid);
@@ -85,14 +90,35 @@ fn sn3_hybrid_graph_host_wall_benchmark() {
     );
 
     // All exact topology assertions above intentionally precede the first CUDA allocation.
+    let (device_free_before_arena, device_total_bytes) = gpu_memory_info();
     let fixture = BenchmarkArena::new(&sn3.topology, &sn3.requirements);
     assert!(fixture.allocation_bytes <= MAX_BENCHMARK_ARENA_BYTES);
+    let arena_pool = fixture.arena.context().pool_memory().unwrap();
+    let (device_free_after_arena, device_total_after_arena) = gpu_memory_info();
+    assert_eq!(device_total_after_arena, device_total_bytes);
+    assert!(arena_pool.used_bytes >= fixture.allocation_bytes as usize);
+    assert!(arena_pool.reserved_bytes >= arena_pool.used_bytes);
 
-    let slots = workspace_slots(&sn3.requirements);
     let columns = fixture.columns(&sn3.topology);
     let destinations = fixture.destinations(&sn3.requirements);
-    let legacy = prepare(&fixture, &columns, &destinations, &slots, sn3.config, false);
-    let hybrid = prepare(&fixture, &columns, &destinations, &slots, sn3.config, true);
+    // Both prepared graphs remain live for alternating replay. Their external inputs may share,
+    // but setup mutates schedule descriptors, so each graph owns a complete workspace.
+    let legacy = prepare(
+        &fixture,
+        &columns,
+        &destinations,
+        &fixture.legacy_slots,
+        sn3.config,
+        false,
+    );
+    let hybrid = prepare(
+        &fixture,
+        &columns,
+        &destinations,
+        &fixture.hybrid_slots,
+        sn3.config,
+        true,
+    );
 
     initialize(
         &fixture,
@@ -217,7 +243,7 @@ fn sn3_hybrid_graph_host_wall_benchmark() {
     let hybrid_p95 = percentile(&hybrid_ms, 95);
     println!(
         concat!(
-            "{{\"schema\":\"stwo.sn3_quotient_numerator_hybrid.host_wall.v4\"," ,
+            "{{\"schema\":\"stwo.sn3_quotient_numerator_hybrid.host_wall.v5\"," ,
             "\"timing_scope\":\"per-replay host wall: graph launch plus stream synchronize; not CUDA events\"," ,
             "\"percentile_method\":\"nearest-rank\"," ,
             "\"result_class\":\"diagnostic same-lineage schedule A/B; not independent mathematical truth\"," ,
@@ -228,7 +254,11 @@ fn sn3_hybrid_graph_host_wall_benchmark() {
             "\"terms\":6341}},\"bytes\":{{\"legacy_logical_output\":{}," ,
             "\"hybrid_logical_output\":{},\"validated_numerator_output\":{}," ,
             "\"validated_auxiliary_output\":{},\"validated_canonical_output\":{}," ,
-            "\"shared_arena\":{}}}," ,
+            "\"shared_data_dual_workspace_arena\":{}," ,
+            "\"workspace_span_each\":{},\"second_workspace_arena_delta\":{}}}," ,
+            "\"device_memory\":{{\"total\":{},\"free_before_arena\":{}," ,
+            "\"free_after_arena\":{},\"isolated_pool_used_after_arena\":{}," ,
+            "\"isolated_pool_reserved_after_arena\":{}}}," ,
             "\"identity\":{{\"output_digest_encoding\":\"framed u32 little-endian v1\"," ,
             "\"topology_fixture_blake3\":\"{}\"," ,
             "\"input_recipe_encoding\":\"typed topology, descriptors, and affine row recipes v2\"," ,
@@ -258,6 +288,13 @@ fn sn3_hybrid_graph_host_wall_benchmark() {
         validated_auxiliary_output_bytes,
         validated_canonical_output_bytes,
         fixture.allocation_bytes,
+        EXPECTED_SN3_WORKSPACE_SPAN_BYTES,
+        EXPECTED_SN3_SECOND_WORKSPACE_ARENA_DELTA_BYTES,
+        device_total_bytes,
+        device_free_before_arena,
+        device_free_after_arena,
+        arena_pool.used_bytes,
+        arena_pool.reserved_bytes,
         sn3.digest,
         input_recipe_blake3,
         eager.digest(),
@@ -314,9 +351,19 @@ fn sn3_input_recipe_is_deterministic_and_shape_exact() {
         ),
         digest
     );
+    let plan = benchmark_arena_plan(&sn3.topology, &sn3.requirements);
     assert_eq!(
-        benchmark_arena_plan(&sn3.topology, &sn3.requirements).allocation_bytes,
-        EXPECTED_SN3_SHARED_ARENA_BYTES
+        plan.allocation_bytes,
+        EXPECTED_SN3_DUAL_WORKSPACE_ARENA_BYTES
+    );
+    assert_eq!(
+        plan.allocation_bytes - EXPECTED_SN3_SINGLE_WORKSPACE_ARENA_BYTES,
+        EXPECTED_SN3_SECOND_WORKSPACE_ARENA_DELTA_BYTES
+    );
+    assert_schedule_workspaces_are_disjoint(
+        &sn3.requirements,
+        &plan.legacy_slots,
+        &plan.hybrid_slots,
     );
 }
 
@@ -390,6 +437,8 @@ fn assert_sn3_shape(
 
 struct BenchmarkArena {
     arena: DeviceArena,
+    legacy_slots: QuotientNumeratorWorkspaceSlots,
+    hybrid_slots: QuotientNumeratorWorkspaceSlots,
     source_ids: Vec<ArenaSlotId>,
     destination_ids: Vec<[ArenaSlotId; 4]>,
     allocation_bytes: u64,
@@ -397,6 +446,8 @@ struct BenchmarkArena {
 
 struct BenchmarkArenaPlan {
     layout: ArenaLayout,
+    legacy_slots: QuotientNumeratorWorkspaceSlots,
+    hybrid_slots: QuotientNumeratorWorkspaceSlots,
     source_ids: Vec<ArenaSlotId>,
     destination_ids: Vec<[ArenaSlotId; 4]>,
     allocation_bytes: u64,
@@ -411,6 +462,8 @@ impl BenchmarkArena {
         let arena = DeviceArena::new(CudaExecContext::new().unwrap(), plan.layout).unwrap();
         Self {
             arena,
+            legacy_slots: plan.legacy_slots,
+            hybrid_slots: plan.hybrid_slots,
             source_ids: plan.source_ids,
             destination_ids: plan.destination_ids,
             allocation_bytes: plan.allocation_bytes,
@@ -459,17 +512,25 @@ fn benchmark_arena_plan(
     topology: &[QuotientNumeratorColumnTopology],
     requirements: &QuotientNumeratorWorkspaceRequirements,
 ) -> BenchmarkArenaPlan {
-    let slots = workspace_slots(requirements);
+    let legacy_slots = workspace_slots(requirements, LEGACY_WORKSPACE_BASE);
+    let hybrid_slots = workspace_slots(requirements, HYBRID_WORKSPACE_BASE);
     let mut specs = Vec::new();
     let mut cursor = 0usize;
-    for requirement in requirements.arena_slot_requirements(&slots).unwrap() {
-        push_spec(
-            &mut specs,
-            &mut cursor,
-            requirement.id,
-            requirement.len_words,
-            requirement.alignment_words,
-        );
+    for (slots, expected_bytes) in [
+        (&legacy_slots, EXPECTED_SN3_WORKSPACE_SPAN_BYTES),
+        (&hybrid_slots, EXPECTED_SN3_WORKSPACE_SPAN_BYTES),
+    ] {
+        let workspace_start = cursor;
+        for requirement in requirements.arena_slot_requirements(slots).unwrap() {
+            push_spec(
+                &mut specs,
+                &mut cursor,
+                requirement.id,
+                requirement.len_words,
+                requirement.alignment_words,
+            );
+        }
+        assert_eq!((cursor - workspace_start) as u64 * 4, expected_bytes);
     }
     for (id, words) in [
         (OODS_POINTS, requirements.input_sample_count * 8),
@@ -506,6 +567,8 @@ fn benchmark_arena_plan(
     assert!(allocation_bytes <= MAX_BENCHMARK_ARENA_BYTES);
     BenchmarkArenaPlan {
         layout: ArenaLayout::new(cursor, &specs).unwrap(),
+        legacy_slots,
+        hybrid_slots,
         source_ids,
         destination_ids,
         allocation_bytes,
@@ -514,24 +577,38 @@ fn benchmark_arena_plan(
 
 fn workspace_slots(
     requirements: &QuotientNumeratorWorkspaceRequirements,
+    base: u32,
 ) -> QuotientNumeratorWorkspaceSlots {
+    let id = |offset| ArenaSlotId(base + offset);
     QuotientNumeratorWorkspaceSlots {
-        runtime_terms: ArenaSlotId(1),
-        group_term_indices: ArenaSlotId(2),
-        group_offsets: ArenaSlotId(3),
-        line_coefficients: ArenaSlotId(4),
-        term_points: ArenaSlotId(5),
-        batch_terms: ArenaSlotId(6),
-        batch_group_offsets: ArenaSlotId(7),
-        batch_source_ptrs: ArenaSlotId(8),
-        output_ptrs: ArenaSlotId(9),
-        output_log_sizes: ArenaSlotId(10),
-        coefficient_ptrs: (requirements.coefficient_pointer_words != 0).then_some(ArenaSlotId(11)),
-        coefficient_sizes: (requirements.coefficient_size_words != 0).then_some(ArenaSlotId(12)),
+        runtime_terms: id(0),
+        group_term_indices: id(1),
+        group_offsets: id(2),
+        line_coefficients: id(3),
+        term_points: id(4),
+        batch_terms: id(5),
+        batch_group_offsets: id(6),
+        batch_source_ptrs: id(7),
+        output_ptrs: id(8),
+        output_log_sizes: id(9),
+        coefficient_ptrs: (requirements.coefficient_pointer_words != 0).then_some(id(10)),
+        coefficient_sizes: (requirements.coefficient_size_words != 0).then_some(id(11)),
         coefficient_output_ptrs: (requirements.coefficient_output_pointer_words != 0)
-            .then_some(ArenaSlotId(13)),
-        lde_tile: (requirements.lde_tile_words != 0).then_some(ArenaSlotId(14)),
+            .then_some(id(12)),
+        lde_tile: (requirements.lde_tile_words != 0).then_some(id(13)),
     }
+}
+
+fn assert_schedule_workspaces_are_disjoint(
+    requirements: &QuotientNumeratorWorkspaceRequirements,
+    legacy: &QuotientNumeratorWorkspaceSlots,
+    hybrid: &QuotientNumeratorWorkspaceSlots,
+) {
+    let legacy = requirements.arena_slot_requirements(legacy).unwrap();
+    let hybrid = requirements.arena_slot_requirements(hybrid).unwrap();
+    assert!(legacy
+        .iter()
+        .all(|left| hybrid.iter().all(|right| left.id != right.id)));
 }
 
 fn push_spec(
