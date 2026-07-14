@@ -20,6 +20,8 @@ LOOP_TOOL_PATHS = [
     "tools/gpu_lab/fri_module.py",
     "tools/gpu_lab/fri_publication.py",
     "tools/gpu_lab/fri_round6_fixture.py",
+    "tools/gpu_lab/fri_round6_execution.py",
+    "tools/gpu_lab/fri_round6_process.py",
     "tools/gpu_lab/fri_round6_loop.py",
     "tools/gpu_lab/fri_round6_loop_cli.py",
     "tools/gpu_lab/fri_round6_loop_identity.py",

@@ -26,6 +26,7 @@ from .common import (
 from .identity import validate_abi, validate_generator_sources
 from .indexed_fixture_tests import indexed_fixture_self_test
 from .fri_module_tests import fri_module_self_test
+from .fri_round6_execution_tests import fri_round6_execution_self_test
 from .fri_round6_loop_tests import fri_round6_loop_self_test
 from .loop import loop_self_test
 from .oracle import validate_oracle_index
@@ -262,6 +263,7 @@ def self_test(root: Path) -> None:
         raise ValueError("mutated generator closure was accepted")
     fri_module_self_test(root)
     fri_round6_loop_self_test(root)
+    fri_round6_execution_self_test(root)
     for schema in ("semantic-fixture.schema.json", "semantic-fixture-index.schema.json",
                    "execution-manifest.schema.json", "host-oracle-index.schema.json",
                    "host-oracle-artifact-v2.schema.json",

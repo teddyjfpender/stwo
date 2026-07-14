@@ -343,6 +343,12 @@ def fri_round6_loop_self_test(lab_root: Path) -> None:
                 "module_index_sha256", "00" * 32)),
             ("partial correctness", lambda value: value["correctness"][
                 "primary_graph"].__setitem__("checked_words", 415)),
+            ("float device ordinal", lambda value: value["device"].__setitem__(
+                "ordinal", 0.0)),
+            ("float graph count", lambda value: value["graph_contract"].__setitem__(
+                "kernels", 7.0)),
+            ("float checked words", lambda value: value["correctness"][
+                "primary_graph"].__setitem__("checked_words", 416.0)),
             ("extra result key", lambda value: value.__setitem__("unreviewed", True)),
         ):
             hostile = deepcopy(result)

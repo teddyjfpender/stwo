@@ -42,15 +42,19 @@ class BoundFile:
     path: Path
     sha256: str
     byte_length: int
-    identity: tuple[int, int, int, int, int]
+    identity: tuple[int, int, int, int, int, int, int]
     executable: bool = False
 
     def record(self) -> dict[str, Any]:
         return {"path": str(self.path), "sha256": self.sha256, "bytes": self.byte_length}
 
 
-def _identity(status: os.stat_result) -> tuple[int, int, int, int, int]:
-    return (status.st_dev, status.st_ino, status.st_size, status.st_mtime_ns, status.st_ctime_ns)
+def _identity(status: os.stat_result) -> tuple[int, int, int, int, int, int, int]:
+    return (
+        status.st_dev, status.st_ino, status.st_size,
+        status.st_mtime_ns, status.st_ctime_ns,
+        stat.S_IMODE(status.st_mode), status.st_nlink,
+    )
 
 
 def _reject_symlink_components(path: Path, role: str) -> Path:
@@ -60,20 +64,32 @@ def _reject_symlink_components(path: Path, role: str) -> Path:
     return absolute
 
 
+def observe_file(
+    path: Path, role: str, *, executable: bool = False, read_only: bool = False,
+) -> BoundFile:
+    absolute = _reject_symlink_components(path, role)
+    resolved = absolute.resolve(strict=True)
+    require(resolved == absolute, f"{role} path changed while it was resolved")
+    before = resolved.stat()
+    require(stat.S_ISREG(before.st_mode) and before.st_size > 0, f"{role} is not a nonempty file")
+    require(not executable or before.st_mode & 0o111, f"{role} is not executable")
+    require(not read_only or (stat.S_IMODE(before.st_mode) == 0o400 and before.st_nlink == 1),
+            f"{role} is not a single-link owner-read-only file")
+    digest = sha256_file(resolved)
+    rebound = _reject_symlink_components(path, role).resolve(strict=True)
+    require(rebound == resolved, f"{role} path changed while it was hashed")
+    after = rebound.stat()
+    require(_identity(before) == _identity(after), f"{role} changed while it was hashed")
+    return BoundFile(role, resolved, digest, before.st_size, _identity(before), executable)
+
+
 def bind_file(
     path: Path, expected_sha256: str, role: str, *, executable: bool = False,
 ) -> BoundFile:
     require_sha256(expected_sha256, f"{role} sha256")
-    absolute = _reject_symlink_components(path, role)
-    resolved = absolute.resolve(strict=True)
-    before = resolved.stat()
-    require(stat.S_ISREG(before.st_mode) and before.st_size > 0, f"{role} is not a nonempty file")
-    require(not executable or before.st_mode & 0o111, f"{role} is not executable")
-    digest = sha256_file(resolved)
-    after = resolved.stat()
-    require(_identity(before) == _identity(after), f"{role} changed while it was hashed")
-    require(digest == expected_sha256, f"{role} sha256 mismatch")
-    return BoundFile(role, resolved, digest, before.st_size, _identity(before), executable)
+    bound = observe_file(path, role, executable=executable)
+    require(bound.sha256 == expected_sha256, f"{role} sha256 mismatch")
+    return bound
 
 
 def recheck(bound: BoundFile) -> None:
@@ -204,15 +220,23 @@ def validate_runner_result(value: Any, expected: dict[str, Any]) -> dict[str, An
     require_exact_keys(device, {"name", "uuid", "ordinal", "target_sm", "driver_version"},
                        "FRI result device")
     require_int(device["driver_version"], "FRI driver version", 1)
+    ordinal = require_int(device["ordinal"], "FRI device ordinal")
+    target_sm = require_int(device["target_sm"], "FRI device target SM", 50)
     require(isinstance(device["name"], str) and device["name"]
+            and isinstance(device["uuid"], str)
             and re.fullmatch(r"[0-9a-f]{32}", device["uuid"]) is not None
-            and device["ordinal"] == expected["device"]
-            and device["target_sm"] == expected["target_sm"],
+            and ordinal == expected["device"] and target_sm == expected["target_sm"],
             "FRI result device identity differs")
-    require(value["graph_contract"] == {
+    graph = value["graph_contract"]
+    expected_graph = {
         "kernels": 7, "device_copies": 6, "entry_log": 6,
         "exit_log": 3, "packed_leaf_log": 2,
-    }, "FRI result graph contract differs")
+    }
+    require(isinstance(graph, dict), "FRI result graph contract must be an object")
+    require_exact_keys(graph, set(expected_graph), "FRI result graph contract")
+    for name, expected_value in expected_graph.items():
+        require(require_int(graph[name], f"FRI graph contract {name}") == expected_value,
+                f"FRI result graph contract {name} differs")
     correctness = value["correctness"]
     require(isinstance(correctness, dict), "FRI result correctness must be an object")
     names = {"primary_eager", "primary_graph", "hostile_eager", "hostile_graph",
@@ -222,7 +246,9 @@ def validate_runner_result(value: Any, expected: dict[str, Any]) -> dict[str, An
         check = correctness[name]
         require(isinstance(check, dict), f"FRI result {name} must be an object")
         require_exact_keys(check, {"passed", "checked_words", "error"}, f"FRI result {name}")
-        require(check == {"passed": True, "checked_words": VALIDATION_WORDS, "error": ""},
+        checked_words = require_int(check["checked_words"], f"FRI result {name} checked words")
+        require(check["passed"] is True and checked_words == VALIDATION_WORDS
+                and isinstance(check["error"], str) and check["error"] == "",
                 f"FRI result {name} did not pass exact validation")
     stale = correctness["stale_cursor_status_order"]
     require(isinstance(stale, dict), "FRI stale-cursor result must be an object")
