@@ -752,7 +752,10 @@ fn upload_and_sync(
 
 #[cfg(test)]
 mod tests {
+    use num_traits::{One, Zero};
     use stwo::core::circle::SECURE_FIELD_CIRCLE_GEN;
+    use stwo::core::fields::cm31::CM31;
+    use stwo::core::fields::FieldExpOps;
     use stwo::core::pcs::quotients::denominator_inverses;
 
     use super::*;
@@ -869,6 +872,178 @@ mod tests {
                     sum + numerator.mul_cm31(inverse)
                 });
             assert_eq!(immediate, expected, "case {case}");
+        }
+    }
+
+    fn zero_safe_inverse(value: CM31) -> CM31 {
+        if value.is_zero() {
+            CM31::zero()
+        } else {
+            value.inverse()
+        }
+    }
+
+    fn chunk_batch_inverse(values: &[CM31], chunk_size: usize) -> Vec<CM31> {
+        assert!(chunk_size > 0);
+        values
+            .chunks(chunk_size)
+            .flat_map(|chunk| {
+                let mut prefixes = vec![CM31::one(); chunk_size];
+                for offset in 0..chunk_size {
+                    let value = chunk.get(offset).copied().unwrap_or_else(CM31::one);
+                    let value = if value.is_zero() { CM31::one() } else { value };
+                    prefixes[offset] = if offset == 0 {
+                        value
+                    } else {
+                        prefixes[offset - 1] * value
+                    };
+                }
+
+                let mut inverse_product = prefixes[chunk_size - 1].inverse();
+                for offset in (1..chunk_size).rev() {
+                    let value = chunk.get(offset).copied().unwrap_or_else(CM31::one);
+                    let normalized = if value.is_zero() { CM31::one() } else { value };
+                    let inverse = inverse_product * prefixes[offset - 1];
+                    inverse_product *= normalized;
+                    prefixes[offset] = if value.is_zero() {
+                        CM31::zero()
+                    } else {
+                        inverse
+                    };
+                }
+                prefixes[0] = if chunk[0].is_zero() {
+                    CM31::zero()
+                } else {
+                    inverse_product
+                };
+                prefixes.truncate(chunk.len());
+                prefixes
+            })
+            .collect()
+    }
+
+    #[test]
+    fn chunk_batch_inverse_matches_independent_elementwise_oracle() {
+        let mut state = 0x9e37_79b9u32;
+        for len in [1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 19, 31, 32, 33] {
+            for case in 0..128usize {
+                let values = (0..len)
+                    .map(|sample| {
+                        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                        let a = state & 0x7fff_ffff;
+                        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                        let b = state & 0x7fff_ffff;
+                        if (case + sample) % 17 == 0 {
+                            CM31::zero()
+                        } else {
+                            CM31::from_u32_unchecked(a, b)
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let expected = values
+                    .iter()
+                    .copied()
+                    .map(zero_safe_inverse)
+                    .collect::<Vec<_>>();
+                for chunk_size in [4, 8, 16] {
+                    assert_eq!(
+                        chunk_batch_inverse(&values, chunk_size),
+                        expected,
+                        "len {len}, chunk {chunk_size}, case {case}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn chunk_batched_quotients_preserve_each_rows_canonical_sample_order() {
+        let mut state = 0x243f_6a88u32;
+        let mut next_u31 = || {
+            state = state.wrapping_mul(22_695_477).wrapping_add(1);
+            state & 0x3fff_ffff
+        };
+        for rows in [1, 3, 8, 17] {
+            for samples in [1, 3, 4, 5, 8, 9, 19, 32] {
+                let denominators = (0..samples)
+                    .map(|sample| {
+                        (0..rows)
+                            .map(|row| {
+                                if (sample * rows + row) % 29 == 0 {
+                                    CM31::zero()
+                                } else {
+                                    CM31::from_u32_unchecked(next_u31(), next_u31())
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>();
+                let numerators = (0..rows)
+                    .map(|_| {
+                        (0..samples)
+                            .map(|_| {
+                                SecureField::from_u32_unchecked(
+                                    next_u31(),
+                                    next_u31(),
+                                    next_u31(),
+                                    next_u31(),
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>();
+                let batch_coefficients = (0..samples)
+                    .map(|_| {
+                        SecureField::from_u32_unchecked(
+                            next_u31(),
+                            next_u31(),
+                            next_u31(),
+                            next_u31(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                for chunk_size in [4, 8] {
+                    let batched = (0..rows)
+                        .map(|row| {
+                            let row_denominators = denominators
+                                .iter()
+                                .map(|column| column[row])
+                                .collect::<Vec<_>>();
+                            chunk_batch_inverse(&row_denominators, chunk_size)
+                        })
+                        .collect::<Vec<_>>();
+
+                    for row in 0..rows {
+                        let direct_sum = (0..samples).fold(SecureField::zero(), |sum, sample| {
+                            sum + numerators[row][sample]
+                                .mul_cm31(zero_safe_inverse(denominators[sample][row]))
+                        });
+                        let batched_sum = (0..samples).fold(SecureField::zero(), |sum, sample| {
+                            sum + numerators[row][sample].mul_cm31(batched[row][sample])
+                        });
+                        assert_eq!(
+                            batched_sum, direct_sum,
+                            "sum rows {rows}, samples {samples}, chunk {chunk_size}, row {row}"
+                        );
+
+                        let direct_horner =
+                            (0..samples).fold(SecureField::zero(), |acc, sample| {
+                                acc * batch_coefficients[sample]
+                                    + numerators[row][sample]
+                                        .mul_cm31(zero_safe_inverse(denominators[sample][row]))
+                            });
+                        let batched_horner =
+                            (0..samples).fold(SecureField::zero(), |acc, sample| {
+                                acc * batch_coefficients[sample]
+                                    + numerators[row][sample].mul_cm31(batched[row][sample])
+                            });
+                        assert_eq!(
+                            batched_horner, direct_horner,
+                            "horner rows {rows}, samples {samples}, chunk {chunk_size}, row {row}"
+                        );
+                    }
+                }
+            }
         }
     }
 

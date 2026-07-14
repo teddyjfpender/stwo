@@ -89,7 +89,11 @@ __global__ void column_line_and_batch_random_coeffs(
 }
 
 
-DEVICE_FORCEINLINE cm31 denominator_inverse_for_sample(
+constexpr uint32_t ACCUMULATE_QUOTIENT_INVERSE_CHUNK = 4;
+constexpr uint32_t COMBINE_QUOTIENT_INVERSE_CHUNK = 8;
+constexpr int QUOTIENT_COMBINE_BLOCK_DIM = 512;
+
+DEVICE_FORCEINLINE cm31 denominator_for_sample(
         const secure_field_point sample_point,
         const point domain_point
 ) {
@@ -99,10 +103,74 @@ DEVICE_FORCEINLINE cm31 denominator_inverse_for_sample(
     const cm31 piy = sample_point.y.b;
     const cm31 first_subtraction = {sub(prx.a, domain_point.x), prx.b};
     const cm31 second_subtraction = {sub(pry.a, domain_point.y), pry.b};
-    return inv(sub(mul(first_subtraction, piy), mul(second_subtraction, pix)));
+    return sub(mul(first_subtraction, piy), mul(second_subtraction, pix));
 }
 
-__global__ void accumulate_quotients_in_gpu(
+DEVICE_FORCEINLINE secure_field_point quotient_sample_point(
+        const secure_field_point *sample_points,
+        const uint32_t sample
+) {
+    return sample_points[sample];
+}
+
+DEVICE_FORCEINLINE secure_field_point quotient_sample_point(
+        const column_sample_batch *sample_batches,
+        const uint32_t sample
+) {
+    return sample_batches[sample].point;
+}
+
+// Batch the sequential inversions owned by one row. Padding a tail chunk with
+// ones keeps every array index compile-time constant, so ptxas can retain the
+// prefix products in registers. Denominators are recomputed on the reverse
+// sweep rather than retained, limiting the live array to two words per sample.
+// Zeros retain the scalar device convention inv(0) == 0.
+template <uint32_t CHUNK_SIZE, typename Sample>
+DEVICE_FORCEINLINE void quotient_inverse_chunk(
+        const Sample *samples,
+        const uint32_t sample_start,
+        const uint32_t sample_count,
+        const point domain_point,
+        cm31 *inverses
+) {
+    uint32_t zero_mask = 0;
+
+#pragma unroll
+    for (uint32_t offset = 0; offset < CHUNK_SIZE; ++offset) {
+        cm31 denominator = cm31{1, 0};
+        if (offset < sample_count) {
+            denominator = denominator_for_sample(
+                    quotient_sample_point(samples, sample_start + offset), domain_point);
+            const bool is_zero = denominator.a == 0 && denominator.b == 0;
+            zero_mask |= static_cast<uint32_t>(is_zero) << offset;
+            denominator = is_zero ? cm31{1, 0} : denominator;
+        }
+        inverses[offset] =
+            offset == 0 ? denominator : mul(inverses[offset - 1], denominator);
+    }
+
+    cm31 inverse_product = inv(inverses[CHUNK_SIZE - 1]);
+#pragma unroll
+    for (int offset = CHUNK_SIZE - 1; offset > 0; --offset) {
+        cm31 denominator = cm31{1, 0};
+        if (static_cast<uint32_t>(offset) < sample_count) {
+            denominator = denominator_for_sample(
+                    quotient_sample_point(samples, sample_start + offset), domain_point);
+            if (denominator.a == 0 && denominator.b == 0) {
+                denominator = cm31{1, 0};
+            }
+        }
+        const cm31 denominator_inverse = mul(inverse_product, inverses[offset - 1]);
+        inverse_product = mul(inverse_product, denominator);
+        inverses[offset] = (zero_mask & (1u << offset)) != 0
+            ? cm31{0, 0}
+            : denominator_inverse;
+    }
+    inverses[0] = (zero_mask & 1u) != 0 ? cm31{0, 0} : inverse_product;
+}
+
+__global__ void __launch_bounds__(QUOTIENT_COMBINE_BLOCK_DIM, 1)
+accumulate_quotients_in_gpu(
         uint32_t half_coset_initial_index,
         uint32_t half_coset_step_size,
         uint32_t domain_size,
@@ -125,38 +193,52 @@ __global__ void accumulate_quotients_in_gpu(
         uint32_t domain_index = bit_reverse(row, domain_log_size);
         point domain_point = domain_at_index(half_coset_initial_index, half_coset_step_size, domain_index, domain_size);
 
-        int i = 0;
-
         qm31 row_accumulator = qm31{cm31{0, 0}, cm31{0, 0}};
         int line_coeffs_offset = 0;
-        while (i < sample_size) {
-            column_sample_batch sample_batch = sample_batches[i];
-            // Keep the two-word inverse live across numerator construction,
-            // not the four-word numerator live across field inversion.
-            const cm31 denominator_inverse =
-                denominator_inverse_for_sample(sample_batch.point, domain_point);
-            qm31 *line_coeffs = &flattened_line_coeffs[line_coeffs_offset * 3];
-            qm31 batch_coeff = batch_random_coeffs[i];
-            int line_coeffs_size = line_coeffs_sizes[i];
+        for (uint32_t sample_start = 0; sample_start < sample_size;
+             sample_start += ACCUMULATE_QUOTIENT_INVERSE_CHUNK) {
+            const uint32_t remaining = sample_size - sample_start;
+            const uint32_t sample_count = remaining < ACCUMULATE_QUOTIENT_INVERSE_CHUNK
+                ? remaining
+                : ACCUMULATE_QUOTIENT_INVERSE_CHUNK;
+            cm31 denominator_inverses[ACCUMULATE_QUOTIENT_INVERSE_CHUNK];
+            quotient_inverse_chunk<ACCUMULATE_QUOTIENT_INVERSE_CHUNK>(
+                    sample_batches,
+                    sample_start,
+                    sample_count,
+                    domain_point,
+                    denominator_inverses);
 
-            qm31 numerator = qm31{cm31{0, 0}, cm31{0, 0}};
-            for(int j = 0; j < line_coeffs_size; j++) {
-                qm31 a = line_coeffs[3 * j + 0];
-                qm31 b = line_coeffs[3 * j + 1];
-                qm31 c = line_coeffs[3 * j + 2];
+#pragma unroll
+            for (uint32_t offset = 0; offset < ACCUMULATE_QUOTIENT_INVERSE_CHUNK;
+                 ++offset) {
+                if (offset >= sample_count) {
+                    continue;
+                }
+                const uint32_t sample = sample_start + offset;
+                column_sample_batch sample_batch = sample_batches[sample];
+                qm31 *line_coeffs = &flattened_line_coeffs[line_coeffs_offset * 3];
+                qm31 batch_coeff = batch_random_coeffs[sample];
+                int line_coeffs_size = line_coeffs_sizes[sample];
 
-                int column_index = sample_batch.columns[j];
-                qm31 linear_term = add(mul_by_scalar(a, domain_point.y), b);
-                qm31 value = mul_by_scalar(c, columns[column_index][row]);
+                qm31 numerator = qm31{cm31{0, 0}, cm31{0, 0}};
+                for(int j = 0; j < line_coeffs_size; j++) {
+                    qm31 a = line_coeffs[3 * j + 0];
+                    qm31 b = line_coeffs[3 * j + 1];
+                    qm31 c = line_coeffs[3 * j + 2];
 
-                numerator = add(numerator, sub(value, linear_term));
+                    int column_index = sample_batch.columns[j];
+                    qm31 linear_term = add(mul_by_scalar(a, domain_point.y), b);
+                    qm31 value = mul_by_scalar(c, columns[column_index][row]);
+
+                    numerator = add(numerator, sub(value, linear_term));
+                }
+
+                row_accumulator = add(
+                    mul(row_accumulator, batch_coeff),
+                    mul(numerator, denominator_inverses[offset]));
+                line_coeffs_offset += line_coeffs_size;
             }
-
-            row_accumulator = add(
-                mul(row_accumulator, batch_coeff),
-                mul(numerator, denominator_inverse));
-            line_coeffs_offset += line_coeffs_size;
-            i++;
         }
 
         result_column_0[row] = row_accumulator.a.a;
@@ -201,7 +283,8 @@ __global__ void accumulate_partial_quotient_numerators_in_gpu(
     }
 }
 
-__global__ void combine_quotients_from_numerators_in_gpu(
+__global__ void __launch_bounds__(QUOTIENT_COMBINE_BLOCK_DIM, 1)
+combine_quotients_from_numerators_in_gpu(
         uint32_t half_coset_initial_index,
         uint32_t half_coset_step_size,
         uint32_t domain_size,
@@ -230,29 +313,49 @@ __global__ void combine_quotients_from_numerators_in_gpu(
         );
 
         qm31 quotient = qm31{cm31{0, 0}, cm31{0, 0}};
-        for (uint32_t i = 0; i < sample_size; ++i) {
-            // Bound live state through the inversion before loading QM31 data.
-            const cm31 denominator_inverse =
-                denominator_inverse_for_sample(sample_points[i], domain_point);
-            uint32_t partial_log_size = partial_numerator_log_sizes[i];
-            uint32_t log_ratio = domain_log_size - partial_log_size;
-            uint32_t lifted_idx = (row >> (log_ratio + 1) << 1) + (row & 1);
+        for (uint32_t sample_start = 0; sample_start < sample_size;
+             sample_start += COMBINE_QUOTIENT_INVERSE_CHUNK) {
+            const uint32_t remaining = sample_size - sample_start;
+            const uint32_t sample_count = remaining < COMBINE_QUOTIENT_INVERSE_CHUNK
+                ? remaining
+                : COMBINE_QUOTIENT_INVERSE_CHUNK;
+            cm31 denominator_inverses[COMBINE_QUOTIENT_INVERSE_CHUNK];
+            quotient_inverse_chunk<COMBINE_QUOTIENT_INVERSE_CHUNK>(
+                    sample_points,
+                    sample_start,
+                    sample_count,
+                    domain_point,
+                    denominator_inverses);
 
-            qm31 partial_numerator = qm31{
-                    cm31{
-                            partial_numerators_0[i][lifted_idx],
-                            partial_numerators_1[i][lifted_idx]
-                    },
-                    cm31{
-                            partial_numerators_2[i][lifted_idx],
-                            partial_numerators_3[i][lifted_idx]
-                    }
-            };
-            qm31 full_numerator = sub(
-                    partial_numerator,
-                    mul_by_scalar(first_linear_term_accs[i], domain_point.y)
-            );
-            quotient = add(quotient, mul(full_numerator, denominator_inverse));
+#pragma unroll
+            for (uint32_t offset = 0; offset < COMBINE_QUOTIENT_INVERSE_CHUNK;
+                 ++offset) {
+                if (offset >= sample_count) {
+                    continue;
+                }
+                const uint32_t sample = sample_start + offset;
+                uint32_t partial_log_size = partial_numerator_log_sizes[sample];
+                uint32_t log_ratio = domain_log_size - partial_log_size;
+                uint32_t lifted_idx = (row >> (log_ratio + 1) << 1) + (row & 1);
+
+                qm31 partial_numerator = qm31{
+                        cm31{
+                                partial_numerators_0[sample][lifted_idx],
+                                partial_numerators_1[sample][lifted_idx]
+                        },
+                        cm31{
+                                partial_numerators_2[sample][lifted_idx],
+                                partial_numerators_3[sample][lifted_idx]
+                        }
+                };
+                qm31 full_numerator = sub(
+                        partial_numerator,
+                        mul_by_scalar(first_linear_term_accs[sample], domain_point.y)
+                );
+                quotient = add(
+                        quotient,
+                        mul(full_numerator, denominator_inverses[offset]));
+            }
         }
 
         result_column_0[row] = quotient.a.a;
@@ -320,8 +423,7 @@ void accumulate_quotients(
     stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 
-    // TODO: set to 1024
-    block_dim = 512;
+    block_dim = QUOTIENT_COMBINE_BLOCK_DIM;
     num_blocks = (domain_size + block_dim - 1) / block_dim;
     accumulate_quotients_in_gpu<<<num_blocks, block_dim>>>(
             half_coset_initial_index,
@@ -426,7 +528,7 @@ void combine_quotients_from_numerators(
         cuda_proving_clone_to_device<qm31>(first_linear_term_accs, sample_size);
     uint32_t *partial_numerator_log_sizes_device =
         cuda_proving_clone_to_device<uint32_t>(partial_numerator_log_sizes, sample_size);
-    int block_dim = 512;
+    int block_dim = QUOTIENT_COMBINE_BLOCK_DIM;
     int num_blocks = (domain_size + block_dim - 1) / block_dim;
     combine_quotients_from_numerators_in_gpu<<<num_blocks, block_dim>>>(
             half_coset_initial_index,
@@ -484,7 +586,7 @@ extern "C" int stwo_combine_quotients_from_numerators_on(
         return cudaErrorInvalidValue;
     }
 
-    constexpr int block_dim = 512;
+    constexpr int block_dim = QUOTIENT_COMBINE_BLOCK_DIM;
     const int num_blocks = (domain_size + block_dim - 1) / block_dim;
     combine_quotients_from_numerators_in_gpu<<<
         num_blocks, block_dim, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
