@@ -4,20 +4,25 @@
 //! Run receipts must place this JSON beside `nvidia-smi` identity/driver/clock output,
 //! `nvcc --version`, `rustc -Vv`, and `git rev-parse HEAD`; those are environment facts, not test
 //! semantics, so the existing pod wrapper owns them.
+//! Identity-complete records additionally set `STWO_SN3_NUMERATOR_SOURCE_PROJECTION_SHA256` and
+//! `STWO_SN3_NUMERATOR_CUDA_MODULE_SHA256`; a git HEAD alone is not an artifact identity.
 
-#![cfg(stwo_cuda_link)]
+#[path = "support/sn3_quotient_numerator_bench.rs"]
+mod sn3_quotient_numerator_bench;
 
-use std::time::Instant;
-
+use sn3_quotient_numerator_bench::{
+    artifact_identity, assert_affine_pattern_sanity, assert_canonical_output,
+    capture_canonical_output, input_recipe_digest, json_samples, percentile, poison_outputs,
+    replay_ms, source_pattern_seed, upload_affine_pattern, TWIDDLE_PATTERN_SEED,
+};
 use stwo::core::circle::{CirclePoint, SECURE_FIELD_CIRCLE_GEN};
 use stwo::core::fields::qm31::SecureField;
 use stwo_backend_cuda::{
     quotient_numerator_hybrid_plan, quotient_numerator_workspace_requirements, ArenaLayout,
-    ArenaSlice, ArenaSlotId, ArenaSlotSpec, CudaExecContext, CudaGraphExec, DeviceArena,
-    PreparedQuotientNumeratorGraph, QuotientNumeratorColumn, QuotientNumeratorColumnSource,
-    QuotientNumeratorColumnTopology, QuotientNumeratorDestination, QuotientNumeratorSourceKind,
-    QuotientNumeratorWorkspaceConfig, QuotientNumeratorWorkspaceRequirements,
-    QuotientNumeratorWorkspaceSlots, QuotientOodsSample,
+    ArenaSlotId, ArenaSlotSpec, CudaExecContext, DeviceArena, PreparedQuotientNumeratorGraph,
+    QuotientNumeratorColumn, QuotientNumeratorColumnSource, QuotientNumeratorColumnTopology,
+    QuotientNumeratorDestination, QuotientNumeratorSourceKind, QuotientNumeratorWorkspaceConfig,
+    QuotientNumeratorWorkspaceRequirements, QuotientNumeratorWorkspaceSlots, QuotientOodsSample,
 };
 
 const CONFIG: QuotientNumeratorWorkspaceConfig = QuotientNumeratorWorkspaceConfig {
@@ -39,7 +44,16 @@ const HYBRID_LOGICAL_OUTPUT_BYTES: u64 = 20_266_867_968;
 const CHEAP_GPU_BUDGET_BYTES: u64 = 24 * 1024 * 1024 * 1024;
 const DEFAULT_WARMUPS: usize = 3;
 const DEFAULT_ITERATIONS: usize = 20;
-const COPY_CHUNK_WORDS: usize = 1 << 20;
+const EXPECTED_SN3_INPUT_RECIPE_BLAKE3: &str =
+    "ba4d8f134e932066012cd2795a05c359ee6f4ef568daf665da4a6b94295ee93a";
+const EAGER_LEGACY_POISON: u32 = 0xdead_beef;
+const EAGER_HYBRID_POISON: u32 = 0xa5a5_5a5a;
+const CAPTURE_LEGACY_POISON: u32 = 0x1357_9bdf;
+const CAPTURE_HYBRID_POISON: u32 = 0x2468_ace0;
+const POST_TIMING_LEGACY_POISON: u32 = 0x0bad_f00d;
+const POST_TIMING_HYBRID_POISON: u32 = 0xc001_d00d;
+const TIMED_LEGACY_POISON: u32 = 0x3141_5926;
+const TIMED_HYBRID_POISON: u32 = 0x2718_2818;
 
 const OODS_POINTS: ArenaSlotId = ArenaSlotId(100);
 const OODS_VALUES: ArenaSlotId = ArenaSlotId(101);
@@ -57,6 +71,7 @@ fn sn3_hybrid_graph_host_wall_benchmark() {
     let requirements = quotient_numerator_workspace_requirements(CONFIG, &topology).unwrap();
     let hybrid_plan = quotient_numerator_hybrid_plan(CONFIG, &topology).unwrap();
     assert_sn3_shape(&topology, &requirements, &hybrid_plan);
+    let input_recipe_blake3 = input_recipe_digest(&topology, &requirements, &hybrid_plan, &points);
 
     // All exact topology assertions above intentionally precede the first CUDA allocation.
     let legacy_fixture = BenchmarkArena::new(&topology, &requirements);
@@ -94,21 +109,40 @@ fn sn3_hybrid_graph_host_wall_benchmark() {
         &topology,
         &requirements,
         &points,
-        0xdead_beef,
+        EAGER_LEGACY_POISON,
     );
     initialize(
         &hybrid_fixture,
         &topology,
         &requirements,
         &points,
-        0xa5a5_5a5a,
+        EAGER_HYBRID_POISON,
     );
     legacy.launch().unwrap();
     hybrid.launch().unwrap();
     legacy_fixture.arena.context().sync().unwrap();
     hybrid_fixture.arena.context().sync().unwrap();
-    let validated_output_bytes =
-        assert_full_output_equality(&legacy_fixture, &hybrid_fixture, &requirements);
+    let eager = capture_canonical_output(&legacy_fixture, &requirements);
+    let eager_hybrid_blake3 =
+        assert_canonical_output(&hybrid_fixture, &requirements, &eager, "eager hybrid");
+    let validated_numerator_output_bytes = requirements
+        .groups
+        .iter()
+        .map(|group| group.value_words as u64)
+        .sum::<u64>()
+        .checked_mul(16)
+        .unwrap();
+    let validated_auxiliary_output_bytes = (requirements.groups.len() as u64)
+        .checked_mul(12 * 4)
+        .unwrap();
+    let validated_canonical_output_bytes = eager.len_bytes();
+    assert_eq!(validated_numerator_output_bytes, 402_644_224);
+    assert_eq!(validated_auxiliary_output_bytes, 912);
+    assert_eq!(validated_canonical_output_bytes, 402_645_136);
+    assert_eq!(
+        validated_canonical_output_bytes,
+        validated_numerator_output_bytes + validated_auxiliary_output_bytes
+    );
 
     let capture = legacy_fixture.arena.context().capture().unwrap();
     legacy.launch().unwrap();
@@ -116,6 +150,17 @@ fn sn3_hybrid_graph_host_wall_benchmark() {
     let capture = hybrid_fixture.arena.context().capture().unwrap();
     hybrid.launch().unwrap();
     let hybrid_graph = capture.finish().unwrap();
+
+    poison_outputs(&legacy_fixture, &requirements, CAPTURE_LEGACY_POISON);
+    poison_outputs(&hybrid_fixture, &requirements, CAPTURE_HYBRID_POISON);
+    legacy_graph.launch(legacy_fixture.arena.context()).unwrap();
+    legacy_fixture.arena.context().sync().unwrap();
+    hybrid_graph.launch(hybrid_fixture.arena.context()).unwrap();
+    hybrid_fixture.arena.context().sync().unwrap();
+    let captured_legacy_blake3 =
+        assert_canonical_output(&legacy_fixture, &requirements, &eager, "captured legacy");
+    let captured_hybrid_blake3 =
+        assert_canonical_output(&hybrid_fixture, &requirements, &eager, "captured hybrid");
 
     for round in 0..DEFAULT_WARMUPS {
         if round % 2 == 0 {
@@ -129,12 +174,39 @@ fn sn3_hybrid_graph_host_wall_benchmark() {
 
     let iterations = std::env::var("STWO_SN3_NUMERATOR_BENCH_ITERS")
         .ok()
-        .and_then(|value| value.parse().ok())
-        .filter(|&value| value > 0)
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .expect("STWO_SN3_NUMERATOR_BENCH_ITERS must be an integer")
+        })
         .unwrap_or(DEFAULT_ITERATIONS);
+    assert!(
+        iterations >= 5,
+        "formal SN3 numerator A/B requires at least five iterations"
+    );
     let mut legacy_ms = Vec::with_capacity(iterations);
     let mut hybrid_ms = Vec::with_capacity(iterations);
-    for iteration in 0..iterations {
+
+    // Sample zero is causally bound to work by poisoning immediately before the measured graph
+    // replay and validating that exact replay in full before either graph runs again.
+    poison_outputs(&legacy_fixture, &requirements, TIMED_LEGACY_POISON);
+    poison_outputs(&hybrid_fixture, &requirements, TIMED_HYBRID_POISON);
+    legacy_ms.push(replay_ms(&legacy_graph, legacy_fixture.arena.context()));
+    hybrid_ms.push(replay_ms(&hybrid_graph, hybrid_fixture.arena.context()));
+    let timed_legacy_blake3 = assert_canonical_output(
+        &legacy_fixture,
+        &requirements,
+        &eager,
+        "timed legacy sample 0",
+    );
+    let timed_hybrid_blake3 = assert_canonical_output(
+        &hybrid_fixture,
+        &requirements,
+        &eager,
+        "timed hybrid sample 0",
+    );
+
+    for iteration in 1..iterations {
         if iteration % 2 == 0 {
             legacy_ms.push(replay_ms(&legacy_graph, legacy_fixture.arena.context()));
             hybrid_ms.push(replay_ms(&hybrid_graph, hybrid_fixture.arena.context()));
@@ -144,21 +216,52 @@ fn sn3_hybrid_graph_host_wall_benchmark() {
         }
     }
 
+    poison_outputs(&legacy_fixture, &requirements, POST_TIMING_LEGACY_POISON);
+    poison_outputs(&hybrid_fixture, &requirements, POST_TIMING_HYBRID_POISON);
+    legacy_graph.launch(legacy_fixture.arena.context()).unwrap();
+    legacy_fixture.arena.context().sync().unwrap();
+    hybrid_graph.launch(hybrid_fixture.arena.context()).unwrap();
+    hybrid_fixture.arena.context().sync().unwrap();
+    let post_timing_legacy_blake3 =
+        assert_canonical_output(&legacy_fixture, &requirements, &eager, "post-timing legacy");
+    let post_timing_hybrid_blake3 =
+        assert_canonical_output(&hybrid_fixture, &requirements, &eager, "post-timing hybrid");
+    let artifact_identity = artifact_identity();
+
     let legacy_p50 = percentile(&legacy_ms, 50);
     let legacy_p95 = percentile(&legacy_ms, 95);
     let hybrid_p50 = percentile(&hybrid_ms, 50);
     let hybrid_p95 = percentile(&hybrid_ms, 95);
     println!(
         concat!(
-            "{{\"schema\":\"stwo.sn3_quotient_numerator_hybrid.host_wall.v1\"," ,
+            "{{\"schema\":\"stwo.sn3_quotient_numerator_hybrid.host_wall.v3\"," ,
             "\"timing_scope\":\"per-replay host wall: graph launch plus stream synchronize; not CUDA events\"," ,
             "\"percentile_method\":\"nearest-rank\"," ,
+            "\"result_class\":\"diagnostic same-lineage schedule A/B; not independent mathematical truth\"," ,
+            "\"input_pattern\":\"input-recipe-sealed nonzero canonical-M31 affine row pattern; bounded chunked upload\"," ,
             "\"topology\":{{\"group_logs\":{:?},\"groups\":19,\"eligible_groups\":18," ,
             "\"legacy_groups\":1,\"coefficient_sources\":152,\"coefficient_batches\":74," ,
             "\"terms\":6341}},\"bytes\":{{\"legacy_logical_output\":{}," ,
             "\"hybrid_logical_output\":{},\"validated_numerator_output\":{}," ,
+            "\"validated_auxiliary_output\":{},\"validated_canonical_output\":{}," ,
             "\"legacy_arena\":{},\"hybrid_arena\":{},\"combined_arenas\":{}}}," ,
-            "\"warmups\":{},\"iterations\":{},\"samples_ms\":{{\"legacy\":{},\"hybrid\":{}}}," ,
+            "\"identity\":{{\"output_digest_encoding\":\"framed u32 little-endian v1\"," ,
+            "\"input_recipe_encoding\":\"typed topology, descriptors, and affine row recipes v2\"," ,
+            "\"input_recipe_blake3\":\"{}\",\"eager_legacy_blake3\":\"{}\"," ,
+            "\"eager_hybrid_blake3\":\"{}\",\"captured_legacy_blake3\":\"{}\"," ,
+            "\"captured_hybrid_blake3\":\"{}\",\"timed_sample_index\":0," ,
+            "\"timed_sample_causally_validated\":true,\"timed_legacy_blake3\":\"{}\"," ,
+            "\"timed_hybrid_blake3\":\"{}\",\"post_timing_legacy_blake3\":\"{}\"," ,
+            "\"post_timing_hybrid_blake3\":\"{}\",\"capture_revalidated\":true," ,
+            "\"post_timing_revalidated\":true}}," ,
+            "\"artifact_identity\":{{\"candidate_current_source_blake3\":\"{}\"," ,
+            "\"test_binary_blake3\":\"{}\",\"source_projection_sha256\":{}," ,
+            "\"cuda_module_sha256\":{},\"cuda_build_mode\":\"{}\"," ,
+            "\"identity_complete\":{}}}," ,
+            "\"comparator\":{{\"lineage\":\"same prepared implementation lineage; hybrid adds the single-write schedule and both reuse legacy kernels\"," ,
+            "\"independent_truth\":false}}," ,
+            "\"warmups\":{},\"iterations\":{},\"minimum_iterations\":5," ,
+            "\"samples_ms\":{{\"legacy\":{},\"hybrid\":{}}}," ,
             "\"host_wall_ms\":{{\"legacy\":{{\"p50\":{:.6},\"p95\":{:.6}}}," ,
             "\"hybrid\":{{\"p50\":{:.6},\"p95\":{:.6}}}}}," ,
             "\"speedup\":{{\"p50\":{:.9},\"p95\":{:.9}}}}}"
@@ -166,10 +269,27 @@ fn sn3_hybrid_graph_host_wall_benchmark() {
         GROUP_LOGS,
         LEGACY_LOGICAL_OUTPUT_BYTES,
         HYBRID_LOGICAL_OUTPUT_BYTES,
-        validated_output_bytes,
+        validated_numerator_output_bytes,
+        validated_auxiliary_output_bytes,
+        validated_canonical_output_bytes,
         legacy_fixture.allocation_bytes,
         hybrid_fixture.allocation_bytes,
         combined_arena_bytes,
+        input_recipe_blake3,
+        eager.digest(),
+        eager_hybrid_blake3,
+        captured_legacy_blake3,
+        captured_hybrid_blake3,
+        timed_legacy_blake3,
+        timed_hybrid_blake3,
+        post_timing_legacy_blake3,
+        post_timing_hybrid_blake3,
+        artifact_identity.candidate_source_blake3,
+        artifact_identity.test_binary_blake3,
+        artifact_identity.source_projection_json(),
+        artifact_identity.cuda_module_json(),
+        artifact_identity.cuda_build_mode,
+        artifact_identity.is_complete(),
         DEFAULT_WARMUPS,
         iterations,
         json_samples(&legacy_ms),
@@ -180,6 +300,23 @@ fn sn3_hybrid_graph_host_wall_benchmark() {
         hybrid_p95,
         legacy_p50 / hybrid_p50,
         legacy_p95 / hybrid_p95,
+    );
+}
+
+#[test]
+fn sn3_input_recipe_is_deterministic_and_shape_exact() {
+    assert_affine_pattern_sanity();
+    let (topology, points) = sn3_topology();
+    let requirements = quotient_numerator_workspace_requirements(CONFIG, &topology).unwrap();
+    let hybrid = quotient_numerator_hybrid_plan(CONFIG, &topology).unwrap();
+    assert_sn3_shape(&topology, &requirements, &hybrid);
+    let digest = input_recipe_digest(&topology, &requirements, &hybrid, &points);
+    assert_eq!(digest.to_hex().as_str(), EXPECTED_SN3_INPUT_RECIPE_BLAKE3);
+    let mut changed_points = points.clone();
+    changed_points.swap(0, 1);
+    assert_ne!(
+        input_recipe_digest(&topology, &requirements, &hybrid, &changed_points),
+        digest
     );
 }
 
@@ -500,169 +637,42 @@ fn initialize(
     points: &[CirclePoint<SecureField>],
     poison: u32,
 ) {
-    let values = (0..points.len())
-        .map(|index| {
-            let value = index as u32 * 16 + 1;
-            SecureField::from_u32_unchecked(value, value + 2, value + 4, value + 6)
-        })
-        .collect::<Vec<_>>();
+    let values = oods_values(points.len());
     upload(&fixture.arena, OODS_POINTS, &point_words(points));
     upload(&fixture.arena, OODS_VALUES, &secure_words(&values));
     upload(
         &fixture.arena,
         RANDOM_COEFFICIENT,
-        &secure_words(&[SecureField::from_u32_unchecked(307, 311, 313, 317)]),
+        &secure_words(&[random_coefficient()]),
     );
-    unsafe {
-        fixture
-            .arena
-            .context()
-            .fill_u32_async(
-                fixture.arena.bind(TWIDDLES).unwrap().as_u32_ptr(),
-                1,
-                requirements.forward_twiddle_words,
-            )
-            .unwrap();
-    }
+    upload_affine_pattern(
+        &fixture.arena,
+        TWIDDLES,
+        requirements.forward_twiddle_words,
+        TWIDDLE_PATTERN_SEED,
+    );
     for (index, (&id, column)) in fixture.source_ids.iter().zip(topology).enumerate() {
-        let value = ((index as u32 + 1) * 1_000_003) & 0x7fff_ffff;
-        let slice = fixture.arena.bind(id).unwrap();
-        unsafe {
-            fixture
-                .arena
-                .context()
-                .fill_u32_async(slice.as_u32_ptr(), value, source_words(column))
-                .unwrap();
-        }
+        upload_affine_pattern(
+            &fixture.arena,
+            id,
+            source_words(column),
+            source_pattern_seed(index),
+        );
     }
-    for id in [SAMPLE_POINTS_OUTPUT, FIRST_TERMS_OUTPUT] {
-        let slice = fixture.arena.bind(id).unwrap();
-        unsafe {
-            fixture
-                .arena
-                .context()
-                .fill_u32_async(slice.as_u32_ptr(), poison, slice.len_words())
-                .unwrap();
-        }
-    }
-    for ids in &fixture.destination_ids {
-        for &id in ids {
-            let slice = fixture.arena.bind(id).unwrap();
-            unsafe {
-                fixture
-                    .arena
-                    .context()
-                    .fill_u32_async(slice.as_u32_ptr(), poison, slice.len_words())
-                    .unwrap();
-            }
-        }
-    }
-    fixture.arena.context().sync().unwrap();
+    poison_outputs(fixture, requirements, poison);
 }
 
-fn assert_full_output_equality(
-    legacy: &BenchmarkArena,
-    hybrid: &BenchmarkArena,
-    requirements: &QuotientNumeratorWorkspaceRequirements,
-) -> u64 {
-    assert_range_equal(
-        &legacy.arena,
-        legacy.arena.bind(SAMPLE_POINTS_OUTPUT).unwrap(),
-        &hybrid.arena,
-        hybrid.arena.bind(SAMPLE_POINTS_OUTPUT).unwrap(),
-        requirements.groups.len() * 8,
-        "sample points",
-    );
-    assert_range_equal(
-        &legacy.arena,
-        legacy.arena.bind(FIRST_TERMS_OUTPUT).unwrap(),
-        &hybrid.arena,
-        hybrid.arena.bind(FIRST_TERMS_OUTPUT).unwrap(),
-        requirements.groups.len() * 4,
-        "first terms",
-    );
-    let mut output_words = 0usize;
-    for (group, requirement) in requirements.groups.iter().enumerate() {
-        for coordinate in 0..4 {
-            assert_range_equal(
-                &legacy.arena,
-                legacy
-                    .arena
-                    .bind(legacy.destination_ids[group][coordinate])
-                    .unwrap(),
-                &hybrid.arena,
-                hybrid
-                    .arena
-                    .bind(hybrid.destination_ids[group][coordinate])
-                    .unwrap(),
-                requirement.value_words,
-                &format!("group {group} coordinate {coordinate}"),
-            );
-            output_words = output_words.checked_add(requirement.value_words).unwrap();
-        }
-    }
-    (output_words as u64).checked_mul(4).unwrap()
+fn oods_values(count: usize) -> Vec<SecureField> {
+    (0..count)
+        .map(|index| {
+            let value = index as u32 * 16 + 1;
+            SecureField::from_u32_unchecked(value, value + 2, value + 4, value + 6)
+        })
+        .collect()
 }
 
-fn assert_range_equal(
-    left_arena: &DeviceArena,
-    left: ArenaSlice,
-    right_arena: &DeviceArena,
-    right: ArenaSlice,
-    words: usize,
-    label: &str,
-) {
-    for offset in (0..words).step_by(COPY_CHUNK_WORDS) {
-        let count = COPY_CHUNK_WORDS.min(words - offset);
-        let mut left_host = vec![0u32; count];
-        let mut right_host = vec![0u32; count];
-        unsafe {
-            left_arena
-                .context()
-                .memcpy_d2h_async(
-                    left_host.as_mut_ptr().cast(),
-                    left.as_u32_ptr().add(offset).cast(),
-                    count * 4,
-                )
-                .unwrap();
-            right_arena
-                .context()
-                .memcpy_d2h_async(
-                    right_host.as_mut_ptr().cast(),
-                    right.as_u32_ptr().add(offset).cast(),
-                    count * 4,
-                )
-                .unwrap();
-        }
-        left_arena.context().sync().unwrap();
-        right_arena.context().sync().unwrap();
-        assert_eq!(left_host, right_host, "{label} differs at word {offset}");
-    }
-}
-
-fn replay_ms(graph: &CudaGraphExec, context: &CudaExecContext) -> f64 {
-    let started = Instant::now();
-    graph.launch(context).unwrap();
-    context.sync().unwrap();
-    started.elapsed().as_secs_f64() * 1_000.0
-}
-
-fn percentile(samples: &[f64], percentage: usize) -> f64 {
-    let mut sorted = samples.to_vec();
-    sorted.sort_by(f64::total_cmp);
-    let rank = (percentage * sorted.len()).div_ceil(100).saturating_sub(1);
-    sorted[rank]
-}
-
-fn json_samples(samples: &[f64]) -> String {
-    format!(
-        "[{}]",
-        samples
-            .iter()
-            .map(|sample| format!("{sample:.6}"))
-            .collect::<Vec<_>>()
-            .join(",")
-    )
+fn random_coefficient() -> SecureField {
+    SecureField::from_u32_unchecked(307, 311, 313, 317)
 }
 
 fn output_id(group: usize, coordinate: usize) -> ArenaSlotId {

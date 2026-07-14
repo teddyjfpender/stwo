@@ -20,6 +20,7 @@ stwo-constraint-framework = { path = "../constraint-framework", version = "~2.2.
 ] }
 
 [dev-dependencies]
+blake3.workspace = true
 rand.workspace = true
 stwo-backend-testkit = { path = "../backend-testkit" }
 
