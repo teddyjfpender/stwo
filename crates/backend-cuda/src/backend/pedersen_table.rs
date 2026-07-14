@@ -78,6 +78,108 @@ pub enum RegisteredPedersenTableError {
     },
 }
 
+/// A recoverable, host-visible failure while constructing the process table.
+///
+/// Once one of these failures is observed, registration is poisoned for the
+/// process. Returning the same cause on every later call prevents a second
+/// builder from mixing a new allocation set with partially initialized state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PedersenTableRegistrationError {
+    CudaUnavailable,
+    EmptyTable,
+    RowCountOverflow {
+        requested_rows: usize,
+    },
+    NativeRowCountLimit {
+        padded_rows: usize,
+        max_rows: usize,
+    },
+    HostAllocationFailed {
+        allocation: &'static str,
+    },
+    FillPanicked {
+        column: usize,
+    },
+    ColumnLength {
+        column: usize,
+        expected: usize,
+        actual: usize,
+    },
+    PoolInitialization(crate::CudaRuntimeError),
+    DeviceUploadReturnedNull {
+        column: usize,
+    },
+    InvalidReadyGeometry(RegisteredPedersenTableError),
+    RequestGeometryMismatch {
+        requested_padded_rows: usize,
+        registered_padded_rows: usize,
+    },
+}
+
+impl core::fmt::Display for PedersenTableRegistrationError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::CudaUnavailable => f.write_str("CUDA kernels are not available in this build"),
+            Self::EmptyTable => f.write_str("the pedersen table has no rows"),
+            Self::RowCountOverflow { requested_rows } => write!(
+                f,
+                "pedersen row count {requested_rows} overflows power-of-two padding"
+            ),
+            Self::NativeRowCountLimit {
+                padded_rows,
+                max_rows,
+            } => write!(
+                f,
+                "padded pedersen row count {padded_rows} exceeds native upload limit {max_rows}"
+            ),
+            Self::HostAllocationFailed { allocation } => {
+                write!(f, "host allocation failed for {allocation}")
+            }
+            Self::FillPanicked { column } => {
+                write!(f, "pedersen column builder panicked at column {column}")
+            }
+            Self::ColumnLength {
+                column,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "pedersen column {column} has {actual} rows, expected {expected}"
+            ),
+            Self::PoolInitialization(error) => {
+                write!(f, "CUDA pool initialization failed: {error}")
+            }
+            Self::DeviceUploadReturnedNull { column } => {
+                write!(f, "device upload returned null at pedersen column {column}")
+            }
+            Self::InvalidReadyGeometry(error) => {
+                write!(
+                    f,
+                    "constructed pedersen table has invalid geometry: {error:?}"
+                )
+            }
+            Self::RequestGeometryMismatch {
+                requested_padded_rows,
+                registered_padded_rows,
+            } => write!(
+                f,
+                "requested pedersen geometry has {requested_padded_rows} padded rows, but the \
+                 registered table has {registered_padded_rows}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PedersenTableRegistrationError {}
+
+/// Snapshot of the process-wide registration state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PedersenTableRegistrationState {
+    Uninitialized,
+    Ready(RegisteredPedersenTable),
+    Poisoned(PedersenTableRegistrationError),
+}
+
 impl RegisteredPedersenTable {
     pub const fn n_rows(self) -> usize {
         self.n_rows
@@ -130,83 +232,247 @@ impl RegisteredPedersenTable {
     }
 }
 
-static REGISTERED: OnceLock<Option<RegisteredPedersenTable>> = OnceLock::new();
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum StoredRegistrationState {
+    Ready(RegisteredPedersenTable),
+    Poisoned(PedersenTableRegistrationError),
+}
 
-/// Upload the host pedersen table and register it as the device table.
-/// `n_rows` is the UNPADDED host row count; `fill_column(c, buf)` appends
-/// column `c`'s `n_rows` raw words to `buf` (cleared beforehand). Idempotent
-/// per process (first call wins). Returns `false` — callers must fall back to
-/// host lanes — on a stub build or a malformed column. The uploaded buffers
-/// are deliberately leaked: the table lives for the process, like the host
-/// static it mirrors.
-pub fn register_borrowed_pedersen_table(
+struct RegistrationSlot {
+    state: OnceLock<StoredRegistrationState>,
+}
+
+impl RegistrationSlot {
+    const fn new() -> Self {
+        Self {
+            state: OnceLock::new(),
+        }
+    }
+
+    fn try_register(
+        &self,
+        requested_rows: Result<usize, PedersenTableRegistrationError>,
+        build: impl FnOnce(usize) -> Result<RegisteredPedersenTable, PedersenTableRegistrationError>,
+    ) -> Result<RegisteredPedersenTable, PedersenTableRegistrationError> {
+        let state = self.state.get_or_init(|| {
+            let result = requested_rows.clone().and_then(|padded_rows| {
+                let table = build(padded_rows)?;
+                table
+                    .validate_exact_geometry(padded_rows)
+                    .map_err(PedersenTableRegistrationError::InvalidReadyGeometry)?;
+                Ok(table)
+            });
+            match result {
+                Ok(table) => StoredRegistrationState::Ready(table),
+                Err(error) => StoredRegistrationState::Poisoned(error),
+            }
+        });
+
+        match state {
+            StoredRegistrationState::Poisoned(error) => Err(error.clone()),
+            StoredRegistrationState::Ready(table) => {
+                let requested_padded_rows = requested_rows?;
+                if table.n_rows != requested_padded_rows {
+                    return Err(PedersenTableRegistrationError::RequestGeometryMismatch {
+                        requested_padded_rows,
+                        registered_padded_rows: table.n_rows,
+                    });
+                }
+                Ok(*table)
+            }
+        }
+    }
+
+    fn snapshot(&self) -> PedersenTableRegistrationState {
+        match self.state.get() {
+            None => PedersenTableRegistrationState::Uninitialized,
+            Some(StoredRegistrationState::Ready(table)) => {
+                PedersenTableRegistrationState::Ready(*table)
+            }
+            Some(StoredRegistrationState::Poisoned(error)) => {
+                PedersenTableRegistrationState::Poisoned(error.clone())
+            }
+        }
+    }
+
+    fn ready(&self) -> Option<RegisteredPedersenTable> {
+        match self.state.get() {
+            Some(StoredRegistrationState::Ready(table)) => Some(*table),
+            None | Some(StoredRegistrationState::Poisoned(_)) => None,
+        }
+    }
+}
+
+struct PendingDeviceColumns {
+    pointers: Vec<*mut u32>,
+    published: bool,
+}
+
+impl PendingDeviceColumns {
+    fn new() -> Result<Self, PedersenTableRegistrationError> {
+        let mut pointers = Vec::new();
+        pointers
+            .try_reserve_exact(PEDERSEN_TABLE_N_COLUMNS)
+            .map_err(|_| PedersenTableRegistrationError::HostAllocationFailed {
+                allocation: "pedersen device-pointer list",
+            })?;
+        Ok(Self {
+            pointers,
+            published: false,
+        })
+    }
+
+    fn mark_published(&mut self) {
+        self.published = true;
+    }
+}
+
+impl Drop for PendingDeviceColumns {
+    fn drop(&mut self) {
+        if self.published {
+            return;
+        }
+        for pointer in self.pointers.drain(..) {
+            unsafe {
+                // This is the only available deallocator. It returns no status;
+                // native code logs an async-free failure and falls back to a
+                // synchronous free.
+                bindings::cuda_free_memory(pointer.cast());
+            }
+        }
+    }
+}
+
+static REGISTERED: RegistrationSlot = RegistrationSlot::new();
+
+fn requested_padded_rows(n_rows: usize) -> Result<usize, PedersenTableRegistrationError> {
+    if n_rows == 0 {
+        return Err(PedersenTableRegistrationError::EmptyTable);
+    }
+    let padded_rows = n_rows.checked_next_power_of_two().ok_or(
+        PedersenTableRegistrationError::RowCountOverflow {
+            requested_rows: n_rows,
+        },
+    )?;
+    // The legacy upload entry point takes a C `int`, despite the generated
+    // Rust declaration using `u32`. Reject values that would become negative.
+    let max_rows = i32::MAX as usize;
+    if padded_rows > max_rows {
+        return Err(PedersenTableRegistrationError::NativeRowCountLimit {
+            padded_rows,
+            max_rows,
+        });
+    }
+    Ok(padded_rows)
+}
+
+fn build_borrowed_pedersen_table(
+    n_rows: usize,
+    padded_rows: usize,
+    fill_column: &mut impl FnMut(usize, &mut Vec<u32>),
+) -> Result<RegisteredPedersenTable, PedersenTableRegistrationError> {
+    if !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
+        return Err(PedersenTableRegistrationError::CudaUnavailable);
+    }
+    bindings::try_ensure_mem_pool_init()
+        .map_err(PedersenTableRegistrationError::PoolInitialization)?;
+
+    let mut pending = PendingDeviceColumns::new()?;
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(padded_rows).map_err(|_| {
+        PedersenTableRegistrationError::HostAllocationFailed {
+            allocation: "padded pedersen column buffer",
+        }
+    })?;
+
+    for column in 0..PEDERSEN_TABLE_N_COLUMNS {
+        buf.clear();
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            fill_column(column, &mut buf);
+        }))
+        .is_err()
+        {
+            return Err(PedersenTableRegistrationError::FillPanicked { column });
+        }
+        if buf.len() != n_rows {
+            return Err(PedersenTableRegistrationError::ColumnLength {
+                column,
+                expected: n_rows,
+                actual: buf.len(),
+            });
+        }
+
+        // Padding rows are 0. Real deduce indices never reach them, and raw
+        // words must not be canonicalized during transport.
+        buf.try_reserve_exact(padded_rows - buf.len())
+            .map_err(|_| PedersenTableRegistrationError::HostAllocationFailed {
+                allocation: "padded pedersen column buffer",
+            })?;
+        buf.resize(padded_rows, 0);
+        let device_pointer = unsafe {
+            bindings::copy_uint32_t_vec_from_host_to_device(buf.as_ptr(), padded_rows as u32)
+        };
+        if device_pointer.is_null() {
+            return Err(PedersenTableRegistrationError::DeviceUploadReturnedNull { column });
+        }
+        pending.pointers.push(device_pointer.cast_mut());
+    }
+
+    let columns = std::array::from_fn(|index| RegisteredPedersenColumn {
+        index,
+        device_address: pending.pointers[index] as usize,
+        len_words: padded_rows,
+    });
+    let table = RegisteredPedersenTable {
+        columns,
+        n_rows: padded_rows,
+    };
+    table
+        .validate_exact_geometry(padded_rows)
+        .map_err(PedersenTableRegistrationError::InvalidReadyGeometry)?;
+
+    // These legacy native APIs abort the process on CUDA allocation, copy,
+    // launch, or synchronization errors. They do not expose a status that Rust
+    // can poison and recover from. If both calls return, publication completed;
+    // only then may RAII release ownership and the OnceLock publish `Ready`.
+    unsafe {
+        stwo_backend_cuda_kernels::raw::pedersen_table_init(
+            pending.pointers.as_ptr(),
+            padded_rows as u32,
+        );
+        bindings::stwo_legacy_stream_sync();
+    }
+    pending.mark_published();
+    Ok(table)
+}
+
+/// Checked, one-shot upload and publication of the host pedersen table.
+///
+/// `n_rows` is the unpadded host row count. The fill closure must append exactly
+/// that many raw words for each column. A recoverable failure poisons this slot,
+/// frees every uploaded but unpublished prefix, and is returned unchanged on
+/// later calls without invoking their builders. A ready slot is reusable only
+/// for the same padded geometry.
+///
+/// The legacy upload and publication functions still terminate the process on
+/// native CUDA errors; such aborts cannot be represented as a Rust error until
+/// those native entry points return status codes.
+pub fn try_register_borrowed_pedersen_table(
     n_rows: usize,
     mut fill_column: impl FnMut(usize, &mut Vec<u32>),
-) -> bool {
-    REGISTERED
-        .get_or_init(|| {
-            if !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT || n_rows == 0 {
-                return None;
-            }
-            let padded = n_rows.next_power_of_two();
-            bindings::ensure_mem_pool_init();
+) -> Result<RegisteredPedersenTable, PedersenTableRegistrationError> {
+    REGISTERED.try_register(requested_padded_rows(n_rows), |padded_rows| {
+        build_borrowed_pedersen_table(n_rows, padded_rows, &mut fill_column)
+    })
+}
 
-            let mut device_ptrs: Vec<*mut u32> = Vec::with_capacity(PEDERSEN_TABLE_N_COLUMNS);
-            let mut buf: Vec<u32> = Vec::with_capacity(padded);
-            for c in 0..PEDERSEN_TABLE_N_COLUMNS {
-                buf.clear();
-                fill_column(c, &mut buf);
-                if buf.len() != n_rows {
-                    eprintln!(
-                        "pedersen table registration: column {c} has {} rows, expected {n_rows}",
-                        buf.len()
-                    );
-                    return None;
-                }
-                // Padding rows are 0 — the deduce functions' pow2 mask means only
-                // garbage inputs can read them; the differential gates own value
-                // correctness for real rows. Raw u32 transport (limbs are 9-bit
-                // values, but nothing here may canonicalize).
-                buf.resize(padded, 0);
-                let dev = unsafe {
-                    bindings::copy_uint32_t_vec_from_host_to_device(buf.as_ptr(), padded as u32)
-                };
-                if dev.is_null() {
-                    eprintln!("pedersen table registration: device upload failed (column {c})");
-                    return None;
-                }
-                device_ptrs.push(dev.cast_mut());
-            }
-            unsafe {
-                stwo_backend_cuda_kernels::raw::pedersen_table_init(
-                    device_ptrs.as_ptr(),
-                    padded as u32,
-                );
-            }
-            eprintln!(
-            "pedersen table: registered HOST-BUILT table on device ({PEDERSEN_TABLE_N_COLUMNS} \
-             cols x {padded} rows, borrowed mode)"
-        );
-            // The raw CUDA allocations have process lifetime. The temporary host
-            // pointer vector may be dropped because the C++ registration copied its
-            // pointer values into process-global state.
-            let columns = device_ptrs
-                .iter()
-                .enumerate()
-                .map(|(index, &device_ptr)| RegisteredPedersenColumn {
-                    index,
-                    device_address: device_ptr as usize,
-                    len_words: padded,
-                })
-                .collect::<Vec<_>>()
-                .try_into()
-                .expect("pedersen registration built exactly 56 columns");
-            Some(RegisteredPedersenTable {
-                columns,
-                n_rows: padded,
-            })
-        })
-        .is_some()
+/// Compatibility wrapper for callers that only distinguish device-ready from
+/// host fallback.
+pub fn register_borrowed_pedersen_table(
+    n_rows: usize,
+    fill_column: impl FnMut(usize, &mut Vec<u32>),
+) -> bool {
+    try_register_borrowed_pedersen_table(n_rows, fill_column).is_ok()
 }
 
 /// Whether a (successful) registration happened this process.
@@ -216,7 +482,13 @@ pub fn pedersen_table_registered() -> bool {
 
 /// Borrow the exact process-lifetime table without allocating or copying.
 pub fn registered_borrowed_pedersen_table() -> Option<RegisteredPedersenTable> {
-    REGISTERED.get().copied().flatten()
+    REGISTERED.ready()
+}
+
+/// Inspect whether registration has not run, is ready, or is deterministically
+/// poisoned by the first recoverable failure.
+pub fn pedersen_table_registration_state() -> PedersenTableRegistrationState {
+    REGISTERED.snapshot()
 }
 
 #[cfg(test)]
@@ -231,20 +503,105 @@ mod tests {
             }));
             assert!(!pedersen_table_registered());
             assert!(registered_borrowed_pedersen_table().is_none());
+            assert_eq!(
+                pedersen_table_registration_state(),
+                PedersenTableRegistrationState::Poisoned(
+                    PedersenTableRegistrationError::CudaUnavailable
+                )
+            );
+        }
+    }
+
+    fn table_with_rows(n_rows: usize) -> RegisteredPedersenTable {
+        RegisteredPedersenTable {
+            columns: std::array::from_fn(|index| RegisteredPedersenColumn {
+                index,
+                device_address: 0x1000 + index * 0x100,
+                len_words: n_rows,
+            }),
+            n_rows,
         }
     }
 
     #[test]
-    fn registered_geometry_is_ordered_and_fails_closed() {
-        let columns = std::array::from_fn(|index| RegisteredPedersenColumn {
-            index,
-            device_address: 0x1000 + index * 0x100,
-            len_words: 1 << 23,
-        });
-        let table = RegisteredPedersenTable {
-            columns,
-            n_rows: 1 << 23,
+    fn ready_registration_reuses_without_a_second_builder() {
+        let slot = RegistrationSlot::new();
+        let invocations = std::cell::Cell::new(0);
+        let first = slot
+            .try_register(Ok(32), |_| {
+                invocations.set(invocations.get() + 1);
+                Ok(table_with_rows(32))
+            })
+            .unwrap();
+        let second = slot
+            .try_register(Ok(32), |_| -> Result<_, PedersenTableRegistrationError> {
+                panic!("ready registration invoked a second builder")
+            })
+            .unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(invocations.get(), 1);
+    }
+
+    #[test]
+    fn ready_registration_rejects_request_geometry_drift() {
+        let slot = RegistrationSlot::new();
+        slot.try_register(Ok(32), |_| Ok(table_with_rows(32)))
+            .unwrap();
+
+        assert_eq!(
+            slot.try_register(Ok(64), |_| -> Result<_, PedersenTableRegistrationError> {
+                panic!("geometry drift invoked a second builder")
+            }),
+            Err(PedersenTableRegistrationError::RequestGeometryMismatch {
+                requested_padded_rows: 64,
+                registered_padded_rows: 32,
+            })
+        );
+    }
+
+    #[test]
+    fn malformed_column_poison_is_stable() {
+        let slot = RegistrationSlot::new();
+        let malformed = PedersenTableRegistrationError::ColumnLength {
+            column: 17,
+            expected: 32,
+            actual: 31,
         };
+
+        assert_eq!(
+            slot.try_register(Ok(32), |_| Err(malformed.clone())),
+            Err(malformed.clone())
+        );
+        assert_eq!(
+            slot.snapshot(),
+            PedersenTableRegistrationState::Poisoned(malformed)
+        );
+        assert!(slot.ready().is_none());
+    }
+
+    #[test]
+    fn poisoned_registration_never_invokes_another_builder() {
+        let slot = RegistrationSlot::new();
+        let invocations = std::cell::Cell::new(0);
+        let failure = PedersenTableRegistrationError::DeviceUploadReturnedNull { column: 3 };
+        let first = slot.try_register(Ok(32), |_| {
+            invocations.set(invocations.get() + 1);
+            Err(failure.clone())
+        });
+        let second = slot.try_register(Ok(32), |_| {
+            invocations.set(invocations.get() + 1);
+            Ok(table_with_rows(32))
+        });
+
+        assert_eq!(first, Err(failure.clone()));
+        assert_eq!(second, Err(failure));
+        assert_eq!(invocations.get(), 1);
+    }
+
+    #[test]
+    fn registered_geometry_is_ordered_and_fails_closed() {
+        let table = table_with_rows(1 << 23);
 
         assert!(table.has_exact_rows(1 << 23));
         assert!(!table.has_exact_rows(1 << 22));
