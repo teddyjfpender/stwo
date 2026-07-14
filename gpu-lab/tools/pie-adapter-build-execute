@@ -1,0 +1,8 @@
+#!/usr/bin/env python3
+"""Run one sealed, non-admitting host PIE-adapter build transaction."""
+
+from gpu_lab.pie_adapter_build_cli import main
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

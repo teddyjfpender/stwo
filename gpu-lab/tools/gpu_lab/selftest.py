@@ -30,6 +30,7 @@ from .fri_round6_execution_tests import fri_round6_execution_self_test
 from .fri_round6_loop_tests import fri_round6_loop_self_test
 from .loop import loop_self_test
 from .oracle import validate_oracle_index
+from .pie_adapter_build_execution_tests import pie_adapter_build_execution_self_test
 from .pie_adapter_cleanup_tests import pie_adapter_cleanup_self_test
 from .pie_adapter_contract_tests import pie_adapter_contract_self_test
 from .pie_adapter_execution_tests import pie_adapter_execution_self_test
@@ -77,7 +78,8 @@ def _source_shape_test(root: Path) -> tuple[int, Path, int]:
     for code_root in (root, companion):
         for path in code_root.rglob("*"):
             if (not path.is_file() or "__pycache__" in path.parts or "target" in path.parts
-                    or "cases" in path.parts or "schemas" in path.parts):
+                    or "receipt-targets" in path.parts or "cases" in path.parts
+                    or "schemas" in path.parts):
                 continue
             if path.suffix in suffixes or path.name in exact_names:
                 sources.append(path)
@@ -274,6 +276,7 @@ def self_test(root: Path) -> None:
     pie_adapter_cleanup_self_test(root)
     pie_adapter_inventory_self_test(root)
     pie_adapter_receipt_self_test(root)
+    pie_adapter_build_execution_self_test(root)
     for schema in ("semantic-fixture.schema.json", "semantic-fixture-index.schema.json",
                    "execution-manifest.schema.json", "host-oracle-index.schema.json",
                    "host-oracle-artifact-v2.schema.json",
@@ -284,7 +287,8 @@ def self_test(root: Path) -> None:
                    "pie-adapter-execution-record.schema.json",
                    "pie-adapter-source-inventory-v2.schema.json",
                    "pie-adapter-source-closure-v2.schema.json",
-                   "pie-adapter-build-receipt-v2.schema.json"):
+                   "pie-adapter-build-receipt-v2.schema.json",
+                   "pie-adapter-build-execution-record-v1.schema.json"):
         require(load_json(root / "schemas" / schema).get("$schema") is not None,
                 f"invalid schema document: {schema}")
     require(len(lab_tool_sha256()) == 64, "lab tool closure hash is invalid")

@@ -1,0 +1,179 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://stwo.dev/gpu-lab/pie-adapter-build-execution-record-v1.schema.json",
+  "title": "Stwo GPU lab sealed PIE adapter build execution record",
+  "$comment": "The mandatory Python validator additionally revalidates exact raw trust roots, live source closure, build recipe, target lifecycle, executable, and v2 receipt cross-relations. Builder image and its baked Cargo cache remain caller-declared trust roots; this schema does not claim runtime observation.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "evidence_mode", "passed", "build_execution_attested",
+    "causal_scope", "builder_status", "builder_runtime_attested", "writer_precondition", "production_admissible",
+    "correctness_admissible", "performance_admissible", "source_inventory",
+    "source_closure", "builder", "invocation", "source_revalidation",
+    "target_lifecycle", "child_result", "executable_publication", "adapter_executable", "build_receipt",
+    "receipt_binding"
+  ],
+  "properties": {
+    "schema_version": {"const": "stwo.gpu-lab.pie-adapter-build-execution-record.v1"},
+    "evidence_mode": {"const": "authenticated-fresh-pie-adapter-build"},
+    "passed": {"const": true},
+    "build_execution_attested": {"const": true},
+    "causal_scope": {"const": "declared-image-cache-trust-roots-and-live-source-direct-build-v1"},
+    "builder_status": {"const": "caller-declared-image-and-image-baked-cache-not-runtime-observed-v1"},
+    "builder_runtime_attested": {"const": false},
+    "writer_precondition": {"const": "caller-guaranteed-no-concurrent-source-target-or-artifact-writers-v1"},
+    "production_admissible": {"const": false},
+    "correctness_admissible": {"const": false},
+    "performance_admissible": {"const": false},
+    "source_inventory": {"$ref": "#/$defs/artifact"},
+    "source_closure": {"$ref": "#/$defs/artifact"},
+    "adapter_executable": {"$ref": "#/$defs/artifact"},
+    "build_receipt": {"$ref": "#/$defs/artifact"},
+    "builder": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["image_id", "image_digest", "tools", "cache_manifest", "cache_identity"],
+      "properties": {
+        "image_id": {"$ref": "#/$defs/image_sha"},
+        "image_digest": {"$ref": "#/$defs/image_sha"},
+        "tools": {
+          "type": "object", "additionalProperties": false,
+          "required": ["cargo", "rustc", "native_compiler_linker", "native_archiver"],
+          "properties": {
+            "cargo": {"$ref": "#/$defs/artifact"},
+            "rustc": {"$ref": "#/$defs/artifact"},
+            "native_compiler_linker": {"$ref": "#/$defs/artifact"},
+            "native_archiver": {"$ref": "#/$defs/artifact"}
+          }
+        },
+        "cache_manifest": {"$ref": "#/$defs/artifact"},
+        "cache_identity": {"$ref": "#/$defs/cache_identity"}
+      }
+    },
+    "invocation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract", "shell", "argv", "environment", "working_directory", "resource_limits", "wall_timeout_seconds"],
+      "properties": {
+        "contract": {"const": "direct-cargo-explicit-rustc-cc-linker-ar-v1"},
+        "shell": {"const": false},
+        "argv": {"type": "array", "minItems": 2, "maxItems": 64, "items": {"type": "string", "minLength": 1, "maxLength": 2048}},
+        "environment": {"type": "object", "minProperties": 4, "maxProperties": 64, "additionalProperties": {"type": "string", "maxLength": 4096}},
+        "working_directory": {"$ref": "#/$defs/absolute_path"},
+        "resource_limits": {
+          "type": "object", "additionalProperties": false,
+          "required": ["address_space_bytes", "data_bytes", "cpu_seconds", "file_size_bytes"],
+          "properties": {
+            "address_space_bytes": {"const": 17179869184},
+            "data_bytes": {"const": 12884901888},
+            "cpu_seconds": {"const": 1800},
+            "file_size_bytes": {"const": 1073741824}
+          }
+        },
+        "wall_timeout_seconds": {"const": 3600}
+      }
+    },
+    "source_revalidation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["contract", "before_inventory_raw_sha256", "after_inventory_raw_sha256", "before_source_closure_raw_sha256", "after_source_closure_raw_sha256", "canonical_inventory_sha256", "canonical_source_closure_sha256"],
+      "properties": {
+        "contract": {"const": "same-live-source-inventory-and-closure-before-after-v1"},
+        "before_inventory_raw_sha256": {"$ref": "#/$defs/sha256"},
+        "after_inventory_raw_sha256": {"$ref": "#/$defs/sha256"},
+        "before_source_closure_raw_sha256": {"$ref": "#/$defs/sha256"},
+        "after_source_closure_raw_sha256": {"$ref": "#/$defs/sha256"},
+        "canonical_inventory_sha256": {"$ref": "#/$defs/sha256"},
+        "canonical_source_closure_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "target_lifecycle": {
+      "type": "object", "additionalProperties": false,
+      "required": ["contract", "pre_launch", "post_launch", "fresh_transition"],
+      "properties": {
+        "contract": {"const": "fresh-absent-target-to-bounded-tree-v1"},
+        "pre_launch": {"const": "absent"},
+        "post_launch": {"$ref": "#/$defs/target_state"},
+        "fresh_transition": {"const": true}
+      }
+    },
+    "child_result": {
+      "type": "object", "additionalProperties": false,
+      "required": ["exit_status", "stdout", "stderr"],
+      "properties": {
+        "exit_status": {"const": 0},
+        "stdout": {"$ref": "#/$defs/stream"},
+        "stderr": {"$ref": "#/$defs/stream"}
+      }
+    },
+    "executable_publication": {
+      "type": "object", "additionalProperties": false,
+      "required": ["contract", "source_link_count", "detached", "source_sha256", "final_sha256", "byte_equal"],
+      "properties": {
+        "contract": {"const": "byte-checked-single-link-detach-v1"},
+        "source_link_count": {"type": "integer", "minimum": 1},
+        "detached": {"type": "boolean"},
+        "source_sha256": {"$ref": "#/$defs/sha256"},
+        "final_sha256": {"$ref": "#/$defs/sha256"},
+        "byte_equal": {"const": true}
+      }
+    },
+    "receipt_binding": {
+      "type": "object", "additionalProperties": false,
+      "required": ["raw_sha256", "canonical_build_receipt_sha256", "v2_build_execution_attested"],
+      "properties": {
+        "raw_sha256": {"$ref": "#/$defs/sha256"},
+        "canonical_build_receipt_sha256": {"$ref": "#/$defs/sha256"},
+        "v2_build_execution_attested": {"const": false}
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "image_sha": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "absolute_path": {"type": "string", "pattern": "^/(?!/)(?!.*(?:^|/)\\.\\.?(?:/|$))(?!.*\\\\).+$", "maxLength": 2048},
+    "artifact": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "byte_length", "sha256", "mode", "link_count"],
+      "properties": {
+        "path": {"$ref": "#/$defs/absolute_path"},
+        "byte_length": {"type": "integer", "minimum": 1},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "mode": {"type": "string", "pattern": "^0[0-7]{3}$"},
+        "link_count": {"const": 1}
+      }
+    },
+    "cache_identity": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "kind", "path", "builder_image_id", "builder_image_digest", "storage", "external_mount", "read_only", "runtime_observed"],
+      "properties": {
+        "schema_version": {"const": "stwo.gpu-lab.pie-adapter-builder-cache-identity.v1"},
+        "kind": {"const": "builder-image-baked-cargo-home-declared-v1"},
+        "path": {"$ref": "#/$defs/absolute_path"},
+        "builder_image_id": {"$ref": "#/$defs/image_sha"},
+        "builder_image_digest": {"$ref": "#/$defs/image_sha"},
+        "storage": {"const": "builder-image-layer"},
+        "external_mount": {"const": false},
+        "read_only": {"const": true},
+        "runtime_observed": {"const": false}
+      }
+    },
+    "stream": {
+      "type": "object", "additionalProperties": false,
+      "required": ["byte_length", "sha256"],
+      "properties": {"byte_length": {"type": "integer", "minimum": 0, "maximum": 8388608}, "sha256": {"$ref": "#/$defs/sha256"}}
+    },
+    "target_state": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "file_type", "device", "inode", "mode", "entries", "total_regular_bytes"],
+      "properties": {
+        "path": {"$ref": "#/$defs/absolute_path"},
+        "file_type": {"const": "directory"},
+        "device": {"type": "integer", "minimum": 0},
+        "inode": {"type": "integer", "minimum": 1},
+        "mode": {"type": "string", "pattern": "^0[0-7]{3}$"},
+        "entries": {"type": "integer", "minimum": 1, "maximum": 200000},
+        "total_regular_bytes": {"type": "integer", "minimum": 1, "maximum": 17179869184}
+      }
+    }
+  }
+}
