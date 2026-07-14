@@ -32,6 +32,7 @@
 #include <nvrtc.h>
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -99,6 +100,62 @@ std::atomic<bool> &require_aot() {
     return required;
 }
 
+// Admission closes exactly once. Operations admitted before that point may finish,
+// including publishing or enqueueing a runtime module, but the strict-mode setter does
+// not return until all of them have left their publication/launch scope. Operations
+// entering after closure observe require_aot=true before resolving a function, so they
+// can only load or launch AOT. This fences host enqueue, not asynchronous completion
+// of arbitrary prior GPU work; callers must close admission before proof work begins.
+struct StrictAotAdmission {
+    std::mutex mutex;
+    std::condition_variable drained;
+    bool closed = false;
+    size_t active_operations = 0;
+};
+
+StrictAotAdmission &strict_aot_admission() {
+    static StrictAotAdmission admission;
+    return admission;
+}
+
+class JitOperationAdmission {
+  public:
+    JitOperationAdmission() {
+        // Strict lookups are the hot path. Once admission is closed, avoid taking
+        // the mutex: the release/acquire pair also makes `closed` observable.
+        if (require_aot().load(std::memory_order_acquire)) return;
+        StrictAotAdmission &admission = strict_aot_admission();
+        std::lock_guard<std::mutex> guard(admission.mutex);
+        if (!admission.closed) {
+            ++admission.active_operations;
+            admitted_before_strict_ = true;
+        }
+    }
+
+    ~JitOperationAdmission() {
+        if (!admitted_before_strict_) return;
+        StrictAotAdmission &admission = strict_aot_admission();
+        std::lock_guard<std::mutex> guard(admission.mutex);
+        if (--admission.active_operations == 0) admission.drained.notify_all();
+    }
+
+    JitOperationAdmission(const JitOperationAdmission &) = delete;
+    JitOperationAdmission &operator=(const JitOperationAdmission &) = delete;
+
+  private:
+    bool admitted_before_strict_ = false;
+};
+
+void close_strict_aot_admission() {
+    StrictAotAdmission &admission = strict_aot_admission();
+    std::unique_lock<std::mutex> guard(admission.mutex);
+    admission.closed = true;
+    require_aot().store(true, std::memory_order_release);
+    admission.drained.wait(guard, [&admission] {
+        return admission.active_operations == 0;
+    });
+}
+
 struct JitCache {
     // Guards `functions` and `key_mutexes` only — held briefly for map lookups/inserts,
     // NEVER across a compile, so distinct-key compiles run concurrently.
@@ -113,6 +170,21 @@ struct JitCache {
 JitCache &jit_cache() {
     static JitCache cache;
     return cache;
+}
+
+// A runtime-origin entry is deliberately not a strict-mode cache hit. The caller
+// continues through the per-key compile path, resolves the embedded AOT entry, and
+// replaces this map slot. Missing AOT still fails closed in compile_kernel.
+bool try_use_cached_function(const CachedFunction &cached, CUfunction *out) {
+    if (require_aot().load(std::memory_order_acquire) &&
+        cached.origin != KernelOrigin::Aot) {
+        return false;
+    }
+    (cached.origin == KernelOrigin::Aot ? aot_counters().aot_cache_hits
+                                        : aot_counters().runtime_cache_hits)
+        .fetch_add(1, std::memory_order_relaxed);
+    *out = cached.function;
+    return true;
 }
 
 // Filesystem cache root: JIT-compiled kernels persist across processes, keyed by the
@@ -732,18 +804,8 @@ bool get_or_compile(const char *source, const char *kernel_name, uint64_t cache_
     {
         std::lock_guard<std::mutex> guard(cache.mutex);
         auto it = cache.functions.find(cache_key);
-        if (it != cache.functions.end()) {
-            if (require_aot().load(std::memory_order_acquire) &&
-                it->second.origin != KernelOrigin::Aot) {
-                aot_counters().strict_rejections.fetch_add(1, std::memory_order_relaxed);
-                return false;
-            }
-            (it->second.origin == KernelOrigin::Aot ? aot_counters().aot_cache_hits
-                                                    : aot_counters().runtime_cache_hits)
-                .fetch_add(1, std::memory_order_relaxed);
-            *out = it->second.function;
+        if (it != cache.functions.end() && try_use_cached_function(it->second, out))
             return true;
-        }
     }
 
     // Acquire (or create) this key's compile lock without holding the global lock
@@ -752,18 +814,8 @@ bool get_or_compile(const char *source, const char *kernel_name, uint64_t cache_
     {
         std::lock_guard<std::mutex> guard(cache.mutex);
         auto fit = cache.functions.find(cache_key);
-        if (fit != cache.functions.end()) {
-            if (require_aot().load(std::memory_order_acquire) &&
-                fit->second.origin != KernelOrigin::Aot) {
-                aot_counters().strict_rejections.fetch_add(1, std::memory_order_relaxed);
-                return false;
-            }
-            (fit->second.origin == KernelOrigin::Aot ? aot_counters().aot_cache_hits
-                                                     : aot_counters().runtime_cache_hits)
-                .fetch_add(1, std::memory_order_relaxed);
-            *out = fit->second.function;
+        if (fit != cache.functions.end() && try_use_cached_function(fit->second, out))
             return true;
-        }
         std::shared_ptr<std::mutex> &slot = cache.key_mutexes[cache_key];
         if (!slot) slot = std::make_shared<std::mutex>();
         key_lock = slot;
@@ -775,27 +827,20 @@ bool get_or_compile(const char *source, const char *kernel_name, uint64_t cache_
     {
         std::lock_guard<std::mutex> guard(cache.mutex);
         auto it = cache.functions.find(cache_key);
-        if (it != cache.functions.end()) {
-            if (require_aot().load(std::memory_order_acquire) &&
-                it->second.origin != KernelOrigin::Aot) {
-                aot_counters().strict_rejections.fetch_add(1, std::memory_order_relaxed);
-                return false;
-            }
-            (it->second.origin == KernelOrigin::Aot ? aot_counters().aot_cache_hits
-                                                    : aot_counters().runtime_cache_hits)
-                .fetch_add(1, std::memory_order_relaxed);
-            *out = it->second.function;
+        if (it != cache.functions.end() && try_use_cached_function(it->second, out))
             return true;
-        }
     }
 
+    // This lifetime is the publication fence: strict admission cannot return while a
+    // pre-admission compile can still load a module or insert it into the cache.
+    JitOperationAdmission publication_admission;
     CachedFunction compiled{nullptr, KernelOrigin::Runtime};
     if (!compile_kernel(source, kernel_name, cache_key, relax_opt, &compiled)) {
         return false;
     }
     {
         std::lock_guard<std::mutex> guard(cache.mutex);
-        cache.functions.emplace(cache_key, compiled);
+        cache.functions.insert_or_assign(cache_key, compiled);
     }
     *out = compiled.function;
     return true;
@@ -806,7 +851,7 @@ bool get_or_compile(const char *source, const char *kernel_name, uint64_t cache_
 extern "C" void stwo_cuda_jit_set_require_aot(bool required) {
     // Strictness is monotonic. Relaxing it while other proof threads execute
     // would make fallback policy schedule-dependent.
-    if (required) require_aot().store(true, std::memory_order_release);
+    if (required) close_strict_aot_admission();
 }
 
 extern "C" void stwo_cuda_jit_get_aot_stats(StwoCudaJitAotStats *out) {
@@ -929,6 +974,9 @@ extern "C" bool stwo_cuda_jit_eval_fused(
     uint32_t rc_base,
     bool relax_opt
 ) {
+    // Span function resolution through enqueue. A runtime cache hit admitted before
+    // strict closure cannot escape this wrapper and launch after admission returns.
+    JitOperationAdmission launch_admission;
     CUfunction function = nullptr;
     if (!get_or_compile(source, kernel_name, cache_key, relax_opt, &function)) {
         return false;
@@ -981,6 +1029,8 @@ extern "C" bool stwo_cuda_jit_eval_fused_on(
     bool relax_opt,
     void *stream
 ) {
+    // Same admission lifetime as the legacy-stream entry point above.
+    JitOperationAdmission launch_admission;
     CUfunction function = nullptr;
     if (!get_or_compile(source, kernel_name, cache_key, relax_opt, &function)) {
         return false;
@@ -1047,6 +1097,8 @@ extern "C" bool stwo_cuda_jit_witness_launch(
     // stream here only reorders independent lanes, never their data dependencies.
     void *stream
 ) {
+    // Same admission lifetime as the constraint launch entry points above.
+    JitOperationAdmission launch_admission;
     CUfunction function = nullptr;
     if (!get_or_compile(source, kernel_name, cache_key, relax_opt, &function)) {
         return false;

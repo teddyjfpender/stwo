@@ -40,9 +40,13 @@ pub fn contains_loaded_kernel(cache_key: u64, sm_major: u32, sm_minor: u32) -> b
 
 pub use stwo_backend_cuda_kernels::raw::CudaJitAotStats as RuntimeStats;
 
-/// Permanently select the fail-closed AOT-only lane for subsequent generated
-/// kernel lookups in this process. Call during prover construction, before any
-/// witness or composition work can populate the module cache.
+/// Permanently select the fail-closed AOT-only lane for generated kernels.
+///
+/// This closes runtime admission and waits for every previously admitted compile,
+/// cache publication, and launch enqueue to leave its native operation scope before
+/// returning. It does not synchronize completion of arbitrary GPU work that was already
+/// queued, so calling it during prover construction, before proof work begins, is a
+/// precondition.
 pub fn require_loaded_kernels() {
     unsafe { stwo_backend_cuda_kernels::raw::stwo_cuda_jit_set_require_aot(true) }
 }
@@ -228,4 +232,78 @@ pub fn witness_kernel_source(
         semantic_hash,
         source,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    #[derive(Default)]
+    struct AdmissionModel {
+        active: usize,
+        admitted: bool,
+        closed: bool,
+        runtime_resolved: bool,
+        setter_returned: bool,
+        side_effect_after_commit: bool,
+    }
+
+    impl AdmissionModel {
+        fn enter_runtime_operation(&mut self) {
+            self.admitted = !self.closed;
+            self.active += usize::from(self.admitted);
+        }
+
+        fn resolve_cached_runtime_function(&mut self) {
+            self.runtime_resolved = !self.closed;
+        }
+
+        fn publish_or_enqueue(&mut self) {
+            if self.runtime_resolved {
+                self.side_effect_after_commit |= self.setter_returned;
+            }
+        }
+
+        fn leave_runtime_operation(&mut self) {
+            self.active -= usize::from(self.admitted);
+            self.try_commit();
+        }
+
+        fn close_strict_admission(&mut self) {
+            self.closed = true;
+            self.try_commit();
+        }
+
+        fn try_commit(&mut self) {
+            self.setter_returned |= self.closed && self.active == 0;
+        }
+    }
+
+    #[test]
+    fn strict_commit_cannot_be_crossed_by_runtime_publication_or_launch() {
+        // Exhaust every linearization point for closure around a cached-runtime
+        // operation: enter, resolve, publish/enqueue, leave. Closing before resolve
+        // rejects the runtime origin; closing later waits for the operation guard.
+        for close_before_step in 0..=4 {
+            let mut model = AdmissionModel::default();
+            for step in 0..4 {
+                if close_before_step == step {
+                    model.close_strict_admission();
+                }
+                match step {
+                    0 => model.enter_runtime_operation(),
+                    1 => model.resolve_cached_runtime_function(),
+                    2 => model.publish_or_enqueue(),
+                    3 => model.leave_runtime_operation(),
+                    _ => unreachable!(),
+                }
+            }
+            if close_before_step == 4 {
+                model.close_strict_admission();
+            }
+            assert!(model.setter_returned);
+            assert!(
+                !model.side_effect_after_commit,
+                "closure step {close_before_step}"
+            );
+        }
+    }
 }
