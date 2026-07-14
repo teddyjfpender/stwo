@@ -122,6 +122,16 @@ mod tests {
     }
 
     #[test]
+    fn nofinal_ntt_shapes_pin_their_distinct_occupancy_bounds() {
+        let source = include_str!("../cuda/rfft.cu");
+        assert_eq!(
+            source.matches("LOG_VALS_PER_THREAD == 3 ? 6 : 2").count(),
+            1
+        );
+        assert!(source.contains("1u << (LOG_WARP + LOG_VALS_PER_THREAD)"));
+    }
+
+    #[test]
     fn prepared_oods_symbols_are_linked_in_cuda_and_stub_builds() {
         assert_ne!(raw::stwo_oods_derive_points_on as usize, 0);
         assert_ne!(raw::stwo_oods_eval_first_on as usize, 0);

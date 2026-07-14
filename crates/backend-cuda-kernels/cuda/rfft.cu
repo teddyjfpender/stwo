@@ -179,8 +179,11 @@ void evaluate_columns(const int *eval_domain_sizes, m31 **values, m31 *twiddles_
     cuda_proving_free(device_values);
 }
 
-
-
+// Keep both no-final shapes on their measured spill-free occupancy boundary.
+// On SM90, log3 compiles at 40 registers and admits six 256-thread blocks;
+// log4 compiles at 64 registers and admits two 512-thread blocks. A generic
+// two-block hint regresses log3 to 50 registers, while asking log4 for more
+// than two blocks spills, so the shape-specific bound is deliberate.
 template <unsigned LOG_VALS_PER_THREAD>
 __global__ __launch_bounds__(
     1u << (LOG_WARP + LOG_VALS_PER_THREAD),
