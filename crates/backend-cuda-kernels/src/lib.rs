@@ -33,6 +33,15 @@ mod tests {
     }
 
     #[test]
+    fn checked_pedersen_pool_symbols_are_linked_in_cuda_and_stub_builds() {
+        assert_ne!(raw::cuda_default_pool_alloc_checked as usize, 0);
+        assert_ne!(raw::cuda_default_pool_copy_h2d_checked as usize, 0);
+        assert_ne!(raw::cuda_default_pool_free_checked as usize, 0);
+        assert_ne!(raw::cuda_default_pool_stream_sync_checked as usize, 0);
+        assert_ne!(raw::stwo_pedersen_table_init_borrowed_checked as usize, 0);
+    }
+
+    #[test]
     fn prepared_quotient_symbols_are_linked_in_cuda_and_stub_builds() {
         assert_ne!(raw::stwo_combine_quotients_from_numerators_on as usize, 0);
         assert_ne!(raw::stwo_prepare_quotient_numerator_terms_on as usize, 0);
