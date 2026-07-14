@@ -126,6 +126,7 @@ container_cargo() {
     -v "${RUST_VOLUME}-cargo:/root/.cargo" \
     -e STWO_CUDA_OBJ_CACHE=/workspace/.docker_cuda_obj_cache \
     -e STWO_CUDA_ARCH="${ARCH}" -e STWO_CUDA_BUILD_JOBS="${JOBS}" \
+    -e CARGO_BUILD_JOBS="${JOBS}" \
     -e RUST_MIN_STACK=33554432 \
     -w /workspace "$IMAGE" bash -lc "
       set -e
@@ -143,7 +144,7 @@ if [[ "$MODE" == "link" ]]; then
   # from (or mismatched in) the real nvcc archive — only producing the archive
   # and LINKING the cfg(stwo_cuda_link) test binaries proves symbol coherence.
   # No GPU needed: linking resolves symbols without executing kernels.
-  container_cargo "cargo build -p stwo-backend-cuda-kernels && cargo test -p stwo-backend-cuda --no-run"
+  container_cargo "cargo build --locked -p stwo-backend-cuda-kernels && cargo test --locked -p stwo-backend-cuda --no-run"
   echo '[cuda_compile_check] link-mode PASS (archive built, all native test binaries linked)'
   exit 0
 fi

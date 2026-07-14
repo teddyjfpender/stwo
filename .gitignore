@@ -11,3 +11,4 @@ perf.data
 perf.data.old
 .tldr/
 .claude/cache/core
+.docker_cuda_obj_cache/
