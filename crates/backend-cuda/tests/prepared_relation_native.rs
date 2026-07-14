@@ -19,6 +19,7 @@ use stwo_backend_cuda::{
 
 const SECURE_WORDS: usize = 4;
 const LARGE_MEMORY_VALUE_ID_BASE: u32 = 0x4000_0000;
+const WIDE_TUPLE_WORDS: u32 = 33;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct InstanceSnapshot {
@@ -53,13 +54,15 @@ fn relation_use(
 fn cairo_program() -> RelationKernelProgram {
     use {RelationMultiplicityKind as Multiplicity, RelationTupleKind as Tuple};
 
-    // One tuple wider than RELATION_FUSED_MAX_TUPLE_WORDS so the fused-mode
-    // run exercises the static per-instance fallback to the 3-stage kernels.
-    let wide_tuple_words = RELATION_FUSED_MAX_TUPLE_WORDS + 1;
+    // Exercise all three body classes in one captured graph: the original
+    // narrow fused lane, the generated-Cairo one-read wide lane, and a tuple
+    // beyond the audited wide envelope that must retain the 3-stage fallback.
+    let wide_tuple_words = WIDE_TUPLE_WORDS;
+    let fallback_tuple_words = RELATION_FUSED_MAX_TUPLE_WORDS + 1;
     let mut program = RelationKernelProgram {
         relation_graph_hash: 0x7396_3831_c53d_f4a2,
-        template_use_count: 8,
-        max_alpha_powers: wide_tuple_words,
+        template_use_count: 9,
+        max_alpha_powers: fallback_tuple_words,
         batches: vec![
             RelationBatchProgram {
                 source_layout: RelationSourceLayout::LookupWords { words: 6 },
@@ -192,6 +195,27 @@ fn cairo_program() -> RelationKernelProgram {
                     source_offset_rows: 0,
                 }],
             },
+            RelationBatchProgram {
+                source_layout: RelationSourceLayout::LookupWords {
+                    words: fallback_tuple_words + 1,
+                },
+                columns: vec![RelationColumnDescriptor {
+                    uses: vec![relation_use(
+                        Tuple::LookupWords,
+                        0,
+                        fallback_tuple_words,
+                        31,
+                        Multiplicity::LookupWord,
+                        fallback_tuple_words,
+                        true,
+                    )],
+                }],
+                instances: vec![RelationRowExtent::Exact {
+                    n_real_rows: 11,
+                    padded_rows: 16,
+                    source_offset_rows: 0,
+                }],
+            },
         ],
     };
     // Exercise a non-power-of-two column batch and a three-step dependency
@@ -239,10 +263,14 @@ fn host_sources(seed: u32) -> Vec<Vec<Vec<u32>>> {
         ]
     };
 
-    // Wide-tuple lookup batch: (RELATION_FUSED_MAX_TUPLE_WORDS + 2) word
-    // columns over 16 rows, fused-ineligible by construction.
-    let wide_lookup = vec![(0..(RELATION_FUSED_MAX_TUPLE_WORDS + 2) * 16)
+    // One-read wide lookup batch: 33 tuple words plus its multiplicity column.
+    let wide_lookup = vec![(0..(WIDE_TUPLE_WORDS + 1) * 16)
         .map(|index| (seed + 13 + 29 * index) % 2027)
+        .collect()];
+
+    // One word beyond the audited wide envelope, retained on the 3-stage lane.
+    let fallback_lookup = vec![(0..(RELATION_FUSED_MAX_TUPLE_WORDS + 2) * 16)
+        .map(|index| (seed + 19 + 31 * index) % 2039)
         .collect()];
 
     vec![
@@ -251,6 +279,7 @@ fn host_sources(seed: u32) -> Vec<Vec<Vec<u32>>> {
         memory_big(0, 5),
         memory_big(1, 7),
         wide_lookup,
+        fallback_lookup,
     ]
 }
 
@@ -560,6 +589,7 @@ fn run_eager_capture_and_mutated_replay(
     tail: RelationTailMode,
     expected_kernel_nodes: &[u64],
     implicit_launch: bool,
+    poison_zero_denominator: bool,
 ) {
     let program = cairo_program();
     assert_eq!(
@@ -568,8 +598,8 @@ fn run_eager_capture_and_mutated_replay(
             .iter()
             .map(relation_batch_fused_eligible)
             .collect::<Vec<_>>(),
-        vec![true, true, true, false],
-        "the wide-tuple batch must classify as fused-ineligible"
+        vec![true, true, true, true, false],
+        "narrow, one-read wide, and too-wide fallback classification drifted"
     );
     let scan_probe = (1..=512)
         .map(SecureField::from)
@@ -756,6 +786,7 @@ fn run_eager_capture_and_mutated_replay(
             (2, 0, 8, 1, 4),
             (2, 1, 8, 1, 4),
             (3, 0, 16, 1, 4),
+            (4, 0, 16, 1, 4),
         ]
     );
 
@@ -806,6 +837,38 @@ fn run_eager_capture_and_mutated_replay(
         reference(&program, &second_sources, &second_alphas, second_z)
     );
     assert_ne!(replayed, eager, "replay ignored mutated sources/challenges");
+
+    if poison_zero_denominator {
+        assert_eq!(mode, RelationLaunchMode::Fused);
+        // Force the one-read wide instance's first denominator to zero, then
+        // replay the captured graph. The device trap must surface as a stream
+        // error; silently returning a zero inverse would leave stale committed
+        // output and violate the fail-closed LogUp contract.
+        let wide_batch = &program.batches[3];
+        let wide_use = wide_batch.columns[0].uses[0];
+        let wide_sources = &second_sources[4];
+        let mut zero_z = SecureField::zero();
+        for word in 0..wide_use.tuple_words {
+            zero_z += SecureField::from(tuple_word(wide_sources, 16, 0, 0, wide_use, word))
+                * second_alphas[word as usize];
+        }
+        prepared
+            .upload_challenges_at_transcript_boundary(RelationChallenges {
+                alpha_powers: &second_alphas,
+                z: zero_z,
+            })
+            .unwrap();
+        graph.launch(arena.context()).unwrap();
+        assert!(
+            arena.context().sync().is_err(),
+            "a zero wide-lane denominator must poison the captured launch"
+        );
+        // CUDA documents an illegal-instruction trap as context-fatal. This
+        // oracle already runs in an isolated child process; exit successfully
+        // now so poisoned-context destructors cannot obscure the observed
+        // stream error or contaminate any other native test.
+        std::process::exit(0);
+    }
 }
 
 #[test]
@@ -817,17 +880,20 @@ fn eager_capture_and_mutated_replay_match_cairo_reference() {
         RelationTailMode::Segmented,
         &[8],
         false,
+        false,
     );
 }
 
 #[test]
 fn fused_eager_capture_and_mutated_replay_match_cairo_reference() {
-    // One fused node + three per-instance fallback nodes for the wide-tuple
-    // batch (pairs, slab inverse, fraction chain) + five segmented tail nodes.
+    // One adaptive fused node covers narrow + one-read wide instances. Three
+    // per-instance fallback nodes cover only the >126-word batch, followed by
+    // five segmented tail nodes.
     run_eager_capture_and_mutated_replay(
         RelationLaunchMode::Fused,
         RelationTailMode::Segmented,
         &[9],
+        false,
         false,
     );
 }
@@ -842,17 +908,19 @@ fn scan_tail_eager_capture_and_mutated_replay_match_cairo_reference() {
         RelationTailMode::Scan,
         &[5],
         false,
+        false,
     );
 }
 
 #[test]
 fn fused_scan_tail_eager_capture_and_mutated_replay_match_cairo_reference() {
-    // Four fused-body nodes (fused + wide-tuple fallback pairs/inverse/chain)
-    // + two scan-tail kernels.
+    // Four body nodes (adaptive fused + too-wide fallback
+    // pairs/inverse/chain) + two scan-tail kernels.
     run_eager_capture_and_mutated_replay(
         RelationLaunchMode::Fused,
         RelationTailMode::Scan,
         &[6],
+        false,
         false,
     );
 }
@@ -867,5 +935,35 @@ fn compact_fused_implicit_launch_matches_cairo_reference() {
         RelationTailMode::Segmented,
         &[6, 9],
         true,
+        false,
     );
+}
+
+#[test]
+fn fused_zero_denominator_child_process() {
+    if std::env::var_os("STWO_RELATION_ZERO_DENOMINATOR_CHILD").is_none() {
+        return;
+    }
+    run_eager_capture_and_mutated_replay(
+        RelationLaunchMode::Fused,
+        RelationTailMode::Segmented,
+        &[9],
+        false,
+        true,
+    );
+}
+
+#[test]
+fn fused_zero_denominator_poison_is_fail_closed() {
+    // A device trap invalidates CUDA's process context. Run that contract test
+    // in this test binary's child process so the remaining native parity suite
+    // cannot inherit a poisoned primary context.
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("fused_zero_denominator_child_process")
+        .arg("--nocapture")
+        .env("STWO_RELATION_ZERO_DENOMINATOR_CHILD", "1")
+        .status()
+        .unwrap();
+    assert!(status.success(), "isolated zero-denominator oracle failed");
 }
