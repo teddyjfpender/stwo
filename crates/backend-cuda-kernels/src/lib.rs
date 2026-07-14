@@ -33,12 +33,19 @@ mod tests {
     }
 
     #[test]
-    fn checked_pedersen_pool_symbols_are_linked_in_cuda_and_stub_builds() {
+    fn recent_checked_abi_symbols_are_linked_in_cuda_and_stub_builds() {
         assert_ne!(raw::cuda_default_pool_alloc_checked as usize, 0);
         assert_ne!(raw::cuda_default_pool_copy_h2d_checked as usize, 0);
         assert_ne!(raw::cuda_default_pool_free_checked as usize, 0);
         assert_ne!(raw::cuda_default_pool_stream_sync_checked as usize, 0);
         assert_ne!(raw::stwo_pedersen_table_init_borrowed_checked as usize, 0);
+        assert_ne!(raw::stwo_cuda_device_snapshot as usize, 0);
+        assert_ne!(raw::stwo_preprocessed_alloc_u32_checked as usize, 0);
+        assert_ne!(raw::stwo_preprocessed_copy_h2d_checked as usize, 0);
+        assert_ne!(raw::stwo_preprocessed_gen_seq_checked as usize, 0);
+        assert_ne!(raw::stwo_preprocessed_gen_range_checked as usize, 0);
+        assert_ne!(raw::stwo_preprocessed_gen_xor_checked as usize, 0);
+        assert_ne!(raw::stwo_preprocessed_stream_sync_checked as usize, 0);
     }
 
     #[test]
