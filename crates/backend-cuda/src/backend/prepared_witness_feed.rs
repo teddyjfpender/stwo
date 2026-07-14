@@ -983,9 +983,10 @@ impl<'a> PreparedWitnessFeedGraph<'a> {
         )
     }
 
-    /// [`Self::prepare`] with an explicit kernel selection, bypassing the
-    /// process-global env switch — the parity seam letting one test process
-    /// compare both modes on identical inputs.
+    /// [`Self::prepare`] with an explicit kernel selection. This constructor
+    /// never reads `STWO_CUDA_FEED_PRIVATIZED`; immutable runtime generations
+    /// use it to pin [`WitnessFeedLaunchMode::GlobalAtomics`], while native
+    /// parity tests can select either mode on identical inputs.
     #[allow(clippy::too_many_arguments)]
     pub fn prepare_with_mode(
         arena: &'a DeviceArena,
@@ -1549,6 +1550,11 @@ mod tests {
         ] {
             assert!(!feed_privatized_flag_from(raw), "{raw:?} must stay OFF");
         }
+    }
+
+    #[test]
+    fn explicit_mode_constructor_is_host_visible() {
+        let _constructor = PreparedWitnessFeedGraph::prepare_with_mode;
     }
 
     #[test]

@@ -898,8 +898,9 @@ impl<'a> PreparedProgressiveCommitGraph<'a> {
         )
     }
 
-    /// Prepare an explicitly selected progressive commitment without an
-    /// environment recheck.
+    /// Prepare with the progressive mode selected explicitly. The legacy
+    /// interior-fusion environment switch remains in effect; immutable runtime
+    /// generations use [`Self::prepare_with_modes`] instead.
     #[allow(clippy::too_many_arguments)]
     pub fn prepare_with_mode(
         arena: &'a DeviceArena,
@@ -911,7 +912,7 @@ impl<'a> PreparedProgressiveCommitGraph<'a> {
         twiddles: ArenaSlice,
         mode: ProgressiveCommitMode,
     ) -> Result<Self, PreparedProgressiveCommitError> {
-        Self::prepare_inner(
+        Self::prepare_with_modes(
             arena,
             config,
             requirements,
@@ -919,8 +920,8 @@ impl<'a> PreparedProgressiveCommitGraph<'a> {
             coefficients,
             retained_outputs,
             twiddles,
-            super::blake2s::blake2s_interior_fused_enabled(),
             mode,
+            super::blake2s::blake2s_interior_fused_enabled(),
         )
     }
 
@@ -935,7 +936,7 @@ impl<'a> PreparedProgressiveCommitGraph<'a> {
         twiddles: ArenaSlice,
         interior_fused: bool,
     ) -> Result<Self, PreparedProgressiveCommitError> {
-        Self::prepare_inner(
+        Self::prepare_with_modes(
             arena,
             config,
             requirements,
@@ -943,13 +944,15 @@ impl<'a> PreparedProgressiveCommitGraph<'a> {
             coefficients,
             retained_outputs,
             twiddles,
-            interior_fused,
             ProgressiveCommitMode::from_env(),
+            interior_fused,
         )
     }
 
+    /// Prepare with both launch-topology axes selected explicitly. This is the
+    /// environment-free constructor for immutable runtime generations.
     #[allow(clippy::too_many_arguments)]
-    fn prepare_inner(
+    pub fn prepare_with_modes(
         arena: &'a DeviceArena,
         config: CommitWorkspaceConfig,
         requirements: &ProgressiveCommitWorkspaceRequirements,
@@ -957,10 +960,10 @@ impl<'a> PreparedProgressiveCommitGraph<'a> {
         coefficients: &[CommitCoefficientColumn],
         retained_outputs: &[Option<ArenaSlice>],
         twiddles: ArenaSlice,
+        progressive_mode: ProgressiveCommitMode,
         interior_fused: bool,
-        mode: ProgressiveCommitMode,
     ) -> Result<Self, PreparedProgressiveCommitError> {
-        progressive_prepare_mode_admission_for_mode(mode, &requirements.leaves)?;
+        progressive_prepare_mode_admission_for_mode(progressive_mode, &requirements.leaves)?;
         let workspace = requirements.arena_slot_requirements(slots)?;
         let workspace_ids = workspace
             .iter()
@@ -984,7 +987,7 @@ impl<'a> PreparedProgressiveCommitGraph<'a> {
             coefficients,
             retained_outputs,
             twiddles,
-            mode,
+            progressive_mode,
         )?;
         let merkle = PreparedMerkleFromLeaves::prepare_with_interior_mode(
             arena,

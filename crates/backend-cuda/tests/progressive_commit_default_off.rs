@@ -3,8 +3,8 @@
 use stwo_backend_cuda::{
     progressive_leaf_workspace_requirements, progressive_leaf_workspace_requirements_for_mode,
     progressive_prepare_mode_admission, progressive_prepare_mode_admission_for_mode,
-    PreparedProgressiveCommitError, ProgressiveCommitGeometry, ProgressiveCommitGroupGeometry,
-    ProgressiveCommitMode,
+    PreparedProgressiveCommitError, PreparedProgressiveCommitGraph, ProgressiveCommitGeometry,
+    ProgressiveCommitGroupGeometry, ProgressiveCommitMode,
 };
 
 fn geometry() -> ProgressiveCommitGeometry {
@@ -16,6 +16,11 @@ fn geometry() -> ProgressiveCommitGeometry {
             retain_evaluations: false,
         }],
     }
+}
+
+#[test]
+fn fully_explicit_graph_constructor_is_host_visible() {
+    let _constructor = PreparedProgressiveCommitGraph::prepare_with_modes;
 }
 
 #[test]
