@@ -89,6 +89,8 @@ __device__ __constant__ uint8_t BG_FINAL_COLS[20] = {
 DEVICE_FORCEINLINE uint32_t lo16(uint32_t x) { return x & 0xFFFFu; }
 DEVICE_FORCEINLINE uint32_t hi16(uint32_t x) { return x >> 16; }
 
+#include "blake_g_fused_scalar.cuh"
+
 // One thread per output row. Writes all 73 columns (0..52 trace, 53..72 aux).
 // `inputs` is column_length * 6 raw u32 words, row-major (6 blake_g input words
 // per row; padding rows already carry the host's replicated first input).
@@ -560,9 +562,8 @@ extern "C" int blake_g_write_trace_fused_into_on(
         fused_feed.counts[counts] = counts_host[counts];
     }
     uint32_t blocks = (column_length + BG_BLOCK - 1) / BG_BLOCK;
-    blake_g_write_trace_kernel<<<blocks, BG_BLOCK, 0, stream>>>(
-        nullptr, column_inputs, nullptr, 0, 0, n_rows, column_length,
-        nullptr, resident, fused_feed);
+    blake_g_write_trace_fused_scalar_kernel<<<blocks, BG_BLOCK, 0, stream>>>(
+        column_inputs, n_rows, column_length, resident, fused_feed);
     return static_cast<int>(cudaGetLastError());
 }
 
