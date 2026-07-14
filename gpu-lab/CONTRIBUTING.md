@@ -2,7 +2,9 @@
 
 GPU lab exists to make proof-backend work exact, fast to iterate on, and pleasant to review. A
 change is good only when it improves the system without weakening its semantic identity, evidence,
-or feedback loop. “It works” is necessary; it is not the taste bar.
+or feedback loop. “It works” is necessary; it is not the taste bar. This is the authoritative
+contribution contract for both `stwo/gpu-lab` and `stwo-cairo/gpu_benchmarks/lab`; the latter owns
+orchestration and independent-oracle production but must not fork these rules.
 
 Read the replacement architecture before changing a boundary or adding machinery:
 
@@ -70,6 +72,9 @@ do not recombine the dependency graph behind a convenient facade.
   module globals, supported shapes, and graph policy.
 - Arithmetic, transcript, channel, constraint, or proof-format changes require the repository's
   supervised soundness review. Infrastructure must not quietly redefine those semantics.
+- Prove the local gate can reject a deliberately wrong candidate before spending GPU time. Run
+  schema, identity, oracle, source-shape, and host-reference checks first; CUDA is confirmation of
+  a locally justified change, not a substitute for reasoning or review.
 - A correctness failure suppresses performance acceptance. A soft benchmark failure may preserve
   diagnostics and the loop/environment record, but it must expose no comparison metrics, fail the
   final performance gate, and remain impossible to promote.
@@ -127,12 +132,16 @@ volume. Acceptance and close must persist and verify the local outputs before te
 
 ## Change and review workflow
 
-1. State the semantic boundary, registered shape, ownership change, and expected metric before
-   coding.
+1. State the semantic boundary, registered shape, ownership change, expected metric, and smallest
+   falsifiable vertical slice before coding. Backend progress—not harness surface area—is the unit
+   of delivery.
 2. Add or identify an independent oracle and a mutation that proves the gate can fail.
-3. Change one cohesive module or slab. Compile one architecture and one cubin.
-4. Run CPU/schema/identity tests, then the tiny cheap-CUDA correctness case. Run sanitizers when
-   memory, aliasing, synchronization, or launch geometry changes.
+3. Change one cohesive module or slab. Compile one translation unit, one architecture, and one
+   cubin. Do not rebuild the full prover to answer a kernel-level question.
+4. Run CPU/schema/identity tests and request an adversarial review of arithmetic, ownership,
+   aliasing, lifetime, transcript, and claim boundaries. Resolve soundness findings before any GPU
+   run. Then run the tiny cheap-CUDA correctness case; run sanitizers when memory, aliasing,
+   synchronization, or launch geometry changes.
 5. Benchmark repeated samples; retain raw data and p5/p50/p95. Compare only matching device UUID/SM,
    driver, stable MIG/ECC/persistence/power-limit configuration, fixture, toolchain/flags, ABI, and
    shape; record the baseline and candidate module hashes.
@@ -145,6 +154,18 @@ volume. Acceptance and close must persist and verify the local outputs before te
    stage until its exit gate passes.
 8. Run a consolidated full proof only after a meaningful, locally sealed batch; use the exact
    accepted cubins and manifests.
+
+Ship that sequence in small, reviewable commits. Each commit should express one invariant,
+ownership change, slab, or evidence update; include its narrow local gate; and leave both worktrees
+free of generated products. Do not mix refactors, generated output, benchmark evidence, and a
+semantic change in one commit. Commit after every locally green boundary so another contributor can
+review, bisect, or continue without reconstructing an uncommitted design.
+
+Every performance commit records a quantitative before→after delta in the units the architecture
+claims to improve: passes, launches, bytes, live bytes, allocation count, source generations,
+registers/spills, latency distribution, or semantic throughput. Modelled deltas must be labelled
+modelled, hardware measurements must bind the complete identity tuple, and neither may be silently
+promoted into the other.
 
 Every review should be able to answer:
 

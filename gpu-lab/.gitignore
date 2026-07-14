@@ -1,2 +1,64 @@
+# Python bytecode and tool caches.
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local build trees and content-addressed scratch caches. Checked-in cases, manifests, and schemas
+# live outside these directories.
+/build/
+/cmake-build-*/
+/out/
+/.cache/
+/cache/
+
+# Generated CUDA/compiler products. Source CUDA remains tracked under kernels/.
+*.cubin
+*.ptx
+*.fatbin
+*.sass
+*.o
+*.obj
+*.d
+
+# CMake/Ninja state from an accidentally in-tree configure.
+/CMakeFiles/
+/CMakeCache.txt
+/cmake_install.cmake
+/build.ninja
+/.ninja_*
+/compile_commands.json
+
+# Ephemeral replay-loop output. Accepted baselines and durable evidence are promoted outside these
+# scratch trees; placeholder policy files remain visible.
+/runs/*
+/results/*
+/profiles/*
+/tmp/*
+!/runs/.gitkeep
+!/runs/.gitignore
+!/results/.gitkeep
+!/results/.gitignore
+!/profiles/.gitkeep
+!/profiles/.gitignore
+!/tmp/.gitkeep
+!/tmp/.gitignore
+
+# Nsight report databases are generated profiling products, never source fixtures.
+*.nsys-rep
+*.ncu-rep
+*.qdrep
+
+# Reviewed inputs/contracts stay visible even if a future fixture deliberately embeds a binary
+# module or profiler-shaped filename.
+!/cases/
+!/cases/**
+!/baselines/
+!/baselines/**
+!/manifests/
+!/manifests/**
+!/schemas/
+!/schemas/**
+!/evidence/
+!/evidence/**
