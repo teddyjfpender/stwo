@@ -324,13 +324,26 @@ fn run_boundary_case(
         .collect::<Vec<_>>();
     arena.context().sync().unwrap();
 
-    let prepared = PreparedProgressiveLeaves::prepare(
+    assert!(matches!(
+        PreparedProgressiveLeaves::prepare_with_mode(
+            &arena,
+            &requirements,
+            &slots,
+            &coefficients,
+            &retained,
+            arena.bind(TWIDDLES).unwrap(),
+            ProgressiveCommitMode::FullLifting,
+        ),
+        Err(stwo_backend_cuda::PreparedProgressiveCommitError::Disabled)
+    ));
+    let prepared = PreparedProgressiveLeaves::prepare_with_mode(
         &arena,
         &requirements,
         &slots,
         &coefficients,
         &retained,
         arena.bind(TWIDDLES).unwrap(),
+        ProgressiveCommitMode::DomainProgressive,
     )
     .unwrap();
     assert_eq!(requirements.lde_scratch_words, Some(expected_scratch_words));
@@ -423,7 +436,6 @@ fn run_boundary_case(
 
 #[test]
 fn progressive_lazy_block_boundaries_rises_retention_and_replay_match_cpu() {
-    unsafe { std::env::set_var("STWO_CUDA_COMMIT_DOMAIN_PROGRESSIVE", "1") };
     for (columns, rise_after) in [
         (16, None),
         (17, Some(16)),

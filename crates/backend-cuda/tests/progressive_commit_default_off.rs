@@ -2,8 +2,9 @@
 
 use stwo_backend_cuda::{
     progressive_leaf_workspace_requirements, progressive_leaf_workspace_requirements_for_mode,
-    progressive_prepare_mode_admission, PreparedProgressiveCommitError, ProgressiveCommitGeometry,
-    ProgressiveCommitGroupGeometry, ProgressiveCommitMode,
+    progressive_prepare_mode_admission, progressive_prepare_mode_admission_for_mode,
+    PreparedProgressiveCommitError, ProgressiveCommitGeometry, ProgressiveCommitGroupGeometry,
+    ProgressiveCommitMode,
 };
 
 fn geometry() -> ProgressiveCommitGeometry {
@@ -18,7 +19,7 @@ fn geometry() -> ProgressiveCommitGeometry {
 }
 
 #[test]
-fn absent_flag_rejects_requirements_and_prepared_admission_without_dispatch() {
+fn env_wrapper_stays_default_off_while_explicit_mode_is_fail_closed() {
     unsafe { std::env::remove_var("STWO_CUDA_COMMIT_DOMAIN_PROGRESSIVE") };
     assert_eq!(
         ProgressiveCommitMode::from_env(),
@@ -40,6 +41,30 @@ fn absent_flag_rejects_requirements_and_prepared_admission_without_dispatch() {
     .unwrap();
     assert_eq!(
         progressive_prepare_mode_admission(&explicit).unwrap_err(),
+        PreparedProgressiveCommitError::Disabled
+    );
+
+    // A sealed replacement-backend selector can admit the same topology
+    // without re-reading the legacy process environment.
+    progressive_prepare_mode_admission_for_mode(
+        ProgressiveCommitMode::DomainProgressive,
+        &explicit,
+    )
+    .unwrap();
+    assert_eq!(
+        progressive_prepare_mode_admission_for_mode(ProgressiveCommitMode::FullLifting, &explicit,)
+            .unwrap_err(),
+        PreparedProgressiveCommitError::Disabled
+    );
+
+    let mut mismatched = explicit;
+    mismatched.plan.mode = ProgressiveCommitMode::FullLifting;
+    assert_eq!(
+        progressive_prepare_mode_admission_for_mode(
+            ProgressiveCommitMode::DomainProgressive,
+            &mismatched,
+        )
+        .unwrap_err(),
         PreparedProgressiveCommitError::Disabled
     );
 }

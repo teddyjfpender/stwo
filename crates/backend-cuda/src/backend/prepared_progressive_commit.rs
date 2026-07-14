@@ -317,9 +317,16 @@ pub fn progressive_leaf_workspace_requirements_for_mode(
 pub fn progressive_prepare_mode_admission(
     requirements: &ProgressiveLeafWorkspaceRequirements,
 ) -> Result<(), PreparedProgressiveCommitError> {
-    if requirements.plan.mode != ProgressiveCommitMode::DomainProgressive
-        || ProgressiveCommitMode::from_env() != ProgressiveCommitMode::DomainProgressive
-    {
+    progressive_prepare_mode_admission_for_mode(ProgressiveCommitMode::from_env(), requirements)
+}
+
+/// Explicit-mode admission for a process-level dispatcher. This path never
+/// consults the environment and rejects a mode/topology mismatch.
+pub fn progressive_prepare_mode_admission_for_mode(
+    mode: ProgressiveCommitMode,
+    requirements: &ProgressiveLeafWorkspaceRequirements,
+) -> Result<(), PreparedProgressiveCommitError> {
+    if mode != ProgressiveCommitMode::DomainProgressive || requirements.plan.mode != mode {
         return Err(PreparedProgressiveCommitError::Disabled);
     }
     validate_progressive_requirements(requirements)?;
@@ -487,7 +494,30 @@ impl<'a> PreparedProgressiveLeaves<'a> {
         retained_outputs: &[Option<ArenaSlice>],
         twiddles: ArenaSlice,
     ) -> Result<Self, PreparedProgressiveCommitError> {
-        progressive_prepare_mode_admission(requirements)?;
+        Self::prepare_with_mode(
+            arena,
+            requirements,
+            slots,
+            coefficients,
+            retained_outputs,
+            twiddles,
+            ProgressiveCommitMode::from_env(),
+        )
+    }
+
+    /// Bind an explicitly selected progressive topology without consulting
+    /// the environment. Admission remains fail-closed on mode mismatch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_with_mode(
+        arena: &'a DeviceArena,
+        requirements: &ProgressiveLeafWorkspaceRequirements,
+        slots: &ProgressiveLeafWorkspaceSlots,
+        coefficients: &[CommitCoefficientColumn],
+        retained_outputs: &[Option<ArenaSlice>],
+        twiddles: ArenaSlice,
+        mode: ProgressiveCommitMode,
+    ) -> Result<Self, PreparedProgressiveCommitError> {
+        progressive_prepare_mode_admission_for_mode(mode, requirements)?;
         let workspace = requirements.arena_slot_requirements(slots)?;
         let workspace_ids: BTreeSet<_> = workspace.iter().map(|entry| entry.id).collect();
         if coefficients.len() != requirements.plan.columns.len()
@@ -856,7 +886,32 @@ impl<'a> PreparedProgressiveCommitGraph<'a> {
         retained_outputs: &[Option<ArenaSlice>],
         twiddles: ArenaSlice,
     ) -> Result<Self, PreparedProgressiveCommitError> {
-        Self::prepare_with_interior_mode(
+        Self::prepare_with_mode(
+            arena,
+            config,
+            requirements,
+            slots,
+            coefficients,
+            retained_outputs,
+            twiddles,
+            ProgressiveCommitMode::from_env(),
+        )
+    }
+
+    /// Prepare an explicitly selected progressive commitment without an
+    /// environment recheck.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_with_mode(
+        arena: &'a DeviceArena,
+        config: CommitWorkspaceConfig,
+        requirements: &ProgressiveCommitWorkspaceRequirements,
+        slots: &ProgressiveCommitWorkspaceSlots,
+        coefficients: &[CommitCoefficientColumn],
+        retained_outputs: &[Option<ArenaSlice>],
+        twiddles: ArenaSlice,
+        mode: ProgressiveCommitMode,
+    ) -> Result<Self, PreparedProgressiveCommitError> {
+        Self::prepare_inner(
             arena,
             config,
             requirements,
@@ -865,6 +920,7 @@ impl<'a> PreparedProgressiveCommitGraph<'a> {
             retained_outputs,
             twiddles,
             super::blake2s::blake2s_interior_fused_enabled(),
+            mode,
         )
     }
 
@@ -879,6 +935,32 @@ impl<'a> PreparedProgressiveCommitGraph<'a> {
         twiddles: ArenaSlice,
         interior_fused: bool,
     ) -> Result<Self, PreparedProgressiveCommitError> {
+        Self::prepare_inner(
+            arena,
+            config,
+            requirements,
+            slots,
+            coefficients,
+            retained_outputs,
+            twiddles,
+            interior_fused,
+            ProgressiveCommitMode::from_env(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_inner(
+        arena: &'a DeviceArena,
+        config: CommitWorkspaceConfig,
+        requirements: &ProgressiveCommitWorkspaceRequirements,
+        slots: &ProgressiveCommitWorkspaceSlots,
+        coefficients: &[CommitCoefficientColumn],
+        retained_outputs: &[Option<ArenaSlice>],
+        twiddles: ArenaSlice,
+        interior_fused: bool,
+        mode: ProgressiveCommitMode,
+    ) -> Result<Self, PreparedProgressiveCommitError> {
+        progressive_prepare_mode_admission_for_mode(mode, &requirements.leaves)?;
         let workspace = requirements.arena_slot_requirements(slots)?;
         let workspace_ids = workspace
             .iter()
@@ -895,13 +977,14 @@ impl<'a> PreparedProgressiveCommitGraph<'a> {
                 return Err(PreparedProgressiveCommitError::AliasedSlot(source.id()));
             }
         }
-        let leaves = PreparedProgressiveLeaves::prepare(
+        let leaves = PreparedProgressiveLeaves::prepare_with_mode(
             arena,
             &requirements.leaves,
             &slots.leaves,
             coefficients,
             retained_outputs,
             twiddles,
+            mode,
         )?;
         let merkle = PreparedMerkleFromLeaves::prepare_with_interior_mode(
             arena,

@@ -111,11 +111,11 @@ pub use backend::prepared_pow::{
 pub use backend::prepared_progressive_commit::{
     progressive_commit_workspace_requirements_for_mode, progressive_leaf_workspace_requirements,
     progressive_leaf_workspace_requirements_for_mode, progressive_prepare_mode_admission,
-    ModeAwareCommitWorkspaceRequirements, ModeAwareCommitWorkspaceSlots,
-    PreparedProgressiveCommitError, PreparedProgressiveCommitGraph, PreparedProgressiveLeaves,
-    ProgressiveBatchRequirements, ProgressiveBatchSlots, ProgressiveCommitWorkspaceRequirements,
-    ProgressiveCommitWorkspaceSlots, ProgressiveLeafLaunchKind,
-    ProgressiveLeafWorkspaceRequirements, ProgressiveLeafWorkspaceSlots,
+    progressive_prepare_mode_admission_for_mode, ModeAwareCommitWorkspaceRequirements,
+    ModeAwareCommitWorkspaceSlots, PreparedProgressiveCommitError, PreparedProgressiveCommitGraph,
+    PreparedProgressiveLeaves, ProgressiveBatchRequirements, ProgressiveBatchSlots,
+    ProgressiveCommitWorkspaceRequirements, ProgressiveCommitWorkspaceSlots,
+    ProgressiveLeafLaunchKind, ProgressiveLeafWorkspaceRequirements, ProgressiveLeafWorkspaceSlots,
 };
 pub use backend::prepared_quotient::{
     quotient_workspace_requirements, PreparedQuotientError, PreparedQuotientGraph,
