@@ -1,0 +1,2 @@
+#!/bin/sh
+exec /usr/bin/aarch64-linux-gnu-gcc-12 -B/usr/bin/ "$@"

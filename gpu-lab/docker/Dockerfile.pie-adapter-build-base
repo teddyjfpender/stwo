@@ -8,3 +8,8 @@ RUN apt-get update -qq \
     && git --version \
     && python3 --version \
     && rm -rf /var/lib/apt/lists/*
+
+COPY --chmod=0555 pie-adapter-cc /usr/local/bin/stwo-pie-adapter-cc
+RUN /usr/local/bin/stwo-pie-adapter-cc \
+        -x c -shared /dev/null -o /tmp/stwo-pie-adapter-linker-probe.so \
+    && rm /tmp/stwo-pie-adapter-linker-probe.so
