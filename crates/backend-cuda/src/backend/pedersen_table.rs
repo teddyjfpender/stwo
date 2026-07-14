@@ -54,12 +54,17 @@ impl RegisteredPedersenColumn {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RegisteredPedersenTable {
     columns: [RegisteredPedersenColumn; PEDERSEN_TABLE_N_COLUMNS],
+    source_n_rows: usize,
     n_rows: usize,
 }
 
 /// A registered table failed the exact geometry required by a borrower.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RegisteredPedersenTableError {
+    SourceRowCount {
+        expected: usize,
+        actual: usize,
+    },
     RowCount {
         expected: usize,
         actual: usize,
@@ -114,6 +119,11 @@ pub enum PedersenTableRegistrationError {
         requested_padded_rows: usize,
         registered_padded_rows: usize,
     },
+    RequestSourceRowCountMismatch {
+        requested_source_rows: usize,
+        registered_source_rows: usize,
+        padded_rows: usize,
+    },
 }
 
 impl core::fmt::Display for PedersenTableRegistrationError {
@@ -166,6 +176,15 @@ impl core::fmt::Display for PedersenTableRegistrationError {
                 "requested pedersen geometry has {requested_padded_rows} padded rows, but the \
                  registered table has {registered_padded_rows}"
             ),
+            Self::RequestSourceRowCountMismatch {
+                requested_source_rows,
+                registered_source_rows,
+                padded_rows,
+            } => write!(
+                f,
+                "requested pedersen source has {requested_source_rows} rows, but the registered \
+                 source has {registered_source_rows} rows (both pad to {padded_rows})"
+            ),
         }
     }
 }
@@ -181,6 +200,10 @@ pub enum PedersenTableRegistrationState {
 }
 
 impl RegisteredPedersenTable {
+    pub const fn source_n_rows(self) -> usize {
+        self.source_n_rows
+    }
+
     pub const fn n_rows(self) -> usize {
         self.n_rows
     }
@@ -230,6 +253,27 @@ impl RegisteredPedersenTable {
         }
         Ok(())
     }
+
+    /// Validate both the host source identity and its padded device geometry.
+    pub fn validate_exact_registration_geometry(
+        self,
+        expected_source_rows: usize,
+        expected_padded_rows: usize,
+    ) -> Result<(), RegisteredPedersenTableError> {
+        if self.source_n_rows != expected_source_rows {
+            return Err(RegisteredPedersenTableError::SourceRowCount {
+                expected: expected_source_rows,
+                actual: self.source_n_rows,
+            });
+        }
+        self.validate_exact_geometry(expected_padded_rows)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RegistrationGeometry {
+    source_rows: usize,
+    padded_rows: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -251,14 +295,19 @@ impl RegistrationSlot {
 
     fn try_register(
         &self,
-        requested_rows: Result<usize, PedersenTableRegistrationError>,
-        build: impl FnOnce(usize) -> Result<RegisteredPedersenTable, PedersenTableRegistrationError>,
+        requested_geometry: Result<RegistrationGeometry, PedersenTableRegistrationError>,
+        build: impl FnOnce(
+            RegistrationGeometry,
+        ) -> Result<RegisteredPedersenTable, PedersenTableRegistrationError>,
     ) -> Result<RegisteredPedersenTable, PedersenTableRegistrationError> {
         let state = self.state.get_or_init(|| {
-            let result = requested_rows.clone().and_then(|padded_rows| {
-                let table = build(padded_rows)?;
+            let result = requested_geometry.clone().and_then(|geometry| {
+                let table = build(geometry)?;
                 table
-                    .validate_exact_geometry(padded_rows)
+                    .validate_exact_registration_geometry(
+                        geometry.source_rows,
+                        geometry.padded_rows,
+                    )
                     .map_err(PedersenTableRegistrationError::InvalidReadyGeometry)?;
                 Ok(table)
             });
@@ -271,12 +320,21 @@ impl RegistrationSlot {
         match state {
             StoredRegistrationState::Poisoned(error) => Err(error.clone()),
             StoredRegistrationState::Ready(table) => {
-                let requested_padded_rows = requested_rows?;
-                if table.n_rows != requested_padded_rows {
+                let requested = requested_geometry?;
+                if table.n_rows != requested.padded_rows {
                     return Err(PedersenTableRegistrationError::RequestGeometryMismatch {
-                        requested_padded_rows,
+                        requested_padded_rows: requested.padded_rows,
                         registered_padded_rows: table.n_rows,
                     });
+                }
+                if table.source_n_rows != requested.source_rows {
+                    return Err(
+                        PedersenTableRegistrationError::RequestSourceRowCountMismatch {
+                            requested_source_rows: requested.source_rows,
+                            registered_source_rows: table.source_n_rows,
+                            padded_rows: requested.padded_rows,
+                        },
+                    );
                 }
                 Ok(*table)
             }
@@ -345,7 +403,9 @@ impl Drop for PendingDeviceColumns {
 
 static REGISTERED: RegistrationSlot = RegistrationSlot::new();
 
-fn requested_padded_rows(n_rows: usize) -> Result<usize, PedersenTableRegistrationError> {
+fn requested_geometry(
+    n_rows: usize,
+) -> Result<RegistrationGeometry, PedersenTableRegistrationError> {
     if n_rows == 0 {
         return Err(PedersenTableRegistrationError::EmptyTable);
     }
@@ -363,14 +423,20 @@ fn requested_padded_rows(n_rows: usize) -> Result<usize, PedersenTableRegistrati
             max_rows,
         });
     }
-    Ok(padded_rows)
+    Ok(RegistrationGeometry {
+        source_rows: n_rows,
+        padded_rows,
+    })
 }
 
 fn build_borrowed_pedersen_table(
-    n_rows: usize,
-    padded_rows: usize,
+    geometry: RegistrationGeometry,
     fill_column: &mut impl FnMut(usize, &mut Vec<u32>),
 ) -> Result<RegisteredPedersenTable, PedersenTableRegistrationError> {
+    let RegistrationGeometry {
+        source_rows,
+        padded_rows,
+    } = geometry;
     if !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
         return Err(PedersenTableRegistrationError::CudaUnavailable);
     }
@@ -394,10 +460,10 @@ fn build_borrowed_pedersen_table(
         {
             return Err(PedersenTableRegistrationError::FillPanicked { column });
         }
-        if buf.len() != n_rows {
+        if buf.len() != source_rows {
             return Err(PedersenTableRegistrationError::ColumnLength {
                 column,
-                expected: n_rows,
+                expected: source_rows,
                 actual: buf.len(),
             });
         }
@@ -425,10 +491,11 @@ fn build_borrowed_pedersen_table(
     });
     let table = RegisteredPedersenTable {
         columns,
+        source_n_rows: source_rows,
         n_rows: padded_rows,
     };
     table
-        .validate_exact_geometry(padded_rows)
+        .validate_exact_registration_geometry(source_rows, padded_rows)
         .map_err(PedersenTableRegistrationError::InvalidReadyGeometry)?;
 
     // These legacy native APIs abort the process on CUDA allocation, copy,
@@ -452,7 +519,7 @@ fn build_borrowed_pedersen_table(
 /// that many raw words for each column. A recoverable failure poisons this slot,
 /// frees every uploaded but unpublished prefix, and is returned unchanged on
 /// later calls without invoking their builders. A ready slot is reusable only
-/// for the same padded geometry.
+/// for the same unpadded source row count and padded device geometry.
 ///
 /// The legacy upload and publication functions still terminate the process on
 /// native CUDA errors; such aborts cannot be represented as a Rust error until
@@ -461,8 +528,8 @@ pub fn try_register_borrowed_pedersen_table(
     n_rows: usize,
     mut fill_column: impl FnMut(usize, &mut Vec<u32>),
 ) -> Result<RegisteredPedersenTable, PedersenTableRegistrationError> {
-    REGISTERED.try_register(requested_padded_rows(n_rows), |padded_rows| {
-        build_borrowed_pedersen_table(n_rows, padded_rows, &mut fill_column)
+    REGISTERED.try_register(requested_geometry(n_rows), |geometry| {
+        build_borrowed_pedersen_table(geometry, &mut fill_column)
     })
 }
 
@@ -512,14 +579,22 @@ mod tests {
         }
     }
 
-    fn table_with_rows(n_rows: usize) -> RegisteredPedersenTable {
+    const fn geometry(source_rows: usize, padded_rows: usize) -> RegistrationGeometry {
+        RegistrationGeometry {
+            source_rows,
+            padded_rows,
+        }
+    }
+
+    fn table_with_geometry(source_rows: usize, padded_rows: usize) -> RegisteredPedersenTable {
         RegisteredPedersenTable {
             columns: std::array::from_fn(|index| RegisteredPedersenColumn {
                 index,
                 device_address: 0x1000 + index * 0x100,
-                len_words: n_rows,
+                len_words: padded_rows,
             }),
-            n_rows,
+            source_n_rows: source_rows,
+            n_rows: padded_rows,
         }
     }
 
@@ -528,15 +603,18 @@ mod tests {
         let slot = RegistrationSlot::new();
         let invocations = std::cell::Cell::new(0);
         let first = slot
-            .try_register(Ok(32), |_| {
+            .try_register(Ok(geometry(32, 32)), |_| {
                 invocations.set(invocations.get() + 1);
-                Ok(table_with_rows(32))
+                Ok(table_with_geometry(32, 32))
             })
             .unwrap();
         let second = slot
-            .try_register(Ok(32), |_| -> Result<_, PedersenTableRegistrationError> {
-                panic!("ready registration invoked a second builder")
-            })
+            .try_register(
+                Ok(geometry(32, 32)),
+                |_| -> Result<_, PedersenTableRegistrationError> {
+                    panic!("ready registration invoked a second builder")
+                },
+            )
             .unwrap();
 
         assert_eq!(first, second);
@@ -546,18 +624,47 @@ mod tests {
     #[test]
     fn ready_registration_rejects_request_geometry_drift() {
         let slot = RegistrationSlot::new();
-        slot.try_register(Ok(32), |_| Ok(table_with_rows(32)))
+        slot.try_register(Ok(geometry(32, 32)), |_| Ok(table_with_geometry(32, 32)))
             .unwrap();
 
         assert_eq!(
-            slot.try_register(Ok(64), |_| -> Result<_, PedersenTableRegistrationError> {
-                panic!("geometry drift invoked a second builder")
-            }),
+            slot.try_register(
+                Ok(geometry(64, 64)),
+                |_| -> Result<_, PedersenTableRegistrationError> {
+                    panic!("geometry drift invoked a second builder")
+                }
+            ),
             Err(PedersenTableRegistrationError::RequestGeometryMismatch {
                 requested_padded_rows: 64,
                 registered_padded_rows: 32,
             })
         );
+    }
+
+    #[test]
+    fn ready_registration_rejects_same_padded_different_source_without_rebuilding() {
+        let slot = RegistrationSlot::new();
+        let invocations = std::cell::Cell::new(0);
+        slot.try_register(Ok(geometry(17, 32)), |_| {
+            invocations.set(invocations.get() + 1);
+            Ok(table_with_geometry(17, 32))
+        })
+        .unwrap();
+
+        assert_eq!(
+            slot.try_register(Ok(geometry(32, 32)), |_| {
+                invocations.set(invocations.get() + 1);
+                Ok(table_with_geometry(32, 32))
+            }),
+            Err(
+                PedersenTableRegistrationError::RequestSourceRowCountMismatch {
+                    requested_source_rows: 32,
+                    registered_source_rows: 17,
+                    padded_rows: 32,
+                }
+            )
+        );
+        assert_eq!(invocations.get(), 1);
     }
 
     #[test]
@@ -570,7 +677,7 @@ mod tests {
         };
 
         assert_eq!(
-            slot.try_register(Ok(32), |_| Err(malformed.clone())),
+            slot.try_register(Ok(geometry(32, 32)), |_| Err(malformed.clone())),
             Err(malformed.clone())
         );
         assert_eq!(
@@ -585,13 +692,13 @@ mod tests {
         let slot = RegistrationSlot::new();
         let invocations = std::cell::Cell::new(0);
         let failure = PedersenTableRegistrationError::DeviceUploadReturnedNull { column: 3 };
-        let first = slot.try_register(Ok(32), |_| {
+        let first = slot.try_register(Ok(geometry(32, 32)), |_| {
             invocations.set(invocations.get() + 1);
             Err(failure.clone())
         });
-        let second = slot.try_register(Ok(32), |_| {
+        let second = slot.try_register(Ok(geometry(32, 32)), |_| {
             invocations.set(invocations.get() + 1);
-            Ok(table_with_rows(32))
+            Ok(table_with_geometry(32, 32))
         });
 
         assert_eq!(first, Err(failure.clone()));
@@ -601,8 +708,9 @@ mod tests {
 
     #[test]
     fn registered_geometry_is_ordered_and_fails_closed() {
-        let table = table_with_rows(1 << 23);
+        let table = table_with_geometry(1 << 23, 1 << 23);
 
+        assert_eq!(table.source_n_rows(), 1 << 23);
         assert!(table.has_exact_rows(1 << 23));
         assert!(!table.has_exact_rows(1 << 22));
         assert_eq!(table.column(0).unwrap().index(), 0);
@@ -615,6 +723,17 @@ mod tests {
             .enumerate()
             .all(|(index, column)| column.index() == index));
         assert_eq!(table.validate_exact_geometry(1 << 23), Ok(()));
+        assert_eq!(
+            table.validate_exact_registration_geometry(1 << 23, 1 << 23),
+            Ok(())
+        );
+
+        let mut wrong_source_rows = table;
+        wrong_source_rows.source_n_rows -= 1;
+        assert!(matches!(
+            wrong_source_rows.validate_exact_registration_geometry(1 << 23, 1 << 23),
+            Err(RegisteredPedersenTableError::SourceRowCount { .. })
+        ));
 
         let mut wrong_rows = table;
         wrong_rows.n_rows -= 1;
