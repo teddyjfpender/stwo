@@ -1,0 +1,428 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://stwo.dev/gpu-lab/pie-adapter-execution-record-v1.schema.json",
+  "title": "Stwo GPU lab authenticated PIE adapter execution record",
+  "$comment": "JSON Schema closes local shape/type/constant bounds. The mandatory Python validator additionally enforces out-of-band raw-manifest hash trust, cross-object artifact equality, canonical invocation hashing, fd/inode/path uniqueness, argv/environment fd relationships, dynamic file-size/stderr identities, source-closure hashing, and same-inode output transition; JSON Schema 2020-12 has no standard data-reference operator for those relations.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "evidence_mode",
+    "passed",
+    "adapter_execution_attested",
+    "source_closure_status",
+    "production_admissible",
+    "correctness_admissible",
+    "performance_admissible",
+    "adapter_executable_policy",
+    "provenance_manifest",
+    "source_pie",
+    "bootloader_program",
+    "expected_prover_input",
+    "adapter_executable",
+    "adapter_invocation",
+    "adapter_source_closure",
+    "replay_tool_source_closure",
+    "invocation_contract",
+    "provenance_binding",
+    "execution_contract",
+    "output_lifecycle",
+    "observed_prover_input",
+    "exact_byte_equal"
+  ],
+  "properties": {
+    "schema_version": {"const": "stwo.gpu-lab.pie-adapter-execution-record.v1"},
+    "evidence_mode": {"const": "authenticated-pie-adapter-replay"},
+    "passed": {"const": true},
+    "adapter_execution_attested": {"const": true},
+    "source_closure_status": {"const": "identity-only"},
+    "production_admissible": {"const": false},
+    "correctness_admissible": {"const": false},
+    "performance_admissible": {"const": false},
+    "adapter_executable_policy": {
+      "const": "release-or-stripped-provenance-compatible-max-256mib-v1"
+    },
+    "provenance_manifest": {
+      "allOf": [
+        {"$ref": "#/$defs/artifact"},
+        {"properties": {
+          "kind": {"const": "fri-round6-provenance-json-v1"},
+          "byte_length": {"maximum": 1048576}
+        }}
+      ]
+    },
+    "source_pie": {
+      "allOf": [
+        {"$ref": "#/$defs/artifact"},
+        {"properties": {
+          "kind": {"const": "cairo-pie-zip"},
+          "byte_length": {"maximum": 1073741824}
+        }}
+      ]
+    },
+    "bootloader_program": {
+      "allOf": [
+        {"$ref": "#/$defs/artifact"},
+        {"properties": {
+          "kind": {"const": "cairo-compiled-program-json-v1"},
+          "byte_length": {"maximum": 268435456}
+        }}
+      ]
+    },
+    "expected_prover_input": {
+      "allOf": [
+        {"$ref": "#/$defs/artifact"},
+        {"properties": {
+          "kind": {"const": "stwo-prover-input-bincode-v1"},
+          "byte_length": {"maximum": 268435456}
+        }}
+      ]
+    },
+    "adapter_executable": {
+      "allOf": [
+        {"$ref": "#/$defs/artifact"},
+        {"properties": {
+          "kind": {"const": "adapter-executable"},
+          "byte_length": {"maximum": 268435456}
+        }}
+      ]
+    },
+    "adapter_invocation": {
+      "allOf": [
+        {"$ref": "#/$defs/artifact"},
+        {"properties": {
+          "kind": {"const": "adapter-invocation-json-v1"},
+          "byte_length": {"maximum": 1048576}
+        }}
+      ]
+    },
+    "adapter_source_closure": {
+      "allOf": [
+        {"$ref": "#/$defs/artifact"},
+        {"properties": {
+          "kind": {"const": "adapter-source-closure-json-v1"},
+          "byte_length": {"maximum": 4194304}
+        }}
+      ]
+    },
+    "replay_tool_source_closure": {"$ref": "#/$defs/source_closure"},
+    "invocation_contract": {
+      "$ref": "#/$defs/invocation_contract"
+    },
+    "provenance_binding": {"$ref": "#/$defs/provenance_binding"},
+    "execution_contract": {"$ref": "#/$defs/execution_contract"},
+    "output_lifecycle": {"$ref": "#/$defs/output_lifecycle"},
+    "observed_prover_input": {
+      "allOf": [
+        {"$ref": "#/$defs/artifact"},
+        {"properties": {
+          "kind": {"const": "stwo-prover-input-bincode-v1"},
+          "byte_length": {"maximum": 268435456}
+        }}
+      ]
+    },
+    "exact_byte_equal": {"const": true}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "artifact_path": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2048,
+      "pattern": "^/(?!/)(?!.*//)(?!.*\\\\)(?!.*(?:/\\.{1,2})(?:/|$))(?!.*\\/$)[\\u0020-\\u007e]+$"
+    },
+    "working_directory": {
+      "oneOf": [
+        {"const": "/"},
+        {"$ref": "#/$defs/artifact_path"}
+      ]
+    },
+    "relative_path": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^(?!/)(?!.*//)(?!.*\\\\)(?!\\.{1,2}(?:/|$))(?!.*(?:/\\.{1,2})(?:/|$))(?!.*\\/$)[\\u0020-\\u007e]+$"
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "path", "byte_length", "sha256"],
+      "properties": {
+        "kind": {"type": "string", "minLength": 1, "maxLength": 64},
+        "path": {"$ref": "#/$defs/artifact_path"},
+        "byte_length": {"type": "integer", "minimum": 1},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "source_closure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sources", "closure_sha256"],
+      "properties": {
+        "sources": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "sha256"],
+            "properties": {
+              "path": {"$ref": "#/$defs/relative_path"},
+              "sha256": {"$ref": "#/$defs/sha256"}
+            }
+          }
+        },
+        "closure_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "invocation_contract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version", "protocol", "bootloader_program", "pie_copies",
+        "backend", "engine", "output_encoding"
+      ],
+      "properties": {
+        "schema_version": {"const": "stwo.gpu-lab.pie-adapter-invocation.v1"},
+        "protocol": {"const": "stwo-cairo.gpu-bench.pie-adapt-only.v1"},
+        "bootloader_program": {
+          "allOf": [
+            {"$ref": "#/$defs/artifact"},
+            {"properties": {
+              "kind": {"const": "cairo-compiled-program-json-v1"},
+              "byte_length": {"maximum": 268435456}
+            }}
+          ]
+        },
+        "pie_copies": {"const": 1},
+        "backend": {"const": "simd"},
+        "engine": {"const": "legacy"},
+        "output_encoding": {"const": "bincode-v1-fixed-int"}
+      }
+    },
+    "binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fd", "proc_path", "artifact_path", "byte_length", "sha256", "access",
+        "child_inherited", "device", "inode", "link_count"
+      ],
+      "properties": {
+        "fd": {"type": "integer", "minimum": 3, "maximum": 1048575},
+        "proc_path": {"type": "string", "pattern": "^/proc/self/fd/[0-9]+$"},
+        "artifact_path": {"$ref": "#/$defs/artifact_path"},
+        "byte_length": {"type": "integer", "minimum": 1, "maximum": 1073741824},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "access": {"enum": ["retained-read-only", "retained-read-write"]},
+        "child_inherited": {"type": "boolean"},
+        "device": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "inode": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+        "link_count": {"const": 1}
+      }
+    },
+    "child_input_binding": {
+      "allOf": [
+        {"$ref": "#/$defs/binding"},
+        {"properties": {
+          "access": {"const": "retained-read-only"}, "child_inherited": {"const": true}
+        }}
+      ]
+    },
+    "parent_input_binding": {
+      "allOf": [
+        {"$ref": "#/$defs/binding"},
+        {"properties": {
+          "access": {"const": "retained-read-only"}, "child_inherited": {"const": false}
+        }}
+      ]
+    },
+    "output_binding": {
+      "allOf": [
+        {"$ref": "#/$defs/binding"},
+        {"properties": {
+          "access": {"const": "retained-read-write"}, "child_inherited": {"const": true}
+        }}
+      ]
+    },
+    "bindings": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provenance_manifest",
+        "source_pie",
+        "bootloader_program",
+        "expected_prover_input",
+        "adapter_executable",
+        "adapter_invocation",
+        "adapter_source_closure",
+        "observed_prover_input"
+      ],
+      "properties": {
+        "provenance_manifest": {"$ref": "#/$defs/parent_input_binding"},
+        "source_pie": {"$ref": "#/$defs/child_input_binding"},
+        "bootloader_program": {"$ref": "#/$defs/child_input_binding"},
+        "expected_prover_input": {"$ref": "#/$defs/parent_input_binding"},
+        "adapter_executable": {"$ref": "#/$defs/child_input_binding"},
+        "adapter_invocation": {"$ref": "#/$defs/parent_input_binding"},
+        "adapter_source_closure": {"$ref": "#/$defs/parent_input_binding"},
+        "observed_prover_input": {"$ref": "#/$defs/output_binding"}
+      }
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "LANG", "LC_ALL", "RAYON_NUM_THREADS", "RUST_BACKTRACE",
+        "STWO_BOOTLOADER_JSON", "STWO_DUMP_INPUT"
+      ],
+      "properties": {
+        "LANG": {"const": "C"},
+        "LC_ALL": {"const": "C"},
+        "RAYON_NUM_THREADS": {"const": "8"},
+        "RUST_BACKTRACE": {"const": "0"},
+        "STWO_BOOTLOADER_JSON": {"type": "string", "pattern": "^/proc/self/fd/[0-9]+$"},
+        "STWO_DUMP_INPUT": {"type": "string", "pattern": "^/proc/self/fd/[0-9]+$"}
+      }
+    },
+    "resource_limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["address_space_bytes", "data_bytes", "cpu_seconds", "file_size_bytes"],
+      "properties": {
+        "address_space_bytes": {"const": 17179869184},
+        "data_bytes": {"const": 12884901888},
+        "cpu_seconds": {"const": 240},
+        "file_size_bytes": {"type": "integer", "minimum": 1, "maximum": 268435456}
+      }
+    },
+    "stream": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["byte_length", "sha256"],
+      "properties": {
+        "byte_length": {"type": "integer", "minimum": 0, "maximum": 4096},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "empty_stream": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["byte_length", "sha256"],
+      "properties": {
+        "byte_length": {"const": 0},
+        "sha256": {"const": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}
+      }
+    },
+    "provenance_binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract", "trust_root", "output_relation", "bootloader_coverage"
+      ],
+      "properties": {
+        "contract": {"const": "fri-round6-provenance-v1-external-raw-binding-v1"},
+        "trust_root": {"const": "required-out-of-band-sha256-v1"},
+        "output_relation": {"const": "manifest-expected-equals-observed-byte-for-byte-v1"},
+        "bootloader_coverage": {"const": "separate-required-semantic-live-in-v1"}
+      }
+    },
+    "pre_launch_output": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "file_type", "device", "inode", "link_count", "mode", "byte_length"],
+      "properties": {
+        "path": {"$ref": "#/$defs/artifact_path"}, "file_type": {"const": "regular"},
+        "device": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "inode": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+        "link_count": {"const": 1}, "mode": {"const": "0600"}, "byte_length": {"const": 0}
+      }
+    },
+    "post_launch_output": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "file_type", "device", "inode", "link_count", "mode", "byte_length", "sha256"],
+      "properties": {
+        "path": {"$ref": "#/$defs/artifact_path"}, "file_type": {"const": "regular"},
+        "device": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "inode": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+        "link_count": {"const": 1}, "mode": {"const": "0400"},
+        "byte_length": {"type": "integer", "minimum": 1, "maximum": 268435456},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "output_lifecycle": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "contract", "creation", "failure_cleanup", "finalization", "pre_launch",
+        "retained_descriptor", "post_launch", "same_inode_transition"
+      ],
+      "properties": {
+        "contract": {"const": "fresh-bound-output-inode-transition-v1"},
+        "creation": {"const": "o_creat-o_excl-o_nofollow-0600-v1"},
+        "failure_cleanup": {"const": "unlink-only-if-path-still-bound-inode-v1"},
+        "finalization": {"const": "fchmod-0400-fsync-before-attestation-v1"},
+        "pre_launch": {"$ref": "#/$defs/pre_launch_output"},
+        "retained_descriptor": {
+          "type": "object", "additionalProperties": false,
+          "required": ["fd", "device", "inode", "access"],
+          "properties": {
+            "fd": {"type": "integer", "minimum": 3, "maximum": 1048575},
+            "device": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+            "inode": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+            "access": {"const": "retained-read-write"}
+          }
+        },
+        "post_launch": {"$ref": "#/$defs/post_launch_output"},
+        "same_inode_transition": {"const": true}
+      }
+    },
+    "execution_contract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract",
+        "shell",
+        "stdin",
+        "working_directory",
+        "argv",
+        "environment",
+        "bindings",
+        "input_recheck",
+        "resource_limits",
+        "wall_timeout_seconds",
+        "exit_status",
+        "stdout",
+        "stderr"
+      ],
+      "properties": {
+        "contract": {"const": "linux-retained-descriptor-exec-v1"},
+        "shell": {"const": false},
+        "stdin": {"const": "devnull"},
+        "working_directory": {"$ref": "#/$defs/working_directory"},
+        "argv": {
+          "type": "array",
+          "minItems": 8,
+          "maxItems": 8,
+          "prefixItems": [
+            {"type": "string", "pattern": "^/proc/self/fd/[0-9]+$"},
+            {"const": "--pie"},
+            {"type": "string", "pattern": "^/proc/self/fd/[0-9]+$"},
+            {"const": "--backend"},
+            {"const": "simd"},
+            {"const": "--engine"},
+            {"const": "legacy"},
+            {"const": "--adapt-only"}
+          ],
+          "items": false
+        },
+        "environment": {"$ref": "#/$defs/environment"},
+        "bindings": {"$ref": "#/$defs/bindings"},
+        "input_recheck": {"const": "descriptor-and-path-before-and-after-v1"},
+        "resource_limits": {"$ref": "#/$defs/resource_limits"},
+        "wall_timeout_seconds": {"const": 300},
+        "exit_status": {"const": 0},
+        "stdout": {"$ref": "#/$defs/empty_stream"},
+        "stderr": {"$ref": "#/$defs/stream"}
+      }
+    }
+  }
+}

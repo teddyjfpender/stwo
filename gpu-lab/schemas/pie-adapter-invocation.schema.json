@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://stwo.dev/gpu-lab/pie-adapter-invocation-v1.schema.json",
+  "title": "Stwo GPU lab PIE adapter invocation",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "protocol",
+    "bootloader_program",
+    "pie_copies",
+    "backend",
+    "engine",
+    "output_encoding"
+  ],
+  "properties": {
+    "schema_version": {"const": "stwo.gpu-lab.pie-adapter-invocation.v1"},
+    "protocol": {"const": "stwo-cairo.gpu-bench.pie-adapt-only.v1"},
+    "bootloader_program": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "path", "byte_length", "sha256"],
+      "properties": {
+        "kind": {"const": "cairo-compiled-program-json-v1"},
+        "path": {"$ref": "#/$defs/artifact_path"},
+        "byte_length": {"type": "integer", "minimum": 1, "maximum": 268435456},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "pie_copies": {"const": 1},
+    "backend": {"const": "simd"},
+    "engine": {"const": "legacy"},
+    "output_encoding": {"const": "bincode-v1-fixed-int"}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "artifact_path": {
+      "type": "string",
+      "minLength": 2,
+      "maxLength": 2048,
+      "pattern": "^/(?!/)(?!.*//)(?!.*\\\\)(?!.*(?:/\\.{1,2})(?:/|$))(?!.*\\/$)[\\u0020-\\u007e]+$"
+    }
+  }
+}
