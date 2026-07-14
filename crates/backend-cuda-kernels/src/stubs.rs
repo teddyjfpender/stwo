@@ -674,6 +674,30 @@ pub unsafe extern "C" fn blake_g_write_trace_into_on(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn blake_g_write_trace_fused_into_on(
+    input_cols_host: *const *const u32,
+    n_rows: u32,
+    column_length: u32,
+    trace_cols_host: *const *mut u32,
+    lookup: *mut u32,
+    luts_host: *const *const u32,
+    counts_host: *const *mut u32,
+    stream: *mut core::ffi::c_void,
+) -> i32 {
+    let _ = (
+        input_cols_host,
+        n_rows,
+        column_length,
+        trace_cols_host,
+        lookup,
+        luts_host,
+        counts_host,
+        stream,
+    );
+    no_cuda_symbol("blake_g_write_trace_fused_into_on")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn blake_g_xor_count(
     a_cols: *const *const u32,
     b_cols: *const *const u32,

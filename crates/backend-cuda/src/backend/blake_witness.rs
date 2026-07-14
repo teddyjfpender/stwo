@@ -23,6 +23,12 @@ use crate::{CudaLaunchContext, CudaRuntimeError};
 
 /// Number of committed base-trace columns (cairo-air blake_g N_TRACE_COLUMNS).
 pub const BG_N_TRACE: usize = 53;
+/// Number of column-major data words consumed by one resident blake_g row.
+pub const BG_N_DATA_INPUTS: usize = 6;
+/// Recorded input ABI: six data words plus the real-row enabler column.
+pub const BG_N_RECORDED_INPUTS: usize = 7;
+/// Exact recorded row-body identity implemented by the native fused kernel.
+pub const BG_FUSED_SEMANTIC_HASH: u64 = 0x8eec_56c3_6f57_b843;
 /// Number of auxiliary operand columns emitted alongside the trace (split low
 /// parts + rot7/rot8 limbs the interaction and count feeds need).
 pub const BG_N_AUX: usize = 20;
@@ -189,8 +195,8 @@ fn write_trace_into_on_inner(
     }
 }
 
-const BG_N_LOOKUP_WORDS: usize = 87;
-const BG_N_SUB_WORDS: usize = 48;
+pub const BG_N_LOOKUP_WORDS: usize = 87;
+pub const BG_N_SUB_WORDS: usize = 48;
 
 /// Uploads a dense `(a << shift) | b -> row` LUT (row indices are `< P`, so the
 /// M31 representation is exact) for the device xor multiplicity feed.

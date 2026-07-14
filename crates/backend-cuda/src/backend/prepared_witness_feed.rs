@@ -331,6 +331,7 @@ pub enum PreparedWitnessFeedError {
     SlotMisaligned(ArenaSlotId),
     ContextMismatch(ArenaSlotId),
     ConflictingDestination(ArenaSlotId),
+    BlakeGFusionShape(&'static str),
     KernelLaunchFailed,
     Arena(ArenaError),
     Cuda(CudaRuntimeError),
@@ -855,6 +856,68 @@ pub struct PreparedWitnessFeedGraph<'a> {
     mode: WitnessFeedLaunchMode,
 }
 
+/// Source-free prepared binding for the exact Blake-G producer/feed fusion.
+/// It borrows only the canonical LUTs and shared count destinations; there is
+/// no SubcomponentInputs slab, descriptor upload, pointer table, or feed launch.
+pub struct PreparedBlakeGFusedFeed<'a> {
+    arena: &'a DeviceArena,
+    luts: [ArenaSlice; 4],
+    counts: [ArenaSlice; 5],
+}
+
+impl<'a> PreparedBlakeGFusedFeed<'a> {
+    pub fn prepare(
+        arena: &'a DeviceArena,
+        luts: [ArenaSlice; 4],
+        luts_host: [&[u32]; 4],
+        counts: [ArenaSlice; 5],
+    ) -> Result<Self, PreparedWitnessFeedError> {
+        const LUT_WORDS: [usize; 4] = [1 << 16, 1 << 8, 1 << 14, 1 << 18];
+        const COUNT_WORDS: [usize; 5] = [2 << 16, 16 << 20, 1 << 8, 1 << 14, 1 << 18];
+        if luts
+            .iter()
+            .zip(LUT_WORDS)
+            .any(|(slice, words)| !slice.belongs_to(arena.context()) || slice.len_words() != words)
+            || counts.iter().zip(COUNT_WORDS).any(|(slice, words)| {
+                !slice.belongs_to(arena.context()) || slice.len_words() != words
+            })
+        {
+            return Err(PreparedWitnessFeedError::BlakeGFusionShape(
+                "canonical LUT/count geometry drifted",
+            ));
+        }
+        for ((slice, host), expected_words) in luts.iter().zip(luts_host).zip(LUT_WORDS) {
+            if host.len() != expected_words
+                || host.iter().any(|&row| row as usize >= expected_words)
+            {
+                return Err(PreparedWitnessFeedError::BlakeGFusionShape(
+                    "canonical LUT contents drifted",
+                ));
+            }
+            upload(arena, *slice, host)?;
+        }
+        ensure_distinct(luts.iter().chain(&counts).map(|slice| slice.id()))?;
+        arena.context().sync()?;
+        Ok(Self {
+            arena,
+            luts,
+            counts,
+        })
+    }
+
+    pub fn belongs_to(&self, arena: &DeviceArena) -> bool {
+        core::ptr::eq(self.arena, arena)
+    }
+
+    pub fn luts(&self) -> [ArenaSlice; 4] {
+        self.luts
+    }
+
+    pub fn counts(&self) -> [ArenaSlice; 5] {
+        self.counts
+    }
+}
+
 /// One launch clears the complete union of arena-owned multiplicity slabs.
 pub struct PreparedWitnessFeedClearGraph<'a> {
     arena: &'a DeviceArena,
@@ -1139,6 +1202,10 @@ impl<'a> PreparedWitnessFeedGraph<'a> {
 
     pub fn multiplicity_destinations(&self) -> &[ArenaSlice] {
         &self.multiplicity_destinations
+    }
+
+    pub fn lut_tables(&self) -> &[ArenaSlice] {
+        &self.lut_tables
     }
 
     /// Immutable descriptor storage sealed into the captured kernel arguments.

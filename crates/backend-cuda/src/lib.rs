@@ -135,16 +135,16 @@ pub use backend::prepared_quotient_numerator::{
     QUOTIENT_NUMERATOR_POINTER_ALIGNMENT_WORDS,
 };
 pub use backend::prepared_witness::{
-    witness_workspace_requirements, PreparedWitnessError, PreparedWitnessGraph,
-    PreparedWitnessLaunchTelemetry, PreparedWitnessMode, WitnessArenaSlotRequirement,
-    WitnessKernelIdentity, WitnessWorkspaceRequirements, WitnessWorkspaceSlots,
-    WITNESS_POINTER_ALIGNMENT_WORDS,
+    blake_g_fusion_program_is_exact, witness_workspace_requirements, PreparedWitnessError,
+    PreparedWitnessGraph, PreparedWitnessLaunchTelemetry, PreparedWitnessMode,
+    WitnessArenaSlotRequirement, WitnessKernelIdentity, WitnessWorkspaceRequirements,
+    WitnessWorkspaceSlots, WITNESS_POINTER_ALIGNMENT_WORDS,
 };
 pub use backend::prepared_witness_feed::{
     clear_witness_feed_destinations_once, witness_feed_clear_workspace_requirements,
     witness_feed_descriptor_fits_shared, witness_feed_privatized_footprint_words,
-    witness_feed_workspace_requirements, PreparedWitnessFeedClearGraph, PreparedWitnessFeedError,
-    PreparedWitnessFeedGraph, WitnessFeedArenaSlotRequirement,
+    witness_feed_workspace_requirements, PreparedBlakeGFusedFeed, PreparedWitnessFeedClearGraph,
+    PreparedWitnessFeedError, PreparedWitnessFeedGraph, WitnessFeedArenaSlotRequirement,
     WitnessFeedClearWorkspaceRequirements, WitnessFeedClearWorkspaceSlots, WitnessFeedLaunchMode,
     WitnessFeedWorkspaceRequirements, WitnessFeedWorkspaceSlots, WITNESS_FEED_DESCRIPTOR_WORDS,
     WITNESS_FEED_MAX_TUPLE_WORDS, WITNESS_FEED_NO_LUT, WITNESS_FEED_POINTER_ALIGNMENT_WORDS,

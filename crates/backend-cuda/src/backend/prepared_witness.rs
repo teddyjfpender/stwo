@@ -9,6 +9,10 @@ use core::ffi::c_void;
 use std::collections::BTreeSet;
 use std::ffi::CString;
 
+use super::blake_witness::{
+    BG_FUSED_SEMANTIC_HASH, BG_N_DATA_INPUTS, BG_N_LOOKUP_WORDS, BG_N_RECORDED_INPUTS,
+    BG_N_SUB_WORDS, BG_N_TRACE,
+};
 use super::exec_context::{
     ArenaError, ArenaSlice, ArenaSlotId, CudaLaunchContext, CudaRuntimeError, DeviceArena,
 };
@@ -237,7 +241,7 @@ impl WitnessWorkspaceRequirements {
         &self,
         slots: &WitnessWorkspaceSlots,
     ) -> Result<Vec<WitnessArenaSlotRequirement>, PreparedWitnessError> {
-        self.arena_slot_requirements_inner(slots, true)
+        self.arena_slot_requirements_inner(slots, true, true)
     }
 
     /// Arena requirements when the execution-table descriptor pair is supplied
@@ -247,13 +251,29 @@ impl WitnessWorkspaceRequirements {
         &self,
         slots: &WitnessWorkspaceSlots,
     ) -> Result<Vec<WitnessArenaSlotRequirement>, PreparedWitnessError> {
-        self.arena_slot_requirements_inner(slots, false)
+        self.arena_slot_requirements_inner(slots, false, true)
+    }
+
+    /// Exact native Blake-G contract: the fused producer never executes the
+    /// recorded writer's `SubWord` instructions, so its sub destination aliases
+    /// the existing one-word multiplicity dummy and contributes no arena slab.
+    pub fn arena_slot_requirements_for_blake_g_fusion_with_prepared_execution_tables(
+        &self,
+        slots: &WitnessWorkspaceSlots,
+    ) -> Result<Vec<WitnessArenaSlotRequirement>, PreparedWitnessError> {
+        if slots.multiplicity_dummy != Some(slots.sub_words) {
+            return Err(PreparedWitnessError::BlakeGFusionShape(
+                "retired sub destination must alias the existing dummy",
+            ));
+        }
+        self.arena_slot_requirements_inner(slots, false, false)
     }
 
     fn arena_slot_requirements_inner(
         &self,
         slots: &WitnessWorkspaceSlots,
         include_execution_tables: bool,
+        include_sub_words: bool,
     ) -> Result<Vec<WitnessArenaSlotRequirement>, PreparedWitnessError> {
         validate_slot_shape(self, slots)?;
         let mut result = Vec::new();
@@ -301,10 +321,10 @@ impl WitnessWorkspaceRequirements {
         {
             result.push(words(id, len_words));
         }
-        result.extend([
-            words(slots.lookup_words, self.lookup_words),
-            words(slots.sub_words, self.sub_words),
-        ]);
+        result.push(words(slots.lookup_words, self.lookup_words));
+        if include_sub_words {
+            result.push(words(slots.sub_words, self.sub_words));
+        }
         ensure_distinct(&result.iter().map(|entry| entry.id).collect::<Vec<_>>())?;
         Ok(result)
     }
@@ -426,6 +446,7 @@ pub enum PreparedWitnessError {
     StrictAotUnavailable(WitnessKernelIdentity),
     KernelPreparationFailed(WitnessKernelIdentity),
     KernelLaunchFailed(WitnessKernelIdentity),
+    BlakeGFusionShape(&'static str),
     Arena(ArenaError),
     Cuda(CudaRuntimeError),
 }
@@ -458,6 +479,25 @@ enum WitnessExecutionTables<'a> {
     Prepared(PreparedExecutionTablesView<'a>),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WitnessLaunchContract {
+    Recorded,
+    BlakeGFused,
+}
+
+/// Fail-closed identity gate for the hand-lowered Blake-G implementation.
+/// Geometry alone is insufficient: a regenerated row body must fall back to
+/// the recorded writer until the native lowering is re-proven and re-pinned.
+pub fn blake_g_fusion_program_is_exact(program: &WitnessProgram) -> bool {
+    program.label == "blake_g"
+        && program.semantic_hash() == BG_FUSED_SEMANTIC_HASH
+        && program.n_inputs as usize == BG_N_RECORDED_INPUTS
+        && program.n_cols as usize == BG_N_TRACE
+        && program.n_lookup_words as usize == BG_N_LOOKUP_WORDS
+        && program.n_sub_words as usize == BG_N_SUB_WORDS
+        && program.n_mult_tables == 0
+}
+
 pub struct PreparedWitnessGraph<'a> {
     arena: &'a DeviceArena,
     _tables: WitnessExecutionTables<'a>,
@@ -477,6 +517,7 @@ pub struct PreparedWitnessGraph<'a> {
     multiplicity_dummy: Option<ArenaSlice>,
     lookup_words: ArenaSlice,
     sub_words: ArenaSlice,
+    launch_contract: WitnessLaunchContract,
 }
 
 impl<'a> PreparedWitnessGraph<'a> {
@@ -549,6 +590,7 @@ impl<'a> PreparedWitnessGraph<'a> {
             WitnessExecutionTables::Legacy(tables),
             slots,
             mode,
+            WitnessLaunchContract::Recorded,
         )
     }
 
@@ -573,6 +615,32 @@ impl<'a> PreparedWitnessGraph<'a> {
             WitnessExecutionTables::Prepared(tables),
             slots,
             mode,
+            WitnessLaunchContract::Recorded,
+        )
+    }
+
+    /// Prepare the exact native Blake-G producer/feed replacement. The generic
+    /// recorded writer remains pre-resolved for identity admission, but its
+    /// multi-gigabyte sub destination is structurally absent and generic launch
+    /// is forbidden on the resulting graph.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_blake_g_fused_with_execution_tables(
+        arena: &'a DeviceArena,
+        program: &WitnessProgram,
+        row_count: usize,
+        tables: PreparedExecutionTablesView<'a>,
+        slots: &WitnessWorkspaceSlots,
+        mode: PreparedWitnessMode,
+    ) -> Result<Self, PreparedWitnessError> {
+        Self::prepare_inner(
+            arena,
+            program,
+            row_count,
+            &[],
+            WitnessExecutionTables::Prepared(tables),
+            slots,
+            mode,
+            WitnessLaunchContract::BlakeGFused,
         )
     }
 
@@ -585,16 +653,37 @@ impl<'a> PreparedWitnessGraph<'a> {
         tables: WitnessExecutionTables<'a>,
         slots: &WitnessWorkspaceSlots,
         mode: PreparedWitnessMode,
+        launch_contract: WitnessLaunchContract,
     ) -> Result<Self, PreparedWitnessError> {
         if !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
             return Err(PreparedWitnessError::CudaUnavailable);
         }
         jit_witness::isa::validate_isa_layout().map_err(PreparedWitnessError::InvalidIsa)?;
         let requirements = witness_workspace_requirements(program, row_count, multiplicity_words)?;
-        match tables {
-            WitnessExecutionTables::Legacy(_) => requirements.arena_slot_requirements(slots)?,
-            WitnessExecutionTables::Prepared(_) => {
+        if launch_contract == WitnessLaunchContract::BlakeGFused
+            && !blake_g_fusion_program_is_exact(program)
+        {
+            return Err(PreparedWitnessError::BlakeGFusionShape(
+                "recorded blake_g program identity drifted",
+            ));
+        }
+        match (tables, launch_contract) {
+            (WitnessExecutionTables::Legacy(_), WitnessLaunchContract::Recorded) => {
+                requirements.arena_slot_requirements(slots)?
+            }
+            (WitnessExecutionTables::Prepared(_), WitnessLaunchContract::Recorded) => {
                 requirements.arena_slot_requirements_with_prepared_execution_tables(slots)?
+            }
+            (WitnessExecutionTables::Prepared(_), WitnessLaunchContract::BlakeGFused) => {
+                requirements
+                    .arena_slot_requirements_for_blake_g_fusion_with_prepared_execution_tables(
+                        slots,
+                    )?
+            }
+            (WitnessExecutionTables::Legacy(_), WitnessLaunchContract::BlakeGFused) => {
+                return Err(PreparedWitnessError::BlakeGFusionShape(
+                    "fused blake_g requires prepared execution tables",
+                ));
             }
         };
 
@@ -665,7 +754,16 @@ impl<'a> PreparedWitnessGraph<'a> {
             _ => unreachable!("slot shape validated"),
         };
         let lookup_words = bind_slot(arena, slots.lookup_words, requirements.lookup_words, 1)?;
-        let sub_words = bind_slot(arena, slots.sub_words, requirements.sub_words, 1)?;
+        let sub_words = match launch_contract {
+            WitnessLaunchContract::Recorded => {
+                bind_slot(arena, slots.sub_words, requirements.sub_words, 1)?
+            }
+            WitnessLaunchContract::BlakeGFused => {
+                multiplicity_dummy.ok_or(PreparedWitnessError::BlakeGFusionShape(
+                    "fused blake_g is missing its one-word dummy",
+                ))?
+            }
+        };
 
         let manifest_hash = aot::loaded_manifest_hash();
         let material = witness_kernel_material(program, mode, manifest_hash)?;
@@ -744,6 +842,7 @@ impl<'a> PreparedWitnessGraph<'a> {
             multiplicity_dummy,
             lookup_words,
             sub_words,
+            launch_contract,
         })
     }
 
@@ -761,6 +860,11 @@ impl<'a> PreparedWitnessGraph<'a> {
     ) -> Result<PreparedWitnessLaunchTelemetry, PreparedWitnessError> {
         if launch.identity_token() != self.arena.context().identity_token() {
             return Err(CudaRuntimeError::ContextMismatch.into());
+        }
+        if self.launch_contract != WitnessLaunchContract::Recorded {
+            return Err(PreparedWitnessError::BlakeGFusionShape(
+                "generic recorded launch is forbidden without a sub slab",
+            ));
         }
         let ok = unsafe {
             let source_ptr = self
@@ -784,6 +888,89 @@ impl<'a> PreparedWitnessGraph<'a> {
             )
         };
         if ok {
+            Ok(PreparedWitnessLaunchTelemetry::KERNEL)
+        } else {
+            Err(PreparedWitnessError::KernelLaunchFailed(
+                self.identity.clone(),
+            ))
+        }
+    }
+
+    /// Replace the recorded blake_g writer plus its generic 48-word feed pass
+    /// with the native one-pass producer. Every pointer is an already-bound
+    /// arena address; this method performs no allocation, copy, or sync and is
+    /// safe in the same eager/capture positions as [`Self::launch_on`].
+    pub fn launch_blake_g_fused_on(
+        &self,
+        launch: CudaLaunchContext,
+        n_real_rows: usize,
+        luts: [ArenaSlice; 4],
+        counts: [ArenaSlice; 5],
+    ) -> Result<PreparedWitnessLaunchTelemetry, PreparedWitnessError> {
+        if launch.identity_token() != self.arena.context().identity_token() {
+            return Err(CudaRuntimeError::ContextMismatch.into());
+        }
+        if self.launch_contract != WitnessLaunchContract::BlakeGFused
+            || self.identity.label != "blake_g"
+            || self.input_columns.len() != BG_N_RECORDED_INPUTS
+            || self.output_columns.len() != BG_N_TRACE
+            || self.lookup_words.len_words() < BG_N_LOOKUP_WORDS * self.row_count as usize
+            || n_real_rows > self.row_count as usize
+        {
+            return Err(PreparedWitnessError::BlakeGFusionShape(
+                "recorded blake_g witness geometry drifted",
+            ));
+        }
+        const LUT_WORDS: [usize; 4] = [1 << 16, 1 << 8, 1 << 14, 1 << 18];
+        const COUNT_WORDS: [usize; 5] = [2 << 16, 16 << 20, 1 << 8, 1 << 14, 1 << 18];
+        if luts.iter().zip(LUT_WORDS).any(|(slice, words)| {
+            !slice.belongs_to(self.arena.context()) || slice.len_words() != words
+        }) || counts.iter().zip(COUNT_WORDS).any(|(slice, words)| {
+            !slice.belongs_to(self.arena.context()) || slice.len_words() != words
+        }) {
+            return Err(PreparedWitnessError::BlakeGFusionShape(
+                "canonical xor LUT/count geometry drifted",
+            ));
+        }
+        // Every operand is live for the entire launch. Reject a bad arena
+        // coloring even if the logical planner admitted it: input, trace,
+        // lookup, LUT, and count storage may not alias across this kernel.
+        let mut live_ids = BTreeSet::new();
+        let live_slices = self
+            .input_columns
+            .iter()
+            .chain(&self.output_columns)
+            .chain(core::iter::once(&self.lookup_words))
+            .chain(luts.iter())
+            .chain(counts.iter());
+        if live_slices
+            .into_iter()
+            .any(|slice| !live_ids.insert(slice.id()))
+        {
+            return Err(PreparedWitnessError::BlakeGFusionShape(
+                "live fused blake_g operands alias each other",
+            ));
+        }
+
+        let inputs: [*const u32; BG_N_DATA_INPUTS] =
+            std::array::from_fn(|column| self.input_columns[column].as_u32_ptr().cast_const());
+        let outputs: [*mut u32; BG_N_TRACE] =
+            std::array::from_fn(|column| self.output_columns[column].as_u32_ptr());
+        let lut_ptrs = luts.map(|slice| slice.as_u32_ptr().cast_const());
+        let count_ptrs = counts.map(ArenaSlice::as_u32_ptr);
+        let code = unsafe {
+            stwo_backend_cuda_kernels::raw::blake_g_write_trace_fused_into_on(
+                inputs.as_ptr(),
+                u32::try_from(n_real_rows).map_err(|_| PreparedWitnessError::SizeOverflow)?,
+                self.row_count,
+                outputs.as_ptr(),
+                self.lookup_words.as_u32_ptr(),
+                lut_ptrs.as_ptr(),
+                count_ptrs.as_ptr(),
+                launch.stream_raw().as_ptr(),
+            )
+        };
+        if code == 0 {
             Ok(PreparedWitnessLaunchTelemetry::KERNEL)
         } else {
             Err(PreparedWitnessError::KernelLaunchFailed(
@@ -849,6 +1036,10 @@ impl<'a> PreparedWitnessGraph<'a> {
 
     pub fn sub_words(&self) -> ArenaSlice {
         self.sub_words
+    }
+
+    pub fn is_blake_g_fused(&self) -> bool {
+        self.launch_contract == WitnessLaunchContract::BlakeGFused
     }
 
     /// Immutable descriptor slices, useful to seal the exact Graph-A ABI during
@@ -1198,6 +1389,37 @@ mod tests {
         let no_mult = witness_workspace_requirements(&no_mult_program, 32, &[]).unwrap();
         assert_eq!(no_mult.multiplicity_pointer_words, POINTER_WORDS);
         assert_eq!(no_mult.multiplicity_dummy_words, Some(1));
+    }
+
+    #[test]
+    fn fused_blake_contract_physically_omits_the_sub_slab() {
+        let mut recorder = WitnessRecorder::new("blake_g");
+        let input = recorder.input(0);
+        recorder.col_write(0, input);
+        recorder.lookup_word(0, input);
+        recorder.sub_word(0, input);
+        let requirements =
+            witness_workspace_requirements(&recorder.finish(), 1 << 20, &[]).unwrap();
+        let mut slots = slots(&requirements);
+        slots.sub_words = slots.multiplicity_dummy.unwrap();
+        let fused = requirements
+            .arena_slot_requirements_for_blake_g_fusion_with_prepared_execution_tables(&slots)
+            .unwrap();
+        assert!(fused
+            .iter()
+            .any(|entry| entry.id == slots.sub_words && entry.len_words == 1));
+        assert!(!fused
+            .iter()
+            .any(|entry| entry.id == slots.sub_words && entry.len_words == requirements.sub_words));
+
+        let mut invalid = slots;
+        invalid.sub_words = invalid.lookup_words;
+        assert!(matches!(
+            requirements.arena_slot_requirements_for_blake_g_fusion_with_prepared_execution_tables(
+                &invalid
+            ),
+            Err(PreparedWitnessError::BlakeGFusionShape(_))
+        ));
     }
 
     #[test]

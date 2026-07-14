@@ -45,11 +45,36 @@ struct BlakeGResidentOutputs {
     uint32_t *sub;
 };
 
-__device__ __constant__ uint8_t BG_TUPLE_COLS[BG_N_SUB] = {
+// Resident producer/feed ABI. The generic recorded writer receives six
+// column-major input pointers, so the native replacement binds those same
+// arena columns by value.  Feed pointers are also copied into the kernel
+// argument: no device pointer table, allocation, or setup copy is introduced.
+struct BlakeGColumnInputs {
+    const uint32_t *columns[6];
+};
+
+struct BlakeGFusedFeed {
+    // Canonical input->row LUT order: xor8, xor4, xor7, xor9.
+    const uint32_t *luts[4];
+    // Canonical multiplicity order: xor8, xor12, xor4, xor7, xor9.
+    uint32_t *counts[5];
+};
+
+// LookupData is flattened in interaction-column declaration order.
+__device__ __constant__ uint8_t BG_LOOKUP_TUPLE_COLS[BG_N_SUB] = {
     53, 55, 18, 14, 16, 19, 54, 56, 20, 15, 17, 21,
     57, 59, 28, 24, 26, 29, 58, 60, 30, 25, 27, 31,
     61, 63, 38, 34, 36, 39, 62, 64, 40, 35, 37, 41,
     65, 67, 48, 44, 46, 49, 66, 68, 50, 45, 47, 51,
+};
+
+// SubComponentInputs is flattened by relation field, then instance.  It is a
+// different ABI from LookupData even though both contain the same 16 tuples.
+__device__ __constant__ uint8_t BG_SUB_TUPLE_COLS[BG_N_SUB] = {
+    53, 55, 18, 14, 16, 19, 61, 63, 38, 34, 36, 39,
+    54, 56, 20, 15, 17, 21, 62, 64, 40, 35, 37, 41,
+    57, 59, 28, 58, 60, 30, 24, 26, 29, 25, 27, 31,
+    65, 67, 48, 66, 68, 50, 44, 46, 49, 45, 47, 51,
 };
 __device__ __constant__ uint32_t BG_TUPLE_RELATIONS[16] = {
     112558620, 112558620, 521092554, 521092554,
@@ -69,20 +94,26 @@ DEVICE_FORCEINLINE uint32_t hi16(uint32_t x) { return x >> 16; }
 // per row; padding rows already carry the host's replicated first input).
 __global__ void blake_g_write_trace_kernel(
     const uint32_t *inputs,
+    BlakeGColumnInputs column_inputs,
     const uint32_t *producer_sub,
     uint32_t producer_rows,
     uint32_t producer_word_base,
     uint32_t n_rows,        // real (non-padding) rows; enabler = row < n_rows
     uint32_t column_length,
     uint32_t *const *cols,  // legacy: BG_N_COLS device pointers
-    BlakeGResidentOutputs resident
+    BlakeGResidentOutputs resident,
+    BlakeGFusedFeed fused_feed
 ) {
     uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= column_length) {
         return;
     }
     uint32_t input_words[6];
-    if (producer_sub != nullptr) {
+    if (column_inputs.columns[0] != nullptr) {
+        for (uint32_t word = 0; word < 6; ++word) {
+            input_words[word] = column_inputs.columns[word][row];
+        }
+    } else if (producer_sub != nullptr) {
         // blake_round -> blake_g edge: instance-major stacking. Padding rows
         // replicate the first packed row's lanes, exactly like the host resize.
         uint32_t src = row < n_rows ? row : (row & 15u);
@@ -220,9 +251,12 @@ __global__ void blake_g_write_trace_kernel(
     for (int tuple = 0; tuple < 16; ++tuple) {
         resident.lookup[(size_t)(4 * tuple) * column_length + row] = BG_TUPLE_RELATIONS[tuple];
         for (int word = 0; word < 3; ++word) {
-            uint32_t value = c[BG_TUPLE_COLS[3 * tuple + word]];
+            uint32_t value = c[BG_LOOKUP_TUPLE_COLS[3 * tuple + word]];
             resident.lookup[(size_t)(4 * tuple + 1 + word) * column_length + row] = value;
-            resident.sub[(size_t)(3 * tuple + word) * column_length + row] = value;
+            if (resident.sub != nullptr) {
+                resident.sub[(size_t)(3 * tuple + word) * column_length + row] =
+                    c[BG_SUB_TUPLE_COLS[3 * tuple + word]];
+            }
         }
     }
     resident.lookup[(size_t)64 * column_length + row] = 1139985212;
@@ -231,6 +265,70 @@ __global__ void blake_g_write_trace_kernel(
     }
     resident.lookup[(size_t)85 * column_length + row] = 1;
     resident.lookup[(size_t)86 * column_length + row] = c[52];
+
+    if (fused_feed.counts[0] == nullptr) {
+        return;
+    }
+
+    // The producer owns these exact operands in registers.  Accumulate the
+    // same sixteen canonical descriptor edges as witness_feed_counts_kernel,
+    // but do not materialize/re-read the 48-word SubcomponentInputs slab.
+    const uint8_t xor8_a[8] = {53, 14, 61, 34, 54, 15, 62, 35};
+    const uint8_t xor8_b[8] = {55, 16, 63, 36, 56, 17, 64, 37};
+    for (uint32_t pair = 0; pair < 8; ++pair) {
+        uint32_t a = c[xor8_a[pair]];
+        uint32_t b = c[xor8_b[pair]];
+        if ((a | b) >= (1u << 8)) {
+            continue;
+        }
+        uint32_t key = (a << 8) | b;
+        uint32_t index = fused_feed.luts[0][key];
+        if (index < (1u << 16)) {
+            uint32_t relation = pair >> 2;
+            atomicAdd(&fused_feed.counts[0][relation * (1u << 16) + index], 1u);
+        }
+    }
+
+    const uint8_t xor4_a[2] = {24, 25};
+    const uint8_t xor4_b[2] = {26, 27};
+    const uint8_t xor7_a[2] = {65, 66};
+    const uint8_t xor7_b[2] = {67, 68};
+    const uint8_t xor9_a[2] = {44, 45};
+    const uint8_t xor9_b[2] = {46, 47};
+    for (uint32_t pair = 0; pair < 2; ++pair) {
+        uint32_t a4 = c[xor4_a[pair]], b4 = c[xor4_b[pair]];
+        if ((a4 | b4) < (1u << 4)) {
+            uint32_t i4 = fused_feed.luts[1][(a4 << 4) | b4];
+            if (i4 < (1u << 8)) {
+                atomicAdd(&fused_feed.counts[2][i4], 1u);
+            }
+        }
+        uint32_t a7 = c[xor7_a[pair]], b7 = c[xor7_b[pair]];
+        if ((a7 | b7) < (1u << 7)) {
+            uint32_t i7 = fused_feed.luts[2][(a7 << 7) | b7];
+            if (i7 < (1u << 14)) {
+                atomicAdd(&fused_feed.counts[3][i7], 1u);
+            }
+        }
+        uint32_t a9 = c[xor9_a[pair]], b9 = c[xor9_b[pair]];
+        if ((a9 | b9) < (1u << 9)) {
+            uint32_t i9 = fused_feed.luts[3][(a9 << 9) | b9];
+            if (i9 < (1u << 18)) {
+                atomicAdd(&fused_feed.counts[4][i9], 1u);
+            }
+        }
+    }
+
+    const uint8_t xor12_a[2] = {57, 58};
+    const uint8_t xor12_b[2] = {59, 60};
+    for (uint32_t pair = 0; pair < 2; ++pair) {
+        uint32_t a = c[xor12_a[pair]], b = c[xor12_b[pair]];
+        if ((a | b) < (1u << 12)) {
+            uint32_t column = ((a >> 10) << 2) | (b >> 10);
+            uint32_t table_row = ((a & 0x3ffu) << 10) | (b & 0x3ffu);
+            atomicAdd(&fused_feed.counts[1][column * (1u << 20) + table_row], 1u);
+        }
+    }
 }
 
 // Generic xor multiplicity count feed. For each of `n_pairs` (a, b) column pairs,
@@ -366,9 +464,11 @@ extern "C" void blake_g_write_trace(
 ) {
     uint32_t blocks = (column_length + BG_BLOCK - 1) / BG_BLOCK;
     BlakeGResidentOutputs resident = {};
+    BlakeGColumnInputs column_inputs = {};
+    BlakeGFusedFeed fused_feed = {};
     blake_g_write_trace_kernel<<<blocks, BG_BLOCK>>>(
-        inputs, nullptr, 0, 0, n_rows, column_length,
-        const_cast<uint32_t *const *>(cols), resident);
+        inputs, column_inputs, nullptr, 0, 0, n_rows, column_length,
+        const_cast<uint32_t *const *>(cols), resident, fused_feed);
     stwo_maybe_debug_sync();
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 }
@@ -398,6 +498,8 @@ extern "C" int blake_g_write_trace_into_on(
         return static_cast<int>(cudaErrorInvalidValue);
     }
     BlakeGResidentOutputs resident = {};
+    BlakeGColumnInputs column_inputs = {};
+    BlakeGFusedFeed fused_feed = {};
     for (int column = 0; column < BG_N_TRACE; ++column) {
         if (trace_cols_host[column] == nullptr) {
             return static_cast<int>(cudaErrorInvalidDevicePointer);
@@ -408,8 +510,59 @@ extern "C" int blake_g_write_trace_into_on(
     resident.sub = sub;
     uint32_t blocks = (column_length + BG_BLOCK - 1) / BG_BLOCK;
     blake_g_write_trace_kernel<<<blocks, BG_BLOCK, 0, stream>>>(
-        inputs, producer_sub, producer_rows, producer_word_base,
-        n_rows, column_length, nullptr, resident);
+        inputs, column_inputs, producer_sub, producer_rows, producer_word_base,
+        n_rows, column_length, nullptr, resident, fused_feed);
+    return static_cast<int>(cudaGetLastError());
+}
+
+extern "C" int blake_g_write_trace_fused_into_on(
+    const uint32_t *const *input_cols_host,
+    uint32_t n_rows,
+    uint32_t column_length,
+    uint32_t *const *trace_cols_host,
+    uint32_t *lookup,
+    const uint32_t *const *luts_host,
+    uint32_t *const *counts_host,
+    cudaStream_t stream
+) {
+    if (column_length == 0 || n_rows > column_length || input_cols_host == nullptr ||
+        trace_cols_host == nullptr || lookup == nullptr || luts_host == nullptr ||
+        counts_host == nullptr) {
+        return static_cast<int>(cudaErrorInvalidValue);
+    }
+    BlakeGColumnInputs column_inputs = {};
+    BlakeGResidentOutputs resident = {};
+    BlakeGFusedFeed fused_feed = {};
+    for (int column = 0; column < 6; ++column) {
+        if (input_cols_host[column] == nullptr) {
+            return static_cast<int>(cudaErrorInvalidDevicePointer);
+        }
+        column_inputs.columns[column] = input_cols_host[column];
+    }
+    for (int column = 0; column < BG_N_TRACE; ++column) {
+        if (trace_cols_host[column] == nullptr) {
+            return static_cast<int>(cudaErrorInvalidDevicePointer);
+        }
+        resident.trace[column] = trace_cols_host[column];
+    }
+    resident.lookup = lookup;
+    resident.sub = nullptr;
+    for (int lut = 0; lut < 4; ++lut) {
+        if (luts_host[lut] == nullptr) {
+            return static_cast<int>(cudaErrorInvalidDevicePointer);
+        }
+        fused_feed.luts[lut] = luts_host[lut];
+    }
+    for (int counts = 0; counts < 5; ++counts) {
+        if (counts_host[counts] == nullptr) {
+            return static_cast<int>(cudaErrorInvalidDevicePointer);
+        }
+        fused_feed.counts[counts] = counts_host[counts];
+    }
+    uint32_t blocks = (column_length + BG_BLOCK - 1) / BG_BLOCK;
+    blake_g_write_trace_kernel<<<blocks, BG_BLOCK, 0, stream>>>(
+        nullptr, column_inputs, nullptr, 0, 0, n_rows, column_length,
+        nullptr, resident, fused_feed);
     return static_cast<int>(cudaGetLastError());
 }
 

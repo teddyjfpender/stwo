@@ -1503,6 +1503,20 @@ extern "C" {
         stream: *mut c_void,
     ) -> i32;
 
+    /// Resident producer/feed fusion. Inputs and trace outputs are host
+    /// arrays of 6/53 arena device addresses. LUTs are ordered xor8/4/7/9 and
+    /// count slabs xor8/12/4/7/9. The kernel writes no sub-input slab.
+    pub fn blake_g_write_trace_fused_into_on(
+        input_cols_host: *const *const u32,
+        n_rows: u32,
+        column_length: u32,
+        trace_cols_host: *const *mut u32,
+        lookup: *mut u32,
+        luts_host: *const *const u32,
+        counts_host: *const *mut u32,
+        stream: *mut c_void,
+    ) -> i32;
+
     pub fn blake_g_xor_count(
         a_cols: *const *const u32,
         b_cols: *const *const u32,
