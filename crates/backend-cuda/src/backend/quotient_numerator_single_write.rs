@@ -147,7 +147,7 @@ impl QuotientNumeratorSingleWritePlan {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum QuotientNumeratorSingleWriteError {
     Base(PreparedQuotientNumeratorError),
     NoEligibleGroups,

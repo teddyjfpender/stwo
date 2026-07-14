@@ -124,8 +124,9 @@ pub use backend::prepared_quotient::{
     QUOTIENT_POINTER_ALIGNMENT_WORDS,
 };
 pub use backend::prepared_quotient_numerator::{
-    quotient_numerator_workspace_requirements, PreparedQuotientNumeratorError,
-    PreparedQuotientNumeratorGraph, QuotientNumeratorArenaSlotRequirement,
+    quotient_numerator_workspace_requirements, PreparedNumeratorSchedule,
+    PreparedQuotientNumeratorError, PreparedQuotientNumeratorGraph,
+    QuotientNumeratorArenaSlotRequirement,
     QuotientNumeratorBatchRequirements, QuotientNumeratorColumn, QuotientNumeratorColumnSource,
     QuotientNumeratorColumnTopology, QuotientNumeratorDestination,
     QuotientNumeratorGroupRequirements, QuotientNumeratorSourceKind,

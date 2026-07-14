@@ -292,8 +292,9 @@ struct PreparedBatch {
     group_offset: usize,
 }
 
-#[derive(Clone, Copy)]
-enum PreparedNumeratorSchedule {
+/// Exact quotient-numerator launch schedule sealed by the prepared constructor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreparedNumeratorSchedule {
     LegacyBatches,
     SingleWriteCandidate,
     HybridCandidate {
@@ -687,6 +688,11 @@ impl<'a> PreparedQuotientNumeratorGraph<'a> {
 
     pub fn destinations(&self) -> &[QuotientNumeratorDestination] {
         &self.destinations
+    }
+
+    /// Actual schedule selected by the constructor; launch cannot change it.
+    pub fn schedule(&self) -> PreparedNumeratorSchedule {
+        self.schedule
     }
 
     /// Setup-only adapter for [`super::prepared_quotient::PreparedQuotientGraph::prepare`].
