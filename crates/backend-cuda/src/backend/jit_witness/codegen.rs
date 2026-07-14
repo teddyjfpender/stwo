@@ -181,17 +181,23 @@ fn emit_body_inner(
     let schedule = OutputSchedule::build(program)?;
     let mut deduce_args: Vec<u32> = Vec::new();
     let mut deduce_seq = 0usize;
+    macro_rules! marker {
+        ($($arg:tt)*) => {
+            if instruction_markers {
+                src.push_str(&format!($($arg)*));
+            }
+        };
+    }
 
     for (index, inst) in program.insts.iter().enumerate() {
-        if instruction_markers {
-            src.push_str(&format!("    // STWO_WIT_INST_{index}\n"));
-        }
+        marker!("    // STWO_WIT_INST_{index}\n");
         let op = WitnessOp::from_raw(inst.op)?;
         let (a, b, imm) = (inst.a, inst.b, inst.imm);
 
         // Output opcodes write memory and produce no register.
         match op {
             WitnessOp::ColWrite | WitnessOp::LookupWord | WitnessOp::SubWord => {
+                marker!("    // STWO_WIT_AFTER_INST_{index}\n");
                 continue;
             }
             WitnessOp::MultPush => {
@@ -199,11 +205,13 @@ fn emit_body_inner(
                 // field/count adds commute), exactly as the host AtomicMultiplicityColumn.
                 src.push_str(&format!("    atomicAdd(&mult_counts[{imm}u][r{a}], 1u);\n"));
                 emit_scheduled_outputs(src, &schedule.after_instruction[index])?;
+                marker!("    // STWO_WIT_AFTER_INST_{index}\n");
                 continue;
             }
             WitnessOp::DeduceArg => {
                 deduce_args.push(a);
                 emit_scheduled_outputs(src, &schedule.after_instruction[index])?;
+                marker!("    // STWO_WIT_AFTER_INST_{index}\n");
                 continue;
             }
             WitnessOp::DeduceCall => {
@@ -224,6 +232,7 @@ fn emit_body_inner(
                      \x20   unsigned douts{seq}[{n_outs}];\n"
                 ));
                 emit_scheduled_outputs(src, &schedule.after_deduce_arguments[index])?;
+                marker!("    // STWO_WIT_AFTER_DARGS_{index}\n");
                 match kind {
                     DeduceKind::BlakeG => {
                         src.push_str(&format!("    stwo_wit_blake_g(dargs{seq}, douts{seq});\n"));
@@ -290,9 +299,11 @@ fn emit_body_inner(
                     let reg = base + i;
                     src.push_str(&format!("    unsigned r{reg} = douts{seq}[{i}];\n"));
                     emit_scheduled_outputs(src, &schedule.after_deduce_register[reg])?;
+                    marker!("    // STWO_WIT_AFTER_DREG_{index}_{reg}_{i}\n");
                 }
                 deduce_args.clear();
                 emit_scheduled_outputs(src, &schedule.after_instruction[index])?;
+                marker!("    // STWO_WIT_AFTER_INST_{index}\n");
                 continue;
             }
             _ => {}
@@ -349,6 +360,7 @@ fn emit_body_inner(
         };
         src.push_str(&format!("    unsigned r{dst} = {expr};\n"));
         emit_scheduled_outputs(src, &schedule.after_instruction[index])?;
+        marker!("    // STWO_WIT_AFTER_INST_{index}\n");
     }
     Some(())
 }
@@ -517,7 +529,6 @@ mod tests {
         let outputs = recorder.deduce(DeduceKind::BlakeG, &args);
         recorder.col_write(0, args[0]);
         recorder.col_write(1, outputs[0]);
-
         let source = compile_witness_to_cuda_source(&recorder.finish()).expect("codegen");
         let argument_snapshot = source.find("const unsigned dargs0[6]").unwrap();
         let call = source.find("stwo_wit_blake_g(dargs0, douts0);").unwrap();
@@ -532,7 +543,6 @@ mod tests {
     fn deduce_codegen_and_interp_roundtrip() {
         use super::super::interp::{interpret_row_with, DeduceHost};
         use super::super::isa::DeduceKind;
-
         // Record: g = blake_g(inputs 0..6); sigma = sigma(input 6); commit a few outs.
         let mut r = WitnessRecorder::new("deduce_probe");
         let ins: Vec<_> = (0..7).map(|i| r.input(i)).collect();
@@ -542,14 +552,12 @@ mod tests {
         r.col_write(1, g[3]);
         r.col_write(2, sg[15]);
         let prog = r.finish();
-
         // Codegen: embeds both device fns + the call/bank pattern.
         let src = compile_witness_to_cuda_source(&prog).expect("codegen succeeds");
         assert!(src.contains("stwo_wit_blake_g"), "src: {src}");
         assert!(src.contains("STWO_WIT_BLAKE_SIGMA"), "src: {src}");
         assert!(src.contains("dargs0[6]"), "src: {src}");
         assert!(src.contains("douts1[16]"), "src: {src}");
-
         // Interp with a reference host: blake2s g + sigma row, straight math.
         struct RefHost;
         impl DeduceHost for RefHost {
@@ -636,7 +644,6 @@ mod tests {
     #[test]
     fn ec_deduce_codegen_embeds_fp256_support() {
         use super::super::isa::DeduceKind;
-
         // One W18 EC round chained into a points-table read — the aggregator shape.
         let mut r = WitnessRecorder::new("ec_deduce_probe");
         let ins: Vec<_> = (0..72).map(|i| r.input(i)).collect();
@@ -645,7 +652,6 @@ mod tests {
         r.col_write(0, round[71]);
         r.col_write(1, point[55]);
         let prog = r.finish();
-
         let src = compile_witness_to_cuda_source(&prog).expect("EC deduce codegen succeeds");
         assert!(
             src.contains("stwo_wit_deduce_partial_ec_mul_w18(dargs0, douts0);"),
@@ -669,7 +675,6 @@ mod tests {
     #[test]
     fn felt_deduce_codegen_embeds_fp256_support() {
         use super::super::isa::DeduceKind;
-
         // A chained slope computation: div feeding mul feeding sub — the
         // partial_ec_mul shape.
         let mut r = WitnessRecorder::new("felt_deduce_probe");
@@ -686,7 +691,6 @@ mod tests {
         let a = r.deduce(DeduceKind::FeltAdd, &aargs);
         r.col_write(0, a[27]);
         let prog = r.finish();
-
         let src = compile_witness_to_cuda_source(&prog).expect("felt codegen succeeds");
         assert!(src.contains("stwo_wit_deduce_felt_div(dargs0, douts0);"));
         assert!(src.contains("stwo_wit_deduce_felt_mul(dargs1, douts1);"));
@@ -701,7 +705,6 @@ mod tests {
     #[test]
     fn blake_only_programs_skip_fp256_embed() {
         use super::super::isa::DeduceKind;
-
         // Compile-size guard: the ~70KB fp256 chain must only be paid by kernels
         // that actually carry EC deduces.
         let mut r = WitnessRecorder::new("blake_only_probe");
@@ -709,7 +712,6 @@ mod tests {
         let g = r.deduce(DeduceKind::BlakeG, &ins);
         r.col_write(0, g[0]);
         let prog = r.finish();
-
         let src = compile_witness_to_cuda_source(&prog).expect("codegen succeeds");
         assert!(src.contains("stwo_wit_blake_g"));
         assert!(!src.contains("ff_dispatch_st"));
@@ -736,7 +738,6 @@ mod tests {
         r.mult_push(3, id);
         r.lookup_word(0, pc);
         let prog = r.finish();
-
         let src = compile_witness_to_cuda_source(&prog).expect("codegen succeeds");
         assert!(src.contains(&witness_kernel_name(prog.semantic_hash())));
         assert!(src.contains("out_cols[0u][row]"));

@@ -81,6 +81,7 @@ pub(super) struct ProgramAnalysis {
     pub(super) schedule: OutputSchedule,
     pub(super) definitions: Vec<Option<RegisterDefinition>>,
     pub(super) computational_uses: Vec<Vec<usize>>,
+    pub(super) deduce_argument_uses: Vec<Vec<usize>>,
     pub(super) legal_cuts: Vec<bool>,
     pub(super) stores: Vec<StoreEvent>,
 }
@@ -101,7 +102,7 @@ impl OutputSchedule {
         let n_regs = program.n_regs as usize;
         let mut definitions = vec![None; n_regs];
         let mut last_use = vec![None; n_regs];
-        let mut deduce_argument_use = vec![None; n_regs];
+        let mut deduce_argument_uses = vec![Vec::new(); n_regs];
         let mut pending_deduce_args = Vec::new();
         let mut outputs = Vec::new();
 
@@ -178,7 +179,7 @@ impl OutputSchedule {
                         .then_some(())?;
                     for register in pending_deduce_args.drain(..) {
                         mark_use(register, instruction, &definitions, &mut last_use)?;
-                        deduce_argument_use[register as usize] = Some(instruction);
+                        deduce_argument_uses[register as usize].push(instruction);
                     }
                     let end = (inst.dst as usize).checked_add(n_outs)?;
                     (end <= n_regs).then_some(())?;
@@ -231,7 +232,7 @@ impl OutputSchedule {
             let register = output.register as usize;
             let definition = definitions[register]?;
             let last_use = last_use[register]?;
-            let mut anchor = if deduce_argument_use[register] == Some(last_use) {
+            let mut anchor = if deduce_argument_uses[register].last() == Some(&last_use) {
                 StoreAnchor::AfterDeduceArguments(last_use)
             } else {
                 match definition.deduce_bank_offset {
@@ -313,6 +314,7 @@ impl OutputSchedule {
             schedule,
             definitions,
             computational_uses,
+            deduce_argument_uses,
             legal_cuts,
             stores,
         })

@@ -2,16 +2,16 @@
 //!
 //! A cut is legal only between complete bytecode instructions with no pending
 //! `DeduceArg` bank. Values crossing it are sourced, in order of preference,
-//! from immutable constants/inputs, a globally unique final output moved to the
-//! cut, or a dense word-major scratch slot. This plan is codegen-only until its
-//! interpreter differential and exact ptxas resource gates pass.
+//! from immutable constants/inputs, a globally unique final output stored at its
+//! last prefix use, or a dense word-major scratch slot. This plan is codegen-only
+//! until its interpreter differential and exact ptxas resource gates pass.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::schedule::{OutputSchedule, OutputTarget, ProgramAnalysis, StoreEvent};
 use super::{WitnessOp, WitnessProgram, WITNESS_CODEGEN_VERSION};
 
-pub const PHASE_CODEGEN_VERSION: u64 = 1;
+pub const PHASE_CODEGEN_VERSION: u64 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub enum PhaseOutputTarget {
@@ -35,7 +35,21 @@ pub enum BoundarySource {
     Constant(u32),
     Input(u32),
     Output(PhaseOutputTarget),
-    Scratch { slot: u32 },
+    Scratch {
+        slot: u32,
+        transport_anchor: TransportAnchor,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
+pub enum TransportAnchor {
+    AfterInstruction(usize),
+    AfterDeduceArguments(usize),
+    AfterDeduceRegister {
+        instruction: usize,
+        register: usize,
+        bank_offset: usize,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -50,6 +64,7 @@ pub struct MovedStore {
     pub register: u32,
     pub target: PhaseOutputTarget,
     pub original_anchor_instruction: usize,
+    pub transport_anchor: TransportAnchor,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -141,6 +156,9 @@ impl WitnessPhasePlan {
                 Some(WitnessOp::Const) => BoundarySource::Constant(defining_inst.imm),
                 Some(WitnessOp::Input) => BoundarySource::Input(defining_inst.a),
                 _ => {
+                    let transport_anchor =
+                        prefix_transport_anchor(&analysis, register as u32, cut_instruction)
+                            .ok_or(PhasePlanError::MalformedProgram)?;
                     let movable = unique_future_store(
                         &analysis,
                         &stores_by_target,
@@ -154,7 +172,10 @@ impl WitnessPhasePlan {
                         if !used_output_targets.insert(target) {
                             let slot = next_scratch_slot;
                             next_scratch_slot += 1;
-                            BoundarySource::Scratch { slot }
+                            BoundarySource::Scratch {
+                                slot,
+                                transport_anchor,
+                            }
                         } else {
                             // Global target uniqueness proves last-writer-at-cut,
                             // injectivity, and no overwrite before lazy first use.
@@ -162,6 +183,7 @@ impl WitnessPhasePlan {
                                 register: register as u32,
                                 target,
                                 original_anchor_instruction: event.anchor.rank().0,
+                                transport_anchor,
                             });
                             if let Some(&first_use_without_store) = uses_without_store.first() {
                                 boundary.push(BoundaryValue {
@@ -175,7 +197,10 @@ impl WitnessPhasePlan {
                     } else {
                         let slot = next_scratch_slot;
                         next_scratch_slot += 1;
-                        BoundarySource::Scratch { slot }
+                        BoundarySource::Scratch {
+                            slot,
+                            transport_anchor,
+                        }
                     }
                 }
             };
@@ -278,6 +303,50 @@ fn suffix_uses(
     uses
 }
 
+fn prefix_transport_anchor(
+    analysis: &ProgramAnalysis,
+    register: u32,
+    cut: usize,
+) -> Option<TransportAnchor> {
+    let register = register as usize;
+    let last_prefix_use = analysis
+        .computational_uses
+        .get(register)?
+        .iter()
+        .copied()
+        .take_while(|&instruction| instruction < cut)
+        .last();
+    let anchor = if let Some(instruction) = last_prefix_use {
+        if analysis.deduce_argument_uses[register].contains(&instruction) {
+            TransportAnchor::AfterDeduceArguments(instruction)
+        } else {
+            TransportAnchor::AfterInstruction(instruction)
+        }
+    } else {
+        let definition = analysis.definitions.get(register)?.as_ref()?;
+        match definition.deduce_bank_offset {
+            Some(bank_offset) => TransportAnchor::AfterDeduceRegister {
+                instruction: definition.instruction,
+                register,
+                bank_offset,
+            },
+            None => TransportAnchor::AfterInstruction(definition.instruction),
+        }
+    };
+    (anchor.instruction() < cut).then_some(anchor)
+}
+
+impl TransportAnchor {
+    fn instruction(self) -> usize {
+        match self {
+            Self::AfterInstruction(instruction) | Self::AfterDeduceArguments(instruction) => {
+                instruction
+            }
+            Self::AfterDeduceRegister { instruction, .. } => instruction,
+        }
+    }
+}
+
 fn phase_plan_hash(
     semantic_hash: u64,
     cut: usize,
@@ -303,9 +372,13 @@ fn phase_plan_hash(
                 bytes.push(2);
                 encode_target(target, &mut bytes);
             }
-            BoundarySource::Scratch { slot } => {
+            BoundarySource::Scratch {
+                slot,
+                transport_anchor,
+            } => {
                 bytes.push(3);
                 bytes.extend_from_slice(&slot.to_le_bytes());
+                encode_anchor(transport_anchor, &mut bytes);
             }
         }
     }
@@ -313,8 +386,32 @@ fn phase_plan_hash(
         bytes.extend_from_slice(&store.register.to_le_bytes());
         encode_target(store.target, &mut bytes);
         bytes.extend_from_slice(&(store.original_anchor_instruction as u64).to_le_bytes());
+        encode_anchor(store.transport_anchor, &mut bytes);
     }
     fnv64(bytes)
+}
+
+fn encode_anchor(anchor: TransportAnchor, bytes: &mut Vec<u8>) {
+    match anchor {
+        TransportAnchor::AfterInstruction(instruction) => {
+            bytes.push(0);
+            bytes.extend_from_slice(&(instruction as u64).to_le_bytes());
+        }
+        TransportAnchor::AfterDeduceArguments(instruction) => {
+            bytes.push(1);
+            bytes.extend_from_slice(&(instruction as u64).to_le_bytes());
+        }
+        TransportAnchor::AfterDeduceRegister {
+            instruction,
+            register,
+            bank_offset,
+        } => {
+            bytes.push(2);
+            bytes.extend_from_slice(&(instruction as u64).to_le_bytes());
+            bytes.extend_from_slice(&(register as u64).to_le_bytes());
+            bytes.extend_from_slice(&(bank_offset as u64).to_le_bytes());
+        }
+    }
 }
 
 fn encode_target(target: PhaseOutputTarget, bytes: &mut Vec<u8>) {
@@ -415,5 +512,27 @@ mod tests {
         assert_ne!(first.phase_cache_key(0), second.phase_cache_key(0));
         let key = first.phase_cache_key(0);
         assert_ne!(key, fnv64(first.parent_semantic_hash.to_le_bytes()));
+
+        let mut altered_boundary = second.boundary.clone();
+        let BoundarySource::Scratch {
+            transport_anchor, ..
+        } = &mut altered_boundary
+            .iter_mut()
+            .find(|value| matches!(value.source, BoundarySource::Scratch { .. }))
+            .unwrap()
+            .source
+        else {
+            panic!("expected scratch crossing")
+        };
+        *transport_anchor = TransportAnchor::AfterInstruction(0);
+        assert_ne!(
+            second.plan_hash,
+            phase_plan_hash(
+                second.parent_semantic_hash,
+                second.cut_instruction,
+                &altered_boundary,
+                &second.moved_stores,
+            )
+        );
     }
 }
