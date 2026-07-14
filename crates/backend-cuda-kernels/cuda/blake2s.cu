@@ -1,4 +1,5 @@
 #include "blake2s.cuh"
+#include "blake2s_progressive_scalar.cuh"
 #include <cstdio>
 #include <cstdlib>
 #include "poly_utils.cuh"
@@ -135,37 +136,8 @@ __device__ void blake2s_finalize(Blake2sState* S, Blake2sHash* out) {
     }
 }
 
-// Full-state progressive lane.  Unlike the legacy streaming leaf path, this
-// state is clonable across circle-domain rises and therefore carries the
-// counter, finalization flags, pending block, and pending length explicitly.
-__device__ __forceinline__ void progressive_blake2s_compress(
-    ProgressiveBlake2sState *S,
-    uint64_t counter,
-    uint32_t lastblock) {
-    const uint32_t *m = S->pending;
-    uint32_t v[16];
-    #pragma unroll
-    for (int i = 0; i < 8; ++i) v[i] = S->h[i];
-    #pragma unroll
-    for (int i = 0; i < 8; ++i) v[i + 8] = blake2s_IV[i];
-    v[12] ^= static_cast<uint32_t>(counter);
-    v[13] ^= static_cast<uint32_t>(counter >> 32);
-    v[14] ^= lastblock;
-    #pragma unroll
-    for (int r = 0; r < 10; ++r) {
-        G(r,0,v[0],v[4],v[8],v[12]);
-        G(r,1,v[1],v[5],v[9],v[13]);
-        G(r,2,v[2],v[6],v[10],v[14]);
-        G(r,3,v[3],v[7],v[11],v[15]);
-        G(r,4,v[0],v[5],v[10],v[15]);
-        G(r,5,v[1],v[6],v[11],v[12]);
-        G(r,6,v[2],v[7],v[8],v[13]);
-        G(r,7,v[3],v[4],v[9],v[14]);
-    }
-    #pragma unroll
-    for (int i = 0; i < 8; ++i) S->h[i] ^= v[i] ^ v[i + 8];
-}
-
+// Clonable progressive lane. Counter and pending length are canonical-prefix
+// launch scalars; only row-varying chaining and pending words persist in HBM.
 __host__ __device__ constexpr uint32_t progressive_pending_words(
     uint32_t absorbed_columns) {
     return absorbed_columns == 0 ? 0 : ((absorbed_columns - 1) & 15u) + 1;
@@ -177,18 +149,63 @@ static_assert(progressive_pending_words(17) == 1, "next block must start at one 
 static_assert(progressive_pending_words(0xffffffffu) == 15,
               "maximum canonical prefix must not overflow");
 
-__device__ __forceinline__ void progressive_absorb_word(
-    ProgressiveBlake2sState *S,
-    uint32_t word,
-    uint32_t *pending_words,
-    uint64_t *compressed_bytes) {
-    if (*pending_words == 16) {
-        *compressed_bytes += 64;
-        progressive_blake2s_compress(S, *compressed_bytes, 0);
-        *pending_words = 0;
-    }
-    S->pending[(*pending_words)++] = word;
-}
+#define PROGRESSIVE_LOAD_STATE(S)       \
+    uint32_t h0 = (S).h[0];             \
+    uint32_t h1 = (S).h[1];             \
+    uint32_t h2 = (S).h[2];             \
+    uint32_t h3 = (S).h[3];             \
+    uint32_t h4 = (S).h[4];             \
+    uint32_t h5 = (S).h[5];             \
+    uint32_t h6 = (S).h[6];             \
+    uint32_t h7 = (S).h[7];             \
+    uint32_t p0 = (S).pending[0];        \
+    uint32_t p1 = (S).pending[1];        \
+    uint32_t p2 = (S).pending[2];        \
+    uint32_t p3 = (S).pending[3];        \
+    uint32_t p4 = (S).pending[4];        \
+    uint32_t p5 = (S).pending[5];        \
+    uint32_t p6 = (S).pending[6];        \
+    uint32_t p7 = (S).pending[7];        \
+    uint32_t p8 = (S).pending[8];        \
+    uint32_t p9 = (S).pending[9];        \
+    uint32_t p10 = (S).pending[10];      \
+    uint32_t p11 = (S).pending[11];      \
+    uint32_t p12 = (S).pending[12];      \
+    uint32_t p13 = (S).pending[13];      \
+    uint32_t p14 = (S).pending[14];      \
+    uint32_t p15 = (S).pending[15]
+
+#define PROGRESSIVE_COMPRESS(COUNTER, LAST)                                  \
+    progressive_blake2s_compress_scalar(                                     \
+        h0,h1,h2,h3,h4,h5,h6,h7,                                             \
+        p0,p1,p2,p3,p4,p5,p6,p7,p8,p9,p10,p11,p12,p13,p14,p15,              \
+        COUNTER, LAST)
+
+#define PROGRESSIVE_STORE_STATE(S)    \
+    (S).h[0] = h0;                    \
+    (S).h[1] = h1;                    \
+    (S).h[2] = h2;                    \
+    (S).h[3] = h3;                    \
+    (S).h[4] = h4;                    \
+    (S).h[5] = h5;                    \
+    (S).h[6] = h6;                    \
+    (S).h[7] = h7;                    \
+    (S).pending[0] = p0;              \
+    (S).pending[1] = p1;              \
+    (S).pending[2] = p2;              \
+    (S).pending[3] = p3;              \
+    (S).pending[4] = p4;              \
+    (S).pending[5] = p5;              \
+    (S).pending[6] = p6;              \
+    (S).pending[7] = p7;              \
+    (S).pending[8] = p8;              \
+    (S).pending[9] = p9;              \
+    (S).pending[10] = p10;            \
+    (S).pending[11] = p11;            \
+    (S).pending[12] = p12;            \
+    (S).pending[13] = p13;            \
+    (S).pending[14] = p14;            \
+    (S).pending[15] = p15
 
 __global__ void progressive_leaf_init_in_gpu(
     uint32_t size, ProgressiveBlake2sState *states) {
@@ -214,15 +231,38 @@ __global__ void progressive_leaf_absorb_in_gpu(
     ProgressiveBlake2sState *states) {
     uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= size) return;
-    ProgressiveBlake2sState state = states[row];
+    ProgressiveBlake2sState &state = states[row];
+    PROGRESSIVE_LOAD_STATE(state);
     uint32_t pending_words = progressive_pending_words(absorbed_columns_before);
     uint64_t compressed_bytes =
         static_cast<uint64_t>(absorbed_columns_before - pending_words) * 4;
     for (uint32_t column = 0; column < number_of_columns; ++column) {
-        progressive_absorb_word(
-            &state, columns[column][row], &pending_words, &compressed_bytes);
+        if (pending_words == 16) {
+            compressed_bytes += 64;
+            PROGRESSIVE_COMPRESS(compressed_bytes, 0);
+            pending_words = 0;
+        }
+        uint32_t word = columns[column][row];
+        switch (pending_words++) {
+            case 0: p0 = word; break;
+            case 1: p1 = word; break;
+            case 2: p2 = word; break;
+            case 3: p3 = word; break;
+            case 4: p4 = word; break;
+            case 5: p5 = word; break;
+            case 6: p6 = word; break;
+            case 7: p7 = word; break;
+            case 8: p8 = word; break;
+            case 9: p9 = word; break;
+            case 10: p10 = word; break;
+            case 11: p11 = word; break;
+            case 12: p12 = word; break;
+            case 13: p13 = word; break;
+            case 14: p14 = word; break;
+            default: p15 = word; break;
+        }
     }
-    states[row] = state;
+    PROGRESSIVE_STORE_STATE(state);
 }
 
 __global__ void progressive_leaf_expand_in_gpu(
@@ -243,14 +283,40 @@ __global__ void progressive_leaf_finalize_in_gpu(
     Blake2sHash *result) {
     uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= size) return;
-    ProgressiveBlake2sState state = states[row];
+    const ProgressiveBlake2sState &state = states[row];
+    PROGRESSIVE_LOAD_STATE(state);
     uint32_t pending_words = progressive_pending_words(absorbed_columns);
-    for (uint32_t i = pending_words; i < 16; ++i) state.pending[i] = 0;
-    progressive_blake2s_compress(
-        &state, static_cast<uint64_t>(absorbed_columns) * 4, 0xFFFFFFFFu);
-    #pragma unroll
-    for (int i = 0; i < 8; ++i) result[row].s[i] = state.h[i];
+    if (pending_words < 1) p0 = 0;
+    if (pending_words < 2) p1 = 0;
+    if (pending_words < 3) p2 = 0;
+    if (pending_words < 4) p3 = 0;
+    if (pending_words < 5) p4 = 0;
+    if (pending_words < 6) p5 = 0;
+    if (pending_words < 7) p6 = 0;
+    if (pending_words < 8) p7 = 0;
+    if (pending_words < 9) p8 = 0;
+    if (pending_words < 10) p9 = 0;
+    if (pending_words < 11) p10 = 0;
+    if (pending_words < 12) p11 = 0;
+    if (pending_words < 13) p12 = 0;
+    if (pending_words < 14) p13 = 0;
+    if (pending_words < 15) p14 = 0;
+    if (pending_words < 16) p15 = 0;
+    PROGRESSIVE_COMPRESS(
+        static_cast<uint64_t>(absorbed_columns) * 4, 0xFFFFFFFFu);
+    result[row].s[0] = h0;
+    result[row].s[1] = h1;
+    result[row].s[2] = h2;
+    result[row].s[3] = h3;
+    result[row].s[4] = h4;
+    result[row].s[5] = h5;
+    result[row].s[6] = h6;
+    result[row].s[7] = h7;
 }
+
+#undef PROGRESSIVE_STORE_STATE
+#undef PROGRESSIVE_COMPRESS
+#undef PROGRESSIVE_LOAD_STATE
 
 // Kept in this translation unit deliberately: transcript hashing must share
 // the exact compression implementation used by the ordinary Blake2s Merkle
