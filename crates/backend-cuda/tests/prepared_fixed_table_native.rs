@@ -9,7 +9,7 @@ use stwo_backend_cuda::{
     fixed_table_workspace_requirements, ArenaLayout, ArenaSlice, ArenaSlotId, ArenaSlotSpec,
     CudaExecContext, DeviceArena, FixedTableArenaSlotRequirement,
     FixedTableContiguousWorkspaceSlots, FixedTableLookupSource, FixedTableMaterializationConfig,
-    FixedTableWorkspaceRequirements, PreparedFixedTableGraph,
+    FixedTableSourceColumn, FixedTableWorkspaceRequirements, PreparedFixedTableGraph,
 };
 
 const ROWS: usize = 16;
@@ -248,7 +248,7 @@ fn prepared_fixed_table_eager_capture_and_mutated_multiplicity_match_host() {
     let prepared = PreparedFixedTableGraph::prepare_contiguous(
         &arena,
         &config,
-        &source_slices,
+        &source_slices.map(FixedTableSourceColumn::from),
         multiplicity_slab,
         &slots,
     )
