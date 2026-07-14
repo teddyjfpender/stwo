@@ -16,13 +16,30 @@
 /// Stable identity of the AOT semantic-key/architecture set embedded in this
 /// binary. Zero means no AOT pack is present and is never a valid graph key.
 pub fn loaded_manifest_hash() -> u64 {
-    stwo_backend_cuda_kernels::aot_pack::aot_pack_manifest_hash()
+    let hash = stwo_backend_cuda_kernels::aot_pack::aot_pack_manifest_hash();
+    if hash != 0 && loaded_constraint_max_live_u32_lanes() != constraint_split_max_live_u32_lanes()
+    {
+        return 0;
+    }
+    hash
 }
 
 /// Exact constraint split cap used by the loaded AOT pack. Zero means the
 /// current binary has no pack and is invalid for resident composition planning.
 pub fn loaded_constraint_max_instrs() -> usize {
     stwo_backend_cuda_kernels::aot_pack::aot_pack_constraint_max_instrs()
+}
+
+/// Exact compacted live-u32-lane cap used by the loaded AOT pack. Zero means no
+/// pack is present. [`loaded_manifest_hash`] rejects a stale pack whose value does
+/// not match the runtime lowerer's compiled policy.
+pub fn loaded_constraint_max_live_u32_lanes() -> usize {
+    stwo_backend_cuda_kernels::aot_pack::aot_pack_constraint_max_live_u32_lanes()
+}
+
+/// Runtime/AOT constraint splitter register-pressure policy identity.
+pub const fn constraint_split_max_live_u32_lanes() -> usize {
+    super::jit::CONSTRAINT_SPLIT_MAX_LIVE_U32_LANES
 }
 
 /// Cheap device-architecture admission check. Individual semantic lookups still
@@ -65,7 +82,10 @@ use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
 use stwo_constraint_framework::FrameworkEval;
 
-use super::jit::{cuda_codegen, lower_for_aot as lower_framework_eval_to_v1_split};
+use super::jit::{
+    cuda_codegen, lower_for_aot as lower_framework_eval_to_v1_split,
+    lower_for_aot_with_live_cap as lower_framework_eval_to_v1_split_with_live_cap,
+};
 
 /// One emitted kernel: `name`/`cache_key` are the launch-time lookup identity
 /// (identical to the JIT lane's), `source` is the self-contained CUDA TU.
@@ -160,16 +180,38 @@ pub fn constraint_program<F: FrameworkEval>(
     log_size: u32,
     max_kernel_instrs: usize,
 ) -> Option<EmittedConstraintProgram> {
-    let (parts, base_param_values, ext_param_values) = lower_framework_eval_to_v1_split(
+    constraint_program_with_live_cap(
         eval,
         n_interactions,
-        0,
-        0,
         claimed_sum,
         log_size,
         max_kernel_instrs,
+        constraint_split_max_live_u32_lanes(),
     )
-    .ok()?;
+}
+
+/// Explicit-policy source emitter for offline ptxas/occupancy sweeps. Production
+/// generation uses [`constraint_program`] and the compiled policy identity.
+pub fn constraint_program_with_live_cap<F: FrameworkEval>(
+    eval: &F,
+    n_interactions: u32,
+    claimed_sum: SecureField,
+    log_size: u32,
+    max_kernel_instrs: usize,
+    max_live_u32_lanes: usize,
+) -> Option<EmittedConstraintProgram> {
+    let (parts, base_param_values, ext_param_values) =
+        lower_framework_eval_to_v1_split_with_live_cap(
+            eval,
+            n_interactions,
+            0,
+            0,
+            claimed_sum,
+            log_size,
+            max_kernel_instrs,
+            max_live_u32_lanes,
+        )
+        .ok()?;
     let kernels = parts
         .iter()
         .map(|part| {
@@ -205,13 +247,33 @@ pub fn constraint_kernel_sources<F: FrameworkEval>(
     log_size: u32,
     max_kernel_instrs: usize,
 ) -> Option<Vec<EmittedKernel>> {
+    constraint_kernel_sources_with_live_cap(
+        eval,
+        n_interactions,
+        claimed_sum,
+        log_size,
+        max_kernel_instrs,
+        constraint_split_max_live_u32_lanes(),
+    )
+}
+
+/// Explicit-policy source-only wrapper for offline resource sweeps.
+pub fn constraint_kernel_sources_with_live_cap<F: FrameworkEval>(
+    eval: &F,
+    n_interactions: u32,
+    claimed_sum: SecureField,
+    log_size: u32,
+    max_kernel_instrs: usize,
+    max_live_u32_lanes: usize,
+) -> Option<Vec<EmittedKernel>> {
     Some(
-        constraint_program(
+        constraint_program_with_live_cap(
             eval,
             n_interactions,
             claimed_sum,
             log_size,
             max_kernel_instrs,
+            max_live_u32_lanes,
         )?
         .kernels
         .into_iter()

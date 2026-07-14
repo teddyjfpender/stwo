@@ -16,8 +16,12 @@ use std::ffi::CString;
 use std::os::raw::c_char;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-pub(crate) use program::lower_framework_eval_to_v1_split as lower_for_aot;
 use program::lower_framework_eval_to_v1_split;
+pub(crate) use program::{
+    lower_framework_eval_to_v1_split as lower_for_aot,
+    lower_framework_eval_to_v1_split_with_live_cap as lower_for_aot_with_live_cap,
+    CONSTRAINT_SPLIT_MAX_LIVE_U32_LANES,
+};
 use stwo_constraint_framework::{FrameworkComponent, FrameworkEval};
 
 use crate::columns::{BaseFieldVec, SecureFieldVec};

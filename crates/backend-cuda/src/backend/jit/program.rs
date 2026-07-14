@@ -36,6 +36,15 @@ pub const STWO_METAL_EVAL_PROGRAM_CAP_PREFINALIZED_LOGUP_V1: u64 = 1 << 2;
 
 pub const STWO_METAL_EVAL_PROGRAM_SECURE_EXT_DEGREE_V1: u32 = 4;
 
+/// Maximum compacted live value footprint for one generated constraint kernel,
+/// expressed as scalar u32 lanes (one base register = one lane, one secure-field
+/// register = four lanes). The exact CUDA 11.8/sm_90 cap-192 risk gate compiled
+/// 53/53 kernels and reduced the SN composition schedule to 145 launches (versus
+/// 180 at 160 and 245 at 128). Two bounded rows retain small spills and some rows
+/// remain occupancy-limited, so 192 is a measured ceiling, not permission to remove
+/// the governor. Keep it fixed between AOT generation and runtime lowering.
+pub const CONSTRAINT_SPLIT_MAX_LIVE_U32_LANES: usize = 192;
+
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub enum MetalEvaluationProgramBaseOpcodeV1 {
@@ -740,15 +749,17 @@ pub fn lower_framework_eval_to_v1_with_logup<F: FrameworkEval>(
 > {
     // Uncapped: always the single fused program (the historical pipeline —
     // record, hoist, compact, build — unchanged byte-for-byte).
-    let (mut parts, base_param_values, ext_param_values) = lower_framework_eval_to_v1_split(
-        eval,
-        n_interactions,
-        n_base_params,
-        n_ext_params,
-        claimed_sum,
-        log_size,
-        usize::MAX,
-    )?;
+    let (mut parts, base_param_values, ext_param_values) =
+        lower_framework_eval_to_v1_split_with_live_cap(
+            eval,
+            n_interactions,
+            n_base_params,
+            n_ext_params,
+            claimed_sum,
+            log_size,
+            usize::MAX,
+            usize::MAX,
+        )?;
     debug_assert_eq!(parts.len(), 1);
     let part = parts.pop().expect("uncapped lowering yields one program");
     Ok((part.program, base_param_values, ext_param_values))
@@ -790,6 +801,34 @@ pub fn lower_framework_eval_to_v1_split<F: FrameworkEval>(
     claimed_sum: SecureField,
     log_size: u32,
     max_kernel_instrs: usize,
+) -> Result<
+    (Vec<JitKernelPart>, Vec<BaseField>, Vec<SecureField>),
+    MetalEvaluationProgramLoweringError,
+> {
+    lower_framework_eval_to_v1_split_with_live_cap(
+        eval,
+        n_interactions,
+        n_base_params,
+        n_ext_params,
+        claimed_sum,
+        log_size,
+        max_kernel_instrs,
+        CONSTRAINT_SPLIT_MAX_LIVE_U32_LANES,
+    )
+}
+
+/// Explicit-policy variant used by offline resource sweeps. Production JIT and AOT
+/// callers use [`lower_framework_eval_to_v1_split`], whose live-lane cap is fixed and
+/// sealed into the loaded pack identity.
+pub fn lower_framework_eval_to_v1_split_with_live_cap<F: FrameworkEval>(
+    eval: &F,
+    n_interactions: u32,
+    n_base_params: u32,
+    n_ext_params: u32,
+    claimed_sum: SecureField,
+    log_size: u32,
+    max_kernel_instrs: usize,
+    max_live_u32_lanes: usize,
 ) -> Result<
     (Vec<JitKernelPart>, Vec<BaseField>, Vec<SecureField>),
     MetalEvaluationProgramLoweringError,
@@ -864,11 +903,16 @@ pub fn lower_framework_eval_to_v1_split<F: FrameworkEval>(
     }
     let n_ext_params = checked_param_count(ext_param_offset, ext_param_values.len())?;
 
-    // Size governor: split the still-SSA state (each register written exactly once,
-    // so backward slicing is trivial) into root groups BEFORE register compaction;
-    // each part is then compacted and built independently.
+    // Resource governor: split the still-SSA state (each register written exactly
+    // once, so backward slicing is trivial) into root groups BEFORE register
+    // compaction. Bound both source size and the compacted live scalar-lane footprint;
+    // instruction count alone admits 255-register kernels with local-memory spills.
+    // Each part is compacted and built independently.
     let total_instrs = state.base_insts.len() + state.ext_insts.len();
-    if total_instrs <= max_kernel_instrs || state.constraint_roots.len() <= 1 {
+    if state.constraint_roots.len() <= 1
+        || (total_instrs <= max_kernel_instrs
+            && compacted_live_u32_lanes(&state) <= max_live_u32_lanes)
+    {
         let program =
             finalize_recording_state(state, n_interactions, n_base_params, n_ext_params, log_size);
         return Ok((
@@ -881,7 +925,7 @@ pub fn lower_framework_eval_to_v1_split<F: FrameworkEval>(
         ));
     }
 
-    let parts = split_recording_state(&state, max_kernel_instrs)
+    let parts = split_recording_state(&state, max_kernel_instrs, max_live_u32_lanes)
         .into_iter()
         .map(|(slice, rc_base)| JitKernelPart {
             program: finalize_recording_state(
@@ -895,6 +939,22 @@ pub fn lower_framework_eval_to_v1_split<F: FrameworkEval>(
         })
         .collect();
     Ok((parts, base_param_values, ext_param_values))
+}
+
+/// Conservative source-level proxy for ptxas register pressure after the existing
+/// linear-scan compaction. The weighting follows the generated CUDA representation:
+/// base values occupy one u32 lane and `StwoCudaQm31` values occupy four.
+fn compacted_live_u32_lanes(state: &super::recording::RecordingState) -> usize {
+    let mut compacted = super::recording::RecordingState::from_parts(
+        state.base_insts.clone(),
+        state.ext_insts.clone(),
+        state.constraint_roots.clone(),
+        state.max_base_regs(),
+        state.max_ext_regs(),
+    );
+    compacted.compact_registers();
+    compacted.max_base_regs() as usize
+        + STWO_METAL_EVAL_PROGRAM_SECURE_EXT_DEGREE_V1 as usize * compacted.max_ext_regs() as usize
 }
 
 /// Compact registers, sanity-check operands, and build the owned program. This is the
@@ -986,9 +1046,10 @@ fn finalize_recording_state(
 
 /// Split an SSA recording state (pre-compaction: every register written exactly once)
 /// into contiguous constraint-root groups whose backward slices each stay at or under
-/// `max_kernel_instrs` (base + ext instructions), except when a single root's cone
-/// alone exceeds the cap. Returns `(slice_state, rc_base)` pairs in root order;
-/// `rc_base` is the group's first root's index in the original root list.
+/// both `max_kernel_instrs` (base + ext instructions) and
+/// `max_live_u32_lanes` (compacted base + 4*ext registers), except when a single
+/// root's cone alone exceeds a cap. Returns `(slice_state, rc_base)` pairs in root
+/// order; `rc_base` is the group's first root's index in the original root list.
 ///
 /// Each slice keeps its instructions in original program order, so every root's
 /// dataflow — and therefore its value — is exactly the original's. Instructions
@@ -996,6 +1057,7 @@ fn finalize_recording_state(
 fn split_recording_state(
     state: &super::recording::RecordingState,
     max_kernel_instrs: usize,
+    max_live_u32_lanes: usize,
 ) -> Vec<(super::recording::RecordingState, u32)> {
     use {MetalEvaluationProgramBaseOpcodeV1 as B, MetalEvaluationProgramExtOpcodeV1 as X};
 
@@ -1086,11 +1148,7 @@ fn split_recording_state(
     let mut count = 0usize;
     let mut group_start = 0usize;
 
-    let flush = |start: usize,
-                 end: usize,
-                 needed_base: &[bool],
-                 needed_ext: &[bool],
-                 out: &mut Vec<(super::recording::RecordingState, u32)>| {
+    let make_slice = |start: usize, end: usize, needed_base: &[bool], needed_ext: &[bool]| {
         let slice_base: Vec<MetalEvaluationProgramBaseInstV1> = state
             .base_insts
             .iter()
@@ -1103,14 +1161,21 @@ fn split_recording_state(
             .filter(|inst| needed_ext[inst.dst as usize])
             .copied()
             .collect();
+        super::recording::RecordingState::from_parts(
+            slice_base,
+            slice_ext,
+            roots[start..end].to_vec(),
+            state.max_base_regs(),
+            state.max_ext_regs(),
+        )
+    };
+    let flush = |start: usize,
+                 end: usize,
+                 needed_base: &[bool],
+                 needed_ext: &[bool],
+                 out: &mut Vec<(super::recording::RecordingState, u32)>| {
         out.push((
-            super::recording::RecordingState::from_parts(
-                slice_base,
-                slice_ext,
-                roots[start..end].to_vec(),
-                state.max_base_regs(),
-                state.max_ext_regs(),
-            ),
+            make_slice(start, end, needed_base, needed_ext),
             start as u32,
         ));
     };
@@ -1126,7 +1191,11 @@ fn split_recording_state(
             &mut added_base,
             &mut added_ext,
         );
-        if i > group_start && count + added > max_kernel_instrs {
+        let exceeds_instrs = count + added > max_kernel_instrs;
+        let exceeds_live_lanes = i > group_start
+            && compacted_live_u32_lanes(&make_slice(group_start, i + 1, &needed_base, &needed_ext))
+                > max_live_u32_lanes;
+        if i > group_start && (exceeds_instrs || exceeds_live_lanes) {
             // This root does not fit: undo its marginal cone, flush the group,
             // and retry the root against a fresh group.
             for reg in &added_ext {
@@ -1626,7 +1695,7 @@ mod tests {
         const CAP: usize = 60;
         let full_state = synthetic_state(16, 8);
         assert!(full_state.base_insts.len() + full_state.ext_insts.len() > CAP);
-        let parts = split_recording_state(&full_state, CAP);
+        let parts = split_recording_state(&full_state, CAP, usize::MAX);
         assert!(parts.len() > 1, "expected an actual split");
 
         let rc = rc_powers(fused_roots.len());
@@ -1662,12 +1731,34 @@ mod tests {
     }
 
     #[test]
+    fn live_lane_cap_splits_and_preserves_root_order() {
+        let ext_params = test_ext_params();
+        let full_state = synthetic_state(16, 4);
+        let fused_roots = interpret(&finalize(synthetic_state(16, 4)), &[], &ext_params);
+
+        const LIVE_LANES: usize = 40;
+        let parts = split_recording_state(&full_state, usize::MAX, LIVE_LANES);
+        assert!(parts.len() > 1, "expected register pressure to split");
+
+        let mut concatenated = Vec::new();
+        for (slice, rc_base) in parts {
+            assert_eq!(rc_base as usize, concatenated.len());
+            assert!(
+                compacted_live_u32_lanes(&slice) <= LIVE_LANES || slice.constraint_roots.len() == 1,
+                "multi-root part exceeded the live-lane cap"
+            );
+            concatenated.extend(interpret(&finalize(slice), &[], &ext_params));
+        }
+        assert_eq!(concatenated, fused_roots);
+    }
+
+    #[test]
     fn single_group_split_is_identical_to_fused_program() {
         // With a cap that fits everything, the slice of all roots must reproduce the
         // fused program exactly (the synthetic state has no dead instructions).
         let fused = finalize(synthetic_state(12, 6));
         let state = synthetic_state(12, 6);
-        let mut parts = split_recording_state(&state, usize::MAX);
+        let mut parts = split_recording_state(&state, usize::MAX, usize::MAX);
         assert_eq!(parts.len(), 1);
         let (slice, rc_base) = parts.pop().unwrap();
         assert_eq!(rc_base, 0);
@@ -1706,7 +1797,7 @@ mod tests {
         let fused = finalize(build());
         let fused_roots = interpret(&fused, &[], &ext_params);
 
-        let parts = split_recording_state(&build(), CAP);
+        let parts = split_recording_state(&build(), CAP, usize::MAX);
         assert!(parts.len() >= 2);
         // First part is the irreducible oversized cone.
         assert!(

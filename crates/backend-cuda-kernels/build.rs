@@ -100,8 +100,14 @@ fn main() {
         .unwrap_or(false);
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR must be set"));
     let aot_constraint_max_instrs = generated_aot_constraint_max_instrs();
+    let aot_constraint_max_live_u32_lanes = generated_aot_constraint_max_live_u32_lanes();
     if !nvcc_available {
-        write_aot_pack(&out_dir, &[], aot_constraint_max_instrs);
+        write_aot_pack(
+            &out_dir,
+            &[],
+            aot_constraint_max_instrs,
+            aot_constraint_max_live_u32_lanes,
+        );
         println!("cargo:rustc-env=STWO_CUDA_BUILD_MODE=no-cuda");
         return;
     }
@@ -297,6 +303,7 @@ fn main() {
         &extra_flags,
         &out_dir,
         aot_constraint_max_instrs,
+        aot_constraint_max_live_u32_lanes,
     );
 
     println!("cargo:rustc-env=STWO_CUDA_BUILD_MODE=cuda");
@@ -399,6 +406,7 @@ fn build_aot_pack(
     extra_flags: &[String],
     out_dir: &PathBuf,
     constraint_max_instrs: usize,
+    constraint_max_live_u32_lanes: usize,
 ) {
     let gen_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap())
         .join("cuda")
@@ -496,7 +504,12 @@ fn build_aot_pack(
         .iter()
         .map(|(k, a, p)| (*k, *a, p.as_path()))
         .collect();
-    write_aot_pack(out_dir, &refs, constraint_max_instrs);
+    write_aot_pack(
+        out_dir,
+        &refs,
+        constraint_max_instrs,
+        constraint_max_live_u32_lanes,
+    );
 }
 
 /// Concatenate cubins into `aot_pack.bin` + emit `aot_index.rs` (sorted by
@@ -506,6 +519,7 @@ fn write_aot_pack(
     out_dir: &std::path::Path,
     entries: &[(u64, u32, &std::path::Path)],
     constraint_max_instrs: usize,
+    constraint_max_live_u32_lanes: usize,
 ) {
     let mut pack: Vec<u8> = Vec::new();
     let mut index: Vec<(u64, u32, usize, usize)> = Vec::new();
@@ -525,6 +539,10 @@ fn write_aot_pack(
     rs.push_str("];\n");
     rs.push_str(&format!(
         "pub(crate) const AOT_CONSTRAINT_MAX_INSTRS: usize = {constraint_max_instrs};\n"
+    ));
+    rs.push_str(&format!(
+        "pub(crate) const AOT_CONSTRAINT_MAX_LIVE_U32_LANES: usize = \
+         {constraint_max_live_u32_lanes};\n"
     ));
     std::fs::write(out_dir.join("aot_index.rs"), rs).expect("write aot index");
 }
@@ -547,5 +565,29 @@ fn generated_aot_constraint_max_instrs() -> usize {
         )
     });
     assert!(cap > 0, "generated AOT constraint cap must be non-zero");
+    cap
+}
+
+fn generated_aot_constraint_max_live_u32_lanes() -> usize {
+    let path = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap())
+        .join("cuda")
+        .join("generated")
+        .join("aot_constraint_max_live_u32_lanes.txt");
+    let raw = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+        panic!(
+            "generated AOT constraint live-lane cap is missing at {}: {error}",
+            path.display()
+        )
+    });
+    let cap = raw.trim().parse::<usize>().unwrap_or_else(|error| {
+        panic!(
+            "invalid generated AOT constraint live-lane cap at {}: {error}",
+            path.display()
+        )
+    });
+    assert!(
+        cap > 0,
+        "generated AOT constraint live-lane cap must be non-zero"
+    );
     cap
 }

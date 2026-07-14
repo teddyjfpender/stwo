@@ -56,8 +56,9 @@ pub fn aot_pack_manifest_hash() -> u64 {
             hash = hash.wrapping_mul(0x100000001b3);
         }
     };
-    feed(b"stwo-cuda-aot-pack-v2\0");
+    feed(b"stwo-cuda-aot-pack-v3\0");
     feed(&(AOT_CONSTRAINT_MAX_INSTRS as u64).to_le_bytes());
+    feed(&(AOT_CONSTRAINT_MAX_LIVE_U32_LANES as u64).to_le_bytes());
     feed(&(AOT_INDEX.len() as u64).to_le_bytes());
     for &(cache_key, sm, _offset, len) in AOT_INDEX {
         feed(&cache_key.to_le_bytes());
@@ -75,6 +76,17 @@ pub fn aot_pack_constraint_max_instrs() -> usize {
         0
     } else {
         AOT_CONSTRAINT_MAX_INSTRS
+    }
+}
+
+/// Compacted live-u32-lane cap used to generate the embedded constraint split.
+/// Zero is returned for an empty/stub pack so runtime admission cannot silently
+/// combine a stale AOT pack with a different resource policy.
+pub fn aot_pack_constraint_max_live_u32_lanes() -> usize {
+    if AOT_INDEX.is_empty() {
+        0
+    } else {
+        AOT_CONSTRAINT_MAX_LIVE_U32_LANES
     }
 }
 
@@ -109,9 +121,11 @@ mod manifest_tests {
         if AOT_INDEX.is_empty() {
             assert_eq!(aot_pack_manifest_hash(), 0);
             assert_eq!(aot_pack_constraint_max_instrs(), 0);
+            assert_eq!(aot_pack_constraint_max_live_u32_lanes(), 0);
         } else {
             assert_ne!(aot_pack_manifest_hash(), 0);
             assert_ne!(aot_pack_constraint_max_instrs(), 0);
+            assert_ne!(aot_pack_constraint_max_live_u32_lanes(), 0);
         }
     }
 
