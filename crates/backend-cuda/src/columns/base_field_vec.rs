@@ -4,6 +4,7 @@ use std::ffi::c_void;
 use stwo::core::fields::m31::BaseField;
 
 use super::bindings;
+use crate::backend::exec_context::{check_cuda, CudaRuntimeError};
 
 #[derive(Debug)]
 pub struct BaseFieldVec {
@@ -126,6 +127,35 @@ impl BaseFieldVec {
         // The remaining elements are already zero (from new_zeroes)
         *self = new_vec;
     }
+
+    /// Release an owned allocation through the exact-status default-pool API.
+    ///
+    /// This is the formal staging counterpart to the legacy void-returning [`Drop`]
+    /// path. It consumes the vector and disarms that fallback before issuing the
+    /// checked free. A failed free is therefore returned to the caller and may leave
+    /// the allocation live, but it is never followed by an unobservable second free.
+    /// Borrowed vectors require no release and return success without calling CUDA.
+    pub fn release_checked(self) -> Result<(), CudaRuntimeError> {
+        self.release_checked_with(|device| unsafe {
+            stwo_backend_cuda_kernels::raw::cuda_default_pool_free_checked(device)
+        })
+    }
+
+    fn release_checked_with(
+        mut self,
+        release: impl FnOnce(*mut c_void) -> i32,
+    ) -> Result<(), CudaRuntimeError> {
+        if !self.owns_memory {
+            return Ok(());
+        }
+        // Fail closed: after an exact-status release attempt, Drop must never route
+        // this allocation through the legacy void compatibility API.
+        self.owns_memory = false;
+        check_cuda(
+            "base_field_vec_free",
+            release(self.device_ptr.cast_mut().cast()),
+        )
+    }
 }
 
 impl Clone for BaseFieldVec {
@@ -138,11 +168,59 @@ impl Clone for BaseFieldVec {
 
 impl Drop for BaseFieldVec {
     fn drop(&mut self) {
+        // Legacy compatibility only. Formal default-pool staging must consume the
+        // vector through `release_checked` so the CUDA status remains observable.
         if self.owns_memory {
             unsafe {
                 bindings::cuda_free_memory(self.device_ptr as *const c_void);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use core::ptr::NonNull;
+
+    use super::*;
+
+    fn owned_dangling() -> BaseFieldVec {
+        BaseFieldVec {
+            device_ptr: NonNull::<u32>::dangling().as_ptr(),
+            size: 1,
+            owns_memory: true,
+        }
+    }
+
+    #[test]
+    fn checked_release_returns_exact_failure_without_legacy_fallback() {
+        let error = owned_dangling().release_checked_with(|_| 719).unwrap_err();
+        assert_eq!(
+            error,
+            CudaRuntimeError::Cuda {
+                operation: "base_field_vec_free",
+                code: 719,
+            }
+        );
+    }
+
+    #[test]
+    fn checked_release_skips_borrowed_memory() {
+        BaseFieldVec::from_borrowed_ptr(NonNull::<u32>::dangling().as_ptr(), 1)
+            .release_checked_with(|_| panic!("borrowed memory reached checked free"))
+            .unwrap();
+    }
+
+    #[cfg(not(stwo_cuda_link))]
+    #[test]
+    fn checked_release_stub_reports_exact_not_supported_status() {
+        assert_eq!(
+            owned_dangling().release_checked(),
+            Err(CudaRuntimeError::Cuda {
+                operation: "base_field_vec_free",
+                code: 801,
+            })
+        );
     }
 }
 
