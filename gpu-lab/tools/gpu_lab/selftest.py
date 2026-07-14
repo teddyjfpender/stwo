@@ -33,6 +33,7 @@ from .oracle import validate_oracle_index
 from .pie_adapter_cleanup_tests import pie_adapter_cleanup_self_test
 from .pie_adapter_contract_tests import pie_adapter_contract_self_test
 from .pie_adapter_execution_tests import pie_adapter_execution_self_test
+from .pie_adapter_inventory_tests import pie_adapter_inventory_self_test
 from .pie_adapter_receipt_tests import pie_adapter_receipt_self_test
 from .result_tests import result_self_test
 from .results import _validate_correctness, _validate_timing
@@ -271,6 +272,7 @@ def self_test(root: Path) -> None:
     pie_adapter_contract_self_test(root)
     pie_adapter_execution_self_test(root)
     pie_adapter_cleanup_self_test(root)
+    pie_adapter_inventory_self_test(root)
     pie_adapter_receipt_self_test(root)
     for schema in ("semantic-fixture.schema.json", "semantic-fixture-index.schema.json",
                    "execution-manifest.schema.json", "host-oracle-index.schema.json",

@@ -1,0 +1,8 @@
+#!/usr/bin/env python3
+"""Write the exact non-admitting source inventory for a host PIE-adapter build."""
+
+from gpu_lab.pie_adapter_inventory import main
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

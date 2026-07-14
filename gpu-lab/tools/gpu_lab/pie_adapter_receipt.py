@@ -17,11 +17,17 @@ from .common import (WORKSPACE_ROOT, canonical_bytes, require, require_exact_key
 from .immutable_output import write_immutable_bytes
 from .sealed_process import run_bounded_child
 
-
 INVENTORY_SCHEMA = "stwo.gpu-lab.pie-adapter-source-inventory.v2"
 SOURCE_CLOSURE_SCHEMA = "stwo.gpu-lab.pie-adapter-source-closure.v2"
 BUILD_RECEIPT_SCHEMA = "stwo.gpu-lab.pie-adapter-build-receipt.v2"
 REPOSITORIES = ("stwo", "stwo-cairo")
+ADAPTER_REPOSITORY = "stwo-cairo"
+ADAPTER_ROOT = "gpu_benchmarks/lab/pie-adapter"
+ADAPTER_BINARY = "stwo-gpu-lab-pie-adapter"
+ADAPTER_PROFILE = "release"
+TARGET_NAMESPACE = PurePosixPath(f"{ADAPTER_ROOT}/receipt-targets")
+LINUX_TARGETS = frozenset({"aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"})
+MAX_RUN_ID_CHARS = 128
 SOURCE_STATUS = "live-explicit-inventory-identity-only-v2"
 RECEIPT_STATUS = "declared-build-inputs-live-outputs-no-build-attestation-v2"
 UNATTESTED_BUILD_INPUTS = (
@@ -41,9 +47,8 @@ MAX_ARGUMENT_CHARS = 1024
 WRITER_PRECONDITION = "caller-guaranteed-no-concurrent-source-or-output-writers-v1"
 ATTESTATION_SCOPE = "point-in-time-live-identity-observations-v1"
 
-# This is the independent omission authority for local compiler inputs. Cargo.lock
-# binds registry/git inputs; every local crate manifest and every file below these
-# exact Rust source roots must also appear in the externally reviewed inventory.
+# Cargo.lock binds registry/git inputs; every file below the seven local package
+# roots plus both workspace manifests must appear in the reviewed inventory.
 DISCOVERY_FILES = (
     ("stwo", "Cargo.toml"),
     ("stwo", "crates/constraint-framework/Cargo.toml"),
@@ -64,16 +69,15 @@ DISCOVERY_FILES = (
     ("stwo-cairo", "stwo_cairo_prover/crates/common/Cargo.toml"),
     ("stwo-cairo", "stwo_cairo_prover/crates/common/src/lib.rs"),
 )
-DISCOVERY_TREES = (
-    ("stwo", "crates/constraint-framework/src"),
-    ("stwo", "crates/stwo/src"),
-    ("stwo-cairo", "gpu_benchmarks/lab/pie-adapter/src"),
-    ("stwo-cairo", "stwo_cairo_prover/crates/adapter/src"),
-    ("stwo-cairo", "stwo_cairo_prover/crates/cairo-serialize-derive/src"),
-    ("stwo-cairo", "stwo_cairo_prover/crates/cairo-serialize/src"),
-    ("stwo-cairo", "stwo_cairo_prover/crates/common/src"),
+DISCOVERY_PACKAGE_ROOTS = (
+    ("stwo", "crates/constraint-framework"),
+    ("stwo", "crates/stwo"),
+    ("stwo-cairo", ADAPTER_ROOT),
+    ("stwo-cairo", "stwo_cairo_prover/crates/adapter"),
+    ("stwo-cairo", "stwo_cairo_prover/crates/cairo-serialize-derive"),
+    ("stwo-cairo", "stwo_cairo_prover/crates/cairo-serialize"),
+    ("stwo-cairo", "stwo_cairo_prover/crates/common"),
 )
-
 Locator = dict[str, str]
 CommitReader = Callable[[Path], str]
 
@@ -195,6 +199,30 @@ def _canonical_build_command(build: dict[str, Any]) -> list[str]:
     return command
 
 
+def _require_adapter_build_layout(build: dict[str, Any], executable: Locator) -> None:
+    target_directory = build["target_directory"]
+    target = build["target"]
+    relative = PurePosixPath(target_directory["path"])
+    run_id = relative.name
+    require(build["manifest"] == {
+        "repository": ADAPTER_REPOSITORY, "path": f"{ADAPTER_ROOT}/Cargo.toml",
+    }, "PIE adapter build manifest differs from the fixed host adapter")
+    require(build["profile"] == ADAPTER_PROFILE and build["features"] == []
+            and build["default_features"] is True,
+            "PIE adapter release feature profile differs")
+    require(target in LINUX_TARGETS,
+            "PIE adapter target is not an allowlisted Linux target triple")
+    require(target_directory["repository"] == ADAPTER_REPOSITORY
+            and relative.parent == TARGET_NAMESPACE,
+            "PIE adapter target directory must be a direct child of the receipt-targets namespace")
+    require(0 < len(run_id) <= MAX_RUN_ID_CHARS and run_id[0].isalnum()
+            and all(char.isalnum() or char in "_.-" for char in run_id),
+            "PIE adapter target directory has an invalid bounded run id")
+    expected = PurePosixPath(target_directory["path"]) / target / ADAPTER_PROFILE / ADAPTER_BINARY
+    require(executable == {"repository": ADAPTER_REPOSITORY, "path": str(expected)},
+            "PIE adapter executable locator is not the exact Cargo release output")
+
+
 def validate_inventory(value: Any, workspace_root: Path = WORKSPACE_ROOT) -> dict[str, Any]:
     require(isinstance(value, dict), "PIE adapter source inventory must be an object")
     require_exact_keys(value, {"schema_version", "repository_roots", "expected_sources",
@@ -286,6 +314,7 @@ def validate_inventory(value: Any, workspace_root: Path = WORKSPACE_ROOT) -> dic
                 and PurePosixPath(output["path"]) != target_prefix for output in checked_outputs),
             "PIE adapter generated output escapes CARGO_TARGET_DIR")
     executable = _locator(value["adapter_executable"], "PIE adapter executable")
+    _require_adapter_build_layout(build, executable)
     require(_locator_key(executable) in set(output_keys),
             "PIE adapter executable is not a declared generated output")
     require(not set(source_keys) & set(output_keys),
@@ -318,18 +347,27 @@ def _safe_directory(repository: str, relative: str, workspace_root: Path) -> Pat
 
 
 def discover_expected_sources(workspace_root: Path = WORKSPACE_ROOT) -> list[Locator]:
-    """Discover the fixed, conservative local compiler-input superset."""
+    """Discover all files in the seven local package roots, excluding only build outputs."""
     discovered = {(repository, path): {"repository": repository, "path": path}
                   for repository, path in DISCOVERY_FILES}
-    for repository, relative_root in DISCOVERY_TREES:
+    excluded = (ADAPTER_REPOSITORY, str(TARGET_NAMESPACE))
+    for repository, relative_root in DISCOVERY_PACKAGE_ROOTS:
         root = _safe_directory(repository, relative_root, workspace_root)
         for directory, names, files in os.walk(root, topdown=True, followlinks=False):
             names.sort()
             files.sort()
             base = Path(directory)
+            retained_names: list[str] = []
             for name in names:
-                require(not (base / name).is_symlink(),
-                        f"PIE adapter discovery tree contains a directory symlink: {base / name}")
+                path = base / name
+                relative = str(path.relative_to(workspace_root / repository))
+                status = path.lstat()
+                require(stat.S_ISDIR(status.st_mode) and not stat.S_ISLNK(status.st_mode),
+                        f"PIE adapter discovery tree contains a non-directory or symlink: {path}")
+                if (repository, relative) == excluded:
+                    continue
+                retained_names.append(name)
+            names[:] = retained_names
             for name in files:
                 path = base / name
                 status = path.lstat()

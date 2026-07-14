@@ -13,7 +13,6 @@ from .common import canonical_bytes, require, sha256_bytes
 from .pie_adapter_receipt import (
     BUILD_RECEIPT_SCHEMA,
     DISCOVERY_FILES,
-    DISCOVERY_TREES,
     MAX_JSON_BYTES,
     MAX_OUTPUT_BYTES,
     MAX_SOURCES,
@@ -49,12 +48,8 @@ def _workspace(root: Path) -> tuple[dict, Path]:
         (root / repository).mkdir(parents=True)
     for repository, relative in DISCOVERY_FILES:
         _write(root / repository / relative, f"{repository}:{relative}\n".encode())
-    for repository, relative in DISCOVERY_TREES:
-        leaf = "main.rs" if relative.endswith("pie-adapter/src") else "lib.rs"
-        _write(root / repository / relative / leaf,
-               f"// {repository}:{relative}/{leaf}\n".encode())
 
-    target = "gpu_benchmarks/lab/pie-adapter/receipt-target"
+    target = "gpu_benchmarks/lab/pie-adapter/receipt-targets/test-run"
     executable = f"{target}/x86_64-unknown-linux-gnu/release/stwo-gpu-lab-pie-adapter"
     _write(root / "stwo-cairo" / executable, b"host adapter executable\n", 0o755)
     sources = discover_expected_sources(root)
@@ -294,6 +289,40 @@ def pie_adapter_receipt_self_test(_: Path | None = None) -> None:
         bad_target["build"]["target"] = "x86_64/escape"
         _expect("bad target language", lambda: validate_inventory(bad_target, root),
                 "target")
+        fabricated_target = copy.deepcopy(inventory)
+        fabricated = "riscv64gc-unknown-linux-gnu"
+        fabricated_target["build"]["target"] = fabricated
+        fabricated_target["build"]["command"][-1] = fabricated
+        old_executable = fabricated_target["adapter_executable"]["path"]
+        fabricated_executable = old_executable.replace(
+            "x86_64-unknown-linux-gnu", fabricated,
+        )
+        fabricated_target["generated_outputs"][0]["path"] = fabricated_executable
+        fabricated_target["adapter_executable"]["path"] = fabricated_executable
+        _expect("fabricated Linux target", lambda: validate_inventory(
+            fabricated_target, root), "allowlisted")
+        hostile_namespace = copy.deepcopy(inventory)
+        hostile_target_dir = ".git/objects/fresh-target"
+        hostile_namespace["build"]["target_directory"]["path"] = hostile_target_dir
+        hostile_namespace["build"]["environment"]["CARGO_TARGET_DIR"] = (
+            f"<workspace>/stwo-cairo/{hostile_target_dir}"
+        )
+        hostile_executable = (
+            f"{hostile_target_dir}/x86_64-unknown-linux-gnu/release/"
+            "stwo-gpu-lab-pie-adapter"
+        )
+        hostile_namespace["generated_outputs"][0]["path"] = hostile_executable
+        hostile_namespace["adapter_executable"]["path"] = hostile_executable
+        _expect("self-consistent hostile target namespace", lambda: validate_inventory(
+            hostile_namespace, root), "receipt-targets namespace")
+        wrong_executable = copy.deepcopy(inventory)
+        wrong_path = wrong_executable["adapter_executable"]["path"].replace(
+            "stwo-gpu-lab-pie-adapter", "alternate-adapter",
+        )
+        wrong_executable["generated_outputs"][0]["path"] = wrong_path
+        wrong_executable["adapter_executable"]["path"] = wrong_path
+        _expect("self-consistent alternate executable", lambda: validate_inventory(
+            wrong_executable, root), "exact Cargo release output")
         missing_lock = copy.deepcopy(inventory)
         missing_lock["expected_sources"] = [item for item in missing_lock["expected_sources"]
                                             if not item["path"].endswith("Cargo.lock")]
