@@ -99,7 +99,7 @@ __device__ __forceinline__ uint32_t candidate_hash_word(
   v[12] ^= 40U;
   v[14] ^= 0xffffffffU;
 
-#pragma unroll
+#pragma unroll 1
   for (uint32_t round = 0U; round < 10U; ++round) {
     POW_G(round, 0, v[0], v[4], v[8], v[12]);
     POW_G(round, 1, v[1], v[5], v[9], v[13]);
@@ -117,31 +117,44 @@ __device__ __forceinline__ uint32_t trailing_zeros(uint32_t value) {
   return value == 0U ? 32U : static_cast<uint32_t>(__clz(__brev(value)));
 }
 
-__global__ void persistent_pow_search(
+__global__ void pow_prefix_digest(
     const uint32_t *transcript_state,
+    uint32_t pow_bits,
+    uint32_t *prefix_digest) {
+  if (blockIdx.x != 0U || threadIdx.x != 0U) {
+    return;
+  }
+  uint8_t prefix_input[52] = {0};
+  prefix_input[0] = static_cast<uint8_t>(POW_PREFIX);
+  prefix_input[1] = static_cast<uint8_t>(POW_PREFIX >> 8U);
+  prefix_input[2] = static_cast<uint8_t>(POW_PREFIX >> 16U);
+  prefix_input[3] = static_cast<uint8_t>(POW_PREFIX >> 24U);
+  const uint8_t *digest = reinterpret_cast<const uint8_t *>(transcript_state);
+#pragma unroll
+  for (uint32_t i = 0; i < 32U; ++i) {
+    prefix_input[16U + i] = digest[i];
+  }
+  prefix_input[48] = static_cast<uint8_t>(pow_bits);
+  prefix_input[49] = static_cast<uint8_t>(pow_bits >> 8U);
+  prefix_input[50] = static_cast<uint8_t>(pow_bits >> 16U);
+  prefix_input[51] = static_cast<uint8_t>(pow_bits >> 24U);
+  Blake2sHash value;
+  stwo_blake2s_hash2_device(prefix_input, 52U, nullptr, 0U, &value);
+#pragma unroll
+  for (uint32_t i = 0; i < 8U; ++i) {
+    prefix_digest[i] = value.s[i];
+  }
+}
+
+__global__ void persistent_pow_search(
+    const uint32_t *prefix_digest_words,
     uint32_t pow_bits,
     unsigned long long *best_nonce,
     uint32_t *completed_blocks,
     uint32_t *transcript_nonce) {
   __shared__ Blake2sHash prefixed_digest;
-  if (threadIdx.x == 0U) {
-    uint8_t prefix_input[52] = {0};
-    prefix_input[0] = static_cast<uint8_t>(POW_PREFIX);
-    prefix_input[1] = static_cast<uint8_t>(POW_PREFIX >> 8U);
-    prefix_input[2] = static_cast<uint8_t>(POW_PREFIX >> 16U);
-    prefix_input[3] = static_cast<uint8_t>(POW_PREFIX >> 24U);
-    const uint8_t *digest =
-        reinterpret_cast<const uint8_t *>(transcript_state);
-#pragma unroll
-    for (uint32_t i = 0; i < 32U; ++i) {
-      prefix_input[16U + i] = digest[i];
-    }
-    prefix_input[48] = static_cast<uint8_t>(pow_bits);
-    prefix_input[49] = static_cast<uint8_t>(pow_bits >> 8U);
-    prefix_input[50] = static_cast<uint8_t>(pow_bits >> 16U);
-    prefix_input[51] = static_cast<uint8_t>(pow_bits >> 24U);
-    stwo_blake2s_hash2_device(
-        prefix_input, 52U, nullptr, 0U, &prefixed_digest);
+  if (threadIdx.x < 8U) {
+    prefixed_digest.s[threadIdx.x] = prefix_digest_words[threadIdx.x];
   }
   __syncthreads();
 
@@ -197,18 +210,26 @@ __global__ void persistent_pow_search(
 extern "C" int stwo_blake2s_pow_persistent_on(
     const uint32_t *transcript_state,
     uint32_t pow_bits,
+    uint32_t *prefix_digest,
     unsigned long long *best_nonce,
     uint32_t *completed_blocks,
     uint32_t *transcript_nonce,
     void *stream_raw) {
-  if (transcript_state == nullptr || best_nonce == nullptr ||
-      completed_blocks == nullptr || transcript_nonce == nullptr ||
-      stream_raw == nullptr || pow_bits > 32U) {
+  if (transcript_state == nullptr || prefix_digest == nullptr ||
+      best_nonce == nullptr || completed_blocks == nullptr ||
+      transcript_nonce == nullptr || stream_raw == nullptr || pow_bits > 32U) {
     return static_cast<int>(cudaErrorInvalidValue);
+  }
+  pow_prefix_digest<<<1U, 1U, 0,
+                      reinterpret_cast<cudaStream_t>(stream_raw)>>>(
+      transcript_state, pow_bits, prefix_digest);
+  cudaError_t error = cudaGetLastError();
+  if (error != cudaSuccess) {
+    return static_cast<int>(error);
   }
   persistent_pow_search<<<POW_GRID_SIZE, POW_BLOCK_SIZE, 0,
                           reinterpret_cast<cudaStream_t>(stream_raw)>>>(
-      transcript_state, pow_bits, best_nonce, completed_blocks,
+      prefix_digest, pow_bits, best_nonce, completed_blocks,
       transcript_nonce);
   return static_cast<int>(cudaGetLastError());
 }

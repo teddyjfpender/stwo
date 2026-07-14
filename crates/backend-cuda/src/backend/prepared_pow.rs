@@ -8,7 +8,7 @@
 //! ascending within each hi; because `low < 2^20 < 2^32`, that scan order IS
 //! numeric order on the lattice, so the kernel's numeric minimum over mapped
 //! lattice nonces is byte-identical to `SimdBackend::grind`. Replay contains
-//! only stream memsets and that one kernel.
+//! only stream memsets, one prefix-hash kernel, and the persistent search.
 
 use std::collections::BTreeSet;
 
@@ -19,6 +19,7 @@ use super::exec_context::{
 
 const WORD_BYTES: usize = core::mem::size_of::<u32>();
 pub const POW_NONCE_WORDS: usize = 2;
+pub const POW_PREFIX_DIGEST_WORDS: usize = 8;
 pub const POW_U64_ALIGNMENT_WORDS: usize = core::mem::align_of::<u64>() / WORD_BYTES;
 /// Low-bit width of the SIMD grind lattice (GRIND_LOW_BITS in
 /// `stwo::prover::backend::simd::grind`).
@@ -40,12 +41,14 @@ pub struct Blake2sPowWorkspaceRequirements {
     pub nonce_words: usize,
     pub best_nonce_words: usize,
     pub completed_blocks_words: usize,
+    pub prefix_digest_words: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Blake2sPowWorkspaceSlots {
     pub best_nonce: ArenaSlotId,
     pub completed_blocks: ArenaSlotId,
+    pub prefix_digest: ArenaSlotId,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -104,6 +107,7 @@ pub const fn blake2s_pow_workspace_requirements() -> Blake2sPowWorkspaceRequirem
         nonce_words: POW_NONCE_WORDS,
         best_nonce_words: POW_NONCE_WORDS,
         completed_blocks_words: 1,
+        prefix_digest_words: POW_PREFIX_DIGEST_WORDS,
     }
 }
 
@@ -111,9 +115,16 @@ impl Blake2sPowWorkspaceRequirements {
     pub fn arena_slot_requirements(
         self,
         slots: Blake2sPowWorkspaceSlots,
-    ) -> Result<[Blake2sPowArenaSlotRequirement; 2], PreparedBlake2sPowError> {
-        if slots.best_nonce == slots.completed_blocks {
-            return Err(PreparedBlake2sPowError::AliasedSlot(slots.best_nonce));
+    ) -> Result<[Blake2sPowArenaSlotRequirement; 3], PreparedBlake2sPowError> {
+        let mut distinct = BTreeSet::new();
+        for slot in [
+            slots.best_nonce,
+            slots.completed_blocks,
+            slots.prefix_digest,
+        ] {
+            if !distinct.insert(slot) {
+                return Err(PreparedBlake2sPowError::AliasedSlot(slot));
+            }
         }
         Ok([
             Blake2sPowArenaSlotRequirement {
@@ -126,6 +137,11 @@ impl Blake2sPowWorkspaceRequirements {
                 len_words: self.completed_blocks_words,
                 alignment_words: 1,
             },
+            Blake2sPowArenaSlotRequirement {
+                id: slots.prefix_digest,
+                len_words: self.prefix_digest_words,
+                alignment_words: 1,
+            },
         ])
     }
 }
@@ -136,6 +152,7 @@ pub struct PreparedBlake2sPowGraph<'a> {
     transcript_state: ArenaSlice,
     best_nonce: ArenaSlice,
     completed_blocks: ArenaSlice,
+    prefix_digest: ArenaSlice,
     transcript_nonce: ArenaSlice,
 }
 
@@ -164,6 +181,7 @@ impl<'a> PreparedBlake2sPowGraph<'a> {
         let slot_requirements = requirements.arena_slot_requirements(slots)?;
         let best_nonce = bind_slot(arena, slot_requirements[0])?;
         let completed_blocks = bind_slot(arena, slot_requirements[1])?;
+        let prefix_digest = bind_slot(arena, slot_requirements[2])?;
         if (best_nonce.as_u32_ptr() as usize) % core::mem::align_of::<u64>() != 0 {
             return Err(PreparedBlake2sPowError::MisalignedBestNonce(
                 best_nonce.id(),
@@ -175,6 +193,7 @@ impl<'a> PreparedBlake2sPowGraph<'a> {
             transcript_nonce,
             best_nonce,
             completed_blocks,
+            prefix_digest,
         ];
         let context = arena.context().identity_token();
         let mut identities = BTreeSet::new();
@@ -193,6 +212,7 @@ impl<'a> PreparedBlake2sPowGraph<'a> {
             transcript_state,
             best_nonce,
             completed_blocks,
+            prefix_digest,
             transcript_nonce,
         })
     }
@@ -201,8 +221,8 @@ impl<'a> PreparedBlake2sPowGraph<'a> {
         self.transcript_nonce
     }
 
-    /// Initialize caller-owned scratch and enqueue the one persistent search
-    /// kernel. No digest or nonce crosses the host during replay.
+    /// Initialize caller-owned scratch, hash the transcript prefix once, and
+    /// enqueue the persistent search. No digest or nonce crosses the host.
     pub fn launch(&self) -> Result<(), PreparedBlake2sPowError> {
         unsafe {
             self.arena.context().memset_async(
@@ -225,6 +245,7 @@ impl<'a> PreparedBlake2sPowGraph<'a> {
             stwo_backend_cuda_kernels::raw::stwo_blake2s_pow_persistent_on(
                 self.transcript_state.as_u32_ptr().cast_const(),
                 self.pow_bits,
+                self.prefix_digest.as_u32_ptr(),
                 self.best_nonce.as_u32_ptr().cast::<u64>(),
                 self.completed_blocks.as_u32_ptr(),
                 self.transcript_nonce.as_u32_ptr(),
@@ -300,12 +321,14 @@ mod tests {
         assert_eq!(requirements.nonce_words, 2);
         assert_eq!(requirements.best_nonce_words, 2);
         assert_eq!(requirements.completed_blocks_words, 1);
+        assert_eq!(requirements.prefix_digest_words, 8);
         assert_eq!(POW_U64_ALIGNMENT_WORDS, 2);
         assert_eq!(
             requirements
                 .arena_slot_requirements(Blake2sPowWorkspaceSlots {
                     best_nonce: ArenaSlotId(7),
                     completed_blocks: ArenaSlotId(8),
+                    prefix_digest: ArenaSlotId(9),
                 })
                 .unwrap(),
             [
@@ -317,6 +340,11 @@ mod tests {
                 Blake2sPowArenaSlotRequirement {
                     id: ArenaSlotId(8),
                     len_words: 1,
+                    alignment_words: 1,
+                },
+                Blake2sPowArenaSlotRequirement {
+                    id: ArenaSlotId(9),
+                    len_words: 8,
                     alignment_words: 1,
                 },
             ]

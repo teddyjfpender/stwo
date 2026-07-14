@@ -32,6 +32,7 @@ const POW_STATE: ArenaSlotId = ArenaSlotId(60_000);
 const POW_NONCE: ArenaSlotId = ArenaSlotId(60_001);
 const POW_BEST: ArenaSlotId = ArenaSlotId(60_002);
 const POW_COMPLETED: ArenaSlotId = ArenaSlotId(60_003);
+const POW_PREFIX: ArenaSlotId = ArenaSlotId(60_004);
 
 fn arena_from_requirements(
     requirements: impl IntoIterator<Item = (ArenaSlotId, usize, usize)>,
@@ -276,6 +277,7 @@ fn persistent_pow_eager_and_capture_return_simd_lattice_minimum() {
     let workspace_slots = Blake2sPowWorkspaceSlots {
         best_nonce: POW_BEST,
         completed_blocks: POW_COMPLETED,
+        prefix_digest: POW_PREFIX,
     };
     let mut requested = requirements
         .arena_slot_requirements(workspace_slots)

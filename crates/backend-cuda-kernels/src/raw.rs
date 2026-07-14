@@ -1989,6 +1989,7 @@ extern "C" {
     pub fn stwo_blake2s_pow_persistent_on(
         transcript_state: *const u32,
         pow_bits: u32,
+        prefix_digest: *mut u32,
         best_nonce: *mut u64,
         completed_blocks: *mut u32,
         transcript_nonce: *mut u32,

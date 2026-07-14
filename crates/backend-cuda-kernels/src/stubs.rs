@@ -2678,6 +2678,7 @@ pub unsafe extern "C" fn stwo_fri_last_layer_on(
 pub unsafe extern "C" fn stwo_blake2s_pow_persistent_on(
     _transcript_state: *const u32,
     _pow_bits: u32,
+    _prefix_digest: *mut u32,
     _best_nonce: *mut u64,
     _completed_blocks: *mut u32,
     _transcript_nonce: *mut u32,

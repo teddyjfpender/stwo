@@ -8,11 +8,15 @@
 // lattice nonce -- byte-identical to the SIMD reference grind, whose
 // (hi ascending, low ascending) scan order equals numeric order on the
 // lattice. The state is the 16-word device Blake2s transcript state; its
-// first eight words are the current digest. `best_nonce` is initialized to
-// UINT64_MAX and `completed_blocks` to zero by the prepared caller.
+// first eight words are the current digest. `prefix_digest` is proof-owned
+// eight-word scratch: one setup kernel writes it once, then every search block
+// reads that shared prefix instead of recomputing the same Blake2s hash.
+// `best_nonce` is initialized to UINT64_MAX and `completed_blocks` to zero by
+// the prepared caller.
 extern "C" int stwo_blake2s_pow_persistent_on(
     const uint32_t *transcript_state,
     uint32_t pow_bits,
+    uint32_t *prefix_digest,
     unsigned long long *best_nonce,
     uint32_t *completed_blocks,
     uint32_t *transcript_nonce,
