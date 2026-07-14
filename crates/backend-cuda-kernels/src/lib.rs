@@ -87,8 +87,22 @@ mod tests {
         let _: CombineFn = raw::stwo_combine_quotients_from_numerators_on;
 
         let source = include_str!("../cuda/quotients.cu");
-        assert_eq!(source.matches("denominator_inverse_for_sample(").count(), 3);
-        assert!(source.contains("denominator_inverse_for_sample(sample_points[i], domain_point)"));
+        assert_eq!(source.matches("quotient_inverse_chunk").count(), 3);
+        assert_eq!(source.matches("denominator_for_sample(").count(), 3);
+        assert!(source.contains("constexpr uint32_t ACCUMULATE_QUOTIENT_INVERSE_CHUNK = 4;"));
+        assert!(source.contains("constexpr uint32_t COMBINE_QUOTIENT_INVERSE_CHUNK = 8;"));
+        assert!(source.contains("constexpr int QUOTIENT_COMBINE_BLOCK_DIM = 512;"));
+        assert_eq!(
+            source
+                .matches("__launch_bounds__(QUOTIENT_COMBINE_BLOCK_DIM, 1)")
+                .count(),
+            2
+        );
+        assert!(source.contains("inverses[CHUNK_SIZE - 1]"));
+        assert!(source.contains("inverse_product = mul(inverse_product, denominator)"));
+        assert!(source.contains("zero_mask |= static_cast<uint32_t>(is_zero) << offset"));
+        assert!(!source.contains("__shfl_sync"));
+        assert!(!source.contains("__shfl_down_sync"));
         assert!(!source.contains("cm31 *denominator_inverses"));
         assert!(!source.contains("cuda_proving_malloc<cm31>(sample_size * domain_size)"));
     }
