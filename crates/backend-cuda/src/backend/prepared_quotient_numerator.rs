@@ -278,8 +278,8 @@ impl From<CudaRuntimeError> for PreparedQuotientNumeratorError {
     }
 }
 
-pub use plan::quotient_numerator_workspace_requirements;
 pub(super) use plan::build_plan;
+pub use plan::quotient_numerator_workspace_requirements;
 #[cfg(test)]
 pub(super) use plan::NumeratorPlan;
 
@@ -297,6 +297,9 @@ struct PreparedBatch {
 pub enum PreparedNumeratorSchedule {
     LegacyBatches,
     SingleWriteCandidate,
+    StagedPackedSingleWrite {
+        packed_output_rows: u64,
+    },
     HybridCandidate {
         eligible_groups: usize,
         legacy_groups: usize,
@@ -305,7 +308,7 @@ pub enum PreparedNumeratorSchedule {
 
 use self::bindings::{
     bind_optional, bind_slot, checked_mul, pow2, require_words, upload_and_sync, upload_ptrs,
-    upload_u32,
+    upload_u32, upload_u64,
 };
 
 /// Stable quotient numerator launch object. [`Self::launch`] performs no host
@@ -333,6 +336,7 @@ pub struct PreparedQuotientNumeratorGraph<'a> {
     coefficient_ptrs: Option<ArenaSlice>,
     coefficient_sizes: Option<ArenaSlice>,
     coefficient_output_ptrs: Option<ArenaSlice>,
+    lde_tile: Option<ArenaSlice>,
     batches: Vec<PreparedBatch>,
     schedule: PreparedNumeratorSchedule,
 }
@@ -496,7 +500,7 @@ impl<'a> PreparedQuotientNumeratorGraph<'a> {
             arena,
             slots.batch_group_offsets,
             requirements.batch_group_offset_words,
-            1,
+            2,
         )?;
         let batch_source_ptrs = bind_slot(
             arena,
@@ -677,6 +681,7 @@ impl<'a> PreparedQuotientNumeratorGraph<'a> {
             coefficient_ptrs,
             coefficient_sizes,
             coefficient_output_ptrs,
+            lde_tile,
             batches: prepared_batches,
             schedule: PreparedNumeratorSchedule::LegacyBatches,
         })

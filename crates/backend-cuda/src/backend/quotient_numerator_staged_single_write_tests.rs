@@ -298,13 +298,15 @@ fn mixed_plan_preserves_every_legacy_term_and_reports_exact_passes() {
                     .all(|lde| lde.evaluation_log_size() == launch.evaluation_log_size()));
                 covered_ldes += launch.lde_count();
             }
-            QuotientNumeratorStagedOperation::AccumulateAllGroups {
+            QuotientNumeratorStagedOperation::AccumulatePackedRows {
                 group_count,
                 term_count,
+                packed_output_rows,
             } => {
                 assert_eq!(covered_ldes, candidate.coefficient_ldes().len());
                 assert_eq!(*group_count, legacy.requirements.groups.len());
                 assert_eq!(*term_count, legacy.requirements.term_count);
+                assert_eq!(*packed_output_rows, candidate.packed_output_rows());
             }
         }
     }
@@ -321,6 +323,40 @@ fn mixed_plan_preserves_every_legacy_term_and_reports_exact_passes() {
         report.logical_output_bytes_saved,
         report.factor32_logical_output_bytes - report.candidate_logical_output_bytes
     );
+    assert_eq!(
+        report.rectangular_launch_rows,
+        (legacy.requirements.groups.len() * legacy.requirements.max_output_size) as u64
+    );
+    assert_eq!(
+        report.inactive_rectangular_launch_rows,
+        report.rectangular_launch_rows - report.output_rows as u64
+    );
+    assert_eq!(
+        report.rectangular_row_term_capacity,
+        (legacy.requirements.max_output_size * legacy.requirements.term_count) as u64
+    );
+}
+
+#[test]
+fn packed_row_oracle_covers_every_heterogeneous_group_boundary_once() {
+    let plan = quotient_numerator_staged_single_write_plan(config(), &mixed_topology()).unwrap();
+    let offsets = plan.packed_group_row_offsets();
+    assert_eq!(offsets.len(), plan.requirements().groups.len() + 1);
+    assert_eq!(offsets[0], 0);
+    assert_eq!(offsets.last().copied(), Some(plan.packed_output_rows()));
+    for (group, requirements) in plan.requirements().groups.iter().enumerate() {
+        assert_eq!(
+            offsets[group + 1] - offsets[group],
+            requirements.value_words as u64
+        );
+        assert_eq!(plan.packed_row_location(offsets[group]), Some((group, 0)));
+        assert_eq!(
+            plan.packed_row_location(offsets[group + 1] - 1),
+            Some((group, requirements.value_words as u64 - 1))
+        );
+    }
+    assert_eq!(plan.packed_row_location(plan.packed_output_rows()), None);
+    assert_eq!(plan.packed_row_location(u64::MAX), None);
 }
 
 #[test]
@@ -399,7 +435,14 @@ fn randomized_mixed_source_plan_is_canonical_byte_identical() {
             &staging,
             &line_coefficients,
         );
+        let packed = evaluate_candidate_packed(
+            &candidate,
+            &source_evaluations,
+            &staging,
+            &line_coefficients,
+        );
         assert_eq!(canonical_bytes(&actual), canonical_bytes(&expected));
+        assert_eq!(canonical_bytes(&packed), canonical_bytes(&expected));
 
         let expected_coefficients = topology
             .iter()
@@ -551,6 +594,45 @@ fn evaluate_candidate(
                     coefficients,
                 );
             }
+        }
+    }
+    output
+}
+
+fn evaluate_candidate_packed(
+    plan: &QuotientNumeratorStagedSingleWritePlan,
+    evaluations: &[Vec<u32>],
+    staging: &[u32],
+    coefficients: &[(Qm31Words, Qm31Words)],
+) -> Vec<Vec<Qm31Words>> {
+    let mut output = zero_outputs(plan.requirements());
+    for packed_row in 0..plan.packed_output_rows() {
+        let (group, row) = plan
+            .packed_row_location(packed_row)
+            .expect("every sealed packed row maps to exactly one group row");
+        let row = usize::try_from(row).unwrap();
+        let begin = plan.group_offsets()[group] as usize;
+        let end = plan.group_offsets()[group + 1] as usize;
+        let numerator = &mut output[group][row];
+        for descriptor in
+            plan.term_descriptors()[begin * TERM_WORDS..end * TERM_WORDS].chunks_exact(TERM_WORDS)
+        {
+            let source = match plan.sources()[descriptor[0] as usize] {
+                QuotientNumeratorStagedSource::Evaluation { column, .. } => {
+                    evaluations[column].as_slice()
+                }
+                QuotientNumeratorStagedSource::StagedCoefficient(lde) => {
+                    &staging[lde.offset_words()..lde.end_words()]
+                }
+            };
+            add_term(
+                numerator,
+                row,
+                plan.requirements().groups[group].log_size,
+                descriptor,
+                source,
+                coefficients,
+            );
         }
     }
     output

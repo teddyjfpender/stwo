@@ -107,9 +107,10 @@ impl QuotientNumeratorStagedLdeLaunch {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QuotientNumeratorStagedOperation {
     MaterializeLdes(QuotientNumeratorStagedLdeLaunch),
-    AccumulateAllGroups {
+    AccumulatePackedRows {
         group_count: usize,
         term_count: usize,
+        packed_output_rows: u64,
     },
 }
 
@@ -162,6 +163,19 @@ pub struct QuotientNumeratorStagedSingleWriteReport {
     pub factor32_logical_output_bytes: u64,
     pub candidate_logical_output_bytes: u64,
     pub logical_output_bytes_saved: u64,
+    /// Rows launched by the rectangular `(max_rows, groups)` single-write
+    /// kernel. Inactive rows return before the canonical term loop.
+    pub rectangular_launch_rows: u64,
+    pub inactive_rectangular_launch_rows: u64,
+    /// Exact descriptor-loop iterations performed by useful output rows.
+    pub useful_row_terms: u64,
+    /// Hypothetical term capacity of the rectangular grid. This is an upper
+    /// bound for shape comparison, not a claim that early-return rows execute
+    /// the term loop.
+    pub rectangular_row_term_capacity: u64,
+    /// Worst-case comparisons in the packed row-to-group binary search.
+    pub packed_binary_search_comparisons_per_row_max: u32,
+    pub packed_binary_search_comparisons_max: u64,
     /// Persistent words holding every sampled coefficient column's full LDE.
     pub total_staging_words: usize,
     /// Peak transient factor-32 tile already required by the legacy plan.
@@ -190,6 +204,7 @@ pub struct QuotientNumeratorStagedSingleWritePlan {
     operations: Vec<QuotientNumeratorStagedOperation>,
     sources: Vec<QuotientNumeratorStagedSource>,
     group_offsets: Vec<u32>,
+    packed_group_row_offsets: Vec<u64>,
     term_descriptors: Vec<u32>,
     report: QuotientNumeratorStagedSingleWriteReport,
 }
@@ -216,6 +231,25 @@ impl QuotientNumeratorStagedSingleWritePlan {
 
     pub fn group_offsets(&self) -> &[u32] {
         &self.group_offsets
+    }
+
+    /// Prefix sum of exact output rows. Packed row `r` belongs to the unique
+    /// group `g` satisfying `offsets[g] <= r < offsets[g + 1]`.
+    pub fn packed_group_row_offsets(&self) -> &[u64] {
+        &self.packed_group_row_offsets
+    }
+
+    pub fn packed_output_rows(&self) -> u64 {
+        *self
+            .packed_group_row_offsets
+            .last()
+            .expect("private construction always emits the terminal row offset")
+    }
+
+    /// Host oracle for the native packed-grid mapping. Its branch structure is
+    /// intentionally identical to the CUDA kernel's binary search.
+    pub fn packed_row_location(&self, packed_row: u64) -> Option<(usize, u64)> {
+        packed_row_location(&self.packed_group_row_offsets, packed_row)
     }
 
     /// Group-major `[source, term, source_log_size]`. Inside each group the
@@ -255,6 +289,10 @@ pub enum QuotientNumeratorStagedSingleWriteError {
         required_words: usize,
     },
     OverflowCapacitiesNotDescending,
+    OverflowBindingCountMismatch {
+        expected: usize,
+        actual: usize,
+    },
     StagingSizeOverflow {
         column: usize,
         evaluation_log_size: u32,
@@ -354,10 +392,6 @@ pub fn quotient_numerator_staged_single_write_plan_with_overflow_capacities(
             ),
         );
     }
-    operations.push(QuotientNumeratorStagedOperation::AccumulateAllGroups {
-        group_count: legacy.requirements.groups.len(),
-        term_count: legacy.requirements.term_count,
-    });
     let staged_by_column = coefficient_ldes
         .iter()
         .map(|lde| (lde.column(), *lde))
@@ -483,13 +517,25 @@ pub fn quotient_numerator_staged_single_write_plan_with_overflow_capacities(
         );
     }
 
-    let report = build_report(&legacy.requirements, &coefficient_ldes)?;
+    let packed_group_row_offsets = packed_group_row_offsets(&legacy.requirements)?;
+    let packed_output_rows = *packed_group_row_offsets.last().ok_or(
+        QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+            "packed row manifest has no terminal offset",
+        ),
+    )?;
+    operations.push(QuotientNumeratorStagedOperation::AccumulatePackedRows {
+        group_count: legacy.requirements.groups.len(),
+        term_count: legacy.requirements.term_count,
+        packed_output_rows,
+    });
+    let report = build_report(&legacy.requirements, &coefficient_ldes, &group_offsets)?;
     Ok(QuotientNumeratorStagedSingleWritePlan {
         requirements: legacy.requirements,
         coefficient_ldes,
         operations,
         sources,
         group_offsets,
+        packed_group_row_offsets,
         term_descriptors,
         report,
     })
@@ -606,10 +652,70 @@ fn descriptor_count(words: &[u32]) -> Result<u32, QuotientNumeratorStagedSingleW
     })
 }
 
+fn packed_group_row_offsets(
+    requirements: &QuotientNumeratorWorkspaceRequirements,
+) -> Result<Vec<u64>, QuotientNumeratorStagedSingleWriteError> {
+    let mut offsets = Vec::with_capacity(requirements.groups.len() + 1);
+    let mut rows = 0u64;
+    offsets.push(rows);
+    for group in &requirements.groups {
+        let group_rows = u64::try_from(group.value_words).map_err(|_| {
+            QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+                "group row count exceeds u64",
+            )
+        })?;
+        if group_rows == 0 {
+            return Err(
+                QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+                    "packed row manifest contains an empty group",
+                ),
+            );
+        }
+        rows = rows.checked_add(group_rows).ok_or(
+            QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+                "packed output row count overflowed",
+            ),
+        )?;
+        offsets.push(rows);
+    }
+    Ok(offsets)
+}
+
+fn packed_row_location(offsets: &[u64], packed_row: u64) -> Option<(usize, u64)> {
+    let &total_rows = offsets.last()?;
+    let group_count = offsets.len().checked_sub(1)?;
+    if group_count == 0 || offsets[0] != 0 || packed_row >= total_rows {
+        return None;
+    }
+    let mut low = 0usize;
+    let mut high = group_count;
+    while low < high {
+        let middle = low + (high - low) / 2;
+        if packed_row < offsets[middle + 1] {
+            high = middle;
+        } else {
+            low = middle + 1;
+        }
+    }
+    let row = packed_row.checked_sub(offsets[low])?;
+    (row < offsets[low + 1] - offsets[low]).then_some((low, row))
+}
+
 fn build_report(
     requirements: &QuotientNumeratorWorkspaceRequirements,
     ldes: &[QuotientNumeratorStagedLde],
+    group_offsets: &[u32],
 ) -> Result<QuotientNumeratorStagedSingleWriteReport, QuotientNumeratorStagedSingleWriteError> {
+    if group_offsets.len() != requirements.groups.len() + 1
+        || group_offsets.first().copied() != Some(0)
+        || group_offsets.last().copied() != u32::try_from(requirements.term_count).ok()
+    {
+        return Err(
+            QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+                "packed report group offsets do not cover every term",
+            ),
+        );
+    }
     let output_rows = requirements.groups.iter().try_fold(0usize, |rows, group| {
         rows.checked_add(group.value_words).ok_or(
             QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
@@ -712,6 +818,75 @@ fn build_report(
                 "factor-32 output byte count overflowed",
             ),
         )?;
+    let output_rows_u64 = u64::try_from(output_rows).map_err(|_| {
+        QuotientNumeratorStagedSingleWriteError::DescriptorInvariant("output row count exceeds u64")
+    })?;
+    let max_output_size_u64 = u64::try_from(requirements.max_output_size).map_err(|_| {
+        QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+            "maximum output size exceeds u64",
+        )
+    })?;
+    let group_count_u64 = u64::try_from(requirements.groups.len()).map_err(|_| {
+        QuotientNumeratorStagedSingleWriteError::DescriptorInvariant("group count exceeds u64")
+    })?;
+    let rectangular_launch_rows = max_output_size_u64.checked_mul(group_count_u64).ok_or(
+        QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+            "rectangular launch row count overflowed",
+        ),
+    )?;
+    let inactive_rectangular_launch_rows =
+        rectangular_launch_rows.checked_sub(output_rows_u64).ok_or(
+            QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+                "useful rows exceed the rectangular launch grid",
+            ),
+        )?;
+    let useful_row_terms =
+        requirements
+            .groups
+            .iter()
+            .enumerate()
+            .try_fold(0u64, |total, (group, requirements)| {
+                let terms = u64::from(group_offsets[group + 1] - group_offsets[group]);
+                let rows = u64::try_from(requirements.value_words).map_err(|_| {
+                    QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+                        "group row count exceeds u64",
+                    )
+                })?;
+                total
+                    .checked_add(rows.checked_mul(terms).ok_or(
+                        QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+                            "useful row-term count overflowed",
+                        ),
+                    )?)
+                    .ok_or(
+                        QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+                            "useful row-term count overflowed",
+                        ),
+                    )
+            })?;
+    let rectangular_row_term_capacity = max_output_size_u64
+        .checked_mul(u64::try_from(requirements.term_count).map_err(|_| {
+            QuotientNumeratorStagedSingleWriteError::DescriptorInvariant("term count exceeds u64")
+        })?)
+        .ok_or(
+            QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+                "rectangular row-term capacity overflowed",
+            ),
+        )?;
+    let packed_binary_search_comparisons_per_row_max = usize::BITS
+        .checked_sub(requirements.groups.len().leading_zeros())
+        .ok_or(
+            QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+                "packed binary-search comparison bound underflowed",
+            ),
+        )?;
+    let packed_binary_search_comparisons_max = output_rows_u64
+        .checked_mul(u64::from(packed_binary_search_comparisons_per_row_max))
+        .ok_or(
+            QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+                "packed binary-search comparison count overflowed",
+            ),
+        )?;
 
     Ok(QuotientNumeratorStagedSingleWriteReport {
         group_count: requirements.groups.len(),
@@ -736,6 +911,12 @@ fn build_report(
         factor32_logical_output_bytes,
         candidate_logical_output_bytes,
         logical_output_bytes_saved: factor32_rmw_bytes,
+        rectangular_launch_rows,
+        inactive_rectangular_launch_rows,
+        useful_row_terms,
+        rectangular_row_term_capacity,
+        packed_binary_search_comparisons_per_row_max,
+        packed_binary_search_comparisons_max,
         total_staging_words,
         factor32_staging_words: requirements.lde_tile_words,
         primary_staging_words,

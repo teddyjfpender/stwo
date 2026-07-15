@@ -125,7 +125,7 @@ fn assert_ordered_launch_manifest(plan: &QuotientNumeratorStagedSingleWritePlan)
                     .all(|lde| lde.evaluation_log_size() == launch.evaluation_log_size()));
                 covered = end;
             }
-            QuotientNumeratorStagedOperation::AccumulateAllGroups { .. } => {
+            QuotientNumeratorStagedOperation::AccumulatePackedRows { .. } => {
                 assert!(!saw_accumulation);
                 saw_accumulation = true;
                 assert_eq!(covered, plan.coefficient_ldes().len());

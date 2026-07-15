@@ -4,6 +4,7 @@ use super::*;
 
 pub(super) enum HostDescriptor {
     U32(Vec<u32>),
+    U64(Vec<u64>),
     Pointers(Vec<usize>),
 }
 
@@ -11,6 +12,10 @@ impl HostDescriptor {
     fn bytes(&self) -> (*const c_void, usize) {
         match self {
             Self::U32(values) => (values.as_ptr().cast(), values.len() * WORD_BYTES),
+            Self::U64(values) => (
+                values.as_ptr().cast(),
+                values.len() * core::mem::size_of::<u64>(),
+            ),
             Self::Pointers(values) => (
                 values.as_ptr().cast(),
                 values.len() * core::mem::size_of::<usize>(),
@@ -28,6 +33,13 @@ pub(super) fn upload_u32(destination: ArenaSlice, values: Vec<u32>) -> PendingUp
     PendingUpload {
         destination,
         descriptor: HostDescriptor::U32(values),
+    }
+}
+
+pub(super) fn upload_u64(destination: ArenaSlice, values: Vec<u64>) -> PendingUpload {
+    PendingUpload {
+        destination,
+        descriptor: HostDescriptor::U64(values),
     }
 }
 

@@ -68,6 +68,11 @@ impl PreparedQuotientNumeratorGraph<'_> {
                     return Ok(());
                 }
             }
+            PreparedNumeratorSchedule::StagedPackedSingleWrite { packed_output_rows } => {
+                self.launch_all_staged_ldes(stream)?;
+                self.launch_packed_single_write(packed_output_rows, stream)?;
+                return Ok(());
+            }
             PreparedNumeratorSchedule::LegacyBatches => {}
         }
         if matches!(self.schedule, PreparedNumeratorSchedule::LegacyBatches) {
@@ -148,6 +153,43 @@ impl PreparedQuotientNumeratorGraph<'_> {
                 )
             };
             check_cuda("prepared_quotient_numerator_accumulate", code)?;
+        }
+        Ok(())
+    }
+
+    fn launch_all_staged_ldes(
+        &self,
+        stream: *mut core::ffi::c_void,
+    ) -> Result<(), PreparedQuotientNumeratorError> {
+        let pointer_table = |slice: ArenaSlice, offset: usize| unsafe {
+            slice.as_u32_ptr().cast::<*const u32>().add(offset)
+        };
+        for batch in &self.batches {
+            if batch.coefficient_count == 0 {
+                continue;
+            }
+            let coefficient_ptrs = self.coefficient_ptrs.expect("slot shape validated");
+            let coefficient_sizes = self.coefficient_sizes.expect("slot shape validated");
+            let coefficient_outputs = self.coefficient_output_ptrs.expect("slot shape validated");
+            let code = unsafe {
+                stwo_backend_cuda_kernels::raw::stwo_lde_n2b_columns_on(
+                    pointer_table(coefficient_ptrs, batch.coefficient_offset),
+                    coefficient_sizes.as_u32_ptr().add(batch.coefficient_offset),
+                    coefficient_outputs
+                        .as_u32_ptr()
+                        .cast::<*mut u32>()
+                        .add(batch.coefficient_offset),
+                    batch.evaluation_log_size,
+                    u32::try_from(batch.coefficient_count)
+                        .map_err(|_| PreparedQuotientNumeratorError::SizeOverflow)?,
+                    self.forward_twiddles.as_u32_ptr(),
+                    u32::try_from(self.forward_twiddles.len_words())
+                        .map_err(|_| PreparedQuotientNumeratorError::SizeOverflow)?,
+                    1u32 << (batch.evaluation_log_size - 1),
+                    stream,
+                )
+            };
+            check_cuda("prepared_quotient_numerator_staged_lde", code)?;
         }
         Ok(())
     }

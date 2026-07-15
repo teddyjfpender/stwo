@@ -80,6 +80,10 @@ mod tests {
             raw::stwo_accumulate_quotient_numerator_single_write_on as usize,
             0
         );
+        assert_ne!(
+            raw::stwo_accumulate_quotient_numerator_packed_single_write_on as usize,
+            0
+        );
         assert_ne!(raw::stwo_ntt_b2n_columns_on as usize, 0);
         assert_ne!(raw::stwo_lde_n2b_columns_on as usize, 0);
     }

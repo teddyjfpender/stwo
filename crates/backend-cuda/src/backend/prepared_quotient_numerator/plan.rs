@@ -48,7 +48,7 @@ impl QuotientNumeratorWorkspaceRequirements {
             slot(slots.line_coefficients, self.line_coefficient_words, 1),
             slot(slots.term_points, self.term_point_words, 1),
             slot(slots.batch_terms, self.batch_term_words, 1),
-            slot(slots.batch_group_offsets, self.batch_group_offset_words, 1),
+            slot(slots.batch_group_offsets, self.batch_group_offset_words, 2),
             slot(
                 slots.batch_source_ptrs,
                 self.batch_source_pointer_words,
@@ -373,7 +373,8 @@ pub(in crate::backend) fn build_plan(
         line_coefficient_words: checked_mul(terms.len(), LINE_COEFFICIENT_WORDS)?,
         term_point_words: checked_mul(terms.len(), SECURE_POINT_WORDS)?,
         batch_term_words: checked_mul(terms.len(), BATCH_TERM_WORDS)?,
-        batch_group_offset_words: checked_mul(batches.len(), point_logs.len() + 1)?,
+        batch_group_offset_words: checked_mul(batches.len(), point_logs.len() + 1)?
+            .max(checked_mul(point_logs.len() + 1, 2)?),
         batch_source_pointer_words: checked_mul(
             batches.iter().map(|batch| batch.columns.len()).sum(),
             POINTER_WORDS,

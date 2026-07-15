@@ -10,6 +10,11 @@ use crate::backend::quotient_numerator_single_write::{
     quotient_numerator_hybrid_plan, quotient_numerator_single_write_plan,
     QuotientNumeratorSingleWriteError,
 };
+use crate::backend::quotient_numerator_staged_single_write::{
+    quotient_numerator_staged_single_write_plan_with_overflow_capacities,
+    QuotientNumeratorStagedOperation, QuotientNumeratorStagedSingleWriteError,
+    QuotientNumeratorStagedSource, QuotientNumeratorStagingRole,
+};
 
 impl<'a> PreparedQuotientNumeratorGraph<'a> {
     /// Experimental all-evaluation schedule. Setup reuses the validated legacy
@@ -144,6 +149,269 @@ impl<'a> PreparedQuotientNumeratorGraph<'a> {
         Ok(prepared)
     }
 
+    /// Replacement-v1 coefficient-inclusive schedule. Every coefficient LDE
+    /// is materialized once into the primary factor-32 tile or one exact
+    /// epoch-released overflow role, then one packed 1-D launch writes every
+    /// quotient numerator exactly once.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_staged_packed_single_write(
+        arena: &'a DeviceArena,
+        config: QuotientNumeratorWorkspaceConfig,
+        columns: &[QuotientNumeratorColumn],
+        oods_sample_points: ArenaSlice,
+        oods_sample_values: ArenaSlice,
+        random_coefficient: ArenaSlice,
+        sample_points_destination: ArenaSlice,
+        first_linear_terms_destination: ArenaSlice,
+        destinations: &[QuotientNumeratorDestination],
+        forward_twiddles: ArenaSlice,
+        slots: &QuotientNumeratorWorkspaceSlots,
+        overflow_roles: &[ArenaSlice],
+    ) -> Result<Self, QuotientNumeratorStagedSingleWriteError> {
+        let topology = columns
+            .iter()
+            .map(QuotientNumeratorColumnTopology::from)
+            .collect::<Vec<_>>();
+        let canonical = build_plan(config, &topology)?;
+        let overflow_capacities = overflow_roles
+            .iter()
+            .map(|role| role.len_words())
+            .collect::<Vec<_>>();
+        let candidate = quotient_numerator_staged_single_write_plan_with_overflow_capacities(
+            config,
+            &topology,
+            &overflow_capacities,
+        )?;
+        if candidate.requirements() != &canonical.requirements
+            || candidate.group_offsets() != canonical.group_offsets.as_slice()
+        {
+            return Err(
+                QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+                    "staged and canonical numerator manifests differ",
+                ),
+            );
+        }
+
+        let expected_columns = canonical
+            .batches
+            .iter()
+            .flat_map(|batch| batch.coefficient_columns.iter().copied())
+            .collect::<Vec<_>>();
+        if candidate
+            .coefficient_ldes()
+            .iter()
+            .map(|lde| lde.column())
+            .ne(expected_columns.iter().copied())
+        {
+            return Err(
+                QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+                    "staged LDE order differs from canonical batch order",
+                ),
+            );
+        }
+        let mut operations = candidate.operations().iter();
+        let mut first_lde = 0usize;
+        for batch in canonical
+            .batches
+            .iter()
+            .filter(|batch| !batch.coefficient_columns.is_empty())
+        {
+            let Some(QuotientNumeratorStagedOperation::MaterializeLdes(launch)) = operations.next()
+            else {
+                return Err(
+                    QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+                        "staged LDE launch order differs from canonical batches",
+                    ),
+                );
+            };
+            if launch.evaluation_log_size() != batch.evaluation_log_size
+                || launch.first_lde() != first_lde
+                || launch.lde_count() != batch.coefficient_columns.len()
+            {
+                return Err(
+                    QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+                        "staged LDE launch geometry differs from canonical batch",
+                    ),
+                );
+            }
+            first_lde += launch.lde_count();
+        }
+        match operations.next() {
+            Some(QuotientNumeratorStagedOperation::AccumulatePackedRows {
+                group_count,
+                term_count,
+                packed_output_rows,
+            }) if *group_count == canonical.requirements.groups.len()
+                && *term_count == canonical.requirements.term_count
+                && *packed_output_rows == candidate.packed_output_rows() => {}
+            _ => {
+                return Err(
+                    QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+                        "staged packed launch geometry differs from canonical manifest",
+                    ),
+                )
+            }
+        }
+        if operations.next().is_some() || first_lde != candidate.coefficient_ldes().len() {
+            return Err(
+                QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+                    "staged operation manifest has trailing or missing work",
+                ),
+            );
+        }
+
+        let expected_overflow_roles = candidate.overflow_role_words();
+        if expected_overflow_roles.len() != overflow_roles.len() {
+            return Err(
+                QuotientNumeratorStagedSingleWriteError::OverflowBindingCountMismatch {
+                    expected: expected_overflow_roles.len(),
+                    actual: overflow_roles.len(),
+                },
+            );
+        }
+        for (required, role) in expected_overflow_roles.iter().zip(overflow_roles) {
+            if *required > role.len_words() {
+                return Err(
+                    QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+                        "staged overflow binding is smaller than its sealed used extent",
+                    ),
+                );
+            }
+        }
+
+        let workspace_ids = canonical
+            .requirements
+            .arena_slot_requirements(slots)?
+            .into_iter()
+            .map(|requirement| requirement.id)
+            .collect::<BTreeSet<_>>();
+        let context_token = arena.context().identity_token();
+        let mut role_ids = BTreeSet::new();
+        for role in overflow_roles {
+            if role.context_token() != context_token {
+                return Err(PreparedQuotientNumeratorError::ContextMismatch(role.id()).into());
+            }
+            if workspace_ids.contains(&role.id()) {
+                return Err(
+                    PreparedQuotientNumeratorError::ExternalAliasesWorkspace(role.id()).into(),
+                );
+            }
+            if !role_ids.insert(role.id()) {
+                return Err(PreparedQuotientNumeratorError::AliasedExternalSlot(role.id()).into());
+            }
+        }
+
+        let mut prepared = Self::prepare(
+            arena,
+            config,
+            columns,
+            oods_sample_points,
+            oods_sample_values,
+            random_coefficient,
+            sample_points_destination,
+            first_linear_terms_destination,
+            destinations,
+            forward_twiddles,
+            slots,
+        )?;
+        if candidate.requirements() != prepared.requirements()
+            || prepared.batches.len() != canonical.batches.len()
+        {
+            return Err(
+                QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+                    "staged and prepared numerator requirements differ",
+                ),
+            );
+        }
+        for (prepared_batch, canonical_batch) in prepared.batches.iter().zip(&canonical.batches) {
+            if prepared_batch.evaluation_log_size != canonical_batch.evaluation_log_size
+                || prepared_batch.coefficient_count != canonical_batch.coefficient_columns.len()
+            {
+                return Err(
+                    QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+                        "prepared coefficient batch differs from staged LDE manifest",
+                    ),
+                );
+            }
+        }
+
+        let primary = prepared.lde_tile.ok_or(
+            QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+                "staged coefficient manifest has no primary LDE role",
+            ),
+        )?;
+        let role_slice = |role| -> Result<ArenaSlice, QuotientNumeratorStagedSingleWriteError> {
+            match role {
+                QuotientNumeratorStagingRole::Primary => Ok(primary),
+                QuotientNumeratorStagingRole::Overflow(index) => {
+                    overflow_roles.get(usize::from(index)).copied().ok_or(
+                        QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+                            "staged LDE names a missing overflow role",
+                        ),
+                    )
+                }
+            }
+        };
+        let coefficient_output_pointers = candidate
+            .coefficient_ldes()
+            .iter()
+            .map(|lde| {
+                let role = role_slice(lde.staging_role())?;
+                if lde.role_end_words() > role.len_words() {
+                    return Err(
+                        QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+                            "staged LDE crosses its physical role extent",
+                        ),
+                    );
+                }
+                Ok(unsafe { role.as_u32_ptr().add(lde.role_offset_words()) as usize })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let source_pointers = candidate
+            .sources()
+            .iter()
+            .map(|source| match *source {
+                QuotientNumeratorStagedSource::Evaluation { column, .. } => {
+                    let QuotientNumeratorColumnSource::Evaluation(slice) = columns[column].source
+                    else {
+                        return Err(
+                            QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+                                "staged evaluation source is not a retained evaluation",
+                            ),
+                        );
+                    };
+                    Ok(slice.as_u32_ptr() as usize)
+                }
+                QuotientNumeratorStagedSource::StagedCoefficient(lde) => {
+                    let role = role_slice(lde.staging_role())?;
+                    Ok(unsafe { role.as_u32_ptr().add(lde.role_offset_words()) as usize })
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let coefficient_output_slot = prepared.coefficient_output_ptrs.ok_or(
+            QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+                "staged coefficient outputs have no pointer table",
+            ),
+        )?;
+        upload_and_sync(
+            arena,
+            &[
+                upload_u32(prepared.batch_terms, candidate.term_descriptors().to_vec()),
+                upload_u64(
+                    prepared.batch_group_offsets,
+                    candidate.packed_group_row_offsets().to_vec(),
+                ),
+                upload_ptrs(prepared.batch_source_ptrs, source_pointers),
+                upload_ptrs(coefficient_output_slot, coefficient_output_pointers),
+            ],
+        )?;
+        prepared.schedule = PreparedNumeratorSchedule::StagedPackedSingleWrite {
+            packed_output_rows: candidate.packed_output_rows(),
+        };
+        Ok(prepared)
+    }
+
     pub(super) fn launch_single_write_candidate(
         &self,
         group_offsets: ArenaSlice,
@@ -174,6 +442,41 @@ impl<'a> PreparedQuotientNumeratorGraph<'a> {
             )
         };
         check_cuda("prepared_quotient_numerator_single_write", code)?;
+        Ok(())
+    }
+
+    pub(super) fn launch_packed_single_write(
+        &self,
+        packed_output_rows: u64,
+        stream: *mut c_void,
+    ) -> Result<(), PreparedQuotientNumeratorError> {
+        let group_count = u32::try_from(self.requirements.groups.len()).map_err(|_| {
+            PreparedQuotientNumeratorError::TooManyGroups(self.requirements.groups.len())
+        })?;
+        let output_table = |coordinate: usize| unsafe {
+            self.output_ptrs
+                .as_u32_ptr()
+                .cast::<*mut u32>()
+                .add(coordinate * self.requirements.groups.len())
+        };
+        let code = unsafe {
+            stwo_backend_cuda_kernels::raw::stwo_accumulate_quotient_numerator_packed_single_write_on(
+                self.batch_group_offsets.as_u32_ptr().cast(),
+                self.group_offsets.as_u32_ptr(),
+                self.batch_terms.as_u32_ptr(),
+                group_count,
+                packed_output_rows,
+                self.batch_source_ptrs.as_u32_ptr().cast(),
+                self.line_coefficients.as_u32_ptr().cast(),
+                self.output_log_sizes.as_u32_ptr(),
+                output_table(0),
+                output_table(1),
+                output_table(2),
+                output_table(3),
+                stream,
+            )
+        };
+        check_cuda("prepared_quotient_numerator_packed_single_write", code)?;
         Ok(())
     }
 }

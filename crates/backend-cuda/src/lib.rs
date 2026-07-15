@@ -210,7 +210,7 @@ pub use backend::quotient_numerator_staged_single_write::{
     quotient_numerator_staged_single_write_plan_with_overflow_capacities,
     QuotientNumeratorStagedLde, QuotientNumeratorStagedSingleWriteError,
     QuotientNumeratorStagedSingleWritePlan, QuotientNumeratorStagedSingleWriteReport,
-    QuotientNumeratorStagedSource,
+    QuotientNumeratorStagedSource, QuotientNumeratorStagingRole,
 };
 pub use backend::relation_graph::{
     relation_batch_fused_eligible, relation_graph_requirements, PreparedRelationGraph,
