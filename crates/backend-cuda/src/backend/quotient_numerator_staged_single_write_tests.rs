@@ -64,25 +64,31 @@ fn mixed_topology() -> Vec<QuotientNumeratorColumnTopology> {
 
 #[test]
 fn cumulative_staging_layout_is_exact_and_disjoint() {
-    let layout = coefficient_staging_layout([(7, 5), (3, 7), (9, 4)]).unwrap();
+    let layout = coefficient_staging_layout([(7, 5), (3, 7), (9, 4)], 160).unwrap();
     assert_eq!(
         layout,
         vec![
             QuotientNumeratorStagedLde {
                 column: 7,
                 evaluation_log_size: 5,
+                staging_role: QuotientNumeratorStagingRole::Primary,
+                role_offset_words: 0,
                 offset_words: 0,
                 len_words: 32,
             },
             QuotientNumeratorStagedLde {
                 column: 3,
                 evaluation_log_size: 7,
+                staging_role: QuotientNumeratorStagingRole::Primary,
+                role_offset_words: 32,
                 offset_words: 32,
                 len_words: 128,
             },
             QuotientNumeratorStagedLde {
                 column: 9,
                 evaluation_log_size: 4,
+                staging_role: QuotientNumeratorStagingRole::Overflow,
+                role_offset_words: 0,
                 offset_words: 160,
                 len_words: 16,
             },
@@ -91,12 +97,14 @@ fn cumulative_staging_layout_is_exact_and_disjoint() {
     assert!(layout.windows(2).all(|pair| {
         pair[0].end_words() == pair[1].offset_words && pair[0].end_words() <= pair[1].offset_words
     }));
+    assert_eq!(layout[1].role_end_words(), 160);
+    assert_eq!(layout[2].role_end_words(), 16);
 }
 
 #[test]
 fn staging_layout_rejects_duplicate_columns() {
     assert_eq!(
-        coefficient_staging_layout([(4, 5), (4, 6)]),
+        coefficient_staging_layout([(4, 5), (4, 6)], 64),
         Err(QuotientNumeratorStagedSingleWriteError::DuplicateCoefficientColumn(4))
     );
 }
@@ -104,7 +112,7 @@ fn staging_layout_rejects_duplicate_columns() {
 #[test]
 fn staging_layout_rejects_shift_and_cumulative_overflow() {
     assert!(matches!(
-        coefficient_staging_layout([(4, usize::BITS)]),
+        coefficient_staging_layout([(4, usize::BITS)], usize::MAX),
         Err(
             QuotientNumeratorStagedSingleWriteError::StagingSizeOverflow {
                 column: 4,
@@ -113,7 +121,10 @@ fn staging_layout_rejects_shift_and_cumulative_overflow() {
         ) if evaluation_log_size == usize::BITS
     ));
     assert!(matches!(
-        coefficient_staging_layout([(4, usize::BITS - 1), (9, usize::BITS - 1)]),
+        coefficient_staging_layout(
+            [(4, usize::BITS - 1), (9, usize::BITS - 1)],
+            usize::MAX
+        ),
         Err(
             QuotientNumeratorStagedSingleWriteError::StagingSizeOverflow {
                 column: 9,
@@ -178,6 +189,9 @@ fn mixed_plan_preserves_every_legacy_term_and_reports_exact_passes() {
     assert_eq!(report.coefficient_source_count, 3);
     assert_eq!(report.total_staging_words, 192);
     assert_eq!(report.factor32_staging_words, 128);
+    assert_eq!(report.primary_staging_words, 64);
+    assert_eq!(report.unused_factor32_staging_words, 64);
+    assert_eq!(report.overflow_staging_words, 128);
     assert_eq!(report.incremental_staging_words_over_factor32, 64);
     assert_eq!(report.factor32_batch_count, legacy.batches.len());
     assert_eq!(report.factor32_accumulation_passes, legacy.batches.len());
@@ -204,6 +218,28 @@ fn mixed_plan_preserves_every_legacy_term_and_reports_exact_passes() {
         legacy.batches.len() + 1
     );
     assert_eq!(report.candidate_output_passes, 1);
+    let mut covered_ldes = 0;
+    for operation in candidate.operations() {
+        match operation {
+            QuotientNumeratorStagedOperation::MaterializeLdes(launch) => {
+                assert_eq!(launch.first_lde(), covered_ldes);
+                assert!(launch.lde_count() > 0);
+                assert!(candidate.coefficient_ldes()
+                    [launch.first_lde()..launch.first_lde() + launch.lde_count()]
+                    .iter()
+                    .all(|lde| lde.evaluation_log_size() == launch.evaluation_log_size()));
+                covered_ldes += launch.lde_count();
+            }
+            QuotientNumeratorStagedOperation::AccumulateAllGroups {
+                group_count,
+                term_count,
+            } => {
+                assert_eq!(covered_ldes, candidate.coefficient_ldes().len());
+                assert_eq!(*group_count, legacy.requirements.groups.len());
+                assert_eq!(*term_count, legacy.requirements.term_count);
+            }
+        }
+    }
     assert_eq!(
         report.factor32_logical_output_bytes,
         report.output_rows as u64 * 16
@@ -229,6 +265,8 @@ fn evaluation_only_and_unsampled_coefficient_columns_need_no_staging() {
     assert!(evaluation_only.coefficient_ldes().is_empty());
     assert_eq!(evaluation_only.report().total_staging_words, 0);
     assert_eq!(evaluation_only.report().factor32_staging_words, 0);
+    assert_eq!(evaluation_only.report().primary_staging_words, 0);
+    assert_eq!(evaluation_only.report().overflow_staging_words, 0);
     assert_eq!(
         evaluation_only
             .report()

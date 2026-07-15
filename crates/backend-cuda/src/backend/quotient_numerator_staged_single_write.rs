@@ -24,6 +24,8 @@ const FACTOR32_TILE_COLUMNS: usize = 32;
 pub struct QuotientNumeratorStagedLde {
     column: usize,
     evaluation_log_size: u32,
+    staging_role: QuotientNumeratorStagingRole,
+    role_offset_words: usize,
     offset_words: usize,
     len_words: usize,
 }
@@ -35,6 +37,22 @@ impl QuotientNumeratorStagedLde {
 
     pub fn evaluation_log_size(self) -> u32 {
         self.evaluation_log_size
+    }
+
+    pub fn staging_role(self) -> QuotientNumeratorStagingRole {
+        self.staging_role
+    }
+
+    /// Offset inside [`Self::staging_role`]. Native preparation binds the
+    /// primary and overflow roles independently; no LDE may cross a role.
+    pub fn role_offset_words(self) -> usize {
+        self.role_offset_words
+    }
+
+    pub fn role_end_words(self) -> usize {
+        self.role_offset_words
+            .checked_add(self.len_words)
+            .expect("private construction validates the staged role end")
     }
 
     pub fn offset_words(self) -> usize {
@@ -50,6 +68,49 @@ impl QuotientNumeratorStagedLde {
             .checked_add(self.len_words)
             .expect("private construction validates the staged LDE end")
     }
+}
+
+/// Physical ownership of a staged coefficient LDE.
+///
+/// `Primary` reuses the factor-32 quotient tile. `Overflow` is live only in
+/// the quotient epoch and must alias an epoch-disjoint released commitment
+/// slab; it is never an independently allocated third slab.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum QuotientNumeratorStagingRole {
+    Primary,
+    Overflow,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QuotientNumeratorStagedLdeLaunch {
+    evaluation_log_size: u32,
+    first_lde: usize,
+    lde_count: usize,
+}
+
+impl QuotientNumeratorStagedLdeLaunch {
+    pub fn evaluation_log_size(self) -> u32 {
+        self.evaluation_log_size
+    }
+
+    pub fn first_lde(self) -> usize {
+        self.first_lde
+    }
+
+    pub fn lde_count(self) -> usize {
+        self.lde_count
+    }
+}
+
+/// Exact prepared-call order. Every LDE sublaunch precedes the sole
+/// group-major numerator accumulation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QuotientNumeratorStagedOperation {
+    MaterializeLdes(QuotientNumeratorStagedLdeLaunch),
+    AccumulateAllGroups {
+        group_count: usize,
+        term_count: usize,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -105,6 +166,16 @@ pub struct QuotientNumeratorStagedSingleWriteReport {
     pub total_staging_words: usize,
     /// Peak transient factor-32 tile already required by the legacy plan.
     pub factor32_staging_words: usize,
+    /// Words actually occupied inside the existing factor-32 tile role.
+    pub primary_staging_words: usize,
+    /// Unused tail of the existing factor-32 tile. It cannot be added to the
+    /// overflow capacity because no individual LDE may straddle roles.
+    pub unused_factor32_staging_words: usize,
+    /// Exact second-role size after assigning whole LDEs. This is the amount
+    /// that must fit an epoch-disjoint released commitment slab.
+    pub overflow_staging_words: usize,
+    /// Arithmetic footprint delta; it may be smaller than `overflow` because
+    /// the primary role can retain an unusable tail smaller than the next LDE.
     pub incremental_staging_words_over_factor32: usize,
 }
 
@@ -112,6 +183,7 @@ pub struct QuotientNumeratorStagedSingleWriteReport {
 pub struct QuotientNumeratorStagedSingleWritePlan {
     requirements: QuotientNumeratorWorkspaceRequirements,
     coefficient_ldes: Vec<QuotientNumeratorStagedLde>,
+    operations: Vec<QuotientNumeratorStagedOperation>,
     sources: Vec<QuotientNumeratorStagedSource>,
     group_offsets: Vec<u32>,
     term_descriptors: Vec<u32>,
@@ -126,6 +198,10 @@ impl QuotientNumeratorStagedSingleWritePlan {
     /// LDE launches execute in this order into disjoint cumulative ranges.
     pub fn coefficient_ldes(&self) -> &[QuotientNumeratorStagedLde] {
         &self.coefficient_ldes
+    }
+
+    pub fn operations(&self) -> &[QuotientNumeratorStagedOperation] {
+        &self.operations
     }
 
     /// Exact legacy batch/source order with coefficient addresses replaced by
@@ -206,7 +282,39 @@ pub fn quotient_numerator_staged_single_write_plan(
             .iter()
             .map(|&column| (column, batch.evaluation_log_size))
     });
-    let coefficient_ldes = coefficient_staging_layout(coefficient_entries)?;
+    let coefficient_ldes =
+        coefficient_staging_layout(coefficient_entries, legacy.requirements.lde_tile_words)?;
+    let mut operations = Vec::new();
+    let mut first_lde = 0usize;
+    for batch in &legacy.batches {
+        if batch.coefficient_columns.is_empty() {
+            continue;
+        }
+        let count = batch.coefficient_columns.len();
+        operations.push(QuotientNumeratorStagedOperation::MaterializeLdes(
+            QuotientNumeratorStagedLdeLaunch {
+                evaluation_log_size: batch.evaluation_log_size,
+                first_lde,
+                lde_count: count,
+            },
+        ));
+        first_lde = first_lde.checked_add(count).ok_or(
+            QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+                "LDE launch range overflowed",
+            ),
+        )?;
+    }
+    if first_lde != coefficient_ldes.len() {
+        return Err(
+            QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+                "LDE launch manifest lost or duplicated a staged column",
+            ),
+        );
+    }
+    operations.push(QuotientNumeratorStagedOperation::AccumulateAllGroups {
+        group_count: legacy.requirements.groups.len(),
+        term_count: legacy.requirements.term_count,
+    });
     let staged_by_column = coefficient_ldes
         .iter()
         .map(|lde| (lde.column(), *lde))
@@ -336,6 +444,7 @@ pub fn quotient_numerator_staged_single_write_plan(
     Ok(QuotientNumeratorStagedSingleWritePlan {
         requirements: legacy.requirements,
         coefficient_ldes,
+        operations,
         sources,
         group_offsets,
         term_descriptors,
@@ -345,9 +454,13 @@ pub fn quotient_numerator_staged_single_write_plan(
 
 fn coefficient_staging_layout(
     entries: impl IntoIterator<Item = (usize, u32)>,
+    primary_capacity_words: usize,
 ) -> Result<Vec<QuotientNumeratorStagedLde>, QuotientNumeratorStagedSingleWriteError> {
     let mut seen = BTreeSet::new();
     let mut offset_words = 0usize;
+    let mut primary_offset_words = 0usize;
+    let mut overflow_offset_words = 0usize;
+    let mut overflow_started = false;
     let mut ldes = Vec::new();
     for (column, evaluation_log_size) in entries {
         if !seen.insert(column) {
@@ -367,9 +480,33 @@ fn coefficient_staging_layout(
                 evaluation_log_size,
             },
         )?;
+        let primary_next = primary_offset_words.checked_add(len_words).ok_or(
+            QuotientNumeratorStagedSingleWriteError::StagingSizeOverflow {
+                column,
+                evaluation_log_size,
+            },
+        )?;
+        let (staging_role, role_offset_words) =
+            if !overflow_started && primary_next <= primary_capacity_words {
+                let role_offset = primary_offset_words;
+                primary_offset_words = primary_next;
+                (QuotientNumeratorStagingRole::Primary, role_offset)
+            } else {
+                overflow_started = true;
+                let role_offset = overflow_offset_words;
+                overflow_offset_words = overflow_offset_words.checked_add(len_words).ok_or(
+                    QuotientNumeratorStagedSingleWriteError::StagingSizeOverflow {
+                        column,
+                        evaluation_log_size,
+                    },
+                )?;
+                (QuotientNumeratorStagingRole::Overflow, role_offset)
+            };
         ldes.push(QuotientNumeratorStagedLde {
             column,
             evaluation_log_size,
+            staging_role,
+            role_offset_words,
             offset_words,
             len_words,
         });
@@ -407,13 +544,39 @@ fn build_report(
         }
     })?;
     let total_staging_words = ldes.last().map_or(0, |lde| lde.end_words());
-    let incremental_staging_words_over_factor32 = total_staging_words
-        .checked_sub(requirements.lde_tile_words)
+    let primary_staging_words = ldes
+        .iter()
+        .filter(|lde| lde.staging_role() == QuotientNumeratorStagingRole::Primary)
+        .map(|lde| lde.role_end_words())
+        .max()
+        .unwrap_or(0);
+    let overflow_staging_words = ldes
+        .iter()
+        .filter(|lde| lde.staging_role() == QuotientNumeratorStagingRole::Overflow)
+        .map(|lde| lde.role_end_words())
+        .max()
+        .unwrap_or(0);
+    if primary_staging_words > requirements.lde_tile_words
+        || primary_staging_words
+            .checked_add(overflow_staging_words)
+            .is_none_or(|words| words != total_staging_words)
+    {
+        return Err(
+            QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+                "segmented staging accounting does not reconcile",
+            ),
+        );
+    }
+    let unused_factor32_staging_words = requirements
+        .lde_tile_words
+        .checked_sub(primary_staging_words)
         .ok_or(
             QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
-                "persistent staging is smaller than the factor-32 tile",
+                "primary staging exceeds the factor-32 role",
             ),
         )?;
+    let incremental_staging_words_over_factor32 =
+        total_staging_words.saturating_sub(requirements.lde_tile_words);
     let factor32_accumulation_passes = (coefficient_output_rows != 0)
         .then_some(requirements.batches.len())
         .unwrap_or(0);
@@ -468,6 +631,9 @@ fn build_report(
         logical_output_bytes_saved: factor32_rmw_bytes,
         total_staging_words,
         factor32_staging_words: requirements.lde_tile_words,
+        primary_staging_words,
+        unused_factor32_staging_words,
+        overflow_staging_words,
         incremental_staging_words_over_factor32,
     })
 }
@@ -486,3 +652,7 @@ fn bytes(rows: usize, bytes_per_row: u64) -> Result<u64, QuotientNumeratorStaged
 #[cfg(test)]
 #[path = "quotient_numerator_staged_single_write_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "quotient_numerator_staged_single_write_admission_tests.rs"]
+mod admission_tests;
