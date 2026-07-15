@@ -18,6 +18,8 @@ use super::exec_context::{
     check_cuda, ArenaError, ArenaSlice, ArenaSlotId, CudaRuntimeError, DeviceArena,
 };
 
+mod in_place;
+
 const WORD_BYTES: usize = core::mem::size_of::<u32>();
 const HASH_WORDS: usize = core::mem::size_of::<Blake2sHash>() / WORD_BYTES;
 const POINTER_WORDS: usize = core::mem::size_of::<*mut u32>().div_ceil(WORD_BYTES);
