@@ -1384,6 +1384,20 @@ extern "C" {
         stream: *mut c_void,
     ) -> i32;
 
+    /// Allocation-free B2N transform that writes the normalized result to
+    /// both halves of each paired `2^(log_n + 1)`-word retained output. This
+    /// is byte-identical to the first N2B layer after coefficient zero-extension.
+    pub fn stwo_ntt_b2n_columns_to_retained_on(
+        inputs: *const *const u32,
+        retained_outputs: *const *mut u32,
+        log_n: u32,
+        num_poly: u32,
+        g_twiddles: *const u32,
+        twiddles_size: u32,
+        eval_domain_size: u32,
+        stream: *mut c_void,
+    ) -> i32;
+
     pub fn ntt_n2b_columns(
         values_columns: *mut *mut u32,
         log_n: u32,
@@ -2641,4 +2655,62 @@ extern "C" {
         states: *mut ProgressiveBlake2sState,
         stream: *mut c_void,
     ) -> i32;
+}
+
+#[cfg(test)]
+mod direct_retained_b2n_contract_tests {
+    use super::*;
+
+    type DirectRetainedB2nFn = unsafe extern "C" fn(
+        *const *const u32,
+        *const *mut u32,
+        u32,
+        u32,
+        *const u32,
+        u32,
+        u32,
+        *mut c_void,
+    ) -> i32;
+
+    #[test]
+    fn direct_retained_b2n_abi_is_linked() {
+        let _: DirectRetainedB2nFn = stwo_ntt_b2n_columns_to_retained_on;
+    }
+
+    #[test]
+    fn duplicate_image_is_byte_exact_first_zero_extended_n2b_layer() {
+        const P: u64 = (1u64 << 31) - 1;
+        for log_n in 3..=12 {
+            let n = 1usize << log_n;
+            for index in 0..n {
+                let coefficient = (((index as u64 * 0x45d9_f3b) + log_n as u64) % P) as u32;
+                for twiddle in [0, 1, P / 2, P - 1] {
+                    let zero_times_twiddle = (0u64 * twiddle) % P;
+                    let left = ((u64::from(coefficient) + zero_times_twiddle) % P) as u32;
+                    let right = ((u64::from(coefficient) + P - zero_times_twiddle) % P) as u32;
+                    assert_eq!(left.to_le_bytes(), coefficient.to_le_bytes());
+                    assert_eq!(right.to_le_bytes(), coefficient.to_le_bytes());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cuda_terminal_writer_is_fused_and_fail_closed() {
+        let source = include_str!("../cuda/ifft.cu");
+        for required in [
+            "output_ntt_start[output_index + (1u << log_n)] = vals[i]",
+            "output_start[left_index + (1u << log_n)] = left_r",
+            "output_start[right_index + (1u << log_n)] = right_r",
+            "DUPLICATE_TO_RETAINED && start_stage + stages - 1 != log_n",
+            "DUPLICATE_TO_RETAINED && i + 1 == count",
+            "b2n_columns_out_of_place_entry<false>",
+            "b2n_columns_out_of_place_entry<true>",
+        ] {
+            assert!(
+                source.contains(required),
+                "missing CUDA contract: {required}"
+            );
+        }
+    }
 }

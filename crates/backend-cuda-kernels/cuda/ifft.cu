@@ -617,7 +617,7 @@ EXTERN void ntt_b2n_init_6_3_stage_batch(m31** input, m31** output,
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 }
 
-template <unsigned LOG_VALS_PER_THREAD>
+template <unsigned LOG_VALS_PER_THREAD, bool DUPLICATE_TO_RETAINED>
 __global__ void  b2n_noinit_block_batch(m31** input, m31** output,
                                   const unsigned log_n, const unsigned num_poly,
                                   unsigned min_stage, unsigned max_stage,
@@ -731,7 +731,12 @@ __global__ void  b2n_noinit_block_batch(m31** input, m31** output,
   m31* output_ntt_start = output[ntt_idx];
 #pragma unroll
   for (unsigned i = 0; i < (1 << LOG_VALS_PER_THREAD); i++) {
-    output_ntt_start[block_start + i * new_min_stride + new_offset] = vals[i];
+    const unsigned output_index = block_start + i * new_min_stride + new_offset;
+    output_ntt_start[output_index] = vals[i];
+    if constexpr (DUPLICATE_TO_RETAINED) {
+      // The omitted first N2B butterfly sees (coefficient, 0), hence (c, c).
+      output_ntt_start[output_index + (1u << log_n)] = vals[i];
+    }
   }
 
 }
@@ -753,7 +758,7 @@ EXTERN void ntt_b2n_noinit_4_stage_batch(m31** input, m31** output,
     grid_dim.y = (1 << log_n) / (min_stride << num_stage);
     m31 rescale_factor = inv(pow(m31{2}, log_n));
 
-    b2n_noinit_block_batch<log_val_per_thread><<<grid_dim, block_dim, 0>>>(
+    b2n_noinit_block_batch<log_val_per_thread, false><<<grid_dim, block_dim, 0>>>(
         input, output,
         log_n, num_poly, start_stage, end_stage, g_twiddles, rescale_factor);
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
@@ -778,7 +783,7 @@ EXTERN void ntt_b2n_noinit_6_stage_batch(m31** input, m31** output,
     grid_dim.x = min_stride / num_threads_per_warp;
     grid_dim.y = (1 << log_n) / (1 << end_stage);
     m31 rescale_factor = inv(pow(m31{2}, log_n));
-    b2n_noinit_block_batch<log_val_per_thread><<<grid_dim, block_dim, 0>>>(
+    b2n_noinit_block_batch<log_val_per_thread, false><<<grid_dim, block_dim, 0>>>(
         input, output,
         log_n, num_poly, start_stage, end_stage, g_twiddles, rescale_factor);
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
@@ -803,7 +808,7 @@ EXTERN void ntt_b2n_noinit_8_stage_batch(m31** input, m31** output,
     grid_dim.x = min_stride / num_threads_per_warp;
     grid_dim.y = (1 << log_n) / (1 << end_stage);
     m31 rescale_factor = inv(pow(m31{2}, log_n));
-    b2n_noinit_block_batch<log_val_per_thread><<<grid_dim, block_dim, 0>>>(
+    b2n_noinit_block_batch<log_val_per_thread, false><<<grid_dim, block_dim, 0>>>(
         input, output,
         log_n, num_poly, start_stage, end_stage, g_twiddles, rescale_factor);
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
@@ -811,6 +816,7 @@ EXTERN void ntt_b2n_noinit_8_stage_batch(m31** input, m31** output,
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 }
 
+template <bool DUPLICATE_TO_RETAINED>
 __global__ void ntt_b2n_stage_batch(m31** input, m31** output,
                               unsigned log_n, unsigned stage,
                               m31 *layer_twiddles, m31 rescale_factor) {
@@ -847,6 +853,11 @@ __global__ void ntt_b2n_stage_batch(m31** input, m31** output,
 
     output_start[left_index] = left_r;
     output_start[right_index] = right_r;
+    if constexpr (DUPLICATE_TO_RETAINED) {
+        // The omitted first N2B butterfly sees (coefficient, 0), hence (c, c).
+        output_start[left_index + (1u << log_n)] = left_r;
+        output_start[right_index + (1u << log_n)] = right_r;
+    }
 
 }
 
@@ -876,7 +887,7 @@ static cudaError_t ntt_b2n_native_device_batch_on(
     const m31 rescale_factor = inv(pow(m31{2}, log_n));
     unsigned layer_domain_size = (1u << log_n) >> 1;
     unsigned layer_domain_offset = 0;
-    ntt_b2n_stage_batch<<<grid_dim, block_dim, 0, stream>>>(
+    ntt_b2n_stage_batch<false><<<grid_dim, block_dim, 0, stream>>>(
         device_values, device_values, log_n, 1, g_twiddles, rescale_factor);
     cudaError_t error = cudaGetLastError();
     if (error != cudaSuccess) {
@@ -884,7 +895,7 @@ static cudaError_t ntt_b2n_native_device_batch_on(
     }
 
     for (unsigned stage = 2; stage <= log_n; stage++) {
-        ntt_b2n_stage_batch<<<grid_dim, block_dim, 0, stream>>>(
+        ntt_b2n_stage_batch<false><<<grid_dim, block_dim, 0, stream>>>(
             device_values, device_values, log_n, stage,
             &g_twiddles[layer_domain_offset], rescale_factor);
         error = cudaGetLastError();
@@ -1019,14 +1030,15 @@ cudaError_t b2n_dispatch_init_interval_on(
     }
 }
 
-template <unsigned LOG_VALUES_PER_THREAD>
+template <unsigned LOG_VALUES_PER_THREAD, bool DUPLICATE_TO_RETAINED>
 cudaError_t b2n_noinit_interval_on(m31 **values, unsigned log_n,
                                   unsigned num_poly, unsigned start_stage,
                                   unsigned stages, m31 *twiddles,
                                   cudaStream_t stream) {
     constexpr unsigned expected = 2 * LOG_VALUES_PER_THREAD;
     if (stages != expected || start_stage == 0 ||
-        start_stage + stages - 1 > log_n)
+        start_stage + stages - 1 > log_n ||
+        (DUPLICATE_TO_RETAINED && start_stage + stages - 1 != log_n))
         return cudaErrorInvalidConfiguration;
     constexpr unsigned warp = 32;
     dim3 block{warp, 1u << LOG_VALUES_PER_THREAD, 1};
@@ -1034,12 +1046,33 @@ cudaError_t b2n_noinit_interval_on(m31 **values, unsigned log_n,
     const unsigned min_stride = 1u << (start_stage - 1);
     dim3 grid{min_stride / warp, (1u << log_n) / (1u << end_stage), num_poly};
     const m31 rescale_factor = inv(pow(m31{2}, log_n));
-    b2n_noinit_block_batch<LOG_VALUES_PER_THREAD><<<grid, block, 0, stream>>>(
+    b2n_noinit_block_batch<LOG_VALUES_PER_THREAD, DUPLICATE_TO_RETAINED>
+        <<<grid, block, 0, stream>>>(
         values, values, log_n, num_poly, start_stage, end_stage, twiddles,
         rescale_factor);
     return cudaGetLastError();
 }
 
+template <bool DUPLICATE_TO_RETAINED>
+cudaError_t b2n_dispatch_noinit_interval_on(
+    m31 **values, unsigned log_n, unsigned num_poly, unsigned start_stage,
+    unsigned stages, m31 *twiddles, cudaStream_t stream) {
+    switch (stages) {
+    case 4:
+        return b2n_noinit_interval_on<2, DUPLICATE_TO_RETAINED>(
+            values, log_n, num_poly, start_stage, stages, twiddles, stream);
+    case 6:
+        return b2n_noinit_interval_on<3, DUPLICATE_TO_RETAINED>(
+            values, log_n, num_poly, start_stage, stages, twiddles, stream);
+    case 8:
+        return b2n_noinit_interval_on<4, DUPLICATE_TO_RETAINED>(
+            values, log_n, num_poly, start_stage, stages, twiddles, stream);
+    default:
+        return cudaErrorInvalidConfiguration;
+    }
+}
+
+template <bool DUPLICATE_TO_RETAINED>
 cudaError_t b2n_stagewise_out_of_place_on(m31 **input, m31 **output,
                                           unsigned log_n, unsigned num_poly,
                                           m31 *twiddles,
@@ -1052,20 +1085,28 @@ cudaError_t b2n_stagewise_out_of_place_on(m31 **input, m31 **output,
     const m31 rescale_factor = inv(pow(m31{2}, log_n));
     unsigned layer_size = (1u << log_n) >> 1;
     unsigned layer_offset = 0;
-    ntt_b2n_stage_batch<<<grid, block, 0, stream>>>(
+    ntt_b2n_stage_batch<false><<<grid, block, 0, stream>>>(
         input, output, log_n, 1, twiddles, rescale_factor);
     cudaError_t error = cudaGetLastError();
-    for (unsigned stage = 2; error == cudaSuccess && stage <= log_n; ++stage) {
-        ntt_b2n_stage_batch<<<grid, block, 0, stream>>>(
+    for (unsigned stage = 2; error == cudaSuccess && stage < log_n; ++stage) {
+        ntt_b2n_stage_batch<false><<<grid, block, 0, stream>>>(
             output, output, log_n, stage, &twiddles[layer_offset],
             rescale_factor);
         error = cudaGetLastError();
         layer_size >>= 1;
         layer_offset += layer_size;
     }
+    if (error == cudaSuccess) {
+        ntt_b2n_stage_batch<DUPLICATE_TO_RETAINED>
+            <<<grid, block, 0, stream>>>(output, output, log_n, log_n,
+                                         &twiddles[layer_offset],
+                                         rescale_factor);
+        error = cudaGetLastError();
+    }
     return error;
 }
 
+template <bool DUPLICATE_TO_RETAINED>
 cudaError_t b2n_fused_out_of_place_on(m31 **input, m31 **output,
                                       unsigned log_n, unsigned num_poly,
                                       m31 *twiddles, cudaStream_t stream) {
@@ -1078,8 +1119,8 @@ cudaError_t b2n_fused_out_of_place_on(m31 **input, m31 **output,
     } else if (log_n >= 25 && log_n <= 29) {
         parts = LAUNCH_B2N_CONFIG_25_29[log_n - 25]; count = 4;
     } else {
-        return b2n_stagewise_out_of_place_on(input, output, log_n, num_poly,
-                                             twiddles, stream);
+        return b2n_stagewise_out_of_place_on<DUPLICATE_TO_RETAINED>(
+            input, output, log_n, num_poly, twiddles, stream);
     }
     if (!b2n_partition_is_exact(parts, count, log_n))
         return cudaErrorInvalidConfiguration;
@@ -1089,20 +1130,19 @@ cudaError_t b2n_fused_out_of_place_on(m31 **input, m31 **output,
     unsigned start = 1u + static_cast<unsigned>(parts[0]);
     for (size_t i = 1; error == cudaSuccess && i < count; ++i) {
         const unsigned stages = static_cast<unsigned>(parts[i]);
-        switch (stages) {
-        case 4: error = b2n_noinit_interval_on<2>(output, log_n, num_poly, start, stages, twiddles, stream); break;
-        case 6: error = b2n_noinit_interval_on<3>(output, log_n, num_poly, start, stages, twiddles, stream); break;
-        case 8: error = b2n_noinit_interval_on<4>(output, log_n, num_poly, start, stages, twiddles, stream); break;
-        default: return cudaErrorInvalidConfiguration;
-        }
+        const bool duplicate = DUPLICATE_TO_RETAINED && i + 1 == count;
+        error = duplicate
+            ? b2n_dispatch_noinit_interval_on<true>(
+                  output, log_n, num_poly, start, stages, twiddles, stream)
+            : b2n_dispatch_noinit_interval_on<false>(
+                  output, log_n, num_poly, start, stages, twiddles, stream);
         start += stages;
     }
     return error;
 }
 
-} // namespace
-
-extern "C" int stwo_ntt_b2n_columns_out_of_place_on(
+template <bool DUPLICATE_TO_RETAINED>
+int b2n_columns_out_of_place_entry(
     const uint32_t *const *inputs, uint32_t *const *outputs, uint32_t log_n,
     uint32_t num_poly, const uint32_t *g_twiddles, uint32_t twiddles_size,
     uint32_t eval_domain_size, void *stream_raw) {
@@ -1119,11 +1159,31 @@ extern "C" int stwo_ntt_b2n_columns_out_of_place_on(
         auto input = reinterpret_cast<m31 **>(const_cast<uint32_t **>(inputs + base));
         auto output = reinterpret_cast<m31 **>(
             const_cast<uint32_t **>(outputs + base));
-        cudaError_t error = b2n_fused_out_of_place_on(
+        cudaError_t error = b2n_fused_out_of_place_on<DUPLICATE_TO_RETAINED>(
             input, output, log_n, chunk, twiddles, stream);
         if (error != cudaSuccess) return (int)error;
     }
     return (int)cudaSuccess;
+}
+
+} // namespace
+
+extern "C" int stwo_ntt_b2n_columns_out_of_place_on(
+    const uint32_t *const *inputs, uint32_t *const *outputs, uint32_t log_n,
+    uint32_t num_poly, const uint32_t *g_twiddles, uint32_t twiddles_size,
+    uint32_t eval_domain_size, void *stream_raw) {
+    return b2n_columns_out_of_place_entry<false>(
+        inputs, outputs, log_n, num_poly, g_twiddles, twiddles_size,
+        eval_domain_size, stream_raw);
+}
+
+extern "C" int stwo_ntt_b2n_columns_to_retained_on(
+    const uint32_t *const *inputs, uint32_t *const *retained_outputs,
+    uint32_t log_n, uint32_t num_poly, const uint32_t *g_twiddles,
+    uint32_t twiddles_size, uint32_t eval_domain_size, void *stream_raw) {
+    return b2n_columns_out_of_place_entry<true>(
+        inputs, retained_outputs, log_n, num_poly, g_twiddles, twiddles_size,
+        eval_domain_size, stream_raw);
 }
 
 
@@ -1144,7 +1204,7 @@ EXTERN void ntt_b2n_native_batch(m31** input, m31** output,
     unsigned layer_domain_size = (1 << log_n) >> 1;
     unsigned layer_domain_offset = 0;
     if (start_stage == 1) {
-        ntt_b2n_stage_batch<<<grid_dim, block_dim, 0>>>(
+        ntt_b2n_stage_batch<false><<<grid_dim, block_dim, 0>>>(
             input, output, log_n, 1, g_twiddles, rescale_factor);
         ASSERT_CUDA_SUCCESS(cudaGetLastError());
     }
@@ -1153,7 +1213,7 @@ EXTERN void ntt_b2n_native_batch(m31** input, m31** output,
     ASSERT_TRUE(end_stage <= log_n, "end_stage <= log_n in ntt_n2b_native");
     for (unsigned stage = 2; stage <= end_stage; stage++) {
         if (stage >= start_stage) {
-            ntt_b2n_stage_batch<<<grid_dim, block_dim, 0>>>(
+            ntt_b2n_stage_batch<false><<<grid_dim, block_dim, 0>>>(
                 output, output, log_n, stage, &g_twiddles[layer_domain_offset], rescale_factor);
             ASSERT_CUDA_SUCCESS(cudaGetLastError());
         }

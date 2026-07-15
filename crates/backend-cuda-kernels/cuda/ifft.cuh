@@ -72,4 +72,21 @@ int stwo_ntt_b2n_columns_out_of_place_on(
         void *stream
 );
 
+// Allocation-free inverse transform whose paired outputs each have 2^(log_n+1)
+// words. The normalized B2N result is written byte-identically to both halves,
+// which is exactly the first forward N2B layer for a zero-extended polynomial.
+// Inputs may exactly alias the lower half of their paired output; all other
+// partial and cross-column aliases are forbidden by the Rust binder.
+extern "C"
+int stwo_ntt_b2n_columns_to_retained_on(
+        const uint32_t *const *inputs,
+        uint32_t *const *retained_outputs,
+        uint32_t log_n,
+        uint32_t num_poly,
+        const uint32_t *g_twiddles,
+        uint32_t twiddles_size,
+        uint32_t eval_domain_size,
+        void *stream
+);
+
 #endif // POLY_IFFT_H
