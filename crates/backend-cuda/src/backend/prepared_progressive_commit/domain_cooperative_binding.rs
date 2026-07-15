@@ -75,20 +75,39 @@ impl<'a> PreparedProgressiveCommitGraph<'a> {
         twiddles: ArenaSlice,
     ) -> Result<Self, DomainCooperativeBindingError> {
         let program = admit_base(base)?;
+        program.bind(arena, base, slots, coefficients, retained_outputs, twiddles)
+    }
+}
+
+impl DomainCooperativeProgram {
+    /// Bind this exact address-free Mode-A program. The caller supplies the
+    /// Fused16 base identity it was compiled from; any program/base drift is
+    /// rejected before CUDA preparation, and no legacy fallback exists.
+    pub fn bind<'a>(
+        &self,
+        arena: &'a DeviceArena,
+        base: &CommitProgram,
+        slots: &ProgressiveCommitWorkspaceSlots,
+        coefficients: &[CommitCoefficientColumn],
+        retained_outputs: &[Option<ArenaSlice>],
+        twiddles: ArenaSlice,
+    ) -> Result<PreparedProgressiveCommitGraph<'a>, DomainCooperativeBindingError> {
+        admit_program(self, base)?;
         let identity = base.identity();
-        let mut prepared = Self::prepare_in_place_slab_with_modes_and_ntt_fusion(
-            arena,
-            identity.config,
-            base.requirements(),
-            slots,
-            coefficients,
-            retained_outputs,
-            twiddles,
-            ProgressiveCommitMode::DomainProgressive,
-            identity.interior4_fused,
-            ProgressiveNttLeafFusionMode::Separate,
-        )?;
-        promote_leaves(&program, &mut prepared.leaves)?;
+        let mut prepared =
+            PreparedProgressiveCommitGraph::prepare_in_place_slab_with_modes_and_ntt_fusion(
+                arena,
+                identity.config,
+                base.requirements(),
+                slots,
+                coefficients,
+                retained_outputs,
+                twiddles,
+                ProgressiveCommitMode::DomainProgressive,
+                identity.interior4_fused,
+                ProgressiveNttLeafFusionMode::Separate,
+            )?;
+        promote_leaves(self, &mut prepared.leaves)?;
         Ok(prepared)
     }
 }
@@ -96,14 +115,22 @@ impl<'a> PreparedProgressiveCommitGraph<'a> {
 fn admit_base(
     base: &CommitProgram,
 ) -> Result<DomainCooperativeProgram, DomainCooperativeBindingError> {
+    let program = DomainCooperativeProgram::compile_mode_a(base)?;
+    admit_program(&program, base)?;
+    Ok(program)
+}
+
+fn admit_program(
+    program: &DomainCooperativeProgram,
+    base: &CommitProgram,
+) -> Result<(), DomainCooperativeBindingError> {
     if base.identity().ntt_leaf_fusion != ProgressiveNttLeafFusionMode::Fused16 {
         return Err(DomainCooperativeBindingError::RequiresFused16Baseline {
             actual: base.identity().ntt_leaf_fusion,
         });
     }
-    let program = DomainCooperativeProgram::compile_mode_a(base)?;
     program.validate_against(base)?;
-    Ok(program)
+    Ok(())
 }
 
 fn promote_leaves(

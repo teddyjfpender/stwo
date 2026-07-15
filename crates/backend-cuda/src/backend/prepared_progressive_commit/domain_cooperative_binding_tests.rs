@@ -4,6 +4,13 @@ use crate::backend::progressive_commit::{
 };
 
 fn base_program(mode: ProgressiveNttLeafFusionMode) -> CommitProgram {
+    base_program_with_interior(mode, true)
+}
+
+fn base_program_with_interior(
+    mode: ProgressiveNttLeafFusionMode,
+    interior_fused: bool,
+) -> CommitProgram {
     CommitProgram::compile(
         CommitWorkspaceConfig {
             log_blowup_factor: 1,
@@ -20,7 +27,7 @@ fn base_program(mode: ProgressiveNttLeafFusionMode) -> CommitProgram {
             }],
         },
         mode,
-        true,
+        interior_fused,
     )
     .unwrap()
 }
@@ -145,6 +152,19 @@ fn initialization_and_baseline_are_explicit_and_default_off() {
         Err(DomainCooperativeBindingError::RequiresFused16Baseline {
             actual: ProgressiveNttLeafFusionMode::Separate,
         })
+    );
+}
+
+#[test]
+fn precompiled_program_rejects_base_identity_drift() {
+    let base = base_program(ProgressiveNttLeafFusionMode::Fused16);
+    let program = admit_base(&base).unwrap();
+    let drifted = base_program_with_interior(ProgressiveNttLeafFusionMode::Fused16, false);
+    assert_eq!(
+        admit_program(&program, &drifted),
+        Err(DomainCooperativeBindingError::Program(
+            DomainCooperativeProgramError::NonCanonicalProgram,
+        ))
     );
 }
 
