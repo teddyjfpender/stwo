@@ -80,8 +80,12 @@ fn public_programs(
 
 fn assert_receipt_invariants(receipt: &DirectCompactTerminalReceipt) {
     macro_rules! sum {
-        ($field:ident) => {
-            receipt.batches.iter().map(|batch| batch.$field).sum::<_>()
+        ($field:ident, $type:ty) => {
+            receipt
+                .batches
+                .iter()
+                .map(|batch| batch.$field)
+                .sum::<$type>()
         };
     }
 
@@ -95,28 +99,31 @@ fn assert_receipt_invariants(receipt: &DirectCompactTerminalReceipt) {
     }
     assert_eq!(
         receipt.separate_absorb_reread_bytes_removed,
-        sum!(separate_absorb_reread_bytes_removed)
+        sum!(separate_absorb_reread_bytes_removed, u64)
     );
     assert_eq!(
         receipt.terminal_prefinal_read_bytes_added,
-        sum!(terminal_prefinal_read_bytes_added)
+        sum!(terminal_prefinal_read_bytes_added, u64)
     );
     assert_eq!(
         receipt.compact_tail_reread_bytes_added,
-        sum!(compact_tail_reread_bytes_added)
+        sum!(compact_tail_reread_bytes_added, u64)
     );
-    assert_eq!(receipt.net_read_bytes_removed, sum!(net_read_bytes_removed));
+    assert_eq!(
+        receipt.net_read_bytes_removed,
+        sum!(net_read_bytes_removed, u64)
+    );
     assert_eq!(
         receipt.terminal_prefinal_write_bytes_added,
-        sum!(terminal_prefinal_write_bytes_added)
+        sum!(terminal_prefinal_write_bytes_added, u64)
     );
     assert_eq!(
         receipt.net_device_bytes_removed,
-        sum!(net_device_bytes_removed)
+        sum!(net_device_bytes_removed, u64)
     );
     assert_eq!(
         receipt.canonical_retained_write_bytes_before,
-        sum!(canonical_retained_write_bytes)
+        sum!(canonical_retained_write_bytes, u64)
     );
     assert_eq!(
         receipt.canonical_retained_write_bytes_after,
@@ -124,23 +131,23 @@ fn assert_receipt_invariants(receipt: &DirectCompactTerminalReceipt) {
     );
     assert_eq!(
         receipt.separate_absorb_launches_removed,
-        sum!(separate_absorb_launches_removed)
+        sum!(separate_absorb_launches_removed, u32)
     );
     assert_eq!(
         receipt.fixed_terminal_launches,
-        sum!(fixed_terminal_launches)
+        sum!(fixed_terminal_launches, u32)
     );
     assert_eq!(
         receipt.extra_remainder_interval_launches,
-        sum!(extra_remainder_interval_launches)
+        sum!(extra_remainder_interval_launches, u32)
     );
     assert_eq!(
         receipt.generic_remainder_terminal_launches,
-        sum!(generic_remainder_terminal_launches)
+        sum!(generic_remainder_terminal_launches, u32)
     );
     assert_eq!(
         receipt.net_cuda_launches_removed,
-        sum!(net_cuda_launches_removed)
+        sum!(net_cuda_launches_removed, i32)
     );
     assert_eq!(
         receipt.cooperative_quad_blake2s_batches,
