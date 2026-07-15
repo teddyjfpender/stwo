@@ -73,17 +73,7 @@ pub fn run() -> FixtureReceipt {
     ];
     let first_sources = source_set(0x1234_5678);
     let second_sources = source_set(0x6a09_e667);
-    let twiddles = CpuBackend::precompute_twiddles(
-        CanonicCoset::new(config.lifting_log_size)
-            .circle_domain()
-            .half_coset,
-    );
-    let twiddle_words = twiddles
-        .twiddles
-        .iter()
-        .map(|value| value.0)
-        .collect::<Vec<_>>();
-    assert_eq!(twiddle_words.len(), requirements.forward_twiddle_words);
+    let twiddle_words = required_forward_twiddle_words(config, &requirements);
 
     for device in [&legacy_arena, &candidate_arena] {
         upload_words(
@@ -231,6 +221,47 @@ pub fn run() -> FixtureReceipt {
         checks,
         hashes,
     }
+}
+
+fn required_forward_twiddle_words(
+    config: QuotientNumeratorWorkspaceConfig,
+    requirements: &QuotientNumeratorWorkspaceRequirements,
+) -> Vec<u32> {
+    let full = forward_twiddle_words(config.lifting_log_size);
+    assert!(full.len() >= requirements.forward_twiddle_words);
+    full[full.len() - requirements.forward_twiddle_words..].to_vec()
+}
+
+fn forward_twiddle_words(log_size: u32) -> Vec<u32> {
+    CpuBackend::precompute_twiddles(CanonicCoset::new(log_size).circle_domain().half_coset)
+        .twiddles
+        .iter()
+        .map(|value| value.0)
+        .collect()
+}
+
+#[test]
+fn compact_forward_twiddles_match_lifting_tree_tail() {
+    let config = QuotientNumeratorWorkspaceConfig {
+        lifting_log_size: 10,
+        log_blowup_factor: 2,
+        max_lde_tile_words: 32 * (1 << 10),
+    };
+    let points = [
+        SECURE_FIELD_CIRCLE_GEN.mul(3),
+        SECURE_FIELD_CIRCLE_GEN.mul(5),
+        SECURE_FIELD_CIRCLE_GEN.mul(7),
+        SECURE_FIELD_CIRCLE_GEN.mul(11),
+    ];
+    let requirements =
+        quotient_numerator_workspace_requirements(config, &topology(points)).unwrap();
+    let compact = forward_twiddle_words(7);
+
+    assert_eq!(requirements.forward_twiddle_words, 64);
+    assert_eq!(
+        required_forward_twiddle_words(config, &requirements),
+        compact
+    );
 }
 
 #[cfg(stwo_cuda_link)]
