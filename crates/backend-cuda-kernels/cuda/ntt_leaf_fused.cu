@@ -11,6 +11,15 @@
 #include "ntt_compact_leaf.cuh"
 #include "poly_utils.cuh"
 #include "rfft.cuh"
+
+#ifndef STWO_DIRECT_COMPACT_FAST32
+#define STWO_DIRECT_COMPACT_FAST32 0
+#endif
+
+static_assert(STWO_DIRECT_COMPACT_FAST32 == 0 ||
+                  STWO_DIRECT_COMPACT_FAST32 == 1,
+              "STWO_DIRECT_COMPACT_FAST32 must be 0 or 1");
+
 namespace {
 
 enum class FusedLeafSink : uint32_t {
@@ -91,7 +100,9 @@ DEVICE_FORCEINLINE bool writes_completed_evaluation(
 template <FusedLeafSink SINK>
 DEVICE_FORCEINLINE m31 fused_mul(m31 a, m31 b) {
     if constexpr (SINK == FusedLeafSink::DirectCompact) {
+#if STWO_DIRECT_COMPACT_FAST32
         return stwo_m31_mul_fast32(a, b);
+#endif
     }
     return mul(a, b);
 }
@@ -99,7 +110,9 @@ DEVICE_FORCEINLINE m31 fused_mul(m31 a, m31 b) {
 template <FusedLeafSink SINK>
 DEVICE_FORCEINLINE m31 fused_add(m31 a, m31 b) {
     if constexpr (SINK == FusedLeafSink::DirectCompact) {
+#if STWO_DIRECT_COMPACT_FAST32
         return stwo_m31_add_fast32(a, b);
+#endif
     }
     return add(a, b);
 }
@@ -107,7 +120,9 @@ DEVICE_FORCEINLINE m31 fused_add(m31 a, m31 b) {
 template <FusedLeafSink SINK>
 DEVICE_FORCEINLINE m31 fused_sub(m31 a, m31 b) {
     if constexpr (SINK == FusedLeafSink::DirectCompact) {
+#if STWO_DIRECT_COMPACT_FAST32
         return stwo_m31_sub_fast32(a, b);
+#endif
     }
     return sub(a, b);
 }

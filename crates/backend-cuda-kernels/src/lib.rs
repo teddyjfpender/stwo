@@ -222,6 +222,24 @@ mod tests {
         assert!(compact.contains("stwo_blake2s_compress_leaf_block_quad_device"));
         assert!(source.contains("compact_scratch + quad * 16"));
         assert!(!source.contains("consume_fused_leaf_message<FusedLeafSink::DirectCompact>"));
+        assert!(source.contains("#ifndef STWO_DIRECT_COMPACT_FAST32"));
+        assert!(source.contains("#define STWO_DIRECT_COMPACT_FAST32 0"));
+        assert!(source.contains(
+            "static_assert(STWO_DIRECT_COMPACT_FAST32 == 0 ||\n                  STWO_DIRECT_COMPACT_FAST32 == 1,"
+        ));
+        assert!(source.contains("STWO_DIRECT_COMPACT_FAST32 must be 0 or 1"));
+        assert_eq!(source.matches("#if STWO_DIRECT_COMPACT_FAST32").count(), 3);
+        assert_eq!(source.matches("STWO_DIRECT_COMPACT_FAST32").count(), 8);
+        for operation in ["mul", "add", "sub"] {
+            let branch = format!(
+                "if constexpr (SINK == FusedLeafSink::DirectCompact) {{\n#if STWO_DIRECT_COMPACT_FAST32\n        return stwo_m31_{operation}_fast32(a, b);\n#endif\n    }}\n    return {operation}(a, b);"
+            );
+            assert!(
+                source.contains(&branch),
+                "missing direct sink {operation} A/B gate"
+            );
+        }
+        assert!(!source.contains("STWO_M31_FAST32_GLOBAL"));
     }
 
     #[test]
