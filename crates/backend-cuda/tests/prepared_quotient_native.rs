@@ -504,6 +504,18 @@ fn quotient_producer_b2n_exact_sn2_eager_and_graph_match_fallback() {
     )
     .unwrap();
     assert_eq!(candidate.producer_b2n_receipt(), Some(program.receipt()));
+    let attestation = candidate.producer_b2n_runtime_attestation().unwrap();
+    assert_eq!(attestation.sm_arch, 90);
+    assert_eq!(attestation.producer.function.binary_version, 90);
+    assert_eq!(attestation.producer.launch_threads, 128);
+    assert_eq!(attestation.continuations[0].start_stage, 8);
+    assert_eq!(attestation.continuations[1].start_stage, 16);
+    assert_eq!(attestation.continuations[0].ordinal, 0);
+    assert_eq!(attestation.continuations[1].ordinal, 1);
+    assert_eq!(
+        attestation.continuations[0].function,
+        attestation.continuations[1].function
+    );
 
     let eager_partials = partial_values(&logs, 23);
     upload_partials(&fallback_arena, &eager_partials);

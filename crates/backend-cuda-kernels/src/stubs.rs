@@ -6,8 +6,8 @@
 use core::ffi::c_void;
 
 use crate::raw::{
-    Blake2sHash, CirclePointBaseField, CompactBlake2sTailDescriptor, CudaSecureField,
-    LayerIndexPair, ProgressiveBlake2sState,
+    Blake2sHash, CirclePointBaseField, CompactBlake2sTailDescriptor, CudaFunctionAttributes,
+    CudaSecureField, LayerIndexPair, ProgressiveBlake2sState,
 };
 
 const CUDA_ERROR_NOT_SUPPORTED: i32 = 801;
@@ -1686,6 +1686,13 @@ pub unsafe extern "C" fn stwo_combine_quotients_b2n_init7_on(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_combine_quotients_b2n_init7_function_attributes(
+    _out: *mut CudaFunctionAttributes,
+) -> i32 {
+    no_cuda_symbol("stwo_combine_quotients_b2n_init7_function_attributes")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stwo_prepare_quotient_numerator_terms_on(
     _term_descriptors: *const u32,
     _term_count: u32,
@@ -2058,6 +2065,15 @@ pub unsafe extern "C" fn stwo_ntt_b2n_columns_after_first_seven_on(
     _stream: *mut core::ffi::c_void,
 ) -> i32 {
     no_cuda_symbol("stwo_ntt_b2n_columns_after_first_seven_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_ntt_b2n_after_first_seven_function_attributes(
+    _start_stage: u32,
+    _stages: u32,
+    _out: *mut CudaFunctionAttributes,
+) -> i32 {
+    no_cuda_symbol("stwo_ntt_b2n_after_first_seven_function_attributes")
 }
 
 #[unsafe(no_mangle)]

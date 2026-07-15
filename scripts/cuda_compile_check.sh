@@ -178,8 +178,12 @@ if [[ "$MODE" == "resources" ]]; then
     trap 'rm -f "$receipt"' EXIT
     printf '%s\n' "$out" > "$receipt"
     gpu-lab/tools/check-cuda-resources "$receipt" \
-      --kernel '_Z22b2n_noinit_block_batchILj4ELb1EE' \
-      --launch-threads 512 --registers-per-sm 65536
+      --kernel '_Z22b2n_noinit_block_batchILj4ELb0EE' \
+      --launch-threads 512 --required-blocks-per-sm 1 \
+      --registers-per-sm 65536 --max-registers 128 \
+      --max-stack-bytes 0 --max-spill-store-bytes 0 \
+      --max-spill-load-bytes 0 \
+      --max-static-shared-bytes 34816
     gpu-lab/tools/check-cuda-resources "$receipt" \
       --kernel '_Z32composition_split_boundary_batchILj3ELb1EE' \
       --launch-threads 256 --registers-per-sm 65536
@@ -203,7 +207,11 @@ if [[ "$MODE" == "resources" ]]; then
     # registers/thread; ptxas must additionally report zero stack and spills.
     gpu-lab/tools/check-cuda-resources "$receipt" \
       --kernel '_Z34combine_quotients_b2n_init7_in_gpu' \
-      --launch-threads 512 --registers-per-sm 65536
+      --launch-threads 128 --required-blocks-per-sm 4 \
+      --registers-per-sm 65536 --max-registers 128 \
+      --max-stack-bytes 0 --max-spill-store-bytes 0 \
+      --max-spill-load-bytes 0 \
+      --max-static-shared-bytes 2048
     rm -f "$receipt"
     trap - EXIT
   fi

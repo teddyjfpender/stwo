@@ -6,6 +6,27 @@
 
 use core::ffi::c_void;
 
+/// Attributes reported by CUDA for a function loaded on the current device.
+/// Keep in sync with `StwoCudaFunctionAttributes` in
+/// `cuda/resource_attestation.cuh`.
+#[repr(C, align(8))]
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub struct CudaFunctionAttributes {
+    pub abi_version: u32,
+    pub max_threads_per_block: u32,
+    pub registers_per_thread: u32,
+    pub binary_version: u32,
+    pub ptx_version: u32,
+    pub reserved: u32,
+    pub local_bytes: u64,
+    pub static_shared_bytes: u64,
+}
+
+const _: () = assert!(core::mem::size_of::<CudaFunctionAttributes>() == 40);
+const _: () = assert!(core::mem::align_of::<CudaFunctionAttributes>() == 8);
+const _: () = assert!(core::mem::offset_of!(CudaFunctionAttributes, local_bytes) == 24);
+const _: () = assert!(core::mem::offset_of!(CudaFunctionAttributes, static_shared_bytes) == 32);
+
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 pub struct CudaSecureField {
@@ -1256,6 +1277,10 @@ extern "C" {
         stream: *mut c_void,
     ) -> i32;
 
+    pub fn stwo_combine_quotients_b2n_init7_function_attributes(
+        out: *mut CudaFunctionAttributes,
+    ) -> i32;
+
     pub fn stwo_prepare_quotient_numerator_terms_on(
         term_descriptors: *const u32,
         term_count: u32,
@@ -1550,6 +1575,12 @@ extern "C" {
         twiddles_size: u32,
         eval_domain_size: u32,
         stream: *mut c_void,
+    ) -> i32;
+
+    pub fn stwo_ntt_b2n_after_first_seven_function_attributes(
+        start_stage: u32,
+        stages: u32,
+        out: *mut CudaFunctionAttributes,
     ) -> i32;
 
     /// Allocation-free B2N transform for logs 3 through 30 using separate

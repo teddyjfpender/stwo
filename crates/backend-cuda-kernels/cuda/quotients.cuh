@@ -3,6 +3,7 @@
 
 #include "fields.cuh"
 #include "point.cuh"
+#include "resource_attestation.cuh"
 #include "utils.cuh"
 
 const unsigned int BLOCK_SIZE = 1024;
@@ -110,6 +111,12 @@ int stwo_combine_quotients_b2n_init7_on(
         uint32_t inverse_twiddle_words,
         uint32_t eval_domain_size,
         void *stream
+);
+
+// Attributes of the exact producer function loaded for the current device.
+extern "C"
+int stwo_combine_quotients_b2n_init7_function_attributes(
+        StwoCudaFunctionAttributes *out
 );
 
 // Prepared FRI-quotient numerator pipeline. All topology tables and scratch

@@ -796,6 +796,13 @@ extern "C" int stwo_combine_quotients_b2n_init7_on(
     return cudaGetLastError();
 }
 
+extern "C" int stwo_combine_quotients_b2n_init7_function_attributes(
+        StwoCudaFunctionAttributes *out
+) {
+    return stwo_cuda_function_attributes(
+            combine_quotients_b2n_init7_in_gpu, out);
+}
+
 namespace {
 
 constexpr uint32_t PREPARED_TERM_WORDS = 5;

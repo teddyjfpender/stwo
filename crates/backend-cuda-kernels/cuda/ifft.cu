@@ -1294,6 +1294,14 @@ extern "C" int stwo_ntt_b2n_columns_after_first_seven_on(
         values, log_n, num_poly, 16, 8, twiddles, stream);
 }
 
+extern "C" int stwo_ntt_b2n_after_first_seven_function_attributes(
+    uint32_t start_stage, uint32_t stages, StwoCudaFunctionAttributes *out) {
+    if ((start_stage != 8 && start_stage != 16) || stages != 8)
+        return (int)cudaErrorInvalidValue;
+    return (int)stwo_cuda_function_attributes(
+        b2n_noinit_block_batch<4, false>, out);
+}
+
 extern "C" int stwo_ntt_b2n_columns_to_retained_on(
     const uint32_t *const *inputs, uint32_t *const *retained_outputs,
     uint32_t log_n, uint32_t num_poly, const uint32_t *g_twiddles,

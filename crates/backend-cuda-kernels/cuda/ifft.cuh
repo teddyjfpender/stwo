@@ -4,6 +4,7 @@
 #include "fields.cuh"
 #include "utils.cuh"
 #include "poly_utils.cuh"
+#include "resource_attestation.cuh"
 
 __device__ __forceinline__ void exchg_dif(m31 &a, m31 &b, const m31 &twiddle) {
     const auto a_tmp = a;
@@ -66,6 +67,15 @@ int stwo_ntt_b2n_columns_after_first_seven_on(
         uint32_t twiddles_size,
         uint32_t eval_domain_size,
         void *stream
+);
+
+// Attributes of the exact no-init specialization used by one continuation.
+// Only the two production intervals (8,8) and (16,8) are admitted.
+extern "C"
+int stwo_ntt_b2n_after_first_seven_function_attributes(
+        uint32_t start_stage,
+        uint32_t stages,
+        StwoCudaFunctionAttributes *out
 );
 
 // Allocation-free inverse transform for 3 <= log_n <= 30 with separate pointer

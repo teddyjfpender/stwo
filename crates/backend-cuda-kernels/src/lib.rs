@@ -77,6 +77,10 @@ mod tests {
     fn prepared_quotient_symbols_are_linked_in_cuda_and_stub_builds() {
         assert_ne!(raw::stwo_combine_quotients_from_numerators_on as usize, 0);
         assert_ne!(raw::stwo_combine_quotients_b2n_init7_on as usize, 0);
+        assert_ne!(
+            raw::stwo_combine_quotients_b2n_init7_function_attributes as usize,
+            0
+        );
         assert_ne!(raw::stwo_prepare_quotient_numerator_terms_on as usize, 0);
         assert_ne!(raw::stwo_finalize_quotient_numerator_groups_on as usize, 0);
         assert_ne!(raw::stwo_zero_quotient_numerator_outputs_on as usize, 0);
@@ -91,6 +95,10 @@ mod tests {
         );
         assert_ne!(raw::stwo_ntt_b2n_columns_on as usize, 0);
         assert_ne!(raw::stwo_ntt_b2n_columns_after_first_seven_on as usize, 0);
+        assert_ne!(
+            raw::stwo_ntt_b2n_after_first_seven_function_attributes as usize,
+            0
+        );
         assert_ne!(raw::stwo_lde_n2b_columns_on as usize, 0);
     }
 
@@ -152,6 +160,22 @@ mod tests {
         ) -> i32;
         let _: B2nContinuationFn = raw::stwo_ntt_b2n_columns_after_first_seven_on;
 
+        type FunctionAttributesFn = unsafe extern "C" fn(*mut raw::CudaFunctionAttributes) -> i32;
+        let _: FunctionAttributesFn = raw::stwo_combine_quotients_b2n_init7_function_attributes;
+        type ContinuationAttributesFn =
+            unsafe extern "C" fn(u32, u32, *mut raw::CudaFunctionAttributes) -> i32;
+        let _: ContinuationAttributesFn = raw::stwo_ntt_b2n_after_first_seven_function_attributes;
+        assert_eq!(core::mem::size_of::<raw::CudaFunctionAttributes>(), 40);
+        assert_eq!(core::mem::align_of::<raw::CudaFunctionAttributes>(), 8);
+        assert_eq!(
+            core::mem::offset_of!(raw::CudaFunctionAttributes, local_bytes),
+            24
+        );
+        assert_eq!(
+            core::mem::offset_of!(raw::CudaFunctionAttributes, static_shared_bytes),
+            32
+        );
+
         let source = include_str!("../cuda/quotients.cu");
         assert_eq!(source.matches("quotient_inverse_chunk").count(), 3);
         assert_eq!(source.matches("denominator_for_sample(").count(), 3);
@@ -189,6 +213,8 @@ mod tests {
             "log_n != 23 || num_poly != 4",
             "values, log_n, num_poly, 8, 8, twiddles, stream",
             "values, log_n, num_poly, 16, 8, twiddles, stream",
+            "(start_stage != 8 && start_stage != 16) || stages != 8",
+            "b2n_noinit_block_batch<4, false>, out",
         ] {
             assert!(
                 inverse_source.contains(required),

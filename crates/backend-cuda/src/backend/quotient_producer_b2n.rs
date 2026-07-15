@@ -21,6 +21,12 @@ use super::prepared_quotient::{QuotientSampleConstants, QuotientWorkspaceConfig}
 pub const QUOTIENT_PRODUCER_B2N_FIRST_STAGES: u32 = 7;
 pub const QUOTIENT_PRODUCER_B2N_LAUNCH_THREADS: u32 = 128;
 pub const QUOTIENT_PRODUCER_BATCH_INVERSE_CHUNK: u32 = 8;
+pub const QUOTIENT_PRODUCER_B2N_CONTINUATION_THREADS: u32 = 512;
+pub const QUOTIENT_PRODUCER_B2N_REQUIRED_SM_ARCH: u32 = 90;
+pub const QUOTIENT_PRODUCER_B2N_CONTINUATION_SHARED_CAP: u64 = 34 * 1024;
+// Architectural admission policy after the exact current-device SM90 and
+// loaded binaryVersion=90 gates pass; this is not observed telemetry.
+const SM90_REGISTER_FILE_POLICY: u32 = 65_536;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QuotientProducerB2nSchedule {
@@ -46,22 +52,121 @@ impl QuotientProducerB2nSchedule {
     }
 }
 
-/// Static AOT resource contract. `scripts/cuda_compile_check.sh --resources`
-/// rejects the cubin if ptxas exceeds this register cap or emits a spill.
+/// A fail-closed limit for one exact launch shape. These are admission limits,
+/// never claims about what ptxas or the loaded function actually produced.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct QuotientProducerB2nResourceContract {
-    pub sm_arch: u32,
-    pub cuda_toolkit_major: u32,
-    pub cuda_toolkit_minor: u32,
+pub struct QuotientProducerB2nKernelResourcePolicy {
     pub launch_threads: u32,
-    pub min_blocks_per_sm: u32,
-    pub ptxas_registers_per_thread: u32,
+    pub required_blocks_per_sm: u32,
     pub max_registers_per_thread: u32,
-    pub ptxas_stack_bytes: u32,
-    pub ptxas_spill_store_bytes: u32,
-    pub ptxas_spill_load_bytes: u32,
-    pub static_shared_bytes: u32,
-    pub zero_spills_required: bool,
+    pub max_local_bytes: u64,
+    pub max_static_shared_bytes: u64,
+}
+
+/// Exact SM90 policy qualified against runtime-loaded CUDA functions during
+/// prepared-graph construction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QuotientProducerB2nResourcePolicy {
+    pub required_sm_arch: u32,
+    pub registers_per_sm: u32,
+    pub producer: QuotientProducerB2nKernelResourcePolicy,
+    pub continuation: QuotientProducerB2nKernelResourcePolicy,
+}
+
+/// Compatibility name for callers that treated this as a policy type. The
+/// former observed-looking ptxas/toolkit fields intentionally no longer exist.
+pub type QuotientProducerB2nResourceContract = QuotientProducerB2nResourcePolicy;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QuotientProducerB2nFunctionAttributes {
+    pub abi_version: u32,
+    pub max_threads_per_block: u32,
+    pub registers_per_thread: u32,
+    pub binary_version: u32,
+    pub ptx_version: u32,
+    pub local_bytes: u64,
+    pub static_shared_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QuotientProducerB2nKernelRole {
+    Producer,
+    Continuation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QuotientProducerB2nLaunchAttestation {
+    pub role: QuotientProducerB2nKernelRole,
+    pub ordinal: u32,
+    pub start_stage: u32,
+    pub stages: u32,
+    pub launch_threads: u32,
+    pub function: QuotientProducerB2nFunctionAttributes,
+}
+
+/// Runtime facts observed from the current device and the three exact launches
+/// selected by the production program.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QuotientProducerB2nRuntimeAttestation {
+    pub device_count: u32,
+    pub current_device: u32,
+    pub sm_arch: u32,
+    pub producer: QuotientProducerB2nLaunchAttestation,
+    pub continuations: [QuotientProducerB2nLaunchAttestation; 2],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QuotientProducerB2nAttestationError {
+    InvalidDeviceSelection {
+        device_count: u32,
+        current_device: u32,
+    },
+    DeviceSmMismatch {
+        required: u32,
+        actual: u32,
+    },
+    LaunchMetadataMismatch {
+        role: QuotientProducerB2nKernelRole,
+        ordinal: u32,
+    },
+    FunctionAbiVersion {
+        role: QuotientProducerB2nKernelRole,
+        expected: u32,
+        actual: u32,
+    },
+    FunctionAbiReserved {
+        role: QuotientProducerB2nKernelRole,
+        actual: u32,
+    },
+    BinaryVersion {
+        role: QuotientProducerB2nKernelRole,
+        expected: u32,
+        actual: u32,
+    },
+    MissingPtxVersion {
+        role: QuotientProducerB2nKernelRole,
+    },
+    MaxThreadsPerBlock {
+        role: QuotientProducerB2nKernelRole,
+        required: u32,
+        actual: u32,
+    },
+    RegistersPerThread {
+        role: QuotientProducerB2nKernelRole,
+        limit: u32,
+        actual: u32,
+    },
+    LocalMemory {
+        role: QuotientProducerB2nKernelRole,
+        limit: u64,
+        actual: u64,
+    },
+    StaticSharedMemory {
+        role: QuotientProducerB2nKernelRole,
+        limit: u64,
+        actual: u64,
+    },
+    ContinuationFunctionsDiffer,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -81,7 +186,7 @@ pub struct QuotientProducerB2nTraffic {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QuotientProducerB2nReceipt {
     pub schedule: QuotientProducerB2nSchedule,
-    pub resources: QuotientProducerB2nResourceContract,
+    pub resources: QuotientProducerB2nResourcePolicy,
     pub traffic: QuotientProducerB2nTraffic,
 }
 
@@ -122,6 +227,17 @@ impl core::fmt::Display for QuotientProducerB2nError {
 
 impl std::error::Error for QuotientProducerB2nError {}
 
+impl core::fmt::Display for QuotientProducerB2nAttestationError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            formatter,
+            "unqualified quotient producer/B2N runtime: {self:?}"
+        )
+    }
+}
+
+impl std::error::Error for QuotientProducerB2nAttestationError {}
+
 impl QuotientProducerB2nProgram {
     pub fn compile(
         config: QuotientWorkspaceConfig,
@@ -144,21 +260,25 @@ impl QuotientProducerB2nProgram {
         Ok(Self {
             receipt: QuotientProducerB2nReceipt {
                 schedule,
-                resources: QuotientProducerB2nResourceContract {
-                    sm_arch: 90,
-                    cuda_toolkit_major: 11,
-                    cuda_toolkit_minor: 8,
-                    launch_threads: QUOTIENT_PRODUCER_B2N_LAUNCH_THREADS,
-                    min_blocks_per_sm: 4,
-                    ptxas_registers_per_thread: 98,
-                    max_registers_per_thread: 128,
-                    ptxas_stack_bytes: 0,
-                    ptxas_spill_store_bytes: 0,
-                    ptxas_spill_load_bytes: 0,
-                    static_shared_bytes: 4
-                        * QUOTIENT_PRODUCER_B2N_LAUNCH_THREADS
-                        * core::mem::size_of::<u32>() as u32,
-                    zero_spills_required: true,
+                resources: QuotientProducerB2nResourcePolicy {
+                    required_sm_arch: QUOTIENT_PRODUCER_B2N_REQUIRED_SM_ARCH,
+                    registers_per_sm: SM90_REGISTER_FILE_POLICY,
+                    producer: QuotientProducerB2nKernelResourcePolicy {
+                        launch_threads: QUOTIENT_PRODUCER_B2N_LAUNCH_THREADS,
+                        required_blocks_per_sm: 4,
+                        max_registers_per_thread: 128,
+                        max_local_bytes: 0,
+                        max_static_shared_bytes: 4
+                            * u64::from(QUOTIENT_PRODUCER_B2N_LAUNCH_THREADS)
+                            * core::mem::size_of::<u32>() as u64,
+                    },
+                    continuation: QuotientProducerB2nKernelResourcePolicy {
+                        launch_threads: QUOTIENT_PRODUCER_B2N_CONTINUATION_THREADS,
+                        required_blocks_per_sm: 1,
+                        max_registers_per_thread: 128,
+                        max_local_bytes: 0,
+                        max_static_shared_bytes: QUOTIENT_PRODUCER_B2N_CONTINUATION_SHARED_CAP,
+                    },
                 },
                 traffic: traffic(schedule)?,
             },
@@ -176,6 +296,149 @@ impl QuotientProducerB2nProgram {
                 == self.receipt.schedule.lifting_log_size - self.receipt.schedule.subdomain_log_size
             && partial_log_sizes == self.partial_log_sizes
     }
+
+    /// Validate current-device and loaded-function facts before any prepared
+    /// graph upload or launch can select this program.
+    pub fn qualify_runtime_attestation(
+        &self,
+        attestation: &QuotientProducerB2nRuntimeAttestation,
+    ) -> Result<(), QuotientProducerB2nAttestationError> {
+        let policy = self.receipt.resources;
+        if attestation.device_count == 0 || attestation.current_device >= attestation.device_count {
+            return Err(
+                QuotientProducerB2nAttestationError::InvalidDeviceSelection {
+                    device_count: attestation.device_count,
+                    current_device: attestation.current_device,
+                },
+            );
+        }
+        if attestation.sm_arch != policy.required_sm_arch {
+            return Err(QuotientProducerB2nAttestationError::DeviceSmMismatch {
+                required: policy.required_sm_arch,
+                actual: attestation.sm_arch,
+            });
+        }
+
+        validate_launch_metadata(
+            attestation.producer,
+            QuotientProducerB2nKernelRole::Producer,
+            0,
+            1,
+            self.receipt.schedule.producer_stages,
+            policy.producer.launch_threads,
+        )?;
+        validate_function(
+            attestation.producer,
+            policy.producer,
+            policy.required_sm_arch,
+            policy.registers_per_sm,
+        )?;
+
+        let mut start_stage = self.receipt.schedule.producer_stages + 1;
+        for (ordinal, continuation) in attestation.continuations.iter().copied().enumerate() {
+            let stages = self.receipt.schedule.continuation_intervals[ordinal];
+            validate_launch_metadata(
+                continuation,
+                QuotientProducerB2nKernelRole::Continuation,
+                ordinal as u32,
+                start_stage,
+                stages,
+                policy.continuation.launch_threads,
+            )?;
+            validate_function(
+                continuation,
+                policy.continuation,
+                policy.required_sm_arch,
+                policy.registers_per_sm,
+            )?;
+            start_stage += stages;
+        }
+        if attestation.continuations[0].function != attestation.continuations[1].function {
+            return Err(QuotientProducerB2nAttestationError::ContinuationFunctionsDiffer);
+        }
+        Ok(())
+    }
+}
+
+fn validate_launch_metadata(
+    launch: QuotientProducerB2nLaunchAttestation,
+    role: QuotientProducerB2nKernelRole,
+    ordinal: u32,
+    start_stage: u32,
+    stages: u32,
+    launch_threads: u32,
+) -> Result<(), QuotientProducerB2nAttestationError> {
+    if launch.role != role
+        || launch.ordinal != ordinal
+        || launch.start_stage != start_stage
+        || launch.stages != stages
+        || launch.launch_threads != launch_threads
+    {
+        return Err(QuotientProducerB2nAttestationError::LaunchMetadataMismatch { role, ordinal });
+    }
+    Ok(())
+}
+
+fn validate_function(
+    launch: QuotientProducerB2nLaunchAttestation,
+    policy: QuotientProducerB2nKernelResourcePolicy,
+    required_binary_version: u32,
+    registers_per_sm: u32,
+) -> Result<(), QuotientProducerB2nAttestationError> {
+    let role = launch.role;
+    let function = launch.function;
+    if function.abi_version != 1 {
+        return Err(QuotientProducerB2nAttestationError::FunctionAbiVersion {
+            role,
+            expected: 1,
+            actual: function.abi_version,
+        });
+    }
+    if function.binary_version != required_binary_version {
+        return Err(QuotientProducerB2nAttestationError::BinaryVersion {
+            role,
+            expected: required_binary_version,
+            actual: function.binary_version,
+        });
+    }
+    if function.ptx_version == 0 {
+        return Err(QuotientProducerB2nAttestationError::MissingPtxVersion { role });
+    }
+    if function.max_threads_per_block < policy.launch_threads {
+        return Err(QuotientProducerB2nAttestationError::MaxThreadsPerBlock {
+            role,
+            required: policy.launch_threads,
+            actual: function.max_threads_per_block,
+        });
+    }
+    let threads_at_required_occupancy = policy
+        .launch_threads
+        .checked_mul(policy.required_blocks_per_sm)
+        .unwrap_or(u32::MAX);
+    let register_envelope_limit = registers_per_sm / threads_at_required_occupancy;
+    let register_limit = policy.max_registers_per_thread.min(register_envelope_limit);
+    if function.registers_per_thread > register_limit {
+        return Err(QuotientProducerB2nAttestationError::RegistersPerThread {
+            role,
+            limit: register_limit,
+            actual: function.registers_per_thread,
+        });
+    }
+    if function.local_bytes > policy.max_local_bytes {
+        return Err(QuotientProducerB2nAttestationError::LocalMemory {
+            role,
+            limit: policy.max_local_bytes,
+            actual: function.local_bytes,
+        });
+    }
+    if function.static_shared_bytes > policy.max_static_shared_bytes {
+        return Err(QuotientProducerB2nAttestationError::StaticSharedMemory {
+            role,
+            limit: policy.max_static_shared_bytes,
+            actual: function.static_shared_bytes,
+        });
+    }
+    Ok(())
 }
 
 fn traffic(
@@ -411,9 +674,200 @@ mod tests {
             ),
             (24, 3, 21)
         );
-        assert_eq!(receipt.resources.max_registers_per_thread, 128);
-        assert_eq!(receipt.resources.ptxas_registers_per_thread, 98);
-        assert_eq!(receipt.resources.static_shared_bytes, 2048);
+        assert_eq!(receipt.resources.required_sm_arch, 90);
+        assert_eq!(receipt.resources.registers_per_sm, 65_536);
+        assert_eq!(receipt.resources.producer.launch_threads, 128);
+        assert_eq!(receipt.resources.producer.required_blocks_per_sm, 4);
+        assert_eq!(receipt.resources.producer.max_registers_per_thread, 128);
+        assert_eq!(receipt.resources.producer.max_static_shared_bytes, 2_048);
+        assert_eq!(receipt.resources.continuation.launch_threads, 512);
+        assert_eq!(
+            receipt.resources.continuation.max_static_shared_bytes,
+            34_816
+        );
+    }
+
+    fn exact_program() -> QuotientProducerB2nProgram {
+        QuotientProducerB2nProgram::compile(
+            QuotientWorkspaceConfig {
+                lifting_log_size: 25,
+                log_blowup_factor: 2,
+            },
+            &[23],
+        )
+        .unwrap()
+    }
+
+    fn function(
+        max_threads_per_block: u32,
+        registers_per_thread: u32,
+        static_shared_bytes: u64,
+    ) -> QuotientProducerB2nFunctionAttributes {
+        QuotientProducerB2nFunctionAttributes {
+            abi_version: 1,
+            max_threads_per_block,
+            registers_per_thread,
+            binary_version: 90,
+            ptx_version: 80,
+            local_bytes: 0,
+            static_shared_bytes,
+        }
+    }
+
+    fn valid_attestation() -> QuotientProducerB2nRuntimeAttestation {
+        let continuation_function = function(1_024, 96, 33_920);
+        QuotientProducerB2nRuntimeAttestation {
+            device_count: 1,
+            current_device: 0,
+            sm_arch: 90,
+            producer: QuotientProducerB2nLaunchAttestation {
+                role: QuotientProducerB2nKernelRole::Producer,
+                ordinal: 0,
+                start_stage: 1,
+                stages: 7,
+                launch_threads: 128,
+                function: function(128, 98, 2_048),
+            },
+            continuations: [
+                QuotientProducerB2nLaunchAttestation {
+                    role: QuotientProducerB2nKernelRole::Continuation,
+                    ordinal: 0,
+                    start_stage: 8,
+                    stages: 8,
+                    launch_threads: 512,
+                    function: continuation_function,
+                },
+                QuotientProducerB2nLaunchAttestation {
+                    role: QuotientProducerB2nKernelRole::Continuation,
+                    ordinal: 1,
+                    start_stage: 16,
+                    stages: 8,
+                    launch_threads: 512,
+                    function: continuation_function,
+                },
+            ],
+        }
+    }
+
+    fn rejected(
+        mutate: impl FnOnce(&mut QuotientProducerB2nRuntimeAttestation),
+    ) -> QuotientProducerB2nAttestationError {
+        let mut attestation = valid_attestation();
+        mutate(&mut attestation);
+        exact_program()
+            .qualify_runtime_attestation(&attestation)
+            .unwrap_err()
+    }
+
+    #[test]
+    fn exact_runtime_attestation_is_qualified() {
+        exact_program()
+            .qualify_runtime_attestation(&valid_attestation())
+            .unwrap();
+    }
+
+    #[test]
+    fn runtime_attestation_rejects_device_and_launch_metadata_mutations() {
+        for error in [
+            rejected(|value| value.device_count = 0),
+            rejected(|value| value.current_device = value.device_count),
+        ] {
+            assert!(matches!(
+                error,
+                QuotientProducerB2nAttestationError::InvalidDeviceSelection { .. }
+            ));
+        }
+        assert!(matches!(
+            rejected(|value| value.sm_arch = 89),
+            QuotientProducerB2nAttestationError::DeviceSmMismatch { .. }
+        ));
+
+        for error in [
+            rejected(|value| value.producer.role = QuotientProducerB2nKernelRole::Continuation),
+            rejected(|value| value.producer.ordinal = 1),
+            rejected(|value| value.producer.start_stage = 2),
+            rejected(|value| value.producer.stages = 6),
+            rejected(|value| value.producer.launch_threads = 127),
+            rejected(|value| value.continuations[0].ordinal = 1),
+            rejected(|value| value.continuations[1].start_stage = 15),
+            rejected(|value| value.continuations[1].stages = 7),
+            rejected(|value| value.continuations[1].launch_threads = 256),
+        ] {
+            assert!(matches!(
+                error,
+                QuotientProducerB2nAttestationError::LaunchMetadataMismatch { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn runtime_attestation_rejects_every_loaded_function_resource_mutation() {
+        assert!(matches!(
+            rejected(|value| value.producer.function.abi_version = 0),
+            QuotientProducerB2nAttestationError::FunctionAbiVersion { .. }
+        ));
+        assert!(matches!(
+            rejected(|value| value.producer.function.binary_version = 89),
+            QuotientProducerB2nAttestationError::BinaryVersion { .. }
+        ));
+        assert!(matches!(
+            rejected(|value| value.producer.function.ptx_version = 0),
+            QuotientProducerB2nAttestationError::MissingPtxVersion { .. }
+        ));
+        assert!(matches!(
+            rejected(|value| value.producer.function.max_threads_per_block = 127),
+            QuotientProducerB2nAttestationError::MaxThreadsPerBlock { .. }
+        ));
+        assert!(matches!(
+            rejected(|value| value.producer.function.registers_per_thread = 129),
+            QuotientProducerB2nAttestationError::RegistersPerThread { .. }
+        ));
+        assert!(matches!(
+            rejected(|value| value.producer.function.local_bytes = 1),
+            QuotientProducerB2nAttestationError::LocalMemory { .. }
+        ));
+        assert!(matches!(
+            rejected(|value| value.producer.function.static_shared_bytes = 2_049),
+            QuotientProducerB2nAttestationError::StaticSharedMemory { .. }
+        ));
+
+        assert!(matches!(
+            rejected(|value| { value.continuations[1].function.max_threads_per_block = 511 }),
+            QuotientProducerB2nAttestationError::MaxThreadsPerBlock { .. }
+        ));
+        assert!(matches!(
+            rejected(|value| value.continuations[1].function.registers_per_thread = 129),
+            QuotientProducerB2nAttestationError::RegistersPerThread { .. }
+        ));
+        assert!(matches!(
+            rejected(|value| value.continuations[1].function.local_bytes = 1),
+            QuotientProducerB2nAttestationError::LocalMemory { .. }
+        ));
+        assert!(matches!(
+            rejected(|value| value.continuations[1].function.static_shared_bytes = 34_817),
+            QuotientProducerB2nAttestationError::StaticSharedMemory { .. }
+        ));
+    }
+
+    #[test]
+    fn continuation_attestations_have_distinct_metadata_but_identical_functions() {
+        let attestation = valid_attestation();
+        assert_ne!(
+            attestation.continuations[0].ordinal,
+            attestation.continuations[1].ordinal
+        );
+        assert_ne!(
+            attestation.continuations[0].start_stage,
+            attestation.continuations[1].start_stage
+        );
+        assert_eq!(
+            attestation.continuations[0].function,
+            attestation.continuations[1].function
+        );
+        assert!(matches!(
+            rejected(|value| value.continuations[1].function.ptx_version = 81),
+            QuotientProducerB2nAttestationError::ContinuationFunctionsDiffer
+        ));
     }
 
     #[test]

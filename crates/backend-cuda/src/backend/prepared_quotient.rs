@@ -14,10 +14,16 @@ use stwo::core::fields::qm31::SecureField;
 use stwo::core::poly::circle::CanonicCoset;
 
 use super::exec_context::{
-    check_cuda, ArenaError, ArenaSlice, ArenaSlotId, CudaRuntimeError, DeviceArena,
+    check_cuda, cuda_device_snapshot, ArenaError, ArenaSlice, ArenaSlotId, CudaRuntimeError,
+    DeviceArena,
 };
 use super::prepared_interpolation::is_supported_interpolation_log_size;
-use super::quotient_producer_b2n::{QuotientProducerB2nProgram, QuotientProducerB2nReceipt};
+use super::quotient_producer_b2n::{
+    QuotientProducerB2nAttestationError, QuotientProducerB2nFunctionAttributes,
+    QuotientProducerB2nKernelRole, QuotientProducerB2nLaunchAttestation,
+    QuotientProducerB2nProgram, QuotientProducerB2nReceipt, QuotientProducerB2nRuntimeAttestation,
+    QUOTIENT_PRODUCER_B2N_CONTINUATION_THREADS, QUOTIENT_PRODUCER_B2N_LAUNCH_THREADS,
+};
 use crate::columns::bindings::{CirclePointSecureField, CudaSecureField};
 
 const WORD_BYTES: usize = core::mem::size_of::<u32>();
@@ -122,6 +128,7 @@ pub enum PreparedQuotientError {
         actual: usize,
     },
     ProducerB2nProgramMismatch,
+    ProducerB2nAttestation(QuotientProducerB2nAttestationError),
     DuplicateSlot(ArenaSlotId),
     ContextMismatch(ArenaSlotId),
     SourceAliasesWorkspace(ArenaSlotId),
@@ -171,6 +178,12 @@ impl From<ArenaError> for PreparedQuotientError {
 impl From<CudaRuntimeError> for PreparedQuotientError {
     fn from(value: CudaRuntimeError) -> Self {
         Self::Cuda(value)
+    }
+}
+
+impl From<QuotientProducerB2nAttestationError> for PreparedQuotientError {
+    fn from(value: QuotientProducerB2nAttestationError) -> Self {
+        Self::ProducerB2nAttestation(value)
     }
 }
 
@@ -348,6 +361,7 @@ pub struct PreparedQuotientGraph<'a> {
     forward_twiddles: ArenaSlice,
     inverse_twiddles: ArenaSlice,
     producer_b2n: Option<QuotientProducerB2nProgram>,
+    producer_b2n_attestation: Option<QuotientProducerB2nRuntimeAttestation>,
 }
 
 impl<'a> PreparedQuotientGraph<'a> {
@@ -408,6 +422,10 @@ impl<'a> PreparedQuotientGraph<'a> {
         {
             return Err(PreparedQuotientError::ProducerB2nProgramMismatch);
         }
+        let producer_b2n_attestation = producer_b2n
+            .as_ref()
+            .map(query_producer_b2n_attestation)
+            .transpose()?;
         let requirements = quotient_workspace_requirements(config, &logs)?;
         let slot_requirements = requirements.arena_slot_requirements(slots)?;
         let workspace_ids: BTreeSet<_> = slot_requirements.iter().map(|entry| entry.id).collect();
@@ -574,6 +592,7 @@ impl<'a> PreparedQuotientGraph<'a> {
             forward_twiddles,
             inverse_twiddles: inverse_subdomain_twiddles,
             producer_b2n,
+            producer_b2n_attestation,
         })
     }
 
@@ -743,6 +762,97 @@ impl<'a> PreparedQuotientGraph<'a> {
     pub fn producer_b2n_receipt(&self) -> Option<QuotientProducerB2nReceipt> {
         self.producer_b2n.as_ref().map(|program| program.receipt())
     }
+
+    /// Current-device and loaded-function facts qualified before preparation.
+    /// `None` is the unchanged ordinary/legacy path.
+    pub const fn producer_b2n_runtime_attestation(
+        &self,
+    ) -> Option<QuotientProducerB2nRuntimeAttestation> {
+        self.producer_b2n_attestation
+    }
+}
+
+fn query_producer_b2n_attestation(
+    program: &QuotientProducerB2nProgram,
+) -> Result<QuotientProducerB2nRuntimeAttestation, PreparedQuotientError> {
+    let device = cuda_device_snapshot()?;
+    let sm_arch = device
+        .sm_major
+        .checked_mul(10)
+        .and_then(|major| major.checked_add(device.sm_minor))
+        .ok_or(PreparedQuotientError::SizeOverflow)?;
+
+    let mut raw_producer = stwo_backend_cuda_kernels::raw::CudaFunctionAttributes::default();
+    let code = unsafe {
+        stwo_backend_cuda_kernels::raw::stwo_combine_quotients_b2n_init7_function_attributes(
+            &mut raw_producer,
+        )
+    };
+    check_cuda("quotient_producer_b2n_function_attributes", code)?;
+    let producer_function =
+        function_attributes(QuotientProducerB2nKernelRole::Producer, raw_producer)?;
+
+    let continuations: [Result<_, PreparedQuotientError>; 2] =
+        [(0, 8), (1, 16)].map(|(ordinal, start_stage)| {
+            let mut raw = stwo_backend_cuda_kernels::raw::CudaFunctionAttributes::default();
+            let code = unsafe {
+                stwo_backend_cuda_kernels::raw::stwo_ntt_b2n_after_first_seven_function_attributes(
+                    start_stage,
+                    8,
+                    &mut raw,
+                )
+            };
+            check_cuda(
+                "quotient_producer_b2n_continuation_function_attributes",
+                code,
+            )?;
+            Ok(QuotientProducerB2nLaunchAttestation {
+                role: QuotientProducerB2nKernelRole::Continuation,
+                ordinal,
+                start_stage,
+                stages: 8,
+                launch_threads: QUOTIENT_PRODUCER_B2N_CONTINUATION_THREADS,
+                function: function_attributes(QuotientProducerB2nKernelRole::Continuation, raw)?,
+            })
+        });
+    let [continuation_0, continuation_1] = continuations;
+    let attestation = QuotientProducerB2nRuntimeAttestation {
+        device_count: device.count,
+        current_device: device.current,
+        sm_arch,
+        producer: QuotientProducerB2nLaunchAttestation {
+            role: QuotientProducerB2nKernelRole::Producer,
+            ordinal: 0,
+            start_stage: 1,
+            stages: 7,
+            launch_threads: QUOTIENT_PRODUCER_B2N_LAUNCH_THREADS,
+            function: producer_function,
+        },
+        continuations: [continuation_0?, continuation_1?],
+    };
+    program.qualify_runtime_attestation(&attestation)?;
+    Ok(attestation)
+}
+
+fn function_attributes(
+    role: QuotientProducerB2nKernelRole,
+    raw: stwo_backend_cuda_kernels::raw::CudaFunctionAttributes,
+) -> Result<QuotientProducerB2nFunctionAttributes, QuotientProducerB2nAttestationError> {
+    if raw.reserved != 0 {
+        return Err(QuotientProducerB2nAttestationError::FunctionAbiReserved {
+            role,
+            actual: raw.reserved,
+        });
+    }
+    Ok(QuotientProducerB2nFunctionAttributes {
+        abi_version: raw.abi_version,
+        max_threads_per_block: raw.max_threads_per_block,
+        registers_per_thread: raw.registers_per_thread,
+        binary_version: raw.binary_version,
+        ptx_version: raw.ptx_version,
+        local_bytes: raw.local_bytes,
+        static_shared_bytes: raw.static_shared_bytes,
+    })
 }
 
 fn points_upload(destination: ArenaSlice, constants: &[QuotientSampleConstants]) -> PendingUpload {
@@ -855,6 +965,39 @@ mod tests {
     use stwo::core::pcs::quotients::denominator_inverses;
 
     use super::*;
+
+    #[test]
+    fn function_attribute_abi_mapping_is_exact_and_reserved_words_fail_closed() {
+        let raw = stwo_backend_cuda_kernels::raw::CudaFunctionAttributes {
+            abi_version: 1,
+            max_threads_per_block: 1_024,
+            registers_per_thread: 96,
+            binary_version: 90,
+            ptx_version: 80,
+            reserved: 0,
+            local_bytes: 0,
+            static_shared_bytes: 33_920,
+        };
+        assert_eq!(
+            function_attributes(QuotientProducerB2nKernelRole::Continuation, raw).unwrap(),
+            QuotientProducerB2nFunctionAttributes {
+                abi_version: 1,
+                max_threads_per_block: 1_024,
+                registers_per_thread: 96,
+                binary_version: 90,
+                ptx_version: 80,
+                local_bytes: 0,
+                static_shared_bytes: 33_920,
+            }
+        );
+        assert!(matches!(
+            function_attributes(
+                QuotientProducerB2nKernelRole::Continuation,
+                stwo_backend_cuda_kernels::raw::CudaFunctionAttributes { reserved: 1, ..raw }
+            ),
+            Err(QuotientProducerB2nAttestationError::FunctionAbiReserved { .. })
+        ));
+    }
 
     #[test]
     fn bound_slots_truncate_pooled_surplus_to_the_logical_requirement() {
