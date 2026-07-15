@@ -1542,8 +1542,9 @@ extern "C" {
         stream: *mut c_void,
     ) -> i32;
 
-    /// Log24/25 Composition boundary that also executes the first forward
-    /// interval before its only retained global write.
+    /// Log-25 Composition boundary that also executes the first forward
+    /// interval before its only retained global write. Log 24 fails closed;
+    /// its 512-thread fused specialization exceeds SM90's register budget.
     #[allow(clippy::too_many_arguments)]
     pub fn stwo_ntt_b2n_composition_fused_first_forward_on(
         source_values: *const *mut u32,

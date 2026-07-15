@@ -104,10 +104,11 @@ int stwo_ntt_b2n_composition_to_retained_on(
         void *stream
 );
 
-// Strong production boundary for log 24/25 only. In addition to the exact
-// split above, this executes the first stage-two-successor N2B interval before
-// the only retained global write. The caller must continue at stage 9 for log
-// 24 and stage 7 for log 25.
+// Strong production boundary for log 25. In addition to the exact split above,
+// this executes the first stage-two-successor N2B interval before the only
+// retained global write. The caller must continue at stage 7. Log 24 returns
+// cudaErrorNotSupported because its 512-thread fused specialization exceeds
+// SM90's register budget; use the terminal fallback and continue at stage 2.
 extern "C"
 int stwo_ntt_b2n_composition_fused_first_forward_on(
         uint32_t **source_values,
