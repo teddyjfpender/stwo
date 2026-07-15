@@ -229,10 +229,11 @@ mod tests {
         let source = include_str!("../cuda/rfft.cu");
         for required in [
             "(log_n != 24 && log_n != 25) || num_poly != 8",
-            "middle_start = 9",
-            "final_start = 17",
+            "config[0] != 8 || config[1] != 8 || config[2] != 10",
+            "config[0] != 6 || config[1] != 8 || config[2] != 11",
             "middle_start = 7",
             "final_start = 15",
+            "ntt_n2b_final_10_stage_batch_on<true>",
             "ntt_n2b_final_11_stage_batch_on<true>",
         ] {
             assert!(
