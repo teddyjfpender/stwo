@@ -59,6 +59,21 @@ extern "C" int stwo_oods_barycentric_weights_on(
     qm31 *scales,
     void *stream);
 
+// One launch prepares disjoint final-weight ranges for a same-log group batch.
+// Large domains preserve the legacy 1024-leaf/512-thread inverse partition.
+extern "C" int stwo_oods_barycentric_weights_collapsed_cohort_on(
+    uint32_t half_coset_initial_index,
+    uint32_t half_coset_step_size,
+    uint32_t size,
+    uint32_t log_size,
+    const secure_field_point *evaluation_points,
+    const uint32_t *descriptor_offsets,
+    uint32_t group_count,
+    qm31 si0,
+    point vanishing_rotation,
+    qm31 *weights,
+    void *stream);
+
 extern "C" int stwo_oods_barycentric_eval_many_on(
     const m31 *const *columns,
     uint32_t column_count,

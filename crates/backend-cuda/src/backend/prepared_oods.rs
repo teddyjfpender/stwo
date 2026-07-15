@@ -21,13 +21,19 @@ use super::exec_context::{
     check_cuda, ArenaError, ArenaSlice, ArenaSlotId, CudaRuntimeError, DeviceArena,
 };
 
+#[path = "prepared_oods/evaluation_launch.rs"]
+mod evaluation_launch;
 #[path = "prepared_oods/pass_collapse.rs"]
 mod pass_collapse;
+#[cfg(test)]
+#[path = "prepared_oods/pass_collapse_tests.rs"]
+mod pass_collapse_tests;
 pub use pass_collapse::{
     oods_canonical_sample_order, OodsCanonicalSample, OodsPassCollapseBatchReceipt,
     OodsPassCollapseCohortReceipt, OodsPassCollapseCohortRejection, OodsPassCollapseError,
     OodsPassCollapseGroupReceipt, OodsPassCollapseIdentity, OodsPassCollapseProgram,
-    OodsPassCollapseReceipt,
+    OodsPassCollapseReceipt, OODS_COLLAPSED_AUX_SHARED_QM31, OODS_COLLAPSED_CORE_SHARED_QM31,
+    OODS_COLLAPSED_DYNAMIC_SHARED_BYTES, OODS_CUDA_DEFAULT_DYNAMIC_SHARED_LIMIT_BYTES,
 };
 
 const WORD_BYTES: usize = core::mem::size_of::<u32>();
@@ -333,6 +339,7 @@ pub enum PreparedOodsError {
         slot: ArenaSlotId,
         alignment_words: usize,
     },
+    PassCollapseProgramIdentity,
     Arena(ArenaError),
     Cuda(CudaRuntimeError),
 }
@@ -639,6 +646,7 @@ pub struct PreparedOodsGraph<'a> {
     barycentric_partials: ArenaSlice,
     groups: Vec<OodsLaunchGroup>,
     evaluation_groups: Vec<OodsEvaluationLaunchGroup>,
+    pass_collapse: Option<OodsPassCollapseProgram>,
 }
 
 impl<'a> PreparedOodsGraph<'a> {
@@ -666,8 +674,56 @@ impl<'a> PreparedOodsGraph<'a> {
         oods_point_parameter: ArenaSlice,
         slots: &OodsWorkspaceSlots,
     ) -> Result<Self, PreparedOodsError> {
+        Self::prepare_mixed_with_pass_collapse(
+            arena,
+            config,
+            columns,
+            oods_point_parameter,
+            slots,
+            None,
+        )
+    }
+
+    pub fn prepare_mixed_pass_collapsed(
+        arena: &'a DeviceArena,
+        config: OodsWorkspaceConfig,
+        columns: &[OodsPolynomialColumn<'_>],
+        oods_point_parameter: ArenaSlice,
+        slots: &OodsWorkspaceSlots,
+        program: &OodsPassCollapseProgram,
+    ) -> Result<Self, PreparedOodsError> {
+        Self::prepare_mixed_with_pass_collapse(
+            arena,
+            config,
+            columns,
+            oods_point_parameter,
+            slots,
+            Some(program),
+        )
+    }
+
+    fn prepare_mixed_with_pass_collapse(
+        arena: &'a DeviceArena,
+        config: OodsWorkspaceConfig,
+        columns: &[OodsPolynomialColumn<'_>],
+        oods_point_parameter: ArenaSlice,
+        slots: &OodsWorkspaceSlots,
+        pass_collapse: Option<&OodsPassCollapseProgram>,
+    ) -> Result<Self, PreparedOodsError> {
         let topology: Vec<_> = columns.iter().map(|column| column.topology).collect();
-        let requirements = oods_workspace_requirements(config, &topology)?;
+        let ordinary_requirements = oods_workspace_requirements(config, &topology)?;
+        let pass_collapse = pass_collapse
+            .map(|program| {
+                program
+                    .validate_against(config, &topology)
+                    .map_err(|_| PreparedOodsError::PassCollapseProgramIdentity)?;
+                Ok::<_, PreparedOodsError>(program.clone())
+            })
+            .transpose()?;
+        let requirements = pass_collapse
+            .as_ref()
+            .map(|program| program.collapsed_requirements().clone())
+            .unwrap_or(ordinary_requirements);
         let slot_requirements = requirements.arena_slot_requirements(slots)?;
         let workspace_ids: BTreeSet<_> = slot_requirements.iter().map(|entry| entry.id).collect();
         let context_token = arena.context().identity_token();
@@ -810,15 +866,30 @@ impl<'a> PreparedOodsGraph<'a> {
                 u32::try_from(sample.output_index).map_err(|_| PreparedOodsError::SizeOverflow)?,
             );
         }
-        upload_and_sync(
-            arena,
-            &[
-                PendingUpload::pointers(source_pointers, &pointers),
-                PendingUpload::base_points(offset_points, &offsets),
-                PendingUpload::u32(fold_counts, &folds),
-                PendingUpload::u32(output_indices, &indices),
-            ],
-        )?;
+        let collapsed_descriptor_offsets = pass_collapse
+            .as_ref()
+            .map(|program| {
+                program
+                    .identity()
+                    .evaluation_groups
+                    .iter()
+                    .map(|group| {
+                        u32::try_from(group.descriptor_offset)
+                            .map_err(|_| PreparedOodsError::SizeOverflow)
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?;
+        let mut uploads = vec![
+            PendingUpload::pointers(source_pointers, &pointers),
+            PendingUpload::base_points(offset_points, &offsets),
+            PendingUpload::u32(fold_counts, &folds),
+            PendingUpload::u32(output_indices, &indices),
+        ];
+        if let Some(descriptor_offsets) = &collapsed_descriptor_offsets {
+            uploads.push(PendingUpload::u32(barycentric_scales, descriptor_offsets));
+        }
+        upload_and_sync(arena, &uploads)?;
 
         let groups = requirements
             .groups
@@ -872,6 +943,7 @@ impl<'a> PreparedOodsGraph<'a> {
             barycentric_partials,
             groups,
             evaluation_groups,
+            pass_collapse,
         })
     }
 
@@ -881,6 +953,10 @@ impl<'a> PreparedOodsGraph<'a> {
 
     pub fn column_ranges(&self) -> &[OodsColumnSampleRange] {
         &self.requirements.column_ranges
+    }
+
+    pub fn pass_collapse_program(&self) -> Option<&OodsPassCollapseProgram> {
+        self.pass_collapse.as_ref()
     }
 
     pub const fn sample_points_destination(&self) -> ArenaSlice {
@@ -900,8 +976,12 @@ impl<'a> PreparedOodsGraph<'a> {
         for group in &self.groups {
             self.launch_group(group, stream)?;
         }
-        for group in &self.evaluation_groups {
-            self.launch_evaluation_group(group, stream)?;
+        if let Some(program) = &self.pass_collapse {
+            self.launch_collapsed_evaluation_groups(program, stream)?;
+        } else {
+            for group in &self.evaluation_groups {
+                self.launch_evaluation_group(group, stream)?;
+            }
         }
         Ok(())
     }
@@ -1024,108 +1104,6 @@ impl<'a> PreparedOodsGraph<'a> {
             )
         };
         check_cuda("prepared_oods_store_results", code)?;
-        Ok(())
-    }
-
-    fn launch_evaluation_group(
-        &self,
-        group: &OodsEvaluationLaunchGroup,
-        stream: *mut c_void,
-    ) -> Result<(), PreparedOodsError> {
-        let group_requirements = &group.requirements;
-        let count = to_u32(group_requirements.sample_count)?;
-        let descriptor_offset = group_requirements.descriptor_offset;
-        let factor_offset = group_requirements.factor_offset_words / SECURE_WORDS;
-        let pointers = unsafe {
-            self.source_pointers
-                .as_u32_ptr()
-                .cast::<*const u32>()
-                .add(descriptor_offset)
-        };
-        let offsets = unsafe {
-            self.offset_points
-                .as_u32_ptr()
-                .cast::<cuda_raw::CirclePointBaseField>()
-                .add(descriptor_offset)
-        };
-        let fold_counts = unsafe { self.fold_counts.as_u32_ptr().add(descriptor_offset) };
-        let output_indices = unsafe { self.output_indices.as_u32_ptr().add(descriptor_offset) };
-        let factors = unsafe {
-            self.folding_factors
-                .as_u32_ptr()
-                .cast::<cuda_raw::CudaSecureField>()
-                .add(factor_offset)
-        };
-        let evaluation_points = unsafe {
-            self.evaluation_points
-                .as_u32_ptr()
-                .cast::<cuda_raw::CudaSecureField>()
-                .add(2 * descriptor_offset)
-                .cast::<u32>()
-        };
-
-        let code = unsafe {
-            cuda_raw::stwo_oods_derive_points_on(
-                self.parameter
-                    .as_u32_ptr()
-                    .cast::<cuda_raw::CudaSecureField>(),
-                offsets,
-                fold_counts,
-                output_indices,
-                count,
-                group_requirements.log_size,
-                self.sample_points.as_u32_ptr(),
-                evaluation_points,
-                factors,
-                stream,
-            )
-        };
-        check_cuda("prepared_oods_derive_evaluation_points", code)?;
-
-        let evaluation_size = to_u32(pow2(group_requirements.log_size)?)?;
-        let code = unsafe {
-            cuda_raw::stwo_oods_barycentric_weights_on(
-                group.half_coset_initial_index,
-                group.half_coset_step_size,
-                evaluation_size,
-                group_requirements.log_size,
-                evaluation_points,
-                group.si0,
-                group.vanishing_rotation,
-                self.barycentric_numerators
-                    .as_u32_ptr()
-                    .cast::<cuda_raw::CudaSecureField>(),
-                self.barycentric_weights
-                    .as_u32_ptr()
-                    .cast::<cuda_raw::CudaSecureField>(),
-                self.barycentric_scales
-                    .as_u32_ptr()
-                    .cast::<cuda_raw::CudaSecureField>(),
-                stream,
-            )
-        };
-        check_cuda("prepared_oods_barycentric_weights", code)?;
-
-        let code = unsafe {
-            cuda_raw::stwo_oods_barycentric_eval_many_on(
-                pointers,
-                count,
-                self.barycentric_weights
-                    .as_u32_ptr()
-                    .cast::<cuda_raw::CudaSecureField>(),
-                evaluation_size,
-                self.barycentric_partials
-                    .as_u32_ptr()
-                    .cast::<cuda_raw::CudaSecureField>(),
-                to_u32(group_requirements.reduction_blocks)?,
-                output_indices,
-                self.sampled_values
-                    .as_u32_ptr()
-                    .cast::<cuda_raw::CudaSecureField>(),
-                stream,
-            )
-        };
-        check_cuda("prepared_oods_barycentric_eval", code)?;
         Ok(())
     }
 }

@@ -12,8 +12,8 @@ use stwo::prover::backend::cpu::CpuCirclePoly;
 use stwo_backend_cuda::{
     oods_workspace_requirements, ArenaLayout, ArenaSlotId, ArenaSlotSpec, CudaExecContext,
     DeviceArena, OodsArenaSlotRequirement, OodsColumnSource, OodsColumnTopology,
-    OodsPolynomialColumn, OodsWorkspaceConfig, OodsWorkspaceRequirements, OodsWorkspaceSlots,
-    PreparedOodsGraph,
+    OodsPassCollapseProgram, OodsPolynomialColumn, OodsWorkspaceConfig, OodsWorkspaceRequirements,
+    OodsWorkspaceSlots, PreparedOodsGraph,
 };
 
 const PARAMETER: ArenaSlotId = ArenaSlotId(50_000);
@@ -207,8 +207,31 @@ fn exact_points_values_log4_lifting24_and_capture_replay() {
         OodsColumnTopology::evaluation_signed_offsets(7, &offsets_a),
     ];
     let requirements = oods_workspace_requirements(config, &topology).unwrap();
+    let pass_collapse = OodsPassCollapseProgram::compile(config, &topology).unwrap();
+    let log8_cohort = pass_collapse
+        .receipt()
+        .same_log_cohorts
+        .iter()
+        .find(|cohort| cohort.log_size == 8)
+        .unwrap();
+    assert!(log8_cohort.batches.len() > 1);
+    assert!(log8_cohort
+        .batches
+        .iter()
+        .any(|batch| batch.first_group > log8_cohort.first_group));
+    let mut arena_requirements = requirements.clone();
+    let collapsed_requirements = pass_collapse.collapsed_requirements();
+    arena_requirements.barycentric_numerator_words = arena_requirements
+        .barycentric_numerator_words
+        .max(collapsed_requirements.barycentric_numerator_words);
+    arena_requirements.barycentric_weight_words = arena_requirements
+        .barycentric_weight_words
+        .max(collapsed_requirements.barycentric_weight_words);
+    arena_requirements.barycentric_scale_words = arena_requirements
+        .barycentric_scale_words
+        .max(collapsed_requirements.barycentric_scale_words);
     let slots = workspace_slots();
-    let arena = arena(&requirements, &slots);
+    let arena = arena(&arena_requirements, &slots);
     let host_d: Vec<u32> = (0..1 << 4).map(|i| (13 * i + 7) & 0x7fff_ffff).collect();
     let host_a: Vec<u32> = (0..1 << 6).map(|i| (17 * i + 3) & 0x7fff_ffff).collect();
     let host_b: Vec<u32> = (0..1 << 11)
@@ -248,31 +271,32 @@ fn exact_points_values_log4_lifting24_and_capture_replay() {
     upload_words(&arena, COLUMN_E, &host_a_evaluations);
     arena.context().sync().unwrap();
 
-    let prepared = PreparedOodsGraph::prepare_mixed(
+    let columns = [
+        OodsPolynomialColumn {
+            source: OodsColumnSource::Coefficients(arena.bind(COLUMN_D).unwrap()),
+            topology: topology[0],
+        },
+        OodsPolynomialColumn {
+            source: OodsColumnSource::Coefficients(arena.bind(COLUMN_A).unwrap()),
+            topology: topology[1],
+        },
+        OodsPolynomialColumn {
+            source: OodsColumnSource::Coefficients(arena.bind(COLUMN_B).unwrap()),
+            topology: topology[2],
+        },
+        OodsPolynomialColumn {
+            source: OodsColumnSource::Evaluations(arena.bind(COLUMN_C).unwrap()),
+            topology: topology[3],
+        },
+        OodsPolynomialColumn {
+            source: OodsColumnSource::Evaluations(arena.bind(COLUMN_E).unwrap()),
+            topology: topology[4],
+        },
+    ];
+    let legacy = PreparedOodsGraph::prepare_mixed(
         &arena,
         config,
-        &[
-            OodsPolynomialColumn {
-                source: OodsColumnSource::Coefficients(arena.bind(COLUMN_D).unwrap()),
-                topology: topology[0],
-            },
-            OodsPolynomialColumn {
-                source: OodsColumnSource::Coefficients(arena.bind(COLUMN_A).unwrap()),
-                topology: topology[1],
-            },
-            OodsPolynomialColumn {
-                source: OodsColumnSource::Coefficients(arena.bind(COLUMN_B).unwrap()),
-                topology: topology[2],
-            },
-            OodsPolynomialColumn {
-                source: OodsColumnSource::Evaluations(arena.bind(COLUMN_C).unwrap()),
-                topology: topology[3],
-            },
-            OodsPolynomialColumn {
-                source: OodsColumnSource::Evaluations(arena.bind(COLUMN_E).unwrap()),
-                topology: topology[4],
-            },
-        ],
+        &columns,
         arena.bind(PARAMETER).unwrap(),
         &slots,
     )
@@ -280,7 +304,7 @@ fn exact_points_values_log4_lifting24_and_capture_replay() {
 
     let first_parameter = SecureField::from_u32_unchecked(2, 3, 5, 7);
     write_parameter(&arena, first_parameter);
-    prepared.launch().unwrap();
+    legacy.launch().unwrap();
     let (first_points, first_values) = expected(
         config,
         first_parameter,
@@ -297,6 +321,33 @@ fn exact_points_values_log4_lifting24_and_capture_replay() {
         read_secure_fields(&arena, slots.sampled_values, requirements.sample_count);
     assert_eq!(first_actual_points, first_points);
     assert_eq!(first_actual_values, first_values);
+
+    // Preparing the collapsed graph after the legacy launch refreshes the
+    // immutable descriptor-offset table in the retired scale slot. This also
+    // proves that a nonzero batch base selects the same canonical groups.
+    let collapsed = PreparedOodsGraph::prepare_mixed_pass_collapsed(
+        &arena,
+        config,
+        &columns,
+        arena.bind(PARAMETER).unwrap(),
+        &slots,
+        &pass_collapse,
+    )
+    .unwrap();
+    assert_eq!(
+        collapsed.requirements(),
+        pass_collapse.collapsed_requirements()
+    );
+    write_parameter(&arena, first_parameter);
+    collapsed.launch().unwrap();
+    assert_eq!(
+        read_points(&arena, slots.sample_points, requirements.sample_count),
+        first_actual_points
+    );
+    assert_eq!(
+        read_secure_fields(&arena, slots.sampled_values, requirements.sample_count),
+        first_actual_values
+    );
     let coefficient_range = requirements.column_ranges[1];
     let evaluation_range = requirements.column_ranges[4];
     assert_eq!(
@@ -317,7 +368,7 @@ fn exact_points_values_log4_lifting24_and_capture_replay() {
     );
 
     let capture = arena.context().capture().unwrap();
-    prepared.launch().unwrap();
+    collapsed.launch().unwrap();
     let graph = capture.finish().unwrap();
     let second_parameter = SecureField::from_u32_unchecked(13, 17, 19, 23);
     write_parameter(&arena, second_parameter);

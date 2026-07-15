@@ -109,7 +109,9 @@ pub use backend::prepared_oods::{
     OodsPassCollapseCohortRejection, OodsPassCollapseError, OodsPassCollapseGroupReceipt,
     OodsPassCollapseIdentity, OodsPassCollapseProgram, OodsPassCollapseReceipt,
     OodsPolynomialColumn, OodsSourceKind, OodsWorkspaceConfig, OodsWorkspaceRequirements,
-    OodsWorkspaceSlots, PreparedOodsError, PreparedOodsGraph, OODS_PARAMETER_WORDS,
+    OodsWorkspaceSlots, PreparedOodsError, PreparedOodsGraph, OODS_COLLAPSED_AUX_SHARED_QM31,
+    OODS_COLLAPSED_CORE_SHARED_QM31, OODS_COLLAPSED_DYNAMIC_SHARED_BYTES,
+    OODS_CUDA_DEFAULT_DYNAMIC_SHARED_LIMIT_BYTES, OODS_PARAMETER_WORDS,
     OODS_POINTER_ALIGNMENT_WORDS,
 };
 pub use backend::prepared_pow::{

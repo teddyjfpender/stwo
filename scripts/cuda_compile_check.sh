@@ -207,6 +207,24 @@ if [[ "$MODE" == "resources" ]]; then
     rm -f "$receipt"
     trap - EXIT
   fi
+  if [[ "$ARCH" == "sm_90" ]] && printf '%s\n' "${FILES[@]}" \
+      | grep -Fxq "${KERNELS_DIR}/cuda/oods_collapsed.cu"; then
+    receipt=$(mktemp)
+    trap 'rm -f "$receipt"' EXIT
+    printf '%s\n' "$out" > "$receipt"
+    # The collapsed OODS launch has one 512-thread CTA per 1024-row partition;
+    # its small-domain sibling uses 256 threads. Keep both executable shapes
+    # inside Hopper's per-SM register file and fail closed on missing ptxas
+    # entries. The global spill check below remains authoritative for spills.
+    gpu-lab/tools/check-cuda-resources "$receipt" \
+      --kernel 'barycentric_weights_collapsed_1024_kernel' \
+      --launch-threads 512 --registers-per-sm 65536
+    gpu-lab/tools/check-cuda-resources "$receipt" \
+      --kernel 'barycentric_weights_collapsed_small_kernel' \
+      --launch-threads 256 --registers-per-sm 65536
+    rm -f "$receipt"
+    trap - EXIT
+  fi
   if echo "$out" | grep -E '[1-9][0-9]* bytes spill (stores|loads)' >/dev/null; then
     echo '[cuda_compile_check] resources FAIL: spills detected'
     exit 1

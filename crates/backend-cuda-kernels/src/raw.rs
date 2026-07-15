@@ -1394,6 +1394,20 @@ extern "C" {
         stream: *mut c_void,
     ) -> i32;
 
+    pub fn stwo_oods_barycentric_weights_collapsed_cohort_on(
+        half_coset_initial_index: u32,
+        half_coset_step_size: u32,
+        size: u32,
+        log_size: u32,
+        evaluation_points: *const u32,
+        descriptor_offsets: *const u32,
+        group_count: u32,
+        si0: CudaSecureField,
+        vanishing_rotation: CirclePointBaseField,
+        weights: *mut CudaSecureField,
+        stream: *mut c_void,
+    ) -> i32;
+
     pub fn stwo_oods_barycentric_eval_many_on(
         columns: *const *const u32,
         column_count: u32,

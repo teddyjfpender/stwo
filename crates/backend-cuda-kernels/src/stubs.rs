@@ -1856,6 +1856,23 @@ pub unsafe extern "C" fn stwo_oods_barycentric_weights_on(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_oods_barycentric_weights_collapsed_cohort_on(
+    _half_coset_initial_index: u32,
+    _half_coset_step_size: u32,
+    _size: u32,
+    _log_size: u32,
+    _evaluation_points: *const u32,
+    _descriptor_offsets: *const u32,
+    _group_count: u32,
+    _si0: CudaSecureField,
+    _vanishing_rotation: CirclePointBaseField,
+    _weights: *mut CudaSecureField,
+    _stream: *mut c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_oods_barycentric_weights_collapsed_cohort_on")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stwo_oods_barycentric_eval_many_on(
     _columns: *const *const u32,
     _column_count: u32,

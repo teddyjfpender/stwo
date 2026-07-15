@@ -324,6 +324,10 @@ mod tests {
         assert_ne!(raw::stwo_oods_eval_reduce_on as usize, 0);
         assert_ne!(raw::stwo_oods_store_results_on as usize, 0);
         assert_ne!(raw::stwo_oods_barycentric_weights_on as usize, 0);
+        assert_ne!(
+            raw::stwo_oods_barycentric_weights_collapsed_cohort_on as usize,
+            0
+        );
         assert_ne!(raw::stwo_oods_barycentric_eval_many_on as usize, 0);
     }
 
