@@ -27,21 +27,21 @@ constexpr uint32_t RELATION_USE_WORDS = 7;
 constexpr uint32_t RELATION_LARGE_MEMORY_VALUE_ID_BASE = 0x40000000u;
 constexpr uint32_t RELATION_XOR12_LIMB_BITS = 10;
 constexpr uint32_t RELATION_XOR12_EXPAND_BITS = 2;
-constexpr uint32_t RELATION_FUSED_NARROW_MAX_TUPLE_WORDS = 32;
-// The wide lane pads each bounded row tile to one 512-leaf Montgomery tree.
+// The one-read lane pads each bounded row tile to one 512-leaf Montgomery tree.
 // Its shared SoA is numerator[512] + denominator[512] + tree[511].
-constexpr uint32_t RELATION_FUSED_WIDE_FRACTIONS = 512;
-constexpr uint32_t RELATION_FUSED_WIDE_TREE_NODES =
-    RELATION_FUSED_WIDE_FRACTIONS - 1u;
-constexpr uint32_t RELATION_FUSED_WIDE_SHARED_WORDS =
-    4u * (RELATION_FUSED_WIDE_FRACTIONS * 2u +
-          RELATION_FUSED_WIDE_TREE_NODES);
-constexpr uint32_t RELATION_FUSED_WIDE_SHARED_BYTES =
-    RELATION_FUSED_WIDE_SHARED_WORDS * sizeof(uint32_t);
-static_assert(RELATION_FUSED_WIDE_FRACTIONS == 2u * RELATION_LAUNCH_BLOCK,
-              "wide-leaf initialization assumes exactly two leaves/thread");
-static_assert(RELATION_FUSED_WIDE_SHARED_BYTES == 24560u,
-              "wide shared-memory budget changed without resource review");
+constexpr uint32_t RELATION_FUSED_ONE_READ_FRACTIONS = 512;
+constexpr uint32_t RELATION_FUSED_ONE_READ_TREE_NODES =
+    RELATION_FUSED_ONE_READ_FRACTIONS - 1u;
+constexpr uint32_t RELATION_FUSED_ONE_READ_SHARED_WORDS =
+    4u * (RELATION_FUSED_ONE_READ_FRACTIONS * 2u +
+          RELATION_FUSED_ONE_READ_TREE_NODES);
+constexpr uint32_t RELATION_FUSED_ONE_READ_SHARED_BYTES =
+    RELATION_FUSED_ONE_READ_SHARED_WORDS * sizeof(uint32_t);
+static_assert(RELATION_FUSED_ONE_READ_FRACTIONS ==
+                  2u * RELATION_LAUNCH_BLOCK,
+              "one-read leaf initialization assumes two leaves/thread");
+static_assert(RELATION_FUSED_ONE_READ_SHARED_BYTES == 24560u,
+              "one-read shared-memory budget changed without resource review");
 
 // Static per-instance eligibility for the fused lane, passed BY VALUE as a
 // kernel parameter: 256 bits cover 256 instances without an arena slot, and

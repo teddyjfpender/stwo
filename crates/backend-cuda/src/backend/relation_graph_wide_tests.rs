@@ -112,7 +112,7 @@ fn wide_lane_cpu(
 ) -> Result<Vec<Vec<SecureField>>, &'static str> {
     let rows = fractions.len();
     let columns = fractions.first().map_or(0, Vec::len);
-    if rows == 0 || columns == 0 || columns > RELATION_FUSED_WIDE_MAX_COLUMNS {
+    if rows == 0 || columns == 0 || columns > RELATION_FUSED_ONE_READ_MAX_COLUMNS {
         return Err("invalid wide shape");
     }
     let tile_rows = (512 / columns).min(REDUCTION_BLOCK);

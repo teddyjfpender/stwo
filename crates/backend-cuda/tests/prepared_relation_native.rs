@@ -9,17 +9,18 @@ use stwo::core::fields::m31::{BaseField, P};
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::utils::{bit_reverse, coset_order_to_circle_domain_order};
 use stwo_backend_cuda::{
-    relation_batch_fused_eligible, ArenaLayout, ArenaSlotId, ArenaSlotSpec, CudaExecContext,
-    DeviceArena, PreparedRelationGraph, RelationBatchProgram, RelationChallenges,
-    RelationColumnDescriptor, RelationGraphSlots, RelationInstanceSlots, RelationInstanceSources,
-    RelationKernelProgram, RelationLaunchMode, RelationMultiplicityKind, RelationRowExtent,
-    RelationSourceLayout, RelationTailMode, RelationTupleKind, RelationUseDescriptor,
-    RELATION_FUSED_MAX_TUPLE_WORDS,
+    relation_batch_fused_eligible, relation_batch_one_read_eligible, ArenaLayout, ArenaSlotId,
+    ArenaSlotSpec, CudaExecContext, DeviceArena, PreparedRelationGraph, RelationBatchProgram,
+    RelationChallenges, RelationColumnDescriptor, RelationGraphSlots, RelationInstanceSlots,
+    RelationInstanceSources, RelationKernelProgram, RelationLaunchMode, RelationMultiplicityKind,
+    RelationRowExtent, RelationSourceLayout, RelationTailMode, RelationTupleKind,
+    RelationUseDescriptor, RELATION_FUSED_MAX_TUPLE_WORDS,
 };
 
 const SECURE_WORDS: usize = 4;
 const LARGE_MEMORY_VALUE_ID_BASE: u32 = 0x4000_0000;
 const WIDE_TUPLE_WORDS: u32 = 33;
+const NARROW_FALLBACK_COLUMNS: usize = 513;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct InstanceSnapshot {
@@ -54,14 +55,25 @@ fn relation_use(
 fn cairo_program() -> RelationKernelProgram {
     use {RelationMultiplicityKind as Multiplicity, RelationTupleKind as Tuple};
 
-    // Exercise all three body classes in one captured graph: the original
-    // narrow fused lane, the generated-Cairo one-read wide lane, and a tuple
-    // beyond the audited wide envelope that must retain the 3-stage fallback.
+    // Exercise all body classes in one captured graph: one-read narrow and
+    // generated-Cairo-wide shapes, the 513-column suffix/recompute fallback,
+    // and a tuple beyond the audited envelope that retains the 3-stage lane.
     let wide_tuple_words = WIDE_TUPLE_WORDS;
     let fallback_tuple_words = RELATION_FUSED_MAX_TUPLE_WORDS + 1;
+    let narrow_fallback_column = RelationColumnDescriptor {
+        uses: vec![relation_use(
+            Tuple::LookupWords,
+            0,
+            2,
+            37,
+            Multiplicity::One,
+            0,
+            false,
+        )],
+    };
     let mut program = RelationKernelProgram {
         relation_graph_hash: 0x7396_3831_c53d_f4a2,
-        template_use_count: 9,
+        template_use_count: 9 + NARROW_FALLBACK_COLUMNS,
         max_alpha_powers: fallback_tuple_words,
         batches: vec![
             RelationBatchProgram {
@@ -216,6 +228,15 @@ fn cairo_program() -> RelationKernelProgram {
                     source_offset_rows: 0,
                 }],
             },
+            RelationBatchProgram {
+                source_layout: RelationSourceLayout::LookupWords { words: 2 },
+                columns: vec![narrow_fallback_column; NARROW_FALLBACK_COLUMNS],
+                instances: vec![RelationRowExtent::Exact {
+                    n_real_rows: 7,
+                    padded_rows: 8,
+                    source_offset_rows: 0,
+                }],
+            },
         ],
     };
     // Exercise a non-power-of-two column batch and a three-step dependency
@@ -273,6 +294,12 @@ fn host_sources(seed: u32) -> Vec<Vec<Vec<u32>>> {
         .map(|index| (seed + 19 + 31 * index) % 2039)
         .collect()];
 
+    // 513 columns force the fused suffix/recompute fallback while remaining
+    // inside the <=32-word tuple envelope.
+    let narrow_fallback_lookup = vec![(0..2 * 8)
+        .map(|index| (seed + 23 + 37 * index) % 2053)
+        .collect()];
+
     vec![
         lookup,
         memory_address,
@@ -280,6 +307,7 @@ fn host_sources(seed: u32) -> Vec<Vec<Vec<u32>>> {
         memory_big(1, 7),
         wide_lookup,
         fallback_lookup,
+        narrow_fallback_lookup,
     ]
 }
 
@@ -598,8 +626,17 @@ fn run_eager_capture_and_mutated_replay(
             .iter()
             .map(relation_batch_fused_eligible)
             .collect::<Vec<_>>(),
-        vec![true, true, true, true, false],
-        "narrow, one-read wide, and too-wide fallback classification drifted"
+        vec![true, true, true, true, false, true],
+        "fused and 3-stage body classification drifted"
+    );
+    assert_eq!(
+        program
+            .batches
+            .iter()
+            .map(relation_batch_one_read_eligible)
+            .collect::<Vec<_>>(),
+        vec![true, true, true, true, false, false],
+        "one-read and 513-column fallback classification drifted"
     );
     let scan_probe = (1..=512)
         .map(SecureField::from)
@@ -787,6 +824,7 @@ fn run_eager_capture_and_mutated_replay(
             (2, 1, 8, 1, 4),
             (3, 0, 16, 1, 4),
             (4, 0, 16, 1, 4),
+            (5, 0, 8, 513, 2052),
         ]
     );
 

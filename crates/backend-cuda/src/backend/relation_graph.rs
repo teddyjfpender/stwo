@@ -45,18 +45,18 @@ pub const RELATION_FUSED_MASK_WORDS: usize = 8;
 /// Proofs with more relation instances than mask bits fail closed to the
 /// 3-stage lane as a whole.
 pub const RELATION_FUSED_MAX_INSTANCES: usize = RELATION_FUSED_MASK_WORDS * 32;
-/// Original two-pass fused lane bound. Tuples at or below this width keep the
-/// one-inversion-per-row suffix lane; wider admitted tuples use the one-read
-/// shared Montgomery lane in `relation_fused.cu`.
+/// Original two-pass fused lane bound. Batches wider than the one-read column
+/// tile keep this suffix/recompute fallback only when every tuple stays at or
+/// below this audited width.
 const RELATION_FUSED_NARROW_MAX_TUPLE_WORDS: u32 = 32;
 /// Audited one-read wide-lane tuple bound. This covers every generated Cairo
 /// relation width (33, 36, 43, 58, 73, 87 and 126) without turning an arbitrary
 /// future relation into an unmeasured fused launch.
 pub const RELATION_FUSED_MAX_TUPLE_WORDS: u32 = 126;
-/// The wide lane batches at most 512 fractions in shared memory. A batch whose
-/// columns alone exceed that bound cannot form even one complete row tile and
-/// therefore keeps the proven 3-stage fallback.
-const RELATION_FUSED_WIDE_MAX_COLUMNS: usize = 512;
+/// The one-read lane batches at most 512 fractions in shared memory. Every
+/// generated Cairo relation batch fits this column bound; larger admitted
+/// batches retain the suffix/recompute fallback below.
+const RELATION_FUSED_ONE_READ_MAX_COLUMNS: usize = 512;
 /// Defensive fused-lane bound on chain length. Running state stays three
 /// QM31 registers regardless of column count; this only guards pathological
 /// programs whose per-thread column walk would dominate a single launch.
@@ -88,24 +88,34 @@ pub enum RelationTailMode {
     Scan,
 }
 
-/// Static fused-lane eligibility of every instance of `batch`. Narrow tuples
-/// keep the original two-pass lane. Wide tuples are admitted only when one row
-/// fits the one-read 512-fraction shared tile. Anything outside either audited
-/// envelope keeps the proven 3-stage path.
-pub fn relation_batch_fused_eligible(batch: &RelationBatchProgram) -> bool {
-    if batch.columns.len() > RELATION_FUSED_MAX_COLUMNS {
-        return false;
-    }
-    let max_tuple_words = batch
+fn relation_batch_max_tuple_words(batch: &RelationBatchProgram) -> u32 {
+    batch
         .columns
         .iter()
         .flat_map(|column| &column.uses)
         .map(|relation_use| relation_use.tuple_words)
         .max()
-        .unwrap_or(0);
-    max_tuple_words <= RELATION_FUSED_MAX_TUPLE_WORDS
-        && (max_tuple_words <= RELATION_FUSED_NARROW_MAX_TUPLE_WORDS
-            || batch.columns.len() <= RELATION_FUSED_WIDE_MAX_COLUMNS)
+        .unwrap_or(0)
+}
+
+/// Static eligibility for the one-read shared Montgomery lane. Every
+/// numerator and denominator is evaluated once, and at least one complete row
+/// must fit its fixed 512-fraction tile.
+pub fn relation_batch_one_read_eligible(batch: &RelationBatchProgram) -> bool {
+    batch.columns.len() <= RELATION_FUSED_ONE_READ_MAX_COLUMNS
+        && relation_batch_max_tuple_words(batch) <= RELATION_FUSED_MAX_TUPLE_WORDS
+}
+
+/// Static fused-lane eligibility of every instance of `batch`. Batches of at
+/// most 512 columns use the one-read lane. Batches from 513 through 1024 retain
+/// the proven suffix/recompute fallback only for tuples of at most 32 words.
+/// Anything outside either audited envelope keeps the proven 3-stage path.
+pub fn relation_batch_fused_eligible(batch: &RelationBatchProgram) -> bool {
+    if batch.columns.len() > RELATION_FUSED_MAX_COLUMNS {
+        return false;
+    }
+    relation_batch_one_read_eligible(batch)
+        || relation_batch_max_tuple_words(batch) <= RELATION_FUSED_NARROW_MAX_TUPLE_WORDS
 }
 
 /// Pack per-instance eligibility flags into the device kernel's by-value
@@ -2125,14 +2135,18 @@ mod tests {
         // Both sample batches sit well inside the fused envelope.
         assert!(relation_batch_fused_eligible(&program.batches[0]));
         assert!(relation_batch_fused_eligible(&program.batches[1]));
+        assert!(relation_batch_one_read_eligible(&program.batches[0]));
+        assert!(relation_batch_one_read_eligible(&program.batches[1]));
 
         // One use wider than the tuple-word cap routes the batch to the
         // 3-stage lane.
         let mut wide = program.batches[0].clone();
         wide.columns[0].uses[0].tuple_words = RELATION_FUSED_MAX_TUPLE_WORDS + 1;
         assert!(!relation_batch_fused_eligible(&wide));
+        assert!(!relation_batch_one_read_eligible(&wide));
         wide.columns[0].uses[0].tuple_words = RELATION_FUSED_MAX_TUPLE_WORDS;
         assert!(relation_batch_fused_eligible(&wide));
+        assert!(relation_batch_one_read_eligible(&wide));
 
         // Every generated wide Cairo tuple is explicitly inside the one-read
         // lane, while the original <=32-word lane remains independently
@@ -2140,13 +2154,19 @@ mod tests {
         for width in [33, 36, 43, 58, 73, 87, 126] {
             wide.columns[0].uses[0].tuple_words = width;
             assert!(relation_batch_fused_eligible(&wide), "width {width}");
+            assert!(relation_batch_one_read_eligible(&wide), "width {width}");
         }
         let column = wide.columns[0].clone();
-        wide.columns = vec![column.clone(); RELATION_FUSED_WIDE_MAX_COLUMNS + 1];
+        wide.columns = vec![column.clone(); RELATION_FUSED_ONE_READ_MAX_COLUMNS];
+        assert!(relation_batch_fused_eligible(&wide));
+        assert!(relation_batch_one_read_eligible(&wide));
+
+        wide.columns.push(column.clone());
         assert!(
             !relation_batch_fused_eligible(&wide),
             "a wide row must fit the 512-fraction shared tile"
         );
+        assert!(!relation_batch_one_read_eligible(&wide));
         for relation_use in &mut wide.columns[0].uses {
             relation_use.tuple_words = RELATION_FUSED_NARROW_MAX_TUPLE_WORDS;
         }
@@ -2159,6 +2179,16 @@ mod tests {
             relation_batch_fused_eligible(&wide),
             "the existing narrow lane retains its 1024-column envelope"
         );
+        assert!(!relation_batch_one_read_eligible(&wide));
+
+        wide.columns = vec![column; RELATION_FUSED_MAX_COLUMNS];
+        for relation_column in &mut wide.columns {
+            for relation_use in &mut relation_column.uses {
+                relation_use.tuple_words = RELATION_FUSED_NARROW_MAX_TUPLE_WORDS;
+            }
+        }
+        assert!(relation_batch_fused_eligible(&wide));
+        assert!(!relation_batch_one_read_eligible(&wide));
 
         // A pathological chain length also fails closed.
         let mut long = program.batches[0].clone();

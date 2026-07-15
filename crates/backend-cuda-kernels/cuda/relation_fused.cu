@@ -1,16 +1,16 @@
 // Fused relation pipeline: one kernel, one proof-wide launch, replacing the
 // 3-stage `relation_pairs_global` -> `batch_inverse_secure_field_ragged` ->
 // `fraction_chain_global` sequence for every fused-eligible instance. The
-// denominator slab is never materialized. Narrow tuples (<= 32 words) retain
-// the proven suffix/recompute lane below. Wide generated Cairo tuples use a
-// one-read shared-memory lane: every (numerator, denominator) is produced once,
-// a 512-leaf Montgomery tree inverts a bounded row tile with one root inverse,
-// and a segmented scan writes the canonical chain directly. The instance's
+// denominator slab is never materialized. Batches of at most 512 columns use
+// a one-read shared-memory lane: every (numerator, denominator) is produced
+// once, a 512-leaf Montgomery tree inverts a bounded row tile with one root
+// inverse, and a segmented scan writes the canonical chain directly. Admitted
+// 513..1024-column batches retain the proven suffix/recompute fallback. The instance's
 // `denominators` binding is a one-word aligned sentinel in a mode-sealed fused
 // preparation, and the proof-wide `inverse_scratch` slot stays allocated but
 // untouched. Neither is passed to or dereferenced by this kernel.
 //
-// Narrow path, per thread (= one row of one instance), with C = columns:
+// Suffix/recompute path, per thread (= one row of one instance), with C = columns:
 //   1. Backward pass c = C-1..0: recompute (num_c, d_c); stage
 //      `num_c * suffix_c` (suffix_c = prod_{j>c} d_j) into output column c;
 //      accumulate `suffix = prod d_j`.
@@ -22,7 +22,7 @@
 //      accumulate and overwrite output column c with the partial-fraction
 //      chain value, then `running *= d_c`.
 //
-// Wide path, per CTA (= one existing 256-row geometry block):
+// One-read path, per CTA (= one existing 256-row geometry block):
 //   1. Choose floor(512 / C) rows (bounded by the block's remaining rows).
 //   2. Compute every fraction once into a conflict-free coordinate-major SoA;
 //      pad the remaining denominator leaves with one.
@@ -37,26 +37,24 @@
 //   (512 numerators + 512 denominators + 511 tree nodes) * 16 B = 24,560 B.
 // Each coordinate plane is contiguous, so a warp's same-coordinate accesses
 // map one word per bank instead of the four-way conflicts of QM31 AoS storage.
-// Excluding tuple-source and descriptor reads, the old 3-stage wide path moves
+// Excluding tuple-source and descriptor reads, the 3-stage path moves
 // 112 HBM bytes/fraction: pair writes 32 B, inverse reads+writes 32 B, and
 // chain reads 32 B then writes 16 B. This lane writes only the final 16 B:
 // 96 B/fraction (85.7%) of intermediate traffic and all three global staging
-// passes disappear. The old 1024-leaf ragged inverse deliberately stops at 32
+// passes disappear. Compared with the suffix/recompute path's 48 logical
+// bytes/fraction, it retires the second source walk and 32 logical body bytes.
+// The old 1024-leaf ragged inverse deliberately stops at 32
 // independent 32-leaf subtree roots and executes 32 inversions/partition; a
-// full wide tile executes one/512 fractions, a 16x lower inversion density.
+// full one-read tile executes one/512 fractions, a 16x lower inversion density.
 // Relative to blindly widening the narrow lane, this also avoids the second
 // tuple/denominator source walk and changes one inverse per row into one inverse
 // per <=512-fraction row tile. Partial final tiles retain exactly one inverse.
 //
-// Occupancy gate (CUDA 11.8, -O3, sm_90): baseline ad7839c1 and this adaptive
-// kernel both use 80 registers/thread, a 32 B stack, and zero spills; candidate
-// static shared is 4 B. At 256 threads, SM90's 65,536-register file admits only
-// three CTAs (61,440 registers). Their exact dynamic+static shared demand is
-// 3 * 24,564 = 73,692 B, far below 228 KiB, so shared memory does not reduce
-// the baseline's 24 resident warps. sm_86 and sm_89 ptxas also report 80
-// registers and zero spills; their 100 KiB shared capacity likewise fits the
-// same register-limited three CTAs. A split narrow/wide launch cannot improve
-// occupancy under this measured resource envelope and would add a graph node.
+// Resource gate: the last qualified sm_90 source used 80 registers/thread, a
+// 32 B stack, zero spills, and this same 24,560 B dynamic shared reservation.
+// Shape-based routing removes the old descriptor scan and shared dispatch word,
+// but its register/stack/occupancy envelope remains uncredited until a fresh
+// ptxas receipt is captured for this exact source.
 //
 // Byte identity with the 3-stage lane: M31/QM31 arithmetic is exact modular
 // arithmetic through the same canonical-form primitives (fields.cu), so the
@@ -116,32 +114,15 @@ __device__ __forceinline__ void relation_reject_zero_denominator(qm31 product) {
   }
 }
 
-__device__ __forceinline__ bool relation_descriptors_are_wide(
-    const uint32_t *descriptors, uint32_t columns) {
-  for (uint32_t column = 0; column < columns; ++column) {
-    const uint32_t *descriptor =
-        descriptors + column * RELATION_DESC_WORDS;
-    if (descriptor[1u + 2u] > RELATION_FUSED_NARROW_MAX_TUPLE_WORDS) {
-      return true;
-    }
-    if (descriptor[0] == 2u &&
-        descriptor[1u + RELATION_USE_WORDS + 2u] >
-            RELATION_FUSED_NARROW_MAX_TUPLE_WORDS) {
-      return true;
-    }
-  }
-  return false;
-}
-
 // Invert 512 shared leaves with one root inversion. Active fractions occupy
 // the prefix and every padded leaf is one, so the tree is exact for arbitrary
 // row_tile * columns <= 512. The tree layout is level-contiguous: 256 parents
 // at offset 0 through the root at offset 510. During the reverse walk each
 // child product is overwritten by its inverse; the final leaves therefore
 // become the denominator-inverse plane in place.
-__device__ __forceinline__ void relation_wide_batch_inverse(
+__device__ __forceinline__ void relation_one_read_batch_inverse(
     relation_shared_qm31 leaves, relation_shared_qm31 tree) {
-  uint32_t child_count = RELATION_FUSED_WIDE_FRACTIONS;
+  uint32_t child_count = RELATION_FUSED_ONE_READ_FRACTIONS;
   relation_shared_qm31 children = leaves;
   uint32_t tree_offset = 0u;
   while (child_count > 1u) {
@@ -167,16 +148,16 @@ __device__ __forceinline__ void relation_wide_batch_inverse(
   __syncthreads();
 
   uint32_t parent_count = 1u;
-  while (parent_count < RELATION_FUSED_WIDE_FRACTIONS) {
+  while (parent_count < RELATION_FUSED_ONE_READ_FRACTIONS) {
     uint32_t parent_offset =
-        RELATION_FUSED_WIDE_FRACTIONS - (parent_count << 1u);
+        RELATION_FUSED_ONE_READ_FRACTIONS - (parent_count << 1u);
     relation_shared_qm31 parents = {tree.words + parent_offset, tree.stride};
     uint32_t next_count = parent_count << 1u;
     relation_shared_qm31 next =
-        next_count == RELATION_FUSED_WIDE_FRACTIONS
+        next_count == RELATION_FUSED_ONE_READ_FRACTIONS
             ? leaves
             : relation_shared_qm31{
-                  tree.words + RELATION_FUSED_WIDE_FRACTIONS -
+                  tree.words + RELATION_FUSED_ONE_READ_FRACTIONS -
                       (next_count << 1u),
                   tree.stride};
     for (uint32_t parent = threadIdx.x; parent < parent_count;
@@ -235,7 +216,7 @@ __device__ __forceinline__ void relation_fused_narrow_row(
   }
 }
 
-__device__ __forceinline__ void relation_fused_wide_block(
+__device__ __forceinline__ void relation_fused_one_read_block(
     const uint32_t *const *sources, uint32_t rows, uint32_t block_first_row,
     uint32_t columns, uint32_t n_real, uint32_t source_offset_rows,
     const uint32_t *instance_descriptors, const qm31 *alphas, qm31 z,
@@ -243,20 +224,20 @@ __device__ __forceinline__ void relation_fused_wide_block(
   // Host eligibility and immutable geometry prove this range. Keep a device
   // guard as well: a future ABI drift must fault instead of dividing by zero
   // or creating a row tile that cannot hold one complete canonical chain.
-  if (columns == 0u || columns > RELATION_FUSED_WIDE_FRACTIONS) {
+  if (columns == 0u || columns > RELATION_FUSED_ONE_READ_FRACTIONS) {
     asm volatile("trap;");
     return;
   }
   relation_shared_qm31 numerators = {shared_words,
-                                     RELATION_FUSED_WIDE_FRACTIONS};
+                                     RELATION_FUSED_ONE_READ_FRACTIONS};
   relation_shared_qm31 denominators = {
-      shared_words + 4u * RELATION_FUSED_WIDE_FRACTIONS,
-      RELATION_FUSED_WIDE_FRACTIONS};
+      shared_words + 4u * RELATION_FUSED_ONE_READ_FRACTIONS,
+      RELATION_FUSED_ONE_READ_FRACTIONS};
   relation_shared_qm31 tree = {
-      shared_words + 8u * RELATION_FUSED_WIDE_FRACTIONS,
-      RELATION_FUSED_WIDE_TREE_NODES};
+      shared_words + 8u * RELATION_FUSED_ONE_READ_FRACTIONS,
+      RELATION_FUSED_ONE_READ_TREE_NODES};
   const qm31 one = {{1, 0}, {0, 0}};
-  uint32_t tile_rows = RELATION_FUSED_WIDE_FRACTIONS / columns;
+  uint32_t tile_rows = RELATION_FUSED_ONE_READ_FRACTIONS / columns;
   tile_rows = tile_rows < RELATION_LAUNCH_BLOCK ? tile_rows
                                                 : RELATION_LAUNCH_BLOCK;
   uint32_t block_last_row = block_first_row + RELATION_LAUNCH_BLOCK;
@@ -295,7 +276,7 @@ __device__ __forceinline__ void relation_fused_wide_block(
     }
     __syncthreads();
 
-    relation_wide_batch_inverse(denominators, tree);
+    relation_one_read_batch_inverse(denominators, tree);
     for (uint32_t index = threadIdx.x; index < active_fractions;
          index += blockDim.x) {
       shared_store(numerators, index,
@@ -359,13 +340,8 @@ __global__ void relation_fused_kernel(
   m31 *const *outputs = output_tables[instance];
   qm31 z = z_ptr[0];
   extern __shared__ m31 shared_words[];
-  __shared__ uint32_t wide_lane;
-  if (threadIdx.x == 0u) {
-    wide_lane = relation_descriptors_are_wide(instance_descriptors, columns);
-  }
-  __syncthreads();
-  if (wide_lane != 0u) {
-    relation_fused_wide_block(
+  if (columns <= RELATION_FUSED_ONE_READ_FRACTIONS) {
+    relation_fused_one_read_block(
         sources, rows, block_first_row, columns, n_real, source_offset_rows,
         instance_descriptors, alphas, z, outputs, shared_words);
     return;
@@ -402,7 +378,7 @@ extern "C" int stwo_relation_fused_on(
   }
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_raw);
   relation_fused_kernel<<<total_row_blocks, RELATION_LAUNCH_BLOCK,
-                          RELATION_FUSED_WIDE_SHARED_BYTES, stream>>>(
+                          RELATION_FUSED_ONE_READ_SHARED_BYTES, stream>>>(
       source_tables, descriptors,
       reinterpret_cast<m31 *const *const *>(output_tables), geometry,
       n_instances, reinterpret_cast<const qm31 *>(alpha_powers),

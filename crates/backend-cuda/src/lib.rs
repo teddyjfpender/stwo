@@ -227,7 +227,8 @@ pub use backend::quotient_numerator_staged_single_write::{
     QuotientNumeratorStagedSource, QuotientNumeratorStagingRole,
 };
 pub use backend::relation_graph::{
-    relation_batch_fused_eligible, relation_graph_requirements, PreparedRelationGraph,
+    relation_batch_fused_eligible, relation_batch_one_read_eligible, relation_graph_requirements,
+    PreparedRelationGraph,
     PreparedRelationOutput, RelationArenaSlotRequirement, RelationBatchProgram, RelationChallenges,
     RelationColumnDescriptor, RelationGraphError, RelationGraphRequirements, RelationGraphSlots,
     RelationInstanceRequirement, RelationInstanceSlots, RelationInstanceSources,
