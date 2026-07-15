@@ -1,6 +1,8 @@
 #include "blake2s.cuh"
 #include "n2b_terminal.cuh"
 
+#include <stdint.h>
+
 // Low-register streaming Blake2s leaf update. The scalar implementation keeps
 // h[8], m[16], and v[16] in one thread and reaches the SM90 255-register
 // ceiling. Here one four-lane subgroup owns one leaf. Lane q owns v[q],
@@ -305,6 +307,80 @@ void compact_leaf_absorb_quad(
     states[row].s[quad_lane + 4] = h_high;
 }
 
+// Source-major expansion successor. One quad loads one source h8 exactly once,
+// then emits every circle-ordered child after reconstructing its lazy tail and
+// absorbing the new native-domain batch. Source and destination are disjoint.
+__global__ __launch_bounds__(kBlockThreads,
+                             STWO_BLAKE2S_PROGRESSIVE_QUAD_MIN_BLOCKS)
+void compact_leaf_expand_absorb_quad(
+    uint32_t source_size,
+    uint32_t expansion,
+    uint32_t number_of_columns,
+    uint32_t absorbed_columns_before,
+    uint32_t **columns,
+    CompactBlake2sTailDescriptor tail,
+    const Blake2sHash *source_states,
+    Blake2sHash *destination_states) {
+    const uint32_t thread = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t source_row = thread / kQuadWidth;
+    const uint32_t quad_lane = threadIdx.x & 3u;
+    if (source_row >= source_size) return;
+
+    const uint32_t lane_in_warp = threadIdx.x & 31u;
+    const uint32_t mask = 0xFu << (lane_in_warp & ~3u);
+    const uint32_t local_row = threadIdx.x / kQuadWidth;
+    __shared__ uint32_t messages[kLeavesPerBlock][16];
+    const uint32_t original_low = source_states[source_row].s[quad_lane];
+    const uint32_t original_high = source_states[source_row].s[quad_lane + 4];
+    const uint32_t source_pair = source_row >> 1;
+    const uint32_t parity = source_row & 1u;
+
+    for (uint32_t child = 0; child < expansion; ++child) {
+        // This is the inverse of lifted_index(target, log2(expansion)).
+        const uint32_t target_row =
+            2u * (expansion * source_pair + child) + parity;
+        uint32_t h_low = original_low;
+        uint32_t h_high = original_high;
+        uint32_t pending_words =
+            stwo_compact_pending_words(absorbed_columns_before);
+        for (uint32_t word = quad_lane; word < pending_words;
+             word += kQuadWidth) {
+            const uint32_t *column = reinterpret_cast<const uint32_t *>(
+                tail.column_addresses[word]);
+            messages[local_row][word] =
+                column[lifted_index(target_row, tail.log_ratios[word])];
+        }
+        __syncwarp(mask);
+
+        uint32_t compressed_bytes =
+            4u * (absorbed_columns_before - pending_words);
+        uint32_t consumed = 0;
+        while (consumed < number_of_columns) {
+            if (pending_words == 16) {
+                compressed_bytes += 64;
+                compress_quad(mask, quad_lane, h_low, h_high,
+                              messages[local_row], compressed_bytes, 0);
+                pending_words = 0;
+                __syncwarp(mask);
+            }
+            const uint32_t available = 16 - pending_words;
+            const uint32_t remaining = number_of_columns - consumed;
+            const uint32_t fill = available < remaining ? available : remaining;
+            for (uint32_t local = quad_lane; local < fill;
+                 local += kQuadWidth) {
+                messages[local_row][pending_words + local] =
+                    columns[consumed + local][target_row];
+            }
+            __syncwarp(mask);
+            pending_words += fill;
+            consumed += fill;
+        }
+        destination_states[target_row].s[quad_lane] = h_low;
+        destination_states[target_row].s[quad_lane + 4] = h_high;
+        __syncwarp(mask);
+    }
+}
+
 // Direct retained N2B stops before the final circle butterfly. One eight-lane
 // owner covers an adjacent row pair: its lower quad loads each pre-final pair
 // once and stages both results, all eight lanes rendezvous, then and only then
@@ -534,6 +610,59 @@ extern "C" int stwo_blake2s_compact_absorb_quad_on(
                                reinterpret_cast<cudaStream_t>(stream)>>>(
         size, number_of_columns, absorbed_columns_before, columns,
         initializes_state, descriptor, states);
+    return cudaGetLastError();
+}
+
+extern "C" int stwo_blake2s_compact_expand_absorb_quad_on(
+    uint32_t from_log_size,
+    uint32_t to_log_size,
+    uint32_t number_of_columns,
+    uint32_t absorbed_columns_before,
+    uint32_t **columns,
+    const CompactBlake2sTailDescriptor *tail,
+    const Blake2sHash *source_states,
+    Blake2sHash *destination_states,
+    void *stream) {
+    constexpr uint32_t kMaxCounterColumns = 0x3fffffffu;
+    if (from_log_size == 0 || from_log_size >= to_log_size ||
+        to_log_size >= 31 || number_of_columns == 0 ||
+        absorbed_columns_before == 0 || columns == nullptr || tail == nullptr ||
+        source_states == nullptr || destination_states == nullptr ||
+        stream == nullptr || number_of_columns > kMaxCounterColumns ||
+        absorbed_columns_before > kMaxCounterColumns - number_of_columns) {
+        return cudaErrorInvalidValue;
+    }
+    const uint32_t source_size = 1u << from_log_size;
+    const uint32_t target_size = 1u << to_log_size;
+    const uintptr_t source_begin = reinterpret_cast<uintptr_t>(source_states);
+    const uintptr_t destination_begin =
+        reinterpret_cast<uintptr_t>(destination_states);
+    const uintptr_t source_bytes =
+        static_cast<uintptr_t>(source_size) * sizeof(Blake2sHash);
+    const uintptr_t destination_bytes =
+        static_cast<uintptr_t>(target_size) * sizeof(Blake2sHash);
+    if ((source_begin & (alignof(Blake2sHash) - 1)) != 0 ||
+        (destination_begin & (alignof(Blake2sHash) - 1)) != 0 ||
+        source_begin > UINTPTR_MAX - source_bytes ||
+        destination_begin > UINTPTR_MAX - destination_bytes) {
+        return cudaErrorInvalidValue;
+    }
+    const uintptr_t source_end = source_begin + source_bytes;
+    const uintptr_t destination_end = destination_begin + destination_bytes;
+    if (source_begin < destination_end && destination_begin < source_end) {
+        return cudaErrorInvalidValue;
+    }
+    const CompactBlake2sTailDescriptor descriptor = *tail;
+    if (!stwo_compact_tail_descriptor_valid(
+            target_size, absorbed_columns_before, descriptor)) {
+        return cudaErrorInvalidValue;
+    }
+    const uint32_t blocks = 1 + (source_size - 1) / kLeavesPerBlock;
+    compact_leaf_expand_absorb_quad<<<
+        blocks, kBlockThreads, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
+        source_size, 1u << (to_log_size - from_log_size), number_of_columns,
+        absorbed_columns_before, columns, descriptor, source_states,
+        destination_states);
     return cudaGetLastError();
 }
 

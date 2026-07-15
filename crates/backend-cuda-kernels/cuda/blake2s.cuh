@@ -196,6 +196,19 @@ int stwo_blake2s_compact_absorb_quad_on(
     const CompactBlake2sTailDescriptor *tail,
     Blake2sHash *states,
     void *stream);
+// Source-major disjoint successor to compact expand + absorb. One four-lane
+// owner loads each source h8 once and emits all circle-ordered lifted children.
+extern "C"
+int stwo_blake2s_compact_expand_absorb_quad_on(
+    uint32_t from_log_size,
+    uint32_t to_log_size,
+    uint32_t number_of_columns,
+    uint32_t absorbed_columns_before,
+    uint32_t **columns,
+    const CompactBlake2sTailDescriptor *tail,
+    const Blake2sHash *source_states,
+    Blake2sHash *destination_states,
+    void *stream);
 // Terminal-retained direct-N2B twin. Each eight-lane owner loads both
 // pre-final siblings before either canonical evaluation is written, then the
 // two four-lane halves absorb the two rows using the compact h8 protocol.
