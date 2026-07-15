@@ -322,25 +322,41 @@ pub fn quotient_producer_b2n_oracle(
     let twiddles = CpuBackend::precompute_twiddles(eval_domain.half_coset)
         .itwiddles
         .extract_subdomain_twiddles(config.lifting_log_size, subdomain_log_size);
+    producer_b2n_first_seven_cuda_layout(&mut coordinates, &twiddles);
+    Ok(coordinates.map(|values| values.into_iter().map(|value| value.0).collect()))
+}
+
+fn producer_b2n_first_seven_cuda_layout(
+    coordinates: &mut [Vec<BaseField>; 4],
+    twiddles: &[BaseField],
+) {
+    let rows = coordinates[0].len();
+    debug_assert!(coordinates.iter().all(|values| values.len() == rows));
+    debug_assert_eq!(rows % QUOTIENT_PRODUCER_B2N_LAUNCH_THREADS as usize, 0);
+    let tile_rows = QUOTIENT_PRODUCER_B2N_LAUNCH_THREADS as usize;
+    let active_threads = tile_rows / 2;
     let mut layer_size = rows / 2;
     let mut layer_offset = 0usize;
     for stage in 1..=QUOTIENT_PRODUCER_B2N_FIRST_STAGES {
         let stride = 1usize << (stage - 1);
-        for gid in 0..rows / 2 {
-            let group = gid & (stride - 1);
-            let pair = gid >> (stage - 1);
-            let left = group + pair * 2 * stride;
-            let right = left + stride;
-            let twiddle = if stage == 1 {
-                circle_twiddle(&twiddles, pair)
-            } else {
-                twiddles[layer_offset + pair]
-            };
-            for values in &mut coordinates {
-                let left_value = values[left];
-                let right_value = values[right];
-                values[left] = left_value + right_value;
-                values[right] = (left_value - right_value) * twiddle;
+        for tile in 0..rows / tile_rows {
+            for local_thread in 0..active_threads {
+                let group = local_thread & (stride - 1);
+                let pair_in_tile = local_thread >> (stage - 1);
+                let left = tile * tile_rows + group + pair_in_tile * 2 * stride;
+                let right = left + stride;
+                let pair = (tile * active_threads + local_thread) >> (stage - 1);
+                let twiddle = if stage == 1 {
+                    circle_twiddle(twiddles, pair)
+                } else {
+                    twiddles[layer_offset + pair]
+                };
+                for values in &mut *coordinates {
+                    let left_value = values[left];
+                    let right_value = values[right];
+                    values[left] = left_value + right_value;
+                    values[right] = (left_value - right_value) * twiddle;
+                }
             }
         }
         if stage >= 2 {
@@ -348,7 +364,6 @@ pub fn quotient_producer_b2n_oracle(
             layer_offset += layer_size;
         }
     }
-    Ok(coordinates.map(|values| values.into_iter().map(|value| value.0).collect()))
 }
 
 fn circle_twiddle(twiddles: &[BaseField], index: usize) -> BaseField {
@@ -517,5 +532,53 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(actual, expected, "coordinate {coordinate}");
         }
+    }
+
+    #[test]
+    fn cuda_layout_oracle_covers_multiple_producer_ctas() {
+        let lifting_log_size = 11;
+        let subdomain_log_size = 9;
+        let rows = 1usize << subdomain_log_size;
+        let eval_domain = CanonicCoset::new(lifting_log_size).circle_domain();
+        let twiddles = CpuBackend::precompute_twiddles(eval_domain.half_coset)
+            .itwiddles
+            .extract_subdomain_twiddles(lifting_log_size, subdomain_log_size);
+        let input: [Vec<BaseField>; 4] = std::array::from_fn(|coordinate| {
+            (0..rows)
+                .map(|row| BaseField::from_u32_unchecked((coordinate * rows + row + 1) as u32))
+                .collect()
+        });
+
+        let mut expected = input.clone();
+        let mut layer_size = rows / 2;
+        let mut layer_offset = 0usize;
+        for stage in 1..=QUOTIENT_PRODUCER_B2N_FIRST_STAGES {
+            let stride = 1usize << (stage - 1);
+            for gid in 0..rows / 2 {
+                let group = gid & (stride - 1);
+                let pair = gid >> (stage - 1);
+                let left = group + pair * 2 * stride;
+                let right = left + stride;
+                let twiddle = if stage == 1 {
+                    circle_twiddle(&twiddles, pair)
+                } else {
+                    twiddles[layer_offset + pair]
+                };
+                for values in &mut expected {
+                    let left_value = values[left];
+                    let right_value = values[right];
+                    values[left] = left_value + right_value;
+                    values[right] = (left_value - right_value) * twiddle;
+                }
+            }
+            if stage >= 2 {
+                layer_size /= 2;
+                layer_offset += layer_size;
+            }
+        }
+
+        let mut actual = input;
+        producer_b2n_first_seven_cuda_layout(&mut actual, &twiddles);
+        assert_eq!(actual, expected);
     }
 }
