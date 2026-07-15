@@ -38,6 +38,27 @@ fn production_schedules_are_exact_and_fail_closed() {
             Err(CompositionSplitError::UnsupportedProductionLog(unsupported))
         );
     }
+
+    for malformed in [
+        CompositionSplitSchedule {
+            final_inverse_stages: 0,
+            ..log24.schedule()
+        },
+        CompositionSplitSchedule {
+            final_inverse_first_stage: u32::MAX,
+            ..log24.schedule()
+        },
+        CompositionSplitSchedule {
+            first_forward_stages: 0,
+            ..log24.schedule()
+        },
+        CompositionSplitSchedule {
+            first_forward_first_stage: u32::MAX,
+            ..log24.schedule()
+        },
+    ] {
+        assert!(!malformed.is_exact());
+    }
 }
 
 #[test]
@@ -182,6 +203,22 @@ fn oracle_rejects_shape_length_and_noncanonical_words() {
             coordinate: 3,
             row: 5,
             word: P,
+        })
+    );
+}
+
+#[test]
+fn disjoint_subslices_of_one_arena_slot_are_valid_but_overlap_is_not() {
+    let slot = ArenaSlotId(7);
+    assert_eq!(
+        validate_address_ranges(&[(slot, (0x1000, 0x1800)), (slot, (0x1800, 0x2000))]),
+        Ok(())
+    );
+    assert_eq!(
+        validate_address_ranges(&[(slot, (0x1000, 0x1801)), (slot, (0x1800, 0x2000))]),
+        Err(CompositionSplitError::InvalidAlias {
+            first: slot,
+            second: slot,
         })
     );
 }

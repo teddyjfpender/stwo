@@ -67,11 +67,33 @@ impl CompositionSplitSchedule {
     }
 
     pub const fn is_exact(self) -> bool {
-        self.final_inverse_first_stage + self.final_inverse_stages - 1 == self.evaluation_log_size
+        let final_inverse_end = match self
+            .final_inverse_first_stage
+            .checked_add(self.final_inverse_stages)
+        {
+            Some(end) => match end.checked_sub(1) {
+                Some(end) => end,
+                None => return false,
+            },
+            None => return false,
+        };
+        let first_forward_end = match self
+            .first_forward_first_stage
+            .checked_add(self.first_forward_stages)
+        {
+            Some(end) => match end.checked_sub(1) {
+                Some(end) => end,
+                None => return false,
+            },
+            None => return false,
+        };
+        let Some(shared_min_stride_log) = self.evaluation_log_size.checked_sub(first_forward_end)
+        else {
+            return false;
+        };
+        final_inverse_end == self.evaluation_log_size
             && self.first_forward_first_stage == 2
-            && self.shared_min_stride_log
-                == self.evaluation_log_size
-                    - (self.first_forward_first_stage + self.first_forward_stages - 1)
+            && self.shared_min_stride_log == shared_min_stride_log
             && self.remaining_forward_intervals == 2
     }
 }
@@ -532,14 +554,20 @@ fn validate_disjoint(
         .chain(&pointers)
         .chain(&twiddles)
         .copied()
-        .collect::<Vec<_>>();
-    for (index, &value) in values.iter().enumerate() {
-        let range = address_range(value)?;
-        for &other in &values[index + 1..] {
-            if value.id() == other.id() || ranges_overlap(range, address_range(other)?) {
+        .map(|value| Ok((value.id(), address_range(value)?)))
+        .collect::<Result<Vec<_>, CompositionSplitError>>()?;
+    validate_address_ranges(&values)
+}
+
+fn validate_address_ranges(
+    values: &[(ArenaSlotId, (usize, usize))],
+) -> Result<(), CompositionSplitError> {
+    for (index, &(id, range)) in values.iter().enumerate() {
+        for &(other_id, other_range) in &values[index + 1..] {
+            if ranges_overlap(range, other_range) {
                 return Err(CompositionSplitError::InvalidAlias {
-                    first: value.id(),
-                    second: other.id(),
+                    first: id,
+                    second: other_id,
                 });
             }
         }
@@ -579,12 +607,17 @@ fn traffic(
         .checked_mul(2)
         .ok_or(CompositionSplitError::SizeOverflow)?;
     let k = u64::from(schedule.inverse_intervals);
+    let scale = |passes: u64| {
+        source_image_bytes
+            .checked_mul(passes)
+            .ok_or(CompositionSplitError::SizeOverflow)
+    };
     Ok(CompositionSplitTraffic {
         source_image_bytes,
         retained_image_bytes,
-        current_logical_bytes: source_image_bytes * (2 * k + 17),
-        terminal_fallback_logical_bytes: source_image_bytes * (2 * k + 13),
-        fused_logical_bytes: source_image_bytes * (2 * k + 9),
+        current_logical_bytes: scale(2 * k + 17)?,
+        terminal_fallback_logical_bytes: scale(2 * k + 13)?,
+        fused_logical_bytes: scale(2 * k + 9)?,
         current_kernel_launches: schedule.inverse_intervals + 4,
         terminal_fallback_kernel_launches: schedule.inverse_intervals + 3,
         fused_kernel_launches: schedule.inverse_intervals + 2,

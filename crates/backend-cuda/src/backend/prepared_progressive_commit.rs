@@ -36,6 +36,8 @@ mod domain_compact_binding;
 mod domain_cooperative;
 mod domain_cooperative_binding;
 mod in_place;
+mod precomputed_compact_domain_binding;
+mod precomputed_compact_state;
 mod program;
 mod program_binding;
 mod program_oracle;
@@ -52,9 +54,7 @@ pub use direct_compact_domain_binding::{
     PreparedDirectCompactDomainCommitGraph,
 };
 pub use direct_compact_terminal_fused::{
-    DirectCompactTerminalBatchMode, DirectCompactTerminalBatchReceipt, DirectCompactTerminalError,
-    DirectCompactTerminalFallbackReason, DirectCompactTerminalReceipt,
-    DirectCompactTerminalSupport,
+    DirectCompactTerminalError, DirectCompactTerminalReceipt,
 };
 pub use direct_retained_b2n::{
     DirectRetainedB2nBatchPlan, DirectRetainedB2nColumn, DirectRetainedB2nError,
@@ -75,6 +75,7 @@ pub use domain_cooperative::{
     DomainCooperativeStep,
 };
 pub use domain_cooperative_binding::DomainCooperativeBindingError;
+pub use precomputed_compact_domain_binding::PreparedPrecomputedCompactDomainCommitGraph;
 pub use program::{
     CommitProgram, CommitProgramError, CommitProgramIdentity, CommitProgramLayer,
     CommitProgramOperation, CommitProgramStep, CommitProgramTraffic,
