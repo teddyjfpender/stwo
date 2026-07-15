@@ -28,6 +28,7 @@ use super::progressive_ntt_leaf_fusion::{
 };
 
 mod domain_compact;
+mod domain_compact_binding;
 mod domain_cooperative;
 mod domain_cooperative_binding;
 mod in_place;
@@ -39,6 +40,10 @@ mod shape_wide;
 pub use domain_compact::{
     CompactDomainComparison, CompactDomainOperation, CompactDomainProgram,
     CompactDomainProgramError, CompactDomainStep, CompactDomainTail,
+};
+pub use domain_compact_binding::{
+    compact_domain_arena_slot_requirements, CompactBlake2sTailDescriptor,
+    CompactDomainBindingError, CompactDomainPreparedLaunchKind, PreparedCompactDomainCommitGraph,
 };
 pub use domain_cooperative::{
     DomainCooperativeComparison, DomainCooperativeOperation, DomainCooperativeProgram,
