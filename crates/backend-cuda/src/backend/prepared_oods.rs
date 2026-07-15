@@ -21,6 +21,14 @@ use super::exec_context::{
     check_cuda, ArenaError, ArenaSlice, ArenaSlotId, CudaRuntimeError, DeviceArena,
 };
 
+#[path = "prepared_oods/pass_collapse.rs"]
+mod pass_collapse;
+pub use pass_collapse::{
+    oods_canonical_sample_order, OodsCanonicalSample, OodsPassCollapseCohortReceipt,
+    OodsPassCollapseError, OodsPassCollapseGroupReceipt, OodsPassCollapseIdentity,
+    OodsPassCollapseProgram, OodsPassCollapseReceipt,
+};
+
 const WORD_BYTES: usize = core::mem::size_of::<u32>();
 const SECURE_WORDS: usize = 4;
 const SECURE_POINT_WORDS: usize = 2 * SECURE_WORDS;
@@ -784,38 +792,22 @@ impl<'a> PreparedOodsGraph<'a> {
             SECURE_WORDS,
         )?;
 
-        let mask_step = CanonicCoset::new(config.mask_log_size).step();
-        let mut canonical_samples = Vec::with_capacity(requirements.sample_count);
-        for (column, source) in columns.iter().enumerate() {
-            let first_sample = requirements.column_ranges[column].first_sample;
-            for mask in 0..source.topology.masks.len() {
-                canonical_samples.push((
-                    source.topology.source_kind,
-                    source.topology.log_size,
-                    source.topology.evaluation_log_size,
-                    source.source.slice().as_u32_ptr() as usize,
-                    source.topology.offset_point(mask_step, mask),
-                    first_sample + mask,
-                ));
-            }
-        }
-        canonical_samples.sort_unstable_by_key(|&(kind, log, _, _, point, output)| match kind {
-            OodsSourceKind::Coefficients => (0, log, 0, 0, output),
-            OodsSourceKind::Evaluations => (1, log, point.x.0, point.y.0, output),
-        });
+        let canonical_samples = pass_collapse::canonical_sample_order_unchecked(config, &topology);
 
         let mut pointers = Vec::with_capacity(requirements.sample_count);
         let mut offsets = Vec::with_capacity(requirements.sample_count);
         let mut folds = Vec::with_capacity(requirements.sample_count);
         let mut indices = Vec::with_capacity(requirements.sample_count);
-        for &(_, _, evaluation_log_size, pointer, offset_point, output) in &canonical_samples {
-            pointers.push(pointer);
+        for sample in &canonical_samples {
+            pointers.push(columns[sample.column_index].source.slice().as_u32_ptr() as usize);
             offsets.push(cuda_raw::CirclePointBaseField {
-                x: offset_point.x.0,
-                y: offset_point.y.0,
+                x: sample.offset_point.x.0,
+                y: sample.offset_point.y.0,
             });
-            folds.push(config.lifting_log_size - evaluation_log_size);
-            indices.push(u32::try_from(output).map_err(|_| PreparedOodsError::SizeOverflow)?);
+            folds.push(config.lifting_log_size - sample.evaluation_log_size);
+            indices.push(
+                u32::try_from(sample.output_index).map_err(|_| PreparedOodsError::SizeOverflow)?,
+            );
         }
         upload_and_sync(
             arena,

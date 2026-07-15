@@ -1,0 +1,585 @@
+//! Shape-sealed accounting for collapsing OODS barycentric weight preparation.
+//!
+//! The executable kernel is deliberately a separate promotion boundary. This
+//! module proves which canonical evaluation groups it must cover, the immutable
+//! descriptor order it must preserve, and the exact launch, logical-request,
+//! and workspace deltas before a production constructor may select it.
+
+use stwo::core::circle::CirclePoint;
+use stwo::core::fields::m31::BaseField;
+use stwo::core::poly::circle::CanonicCoset;
+
+use super::{
+    oods_workspace_requirements, OodsColumnSampleRange, OodsColumnTopology,
+    OodsEvaluationGroupRequirements, OodsLogGroupRequirements, OodsSourceKind, OodsWorkspaceConfig,
+    OodsWorkspaceRequirements, PreparedOodsError, SECURE_WORDS, WORD_BYTES,
+};
+
+const SECURE_BYTES: usize = SECURE_WORDS * WORD_BYTES;
+const LEGACY_WEIGHT_KERNELS_PER_GROUP: usize = 4;
+const COLLAPSED_WEIGHT_KERNELS_PER_GROUP: usize = 1;
+const EVALUATION_KERNELS_PER_GROUP: usize = 2;
+const DERIVE_KERNELS_PER_GROUP: usize = 1;
+const REDUCTION_RADIX: usize = 512;
+
+/// One source/mask pair in the exact descriptor order uploaded by production.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OodsCanonicalSample {
+    pub source_kind: OodsSourceKind,
+    pub source_log_size: u32,
+    pub evaluation_log_size: u32,
+    pub column_index: usize,
+    pub mask_index: usize,
+    pub offset_point: CirclePoint<BaseField>,
+    pub output_index: usize,
+}
+
+/// Immutable identity sealed by [`OodsPassCollapseProgram`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OodsPassCollapseIdentity {
+    pub config: OodsWorkspaceConfig,
+    pub column_ranges: Vec<OodsColumnSampleRange>,
+    pub coefficient_groups: Vec<OodsLogGroupRequirements>,
+    pub evaluation_groups: Vec<OodsEvaluationGroupRequirements>,
+    pub canonical_samples: Vec<OodsCanonicalSample>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OodsPassCollapseGroupReceipt {
+    pub log_size: u32,
+    pub offset_point: CirclePoint<BaseField>,
+    pub descriptor_offset: usize,
+    pub sample_count: usize,
+    pub domain_rows: usize,
+    pub legacy_weight_kernel_launches: usize,
+    pub collapsed_weight_kernel_launches: usize,
+    pub legacy_weight_logical_bytes: usize,
+    pub collapsed_weight_logical_bytes: usize,
+    pub logical_bytes_removed: usize,
+}
+
+/// Consecutive evaluation-point groups that share one domain log.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OodsPassCollapseCohortReceipt {
+    pub log_size: u32,
+    pub first_group: usize,
+    pub group_count: usize,
+    pub sample_count: usize,
+    pub domain_rows: usize,
+    pub legacy_weight_kernel_launches: usize,
+    pub collapsed_weight_kernel_launches: usize,
+    pub logical_bytes_removed: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OodsPassCollapseReceipt {
+    pub coefficient_group_count: usize,
+    pub evaluation_group_count: usize,
+    pub covered_evaluation_group_count: usize,
+    pub evaluation_sample_count: usize,
+    pub groups: Vec<OodsPassCollapseGroupReceipt>,
+    pub same_log_cohorts: Vec<OodsPassCollapseCohortReceipt>,
+    pub unchanged_coefficient_kernel_launches: usize,
+    pub unchanged_evaluation_kernel_launches: usize,
+    pub legacy_weight_kernel_launches: usize,
+    pub collapsed_weight_kernel_launches: usize,
+    pub kernel_launches_removed: usize,
+    pub legacy_total_kernel_launches: usize,
+    pub collapsed_total_kernel_launches: usize,
+    pub legacy_weight_logical_bytes: usize,
+    pub collapsed_weight_logical_bytes: usize,
+    pub logical_bytes_removed: usize,
+    pub legacy_workspace_bytes: usize,
+    pub collapsed_workspace_bytes: usize,
+    pub workspace_bytes_removed: usize,
+    /// Final weights remain global because every column in the group reuses them.
+    pub retained_weight_bytes: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OodsPassCollapseError {
+    Oods(PreparedOodsError),
+    NoEvaluationGroups,
+    InvalidDescriptorCoverage,
+    ProgramIdentity,
+    SizeOverflow,
+}
+
+impl core::fmt::Display for OodsPassCollapseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "invalid OODS pass-collapse program: {self:?}")
+    }
+}
+
+impl std::error::Error for OodsPassCollapseError {}
+
+impl From<PreparedOodsError> for OodsPassCollapseError {
+    fn from(value: PreparedOodsError) -> Self {
+        Self::Oods(value)
+    }
+}
+
+/// Compiled, address-free proof that a shape is eligible for weight-pass collapse.
+#[derive(Clone, Debug)]
+pub struct OodsPassCollapseProgram {
+    identity: OodsPassCollapseIdentity,
+    ordinary_requirements: OodsWorkspaceRequirements,
+    collapsed_requirements: OodsWorkspaceRequirements,
+    receipt: OodsPassCollapseReceipt,
+}
+
+impl OodsPassCollapseProgram {
+    pub fn compile(
+        config: OodsWorkspaceConfig,
+        columns: &[OodsColumnTopology<'_>],
+    ) -> Result<Self, OodsPassCollapseError> {
+        let ordinary_requirements = oods_workspace_requirements(config, columns)?;
+        if ordinary_requirements.evaluation_groups.is_empty() {
+            return Err(OodsPassCollapseError::NoEvaluationGroups);
+        }
+        let canonical_samples = canonical_sample_order_unchecked(config, columns);
+        validate_descriptor_coverage(&ordinary_requirements, &canonical_samples)?;
+
+        let identity = OodsPassCollapseIdentity {
+            config,
+            column_ranges: ordinary_requirements.column_ranges.clone(),
+            coefficient_groups: ordinary_requirements.groups.clone(),
+            evaluation_groups: ordinary_requirements.evaluation_groups.clone(),
+            canonical_samples,
+        };
+        let mut collapsed_requirements = ordinary_requirements.clone();
+        // Keep nonempty aligned compatibility slots until the executable arena
+        // API deletes these roles entirely.
+        collapsed_requirements.barycentric_numerator_words = SECURE_WORDS;
+        collapsed_requirements.barycentric_scale_words = SECURE_WORDS;
+        let receipt = compile_receipt(&ordinary_requirements, &collapsed_requirements)?;
+        Ok(Self {
+            identity,
+            ordinary_requirements,
+            collapsed_requirements,
+            receipt,
+        })
+    }
+
+    pub fn validate_against(
+        &self,
+        config: OodsWorkspaceConfig,
+        columns: &[OodsColumnTopology<'_>],
+    ) -> Result<(), OodsPassCollapseError> {
+        let candidate = Self::compile(config, columns)?;
+        if candidate.identity != self.identity
+            || candidate.ordinary_requirements != self.ordinary_requirements
+            || candidate.collapsed_requirements != self.collapsed_requirements
+            || candidate.receipt != self.receipt
+        {
+            return Err(OodsPassCollapseError::ProgramIdentity);
+        }
+        Ok(())
+    }
+
+    pub fn identity(&self) -> &OodsPassCollapseIdentity {
+        &self.identity
+    }
+
+    pub fn ordinary_requirements(&self) -> &OodsWorkspaceRequirements {
+        &self.ordinary_requirements
+    }
+
+    pub fn collapsed_requirements(&self) -> &OodsWorkspaceRequirements {
+        &self.collapsed_requirements
+    }
+
+    pub fn receipt(&self) -> &OodsPassCollapseReceipt {
+        &self.receipt
+    }
+}
+
+/// Independent CPU oracle for the production descriptor upload order.
+pub fn oods_canonical_sample_order(
+    config: OodsWorkspaceConfig,
+    columns: &[OodsColumnTopology<'_>],
+) -> Result<Vec<OodsCanonicalSample>, PreparedOodsError> {
+    oods_workspace_requirements(config, columns)?;
+    Ok(canonical_sample_order_unchecked(config, columns))
+}
+
+pub(super) fn canonical_sample_order_unchecked(
+    config: OodsWorkspaceConfig,
+    columns: &[OodsColumnTopology<'_>],
+) -> Vec<OodsCanonicalSample> {
+    let mask_step = CanonicCoset::new(config.mask_log_size).step();
+    let mut samples = Vec::new();
+    let mut output_index = 0usize;
+    for (column_index, topology) in columns.iter().copied().enumerate() {
+        for mask_index in 0..topology.masks.len() {
+            samples.push(OodsCanonicalSample {
+                source_kind: topology.source_kind,
+                source_log_size: topology.log_size,
+                evaluation_log_size: topology.evaluation_log_size,
+                column_index,
+                mask_index,
+                offset_point: topology.offset_point(mask_step, mask_index),
+                output_index: output_index + mask_index,
+            });
+        }
+        output_index += topology.masks.len();
+    }
+    samples.sort_unstable_by_key(|sample| match sample.source_kind {
+        OodsSourceKind::Coefficients => (0, sample.source_log_size, 0, 0, sample.output_index),
+        OodsSourceKind::Evaluations => (
+            1,
+            sample.source_log_size,
+            sample.offset_point.x.0,
+            sample.offset_point.y.0,
+            sample.output_index,
+        ),
+    });
+    samples
+}
+
+fn validate_descriptor_coverage(
+    requirements: &OodsWorkspaceRequirements,
+    samples: &[OodsCanonicalSample],
+) -> Result<(), OodsPassCollapseError> {
+    if samples.len() != requirements.sample_count {
+        return Err(OodsPassCollapseError::InvalidDescriptorCoverage);
+    }
+    let mut next = 0usize;
+    for group in &requirements.groups {
+        if group.descriptor_offset != next
+            || samples
+                .get(next..next + group.sample_count)
+                .ok_or(OodsPassCollapseError::InvalidDescriptorCoverage)?
+                .iter()
+                .any(|sample| {
+                    sample.source_kind != OodsSourceKind::Coefficients
+                        || sample.source_log_size != group.log_size
+                })
+        {
+            return Err(OodsPassCollapseError::InvalidDescriptorCoverage);
+        }
+        next = checked_add(next, group.sample_count)?;
+    }
+    for group in &requirements.evaluation_groups {
+        if group.descriptor_offset != next
+            || samples
+                .get(next..next + group.sample_count)
+                .ok_or(OodsPassCollapseError::InvalidDescriptorCoverage)?
+                .iter()
+                .any(|sample| {
+                    sample.source_kind != OodsSourceKind::Evaluations
+                        || sample.source_log_size != group.log_size
+                        || sample.offset_point != group.offset_point
+                })
+        {
+            return Err(OodsPassCollapseError::InvalidDescriptorCoverage);
+        }
+        next = checked_add(next, group.sample_count)?;
+    }
+    if next != samples.len() {
+        return Err(OodsPassCollapseError::InvalidDescriptorCoverage);
+    }
+    Ok(())
+}
+
+fn compile_receipt(
+    ordinary: &OodsWorkspaceRequirements,
+    collapsed: &OodsWorkspaceRequirements,
+) -> Result<OodsPassCollapseReceipt, OodsPassCollapseError> {
+    let mut groups = Vec::with_capacity(ordinary.evaluation_groups.len());
+    for group in &ordinary.evaluation_groups {
+        let domain_rows = checked_pow2(group.log_size)?;
+        let legacy_weight_logical_bytes = checked_add(
+            checked_mul(8, checked_mul(domain_rows, SECURE_BYTES)?)?,
+            2 * SECURE_BYTES,
+        )?;
+        let collapsed_weight_logical_bytes = checked_mul(domain_rows, SECURE_BYTES)?;
+        groups.push(OodsPassCollapseGroupReceipt {
+            log_size: group.log_size,
+            offset_point: group.offset_point,
+            descriptor_offset: group.descriptor_offset,
+            sample_count: group.sample_count,
+            domain_rows,
+            legacy_weight_kernel_launches: LEGACY_WEIGHT_KERNELS_PER_GROUP,
+            collapsed_weight_kernel_launches: COLLAPSED_WEIGHT_KERNELS_PER_GROUP,
+            legacy_weight_logical_bytes,
+            collapsed_weight_logical_bytes,
+            logical_bytes_removed: legacy_weight_logical_bytes
+                .checked_sub(collapsed_weight_logical_bytes)
+                .ok_or(OodsPassCollapseError::SizeOverflow)?,
+        });
+    }
+    let same_log_cohorts = compile_cohorts(&groups)?;
+    let coefficient_launches = ordinary.groups.iter().try_fold(0usize, |total, group| {
+        checked_add(total, coefficient_group_launches(group))
+    })?;
+    let evaluation_group_count = groups.len();
+    let unchanged_evaluation_kernel_launches = checked_mul(
+        evaluation_group_count,
+        DERIVE_KERNELS_PER_GROUP + EVALUATION_KERNELS_PER_GROUP,
+    )?;
+    let legacy_weight_kernel_launches =
+        checked_mul(evaluation_group_count, LEGACY_WEIGHT_KERNELS_PER_GROUP)?;
+    let collapsed_weight_kernel_launches =
+        checked_mul(evaluation_group_count, COLLAPSED_WEIGHT_KERNELS_PER_GROUP)?;
+    let legacy_weight_logical_bytes =
+        checked_sum(groups.iter().map(|group| group.legacy_weight_logical_bytes))?;
+    let collapsed_weight_logical_bytes = checked_sum(
+        groups
+            .iter()
+            .map(|group| group.collapsed_weight_logical_bytes),
+    )?;
+    let legacy_workspace_bytes = workspace_bytes(ordinary)?;
+    let collapsed_workspace_bytes = workspace_bytes(collapsed)?;
+    let retained_weight_bytes = checked_mul(ordinary.barycentric_weight_words, WORD_BYTES)?;
+    Ok(OodsPassCollapseReceipt {
+        coefficient_group_count: ordinary.groups.len(),
+        evaluation_group_count,
+        covered_evaluation_group_count: evaluation_group_count,
+        evaluation_sample_count: ordinary
+            .evaluation_groups
+            .iter()
+            .try_fold(0usize, |total, group| {
+                checked_add(total, group.sample_count)
+            })?,
+        groups,
+        same_log_cohorts,
+        unchanged_coefficient_kernel_launches: coefficient_launches,
+        unchanged_evaluation_kernel_launches,
+        legacy_weight_kernel_launches,
+        collapsed_weight_kernel_launches,
+        kernel_launches_removed: legacy_weight_kernel_launches
+            .checked_sub(collapsed_weight_kernel_launches)
+            .ok_or(OodsPassCollapseError::SizeOverflow)?,
+        legacy_total_kernel_launches: checked_add(
+            coefficient_launches,
+            checked_add(
+                unchanged_evaluation_kernel_launches,
+                legacy_weight_kernel_launches,
+            )?,
+        )?,
+        collapsed_total_kernel_launches: checked_add(
+            coefficient_launches,
+            checked_add(
+                unchanged_evaluation_kernel_launches,
+                collapsed_weight_kernel_launches,
+            )?,
+        )?,
+        legacy_weight_logical_bytes,
+        collapsed_weight_logical_bytes,
+        logical_bytes_removed: legacy_weight_logical_bytes
+            .checked_sub(collapsed_weight_logical_bytes)
+            .ok_or(OodsPassCollapseError::SizeOverflow)?,
+        legacy_workspace_bytes,
+        collapsed_workspace_bytes,
+        workspace_bytes_removed: legacy_workspace_bytes
+            .checked_sub(collapsed_workspace_bytes)
+            .ok_or(OodsPassCollapseError::SizeOverflow)?,
+        retained_weight_bytes,
+    })
+}
+
+fn compile_cohorts(
+    groups: &[OodsPassCollapseGroupReceipt],
+) -> Result<Vec<OodsPassCollapseCohortReceipt>, OodsPassCollapseError> {
+    let mut cohorts = Vec::<OodsPassCollapseCohortReceipt>::new();
+    for (group_index, group) in groups.iter().enumerate() {
+        if let Some(cohort) = cohorts
+            .last_mut()
+            .filter(|cohort| cohort.log_size == group.log_size)
+        {
+            cohort.group_count = checked_add(cohort.group_count, 1)?;
+            cohort.sample_count = checked_add(cohort.sample_count, group.sample_count)?;
+            cohort.domain_rows = checked_add(cohort.domain_rows, group.domain_rows)?;
+            cohort.legacy_weight_kernel_launches = checked_add(
+                cohort.legacy_weight_kernel_launches,
+                group.legacy_weight_kernel_launches,
+            )?;
+            cohort.collapsed_weight_kernel_launches = checked_add(
+                cohort.collapsed_weight_kernel_launches,
+                group.collapsed_weight_kernel_launches,
+            )?;
+            cohort.logical_bytes_removed =
+                checked_add(cohort.logical_bytes_removed, group.logical_bytes_removed)?;
+        } else {
+            cohorts.push(OodsPassCollapseCohortReceipt {
+                log_size: group.log_size,
+                first_group: group_index,
+                group_count: 1,
+                sample_count: group.sample_count,
+                domain_rows: group.domain_rows,
+                legacy_weight_kernel_launches: group.legacy_weight_kernel_launches,
+                collapsed_weight_kernel_launches: group.collapsed_weight_kernel_launches,
+                logical_bytes_removed: group.logical_bytes_removed,
+            });
+        }
+    }
+    Ok(cohorts)
+}
+
+fn coefficient_group_launches(group: &OodsLogGroupRequirements) -> usize {
+    let mut reductions = 0usize;
+    let mut rows = group.first_pass_blocks;
+    while rows > 1 {
+        rows = rows.div_ceil(REDUCTION_RADIX);
+        reductions += 1;
+    }
+    DERIVE_KERNELS_PER_GROUP + 1 + reductions + 1
+}
+
+fn workspace_bytes(
+    requirements: &OodsWorkspaceRequirements,
+) -> Result<usize, OodsPassCollapseError> {
+    checked_mul(
+        checked_add(
+            requirements.barycentric_numerator_words,
+            requirements.barycentric_scale_words,
+        )?,
+        WORD_BYTES,
+    )
+}
+
+fn checked_pow2(log_size: u32) -> Result<usize, OodsPassCollapseError> {
+    1usize
+        .checked_shl(log_size)
+        .ok_or(OodsPassCollapseError::SizeOverflow)
+}
+
+fn checked_add(lhs: usize, rhs: usize) -> Result<usize, OodsPassCollapseError> {
+    lhs.checked_add(rhs)
+        .ok_or(OodsPassCollapseError::SizeOverflow)
+}
+
+fn checked_mul(lhs: usize, rhs: usize) -> Result<usize, OodsPassCollapseError> {
+    lhs.checked_mul(rhs)
+        .ok_or(OodsPassCollapseError::SizeOverflow)
+}
+
+fn checked_sum(values: impl IntoIterator<Item = usize>) -> Result<usize, OodsPassCollapseError> {
+    values
+        .into_iter()
+        .try_fold(0usize, |sum, value| checked_add(sum, value))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config() -> OodsWorkspaceConfig {
+        OodsWorkspaceConfig {
+            lifting_log_size: 24,
+            mask_log_size: 12,
+        }
+    }
+
+    #[test]
+    fn canonical_oracle_orders_sources_groups_and_outputs_exactly() {
+        let coefficient_offsets = [2, 0];
+        let evaluation_offsets = [1, 0];
+        let columns = [
+            OodsColumnTopology::evaluation_signed_offsets(8, &evaluation_offsets),
+            OodsColumnTopology::signed_offsets(11, &coefficient_offsets),
+            OodsColumnTopology::evaluation_signed_offsets(8, &[0]),
+            OodsColumnTopology::signed_offsets(7, &[0]),
+        ];
+        let order = oods_canonical_sample_order(config(), &columns).unwrap();
+        assert_eq!(
+            order
+                .iter()
+                .map(|sample| {
+                    (
+                        sample.source_kind,
+                        sample.source_log_size,
+                        sample.column_index,
+                        sample.mask_index,
+                        sample.output_index,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                (OodsSourceKind::Coefficients, 7, 3, 0, 5),
+                (OodsSourceKind::Coefficients, 11, 1, 0, 2),
+                (OodsSourceKind::Coefficients, 11, 1, 1, 3),
+                (OodsSourceKind::Evaluations, 8, 0, 1, 1),
+                (OodsSourceKind::Evaluations, 8, 2, 0, 4),
+                (OodsSourceKind::Evaluations, 8, 0, 0, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn receipt_covers_every_group_and_accounts_exact_pass_deltas() {
+        let columns = [
+            OodsColumnTopology::signed_offsets(11, &[0]),
+            OodsColumnTopology::evaluation_signed_offsets(8, &[0, 1]),
+            OodsColumnTopology::evaluation_signed_offsets(8, &[0]),
+            OodsColumnTopology::evaluation_signed_offsets(10, &[0]),
+        ];
+        let program = OodsPassCollapseProgram::compile(config(), &columns).unwrap();
+        let receipt = program.receipt();
+        assert_eq!(receipt.coefficient_group_count, 1);
+        assert_eq!(receipt.evaluation_group_count, 3);
+        assert_eq!(receipt.covered_evaluation_group_count, 3);
+        assert_eq!(receipt.evaluation_sample_count, 4);
+        assert_eq!(receipt.same_log_cohorts.len(), 2);
+        assert_eq!(receipt.same_log_cohorts[0].log_size, 8);
+        assert_eq!(receipt.same_log_cohorts[0].group_count, 2);
+        assert_eq!(receipt.same_log_cohorts[0].sample_count, 3);
+        assert_eq!(receipt.unchanged_coefficient_kernel_launches, 4);
+        assert_eq!(receipt.unchanged_evaluation_kernel_launches, 9);
+        assert_eq!(receipt.legacy_weight_kernel_launches, 12);
+        assert_eq!(receipt.collapsed_weight_kernel_launches, 3);
+        assert_eq!(receipt.kernel_launches_removed, 9);
+        assert_eq!(receipt.legacy_total_kernel_launches, 25);
+        assert_eq!(receipt.collapsed_total_kernel_launches, 16);
+        assert_eq!(receipt.legacy_weight_logical_bytes, 196_704);
+        assert_eq!(receipt.collapsed_weight_logical_bytes, 24_576);
+        assert_eq!(receipt.logical_bytes_removed, 172_128);
+        assert_eq!(receipt.workspace_bytes_removed, 16_384);
+        assert_eq!(receipt.retained_weight_bytes, 16_384);
+        assert_eq!(
+            program.collapsed_requirements().barycentric_numerator_words,
+            SECURE_WORDS
+        );
+        assert_eq!(
+            program.collapsed_requirements().barycentric_scale_words,
+            SECURE_WORDS
+        );
+    }
+
+    #[test]
+    fn topology_and_canonical_order_mutations_fail_identity() {
+        let original = [
+            OodsColumnTopology::signed_offsets(11, &[0]),
+            OodsColumnTopology::evaluation_signed_offsets(8, &[0, 1]),
+        ];
+        let program = OodsPassCollapseProgram::compile(config(), &original).unwrap();
+        assert_eq!(program.validate_against(config(), &original), Ok(()));
+
+        let changed_order = [
+            OodsColumnTopology::evaluation_signed_offsets(8, &[0, 1]),
+            OodsColumnTopology::signed_offsets(11, &[0]),
+        ];
+        assert_eq!(
+            program.validate_against(config(), &changed_order),
+            Err(OodsPassCollapseError::ProgramIdentity)
+        );
+        let changed_mask = [
+            OodsColumnTopology::signed_offsets(11, &[0]),
+            OodsColumnTopology::evaluation_signed_offsets(8, &[0, 2]),
+        ];
+        assert_eq!(
+            program.validate_against(config(), &changed_mask),
+            Err(OodsPassCollapseError::ProgramIdentity)
+        );
+    }
+
+    #[test]
+    fn coefficient_only_shape_is_rejected_instead_of_claiming_zero_credit() {
+        let columns = [OodsColumnTopology::signed_offsets(11, &[0])];
+        assert!(matches!(
+            OodsPassCollapseProgram::compile(config(), &columns),
+            Err(OodsPassCollapseError::NoEvaluationGroups)
+        ));
+    }
+}
