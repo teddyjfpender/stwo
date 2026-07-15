@@ -104,7 +104,7 @@ int stwo_ntt_n2b_columns_final_interval_before_circle_on(
 );
 
 // Exact Composition continuation after its fused first forward interval:
-// log24 runs [stage9..16, final8], log25 runs [stage7..14, final11].
+// log24 runs [stage7..14, final10], log25 runs [stage7..14, final11].
 // The pointer table contains exactly eight retained coordinate columns.
 extern "C"
 int stwo_ntt_n2b_columns_after_first_stage_two_interval_on(

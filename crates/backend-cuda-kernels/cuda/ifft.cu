@@ -1167,10 +1167,15 @@ template <bool FUSE_FIRST_FORWARD>
 cudaError_t b2n_composition_split_on(
     m31 **sources, m31 **retained_outputs, unsigned log_n,
     m31 *inverse_twiddles, m31 *forward_twiddles, cudaStream_t stream) {
+    static constexpr size_t LOG24_COMPOSITION_PARTS[3] = {10, 8, 6};
     const size_t *parts = nullptr;
     size_t count = 0;
     if (log_n == 24) {
-        parts = LAUNCH_B2N_CONFIG_19_24[5];
+        // The ordinary 8+8+8 split makes the fused boundary a 512-thread
+        // LOG4 kernel.  A composition-only 10+8+6 split reaches the same
+        // normalized coefficients with the already-qualified 256-thread LOG3
+        // boundary and leaves an exact 8+10 forward continuation.
+        parts = LOG24_COMPOSITION_PARTS;
         count = 3;
     } else if (log_n == 25) {
         parts = LAUNCH_B2N_CONFIG_25_29[0];
@@ -1197,19 +1202,7 @@ cudaError_t b2n_composition_split_on(
     const unsigned final_stages = static_cast<unsigned>(parts[count - 1]);
     if (start_stage + final_stages - 1 != log_n)
         return cudaErrorInvalidConfiguration;
-    if (log_n == 24 && final_stages == 8) {
-        if constexpr (FUSE_FIRST_FORWARD) {
-            // The SM90 log-24 fused specialization needs 207 registers across
-            // 512 threads, so CUDA caps it at 256 threads.  Keep this raw entry
-            // fail-closed instead of emitting a graph that instantiates as 701.
-            return cudaErrorNotSupported;
-        } else {
-            return launch_composition_split_boundary_on<4, false>(
-                sources, retained_outputs, log_n, start_stage, inverse_twiddles,
-                forward_twiddles, stream);
-        }
-    }
-    if (log_n == 25 && final_stages == 6)
+    if ((log_n == 24 || log_n == 25) && final_stages == 6)
         return launch_composition_split_boundary_on<3, FUSE_FIRST_FORWARD>(
             sources, retained_outputs, log_n, start_stage, inverse_twiddles,
             forward_twiddles, stream);

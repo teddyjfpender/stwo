@@ -1471,12 +1471,13 @@ static cudaError_t ntt_n2b_after_first_stage_two_interval_dispatch_on(
     unsigned final_start = 0;
     unsigned final_stages = 0;
     if (log_n == 24) {
-        const auto &config = LAUNCH_N2B_CONFIG_20_27[4];
-        if (config[0] != 8 || config[1] != 8 || config[2] != 8)
+        const auto &config = LAUNCH_N2B_CONFIG_20_27[6];
+        if (config[0] != 8 || config[1] != 8 || config[2] != 10)
             return cudaErrorInvalidConfiguration;
-        middle_start = 9;
-        final_start = 17;
-        final_stages = 8;
+        // Composition's fused LOG3 boundary already owns stages 2..6.
+        middle_start = 7;
+        final_start = 15;
+        final_stages = 10;
     } else if (log_n == 25) {
         const auto &config = LAUNCH_N2B_CONFIG_20_27[5];
         if (config[0] != 6 || config[1] != 8 || config[2] != 11)
@@ -1491,8 +1492,8 @@ static cudaError_t ntt_n2b_after_first_stage_two_interval_dispatch_on(
         values, values, log_n, num_poly, middle_start, twiddles,
         twiddle_words, eval_domain_size, stream);
     if (status != cudaSuccess) return status;
-    return final_stages == 8
-        ? ntt_n2b_final_8_stage_batch_on<true>(
+    return final_stages == 10
+        ? ntt_n2b_final_10_stage_batch_on<true>(
               values, values, log_n, num_poly, final_start, twiddles,
               twiddle_words, eval_domain_size, stream)
         : ntt_n2b_final_11_stage_batch_on<true>(

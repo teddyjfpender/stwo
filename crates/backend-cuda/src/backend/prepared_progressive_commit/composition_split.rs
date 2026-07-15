@@ -42,12 +42,12 @@ impl CompositionSplitSchedule {
             24 => Some(Self {
                 evaluation_log_size: 24,
                 inverse_intervals: 3,
-                final_inverse_first_stage: 17,
-                final_inverse_stages: 8,
+                final_inverse_first_stage: 19,
+                final_inverse_stages: 6,
                 first_forward_first_stage: 2,
-                first_forward_stages: 7,
+                first_forward_stages: 5,
                 remaining_forward_intervals: 2,
-                shared_min_stride_log: 16,
+                shared_min_stride_log: 18,
             }),
             25 => Some(Self {
                 evaluation_log_size: 25,
@@ -231,16 +231,18 @@ impl CompositionSplitProgram {
         self.traffic
     }
 
-    /// The log-24 fused boundary needs 207 registers across a 512-thread CTA
-    /// on SM90, exceeding the 65,536-register block budget.  Its spill-free
-    /// terminal path remains exact; log 25's 256-thread fused boundary is legal.
+    /// Both registered shapes use the spill-free 256-thread LOG3 fused boundary.
+    /// Log 24 reaches it through the exact 10+8+6 inverse partition; log 25 uses
+    /// the ordinary 7+6+6+6 partition.
     pub const fn admits_launch_mode(self, mode: CompositionSplitLaunchMode) -> bool {
-        match mode {
-            CompositionSplitLaunchMode::TerminalFallback => true,
-            CompositionSplitLaunchMode::FusedFirstForward => {
-                self.schedule.evaluation_log_size == 25
-            }
-        }
+        matches!(
+            (self.schedule.evaluation_log_size, mode),
+            (
+                24 | 25,
+                CompositionSplitLaunchMode::TerminalFallback
+                    | CompositionSplitLaunchMode::FusedFirstForward
+            )
+        )
     }
 
     pub fn arena_slot_requirements(

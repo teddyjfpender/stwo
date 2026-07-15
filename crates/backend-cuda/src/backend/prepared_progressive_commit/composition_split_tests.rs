@@ -20,15 +20,15 @@ fn production_schedules_are_exact_and_fail_closed() {
         CompositionSplitSchedule {
             evaluation_log_size: 24,
             inverse_intervals: 3,
-            final_inverse_first_stage: 17,
-            final_inverse_stages: 8,
+            final_inverse_first_stage: 19,
+            final_inverse_stages: 6,
             first_forward_first_stage: 2,
-            first_forward_stages: 7,
+            first_forward_stages: 5,
             remaining_forward_intervals: 2,
-            shared_min_stride_log: 16,
+            shared_min_stride_log: 18,
         }
     );
-    assert_eq!(log24.schedule().first_unfused_forward_stage(), 9);
+    assert_eq!(log24.schedule().first_unfused_forward_stage(), 7);
 
     let log25 = CompositionSplitProgram::compile(25).unwrap();
     assert_eq!(log25.schedule().first_unfused_forward_stage(), 7);
@@ -65,7 +65,7 @@ fn production_schedules_are_exact_and_fail_closed() {
 fn production_launch_mode_admission_is_exact() {
     let log24 = CompositionSplitProgram::compile(24).unwrap();
     assert!(log24.admits_launch_mode(CompositionSplitLaunchMode::TerminalFallback));
-    assert!(!log24.admits_launch_mode(CompositionSplitLaunchMode::FusedFirstForward));
+    assert!(log24.admits_launch_mode(CompositionSplitLaunchMode::FusedFirstForward));
 
     let log25 = CompositionSplitProgram::compile(25).unwrap();
     assert!(log25.admits_launch_mode(CompositionSplitLaunchMode::TerminalFallback));

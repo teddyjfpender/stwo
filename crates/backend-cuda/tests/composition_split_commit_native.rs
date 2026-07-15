@@ -253,11 +253,8 @@ fn prepare<'a>(
             arena.bind(FORWARD_TWIDDLES).unwrap(),
         )
         .unwrap();
-    let candidate_launch_mode = match log_size {
-        24 => CompositionSplitLaunchMode::TerminalFallback,
-        25 => CompositionSplitLaunchMode::FusedFirstForward,
-        _ => unreachable!("production Composition log"),
-    };
+    assert!(matches!(log_size, 24 | 25));
+    let candidate_launch_mode = CompositionSplitLaunchMode::FusedFirstForward;
     let candidate_split = PreparedCompositionSplitGraph::prepare(
         arena,
         split,
@@ -752,7 +749,7 @@ fn fused_split_precomputed_commit_matches_legacy_pipeline_exactly() {
             "passed": true,
             "baseline": "b2n-plus-eight-d2d-plus-ordinary-compact-commit",
             "candidate": "qualified-split-plus-precomputed-compact-commit",
-            "log24_candidate_launch_mode": "TerminalFallback",
+            "log24_candidate_launch_mode": "FusedFirstForward",
             "log25_candidate_launch_mode": "FusedFirstForward",
             "source_postimages_equal": true,
             "coefficient_halves_equal": true,
