@@ -183,8 +183,12 @@ if [[ "$MODE" == "resources" ]]; then
     gpu-lab/tools/check-cuda-resources "$receipt" \
       --kernel '_Z32composition_split_boundary_batchILj3ELb1EE' \
       --launch-threads 256 --registers-per-sm 65536
+    if grep -Fq '_Z32composition_split_boundary_batchILj4ELb1EE' "$receipt"; then
+      echo '[cuda_compile_check] resources FAIL: unsupported log24 fused kernel was emitted'
+      exit 1
+    fi
     gpu-lab/tools/check-cuda-resources "$receipt" \
-      --kernel '_Z32composition_split_boundary_batchILj4ELb1EE' \
+      --kernel '_Z32composition_split_boundary_batchILj4ELb0EE' \
       --launch-threads 512 --registers-per-sm 65536
     rm -f "$receipt"
     trap - EXIT

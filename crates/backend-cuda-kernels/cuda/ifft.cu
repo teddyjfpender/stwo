@@ -1197,10 +1197,18 @@ cudaError_t b2n_composition_split_on(
     const unsigned final_stages = static_cast<unsigned>(parts[count - 1]);
     if (start_stage + final_stages - 1 != log_n)
         return cudaErrorInvalidConfiguration;
-    if (log_n == 24 && final_stages == 8)
-        return launch_composition_split_boundary_on<4, FUSE_FIRST_FORWARD>(
-            sources, retained_outputs, log_n, start_stage, inverse_twiddles,
-            forward_twiddles, stream);
+    if (log_n == 24 && final_stages == 8) {
+        if constexpr (FUSE_FIRST_FORWARD) {
+            // The SM90 log-24 fused specialization needs 207 registers across
+            // 512 threads, so CUDA caps it at 256 threads.  Keep this raw entry
+            // fail-closed instead of emitting a graph that instantiates as 701.
+            return cudaErrorNotSupported;
+        } else {
+            return launch_composition_split_boundary_on<4, false>(
+                sources, retained_outputs, log_n, start_stage, inverse_twiddles,
+                forward_twiddles, stream);
+        }
+    }
     if (log_n == 25 && final_stages == 6)
         return launch_composition_split_boundary_on<3, FUSE_FIRST_FORWARD>(
             sources, retained_outputs, log_n, start_stage, inverse_twiddles,

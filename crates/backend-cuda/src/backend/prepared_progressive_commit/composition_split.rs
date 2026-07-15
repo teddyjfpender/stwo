@@ -2,9 +2,10 @@
 //!
 //! The production lane is deliberately narrow: four coordinate evaluations at
 //! log 24 or 25 become eight canonical retained columns.  The CUDA operator
-//! fuses the final inverse interval, coefficient-half split, zero-extension
-//! duplication, and first forward interval.  This module seals the shape,
-//! traffic contract, and independent CPU oracle; unsupported schedules fail.
+//! either uses the qualified terminal split or fuses the final inverse interval,
+//! coefficient-half split, zero-extension duplication, and first forward
+//! interval.  This module seals the shape, traffic contract, and independent
+//! CPU oracle; unsupported schedules and launch modes fail closed.
 
 use core::ffi::c_void;
 
@@ -145,6 +146,10 @@ pub struct CompositionSplitProgram {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CompositionSplitError {
     UnsupportedProductionLog(u32),
+    UnsupportedLaunchMode {
+        evaluation_log_size: u32,
+        mode: CompositionSplitLaunchMode,
+    },
     InvalidSchedule,
     SourceColumnCount {
         expected: usize,
@@ -224,6 +229,18 @@ impl CompositionSplitProgram {
 
     pub const fn traffic(self) -> CompositionSplitTraffic {
         self.traffic
+    }
+
+    /// The log-24 fused boundary needs 207 registers across a 512-thread CTA
+    /// on SM90, exceeding the 65,536-register block budget.  Its spill-free
+    /// terminal path remains exact; log 25's 256-thread fused boundary is legal.
+    pub const fn admits_launch_mode(self, mode: CompositionSplitLaunchMode) -> bool {
+        match mode {
+            CompositionSplitLaunchMode::TerminalFallback => true,
+            CompositionSplitLaunchMode::FusedFirstForward => {
+                self.schedule.evaluation_log_size == 25
+            }
+        }
     }
 
     pub fn arena_slot_requirements(
@@ -346,6 +363,12 @@ impl<'a> PreparedCompositionSplitGraph<'a> {
         inverse_twiddles: ArenaSlice,
         forward_twiddles: ArenaSlice,
     ) -> Result<Self, CompositionSplitError> {
+        if !program.admits_launch_mode(mode) {
+            return Err(CompositionSplitError::UnsupportedLaunchMode {
+                evaluation_log_size: program.schedule.evaluation_log_size,
+                mode,
+            });
+        }
         let context = arena.context();
         let rows = words(program.schedule.evaluation_log_size)?;
         let twiddle_words = rows / 2;
