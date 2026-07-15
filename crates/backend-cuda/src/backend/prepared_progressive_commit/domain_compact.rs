@@ -14,6 +14,8 @@ const WORD_BYTES: u64 = core::mem::size_of::<u32>() as u64;
 const HASH_WORDS: usize = core::mem::size_of::<Blake2sHash>() / core::mem::size_of::<u32>();
 const HASH_BYTES: u64 = core::mem::size_of::<Blake2sHash>() as u64;
 const SCRATCH_HASHES: usize = 2;
+const SHARED_IN_PLACE_SCRATCH_WORDS: usize =
+    super::super::progressive_commit_in_place::PROGRESSIVE_IN_PLACE_SCRATCH_WORDS;
 const CACHE_TAG: &[u8] = b"stwo-domain-cooperative-compact-h8-v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -343,7 +345,10 @@ impl CompactDomainProgram {
         }
         let slab_words = rows_usize(base.identity().config.lifting_log_size)?
             .checked_mul(HASH_WORDS)
-            .and_then(|words| words.checked_add(SCRATCH_HASHES * HASH_WORDS))
+            // Preserve the qualified progressive/Merkle one-slab admission
+            // contract. Compact expansion uses only two saved hashes, but the
+            // shared suffix still requires its existing 48-word tail.
+            .and_then(|words| words.checked_add(SHARED_IN_PLACE_SCRATCH_WORDS))
             .ok_or(CompactDomainProgramError::SizeOverflow)?;
         let saved = domain
             .slab_words()

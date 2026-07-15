@@ -35,15 +35,15 @@ fn compact_program(logs: &[u32], lifting: u32) -> CompactDomainProgram {
 }
 
 #[test]
-fn exact_sn1_capacity_cut_is_two_gib_plus_scratch_delta() {
+fn exact_sn1_capacity_cut_is_two_gib_with_qualified_shared_scratch() {
     let base = base_program(&[3, 4], 25);
     let domain = DomainCooperativeProgram::compile_mode_a(&base).unwrap();
     let compact = CompactDomainProgram::compile(&base, &domain).unwrap();
     let comparison = compact.comparison();
     assert_eq!(comparison.current_state_slab_words, 805_306_416);
-    assert_eq!(comparison.replacement_state_slab_words, 268_435_472);
-    assert_eq!(comparison.state_slab_words_saved, 536_870_944);
-    assert_eq!(comparison.state_slab_words_saved * 4, 2_147_483_776);
+    assert_eq!(comparison.replacement_state_slab_words, 268_435_504);
+    assert_eq!(comparison.state_slab_words_saved, 536_870_912);
+    assert_eq!(comparison.state_slab_words_saved * 4, 2_147_483_648);
     assert_eq!(
         compact.slab_words(),
         comparison.replacement_state_slab_words
