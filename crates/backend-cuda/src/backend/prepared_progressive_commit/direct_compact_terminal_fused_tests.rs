@@ -124,11 +124,11 @@ fn fixed16_hybrid_is_selected_only_when_exact_traffic_stays_positive() {
 
 #[test]
 fn nonadjacent_absorb_bad_lift_log_and_width_fail_closed() {
-    let batch = batch(0, 0, 1, 4);
-    let mut steps = lde_absorb(&batch).to_vec();
+    let plan = batch(0, 0, 1, 4);
+    let mut steps = lde_absorb(&plan).to_vec();
     steps.swap(0, 1);
     assert!(matches!(
-        DirectCompactTerminalProgram::compile_steps(&steps, &[batch.clone()]),
+        DirectCompactTerminalProgram::compile_steps(&steps, &[plan.clone()]),
         Err(DirectCompactTerminalError::Fallback(
             DirectCompactTerminalFallbackReason::NonAdjacentAbsorb
         ))

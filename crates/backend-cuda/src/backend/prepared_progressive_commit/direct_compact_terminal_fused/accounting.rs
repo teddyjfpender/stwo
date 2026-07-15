@@ -271,7 +271,7 @@ pub(super) fn batch_receipt(
 }
 
 pub(super) fn checked_sum(
-    values: impl Iterator<Item = u64>,
+    mut values: impl Iterator<Item = u64>,
 ) -> Result<u64, DirectCompactTerminalError> {
     values
         .try_fold(0u64, |total, value| total.checked_add(value))
@@ -279,7 +279,7 @@ pub(super) fn checked_sum(
 }
 
 pub(super) fn checked_sum_u32(
-    values: impl Iterator<Item = u32>,
+    mut values: impl Iterator<Item = u32>,
 ) -> Result<u32, DirectCompactTerminalError> {
     values
         .try_fold(0u32, |total, value| total.checked_add(value))
@@ -287,7 +287,7 @@ pub(super) fn checked_sum_u32(
 }
 
 pub(super) fn checked_sum_i32(
-    values: impl Iterator<Item = i32>,
+    mut values: impl Iterator<Item = i32>,
 ) -> Result<i32, DirectCompactTerminalError> {
     values
         .try_fold(0i32, |total, value| total.checked_add(value))
