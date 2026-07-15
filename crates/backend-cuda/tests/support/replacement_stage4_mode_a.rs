@@ -196,33 +196,7 @@ fn raw_prefix_boundaries() -> (usize, BTreeMap<String, String>) {
 }
 
 fn integrated_commit() -> (usize, BTreeMap<String, String>) {
-    let config = CommitWorkspaceConfig {
-        log_blowup_factor: 1,
-        lifting_log_size: 7,
-        unretained_bottom_layers: 4,
-        max_fused_tail_levels: 2,
-    };
-    let geometry = ProgressiveCommitGeometry {
-        lifting_log_size: 7,
-        log_blowup_factor: 1,
-        groups: vec![
-            ProgressiveCommitGroupGeometry {
-                coefficient_log_sizes: vec![3; 15],
-                retain_evaluations: true,
-            },
-            ProgressiveCommitGroupGeometry {
-                coefficient_log_sizes: vec![4; 18],
-                retain_evaluations: true,
-            },
-        ],
-    };
-    let base = CommitProgram::compile(
-        config,
-        geometry,
-        ProgressiveNttLeafFusionMode::Fused16,
-        true,
-    )
-    .unwrap();
+    let base = integrated_program();
     let requirements = base.requirements();
     assert_eq!(requirements.leaves.plan.columns.len(), COLUMNS);
     assert!(requirements
@@ -234,17 +208,7 @@ fn integrated_commit() -> (usize, BTreeMap<String, String>) {
     let slots = workspace_slots(requirements);
     let (legacy_arena, legacy_bytes) = commit_arena(requirements, &slots);
     let (candidate_arena, candidate_bytes) = commit_arena(requirements, &slots);
-    let twiddles = CpuBackend::precompute_twiddles(
-        CanonicCoset::new(config.lifting_log_size)
-            .circle_domain()
-            .half_coset,
-    );
-    let twiddle_words = twiddles
-        .twiddles
-        .iter()
-        .map(|value| value.0)
-        .collect::<Vec<_>>();
-    assert_eq!(twiddle_words.len(), requirements.leaves.twiddle_words);
+    let twiddle_words = required_twiddle_words(requirements);
     let first_coefficients = coefficient_set(requirements, 0x243f_6a88);
     let second_coefficients = coefficient_set(requirements, 0x85a3_08d3);
     for device in [&legacy_arena, &candidate_arena] {
@@ -341,6 +305,66 @@ fn integrated_commit() -> (usize, BTreeMap<String, String>) {
         hash_words(&replay_candidate),
     );
     (legacy_bytes + candidate_bytes, hashes)
+}
+
+fn integrated_program() -> CommitProgram {
+    CommitProgram::compile(
+        CommitWorkspaceConfig {
+            log_blowup_factor: 1,
+            lifting_log_size: 7,
+            unretained_bottom_layers: 4,
+            max_fused_tail_levels: 2,
+        },
+        ProgressiveCommitGeometry {
+            lifting_log_size: 7,
+            log_blowup_factor: 1,
+            groups: vec![
+                ProgressiveCommitGroupGeometry {
+                    coefficient_log_sizes: vec![3; 15],
+                    retain_evaluations: true,
+                },
+                ProgressiveCommitGroupGeometry {
+                    coefficient_log_sizes: vec![4; 18],
+                    retain_evaluations: true,
+                },
+            ],
+        },
+        ProgressiveNttLeafFusionMode::Fused16,
+        true,
+    )
+    .unwrap()
+}
+
+fn required_twiddle_words(requirements: &ProgressiveCommitWorkspaceRequirements) -> Vec<u32> {
+    let full = forward_twiddle_words(requirements.leaves.plan.geometry.lifting_log_size);
+    assert!(full.len() >= requirements.leaves.twiddle_words);
+    full[full.len() - requirements.leaves.twiddle_words..].to_vec()
+}
+
+fn forward_twiddle_words(log_size: u32) -> Vec<u32> {
+    CpuBackend::precompute_twiddles(CanonicCoset::new(log_size).circle_domain().half_coset)
+        .twiddles
+        .iter()
+        .map(|value| value.0)
+        .collect()
+}
+
+#[test]
+fn compact_mode_a_twiddles_match_largest_evaluation_tree() {
+    let base = integrated_program();
+    let requirements = base.requirements();
+    let largest_evaluation_log = requirements
+        .leaves
+        .plan
+        .columns
+        .iter()
+        .map(|column| column.evaluation_log_size)
+        .max()
+        .unwrap();
+    let compact = forward_twiddle_words(largest_evaluation_log);
+
+    assert_eq!(requirements.leaves.twiddle_words, 16);
+    assert_eq!(required_twiddle_words(requirements), compact);
 }
 
 pub(super) fn workspace_slots(
