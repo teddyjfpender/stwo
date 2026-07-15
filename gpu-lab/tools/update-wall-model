@@ -199,6 +199,12 @@ def update(model: dict[str, Any], cheap_ab: Any | None = None) -> dict[str, Any]
         )
     if not same_h100_ab:
         reasons.append("same-H100 bounded segment A/B is missing")
+    if not threshold_possible:
+        next_step = "complete additional exact-work cuts and recompute locally"
+    elif not same_h100_ab:
+        next_step = "bounded same-H100 segment A/B"
+    else:
+        next_step = None
 
     return {
         "schema": OUTPUT_SCHEMA,
@@ -210,7 +216,7 @@ def update(model: dict[str, Any], cheap_ab: Any | None = None) -> dict[str, Any]
             "same_h100_segment_ab_complete": same_h100_ab,
             "full_sn_h100_run_admitted": promoted,
             "reasons": reasons,
-            "next_h100_step": None if promoted else "bounded same-H100 segment A/B",
+            "next_h100_step": next_step,
         },
         "h100_scenarios": {
             "current_host_model": current,
@@ -279,6 +285,10 @@ def self_test() -> None:
         == 0.832936369
     )
     assert result["promotion"]["full_sn_h100_run_admitted"] is False
+    assert (
+        result["promotion"]["next_h100_step"]
+        == "complete additional exact-work cuts and recompute locally"
+    )
     assert result["cheap_gpu_directional_evidence"]["candidate_over_legacy_ratio"] == 0.8
     assert result["cheap_gpu_directional_evidence"]["used_in_h100_arithmetic"] is False
     assert result["h100_scenarios"] == without_cheap["h100_scenarios"]
