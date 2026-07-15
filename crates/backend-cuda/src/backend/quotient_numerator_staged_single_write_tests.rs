@@ -64,7 +64,7 @@ fn mixed_topology() -> Vec<QuotientNumeratorColumnTopology> {
 
 #[test]
 fn cumulative_staging_layout_is_exact_and_disjoint() {
-    let layout = coefficient_staging_layout([(7, 5), (3, 7), (9, 4)], 160).unwrap();
+    let layout = coefficient_staging_layout([(7, 5), (3, 7), (9, 4)], 160, &[usize::MAX]).unwrap();
     assert_eq!(
         layout,
         vec![
@@ -87,7 +87,7 @@ fn cumulative_staging_layout_is_exact_and_disjoint() {
             QuotientNumeratorStagedLde {
                 column: 9,
                 evaluation_log_size: 4,
-                staging_role: QuotientNumeratorStagingRole::Overflow,
+                staging_role: QuotientNumeratorStagingRole::Overflow(0),
                 role_offset_words: 0,
                 offset_words: 160,
                 len_words: 16,
@@ -102,9 +102,39 @@ fn cumulative_staging_layout_is_exact_and_disjoint() {
 }
 
 #[test]
+fn whole_lde_skips_a_role_that_is_one_word_too_small() {
+    let layout = coefficient_staging_layout([(0, 4), (1, 5)], 16, &[31, 32]).unwrap();
+    assert_eq!(
+        layout[1].staging_role(),
+        QuotientNumeratorStagingRole::Overflow(1)
+    );
+    assert_eq!(layout[1].role_offset_words(), 0);
+    assert_eq!(layout[1].len_words(), 32);
+
+    let swapped = coefficient_staging_layout([(0, 4), (1, 5)], 16, &[32, 31]).unwrap();
+    assert_eq!(
+        swapped[1].staging_role(),
+        QuotientNumeratorStagingRole::Overflow(0)
+    );
+}
+
+#[test]
+fn whole_lde_fails_closed_when_no_named_role_can_hold_it() {
+    assert_eq!(
+        coefficient_staging_layout([(0, 4), (1, 5)], 16, &[31, 31]),
+        Err(
+            QuotientNumeratorStagedSingleWriteError::InsufficientOverflowCapacity {
+                column: 1,
+                required_words: 32,
+            }
+        )
+    );
+}
+
+#[test]
 fn staging_layout_rejects_duplicate_columns() {
     assert_eq!(
-        coefficient_staging_layout([(4, 5), (4, 6)], 64),
+        coefficient_staging_layout([(4, 5), (4, 6)], 64, &[usize::MAX]),
         Err(QuotientNumeratorStagedSingleWriteError::DuplicateCoefficientColumn(4))
     );
 }
@@ -112,7 +142,7 @@ fn staging_layout_rejects_duplicate_columns() {
 #[test]
 fn staging_layout_rejects_shift_and_cumulative_overflow() {
     assert!(matches!(
-        coefficient_staging_layout([(4, usize::BITS)], usize::MAX),
+        coefficient_staging_layout([(4, usize::BITS)], usize::MAX, &[usize::MAX]),
         Err(
             QuotientNumeratorStagedSingleWriteError::StagingSizeOverflow {
                 column: 4,
@@ -123,7 +153,8 @@ fn staging_layout_rejects_shift_and_cumulative_overflow() {
     assert!(matches!(
         coefficient_staging_layout(
             [(4, usize::BITS - 1), (9, usize::BITS - 1)],
-            usize::MAX
+            usize::MAX,
+            &[usize::MAX],
         ),
         Err(
             QuotientNumeratorStagedSingleWriteError::StagingSizeOverflow {

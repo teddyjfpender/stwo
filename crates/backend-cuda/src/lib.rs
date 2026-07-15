@@ -124,7 +124,9 @@ pub use backend::prepared_progressive_commit::{
     PreparedProgressiveLeaves, ProgressiveBatchRequirements, ProgressiveBatchSlots,
     ProgressiveCommitStorageMode, ProgressiveCommitWorkspaceRequirements,
     ProgressiveCommitWorkspaceSlots, ProgressiveLeafLaunchKind,
-    ProgressiveLeafWorkspaceRequirements, ProgressiveLeafWorkspaceSlots,
+    ProgressiveLeafWorkspaceRequirements, ProgressiveLeafWorkspaceSlots, ShapeWideColumn,
+    ShapeWideColumnStorage, ShapeWideCommitComparison, ShapeWideCommitProgram,
+    ShapeWideCommitProgramError, ShapeWideLeafOperation, ShapeWideLeafStep, ShapeWideSlabLayout,
 };
 pub use backend::prepared_quotient::{
     quotient_workspace_requirements, PreparedQuotientError, PreparedQuotientGraph,

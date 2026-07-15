@@ -91,7 +91,7 @@ fn assert_role_ranges(
 ) {
     for role in [
         QuotientNumeratorStagingRole::Primary,
-        QuotientNumeratorStagingRole::Overflow,
+        QuotientNumeratorStagingRole::Overflow(0),
     ] {
         let mut prior_end = 0;
         for lde in plan
@@ -104,7 +104,8 @@ fn assert_role_ranges(
         }
         let expected = match role {
             QuotientNumeratorStagingRole::Primary => report.primary_staging_words,
-            QuotientNumeratorStagingRole::Overflow => report.overflow_staging_words,
+            QuotientNumeratorStagingRole::Overflow(0) => report.overflow_staging_words,
+            QuotientNumeratorStagingRole::Overflow(_) => unreachable!(),
         };
         assert_eq!(prior_end, expected);
     }

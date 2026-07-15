@@ -78,7 +78,7 @@ impl QuotientNumeratorStagedLde {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum QuotientNumeratorStagingRole {
     Primary,
-    Overflow,
+    Overflow(u16),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -174,6 +174,10 @@ pub struct QuotientNumeratorStagedSingleWriteReport {
     /// Exact second-role size after assigning whole LDEs. This is the amount
     /// that must fit an epoch-disjoint released commitment slab.
     pub overflow_staging_words: usize,
+    /// Number of separately owned overflow roles. Each staged LDE belongs to
+    /// exactly one role and can never straddle two released commitment slabs.
+    pub overflow_staging_role_count: usize,
+    pub max_overflow_staging_role_words: usize,
     /// Arithmetic footprint delta; it may be smaller than `overflow` because
     /// the primary role can retain an unusable tail smaller than the next LDE.
     pub incremental_staging_words_over_factor32: usize,
@@ -223,6 +227,17 @@ impl QuotientNumeratorStagedSingleWritePlan {
     pub fn report(&self) -> QuotientNumeratorStagedSingleWriteReport {
         self.report
     }
+
+    /// Exact used extent of each dense overflow role, in role-index order.
+    pub fn overflow_role_words(&self) -> Vec<usize> {
+        let mut roles = vec![0; self.report.overflow_staging_role_count];
+        for lde in &self.coefficient_ldes {
+            if let QuotientNumeratorStagingRole::Overflow(role) = lde.staging_role() {
+                roles[usize::from(role)] = roles[usize::from(role)].max(lde.role_end_words());
+            }
+        }
+        roles
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -235,6 +250,10 @@ pub enum QuotientNumeratorStagedSingleWriteError {
         actual_words: usize,
     },
     Factor32TileOverflow,
+    InsufficientOverflowCapacity {
+        column: usize,
+        required_words: usize,
+    },
     StagingSizeOverflow {
         column: usize,
         evaluation_log_size: u32,
@@ -263,6 +282,20 @@ pub fn quotient_numerator_staged_single_write_plan(
     config: QuotientNumeratorWorkspaceConfig,
     columns: &[QuotientNumeratorColumnTopology],
 ) -> Result<QuotientNumeratorStagedSingleWritePlan, QuotientNumeratorStagedSingleWriteError> {
+    quotient_numerator_staged_single_write_plan_with_overflow_capacities(
+        config,
+        columns,
+        &[usize::MAX],
+    )
+}
+
+/// Compile the same immutable manifest while constraining every overflow LDE
+/// to one named physical-role capacity supplied by the resident arena planner.
+pub fn quotient_numerator_staged_single_write_plan_with_overflow_capacities(
+    config: QuotientNumeratorWorkspaceConfig,
+    columns: &[QuotientNumeratorColumnTopology],
+    overflow_capacities_words: &[usize],
+) -> Result<QuotientNumeratorStagedSingleWritePlan, QuotientNumeratorStagedSingleWriteError> {
     let legacy = build_plan(config, columns)?;
     let factor32_words = 1usize
         .checked_shl(config.lifting_log_size)
@@ -282,8 +315,11 @@ pub fn quotient_numerator_staged_single_write_plan(
             .iter()
             .map(|&column| (column, batch.evaluation_log_size))
     });
-    let coefficient_ldes =
-        coefficient_staging_layout(coefficient_entries, legacy.requirements.lde_tile_words)?;
+    let coefficient_ldes = coefficient_staging_layout(
+        coefficient_entries,
+        legacy.requirements.lde_tile_words,
+        overflow_capacities_words,
+    )?;
     let mut operations = Vec::new();
     let mut first_lde = 0usize;
     for batch in &legacy.batches {
@@ -455,11 +491,13 @@ pub fn quotient_numerator_staged_single_write_plan(
 fn coefficient_staging_layout(
     entries: impl IntoIterator<Item = (usize, u32)>,
     primary_capacity_words: usize,
+    overflow_capacities_words: &[usize],
 ) -> Result<Vec<QuotientNumeratorStagedLde>, QuotientNumeratorStagedSingleWriteError> {
     let mut seen = BTreeSet::new();
     let mut offset_words = 0usize;
     let mut primary_offset_words = 0usize;
-    let mut overflow_offset_words = 0usize;
+    let mut overflow_offsets_words = vec![0usize; overflow_capacities_words.len()];
+    let mut overflow_role = 0usize;
     let mut overflow_started = false;
     let mut ldes = Vec::new();
     for (column, evaluation_log_size) in entries {
@@ -493,14 +531,40 @@ fn coefficient_staging_layout(
                 (QuotientNumeratorStagingRole::Primary, role_offset)
             } else {
                 overflow_started = true;
-                let role_offset = overflow_offset_words;
-                overflow_offset_words = overflow_offset_words.checked_add(len_words).ok_or(
-                    QuotientNumeratorStagedSingleWriteError::StagingSizeOverflow {
-                        column,
-                        evaluation_log_size,
-                    },
-                )?;
-                (QuotientNumeratorStagingRole::Overflow, role_offset)
+                loop {
+                    let Some((&capacity, role_offset)) = overflow_capacities_words
+                        .get(overflow_role)
+                        .zip(overflow_offsets_words.get_mut(overflow_role))
+                    else {
+                        return Err(
+                            QuotientNumeratorStagedSingleWriteError::InsufficientOverflowCapacity {
+                                column,
+                                required_words: len_words,
+                            },
+                        );
+                    };
+                    let role_next = role_offset.checked_add(len_words).ok_or(
+                        QuotientNumeratorStagedSingleWriteError::StagingSizeOverflow {
+                            column,
+                            evaluation_log_size,
+                        },
+                    )?;
+                    if role_next <= capacity {
+                        let offset = *role_offset;
+                        *role_offset = role_next;
+                        let role = u16::try_from(overflow_role).map_err(|_| {
+                            QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+                                "overflow role index exceeds u16",
+                            )
+                        })?;
+                        break (QuotientNumeratorStagingRole::Overflow(role), offset);
+                    }
+                    overflow_role = overflow_role.checked_add(1).ok_or(
+                        QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+                            "overflow role index overflowed",
+                        ),
+                    )?;
+                }
             };
         ldes.push(QuotientNumeratorStagedLde {
             column,
@@ -550,12 +614,23 @@ fn build_report(
         .map(|lde| lde.role_end_words())
         .max()
         .unwrap_or(0);
-    let overflow_staging_words = ldes
-        .iter()
-        .filter(|lde| lde.staging_role() == QuotientNumeratorStagingRole::Overflow)
-        .map(|lde| lde.role_end_words())
-        .max()
-        .unwrap_or(0);
+    let mut overflow_roles = BTreeMap::<u16, usize>::new();
+    for lde in ldes {
+        if let QuotientNumeratorStagingRole::Overflow(role) = lde.staging_role() {
+            overflow_roles
+                .entry(role)
+                .and_modify(|words| *words = (*words).max(lde.role_end_words()))
+                .or_insert_with(|| lde.role_end_words());
+        }
+    }
+    let overflow_staging_words = overflow_roles.values().try_fold(0usize, |total, &words| {
+        total.checked_add(words).ok_or(
+            QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+                "overflow staging word count overflowed",
+            ),
+        )
+    })?;
+    let max_overflow_staging_role_words = overflow_roles.values().copied().max().unwrap_or(0);
     if primary_staging_words > requirements.lde_tile_words
         || primary_staging_words
             .checked_add(overflow_staging_words)
@@ -634,6 +709,8 @@ fn build_report(
         primary_staging_words,
         unused_factor32_staging_words,
         overflow_staging_words,
+        overflow_staging_role_count: overflow_roles.len(),
+        max_overflow_staging_role_words,
         incremental_staging_words_over_factor32,
     })
 }
