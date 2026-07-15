@@ -303,13 +303,33 @@ mod progressive_blake2s_state_tests {
             *mut Blake2sHash,
             *mut core::ffi::c_void,
         ) -> i32;
+        type TerminalPairFn = unsafe extern "C" fn(
+            u32,
+            u32,
+            u32,
+            *const *mut u32,
+            u32,
+            *const CompactBlake2sTailDescriptor,
+            *mut u32,
+            u32,
+            *mut Blake2sHash,
+            *mut core::ffi::c_void,
+        ) -> i32;
         let _: AbsorbFn = super::stwo_blake2s_compact_absorb_quad_on;
+        let _: TerminalPairFn =
+            super::stwo_blake2s_compact_absorb_n2b_terminal_pair_on;
         let _: ExpandFn = super::stwo_blake2s_compact_expand_in_place_on;
         let _: FinalizeFn = super::stwo_blake2s_compact_finalize_quad_in_place_on;
 
         let native = include_str!("../cuda/blake2s_quad.cu");
         assert!(native.contains("const CompactBlake2sTailDescriptor descriptor = *tail;"));
         assert!(native.contains("CompactBlake2sTailDescriptor tail,"));
+        assert!(native.contains("__syncwarp(pair_mask);"));
+        assert!(native.contains("prefinal_columns[consumed + local][row]"));
+        assert!(native.contains("stwo_n2b_final_pair("));
+        let terminal = include_str!("../cuda/n2b_terminal.cuh");
+        assert!(terminal.contains("const m31 left = prefinal[2 * pair]"));
+        assert!(terminal.contains("const m31 right = prefinal[2 * pair + 1]"));
         let expansion = include_str!("../cuda/progressive_commit_in_place.cu");
         assert!(expansion.contains("2 * sizeof(Blake2sHash)"));
     }
@@ -939,6 +959,20 @@ extern "C" {
         states: *mut Blake2sHash,
         stream: *mut core::ffi::c_void,
     ) -> i32;
+    /// Final-circle producer plus compact absorb. The native eight-lane owner
+    /// loads a complete sibling pair before writing either retained word.
+    pub fn stwo_blake2s_compact_absorb_n2b_terminal_pair_on(
+        size: u32,
+        number_of_columns: u32,
+        absorbed_columns_before: u32,
+        prefinal_columns: *const *mut u32,
+        initializes_state: u32,
+        tail: *const CompactBlake2sTailDescriptor,
+        twiddles: *mut u32,
+        twiddle_words: u32,
+        states: *mut Blake2sHash,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
     pub fn stwo_blake2s_progressive_expand_on(
         from_log_size: u32,
         to_log_size: u32,
@@ -1521,6 +1555,18 @@ extern "C" {
     /// Continue N2B in place from the exact stage-one image `[c, c]` through
     /// stages 2..=`log_n`, using the device pointer table and `stream`.
     pub fn stwo_ntt_n2b_columns_from_stage_two_on(
+        device_values: *const *mut u32,
+        log_n: u32,
+        num_poly: u32,
+        g_twiddles: *mut u32,
+        twiddles_size: u32,
+        eval_domain_size: u32,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
+    /// Stage-two direct-retained successor ending immediately before the
+    /// terminal circle butterfly owned by the paired compact consumer.
+    pub fn stwo_ntt_n2b_columns_from_stage_two_before_circle_on(
         device_values: *const *mut u32,
         log_n: u32,
         num_poly: u32,
@@ -2790,6 +2836,8 @@ mod direct_retained_b2n_contract_tests {
     fn direct_retained_b2n_abi_is_linked() {
         let _: DirectRetainedB2nFn = stwo_ntt_b2n_columns_to_retained_on;
         let _: StageTwoN2bFn = stwo_ntt_n2b_columns_from_stage_two_on;
+        let _: StageTwoN2bFn =
+            stwo_ntt_n2b_columns_from_stage_two_before_circle_on;
     }
 
     fn optimized_partition(log_n: u32) -> Vec<u32> {
@@ -2928,7 +2976,9 @@ mod direct_retained_b2n_contract_tests {
             "first_stage > 2",
             "eval_domain_size != (1u << (log_n - 1))",
             "stwo_ntt_n2b_columns_from_stage_two_on",
+            "stwo_ntt_n2b_columns_from_stage_two_before_circle_on",
             "eval_domain_size, 2, cuda_stream",
+            "false, false",
         ] {
             assert!(
                 source.contains(required),

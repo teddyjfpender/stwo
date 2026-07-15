@@ -160,6 +160,21 @@ int stwo_blake2s_compact_absorb_quad_on(
     const CompactBlake2sTailDescriptor *tail,
     Blake2sHash *states,
     void *stream);
+// Terminal-retained direct-N2B twin. Each eight-lane owner loads both
+// pre-final siblings before either canonical evaluation is written, then the
+// two four-lane halves absorb the two rows using the compact h8 protocol.
+extern "C"
+int stwo_blake2s_compact_absorb_n2b_terminal_pair_on(
+    uint32_t size,
+    uint32_t number_of_columns,
+    uint32_t absorbed_columns_before,
+    uint32_t **prefinal_columns,
+    uint32_t initializes_state,
+    const CompactBlake2sTailDescriptor *tail,
+    uint32_t *twiddles,
+    uint32_t twiddle_words,
+    Blake2sHash *states,
+    void *stream);
 extern "C"
 int stwo_blake2s_progressive_expand_on(
     uint32_t from_log_size,

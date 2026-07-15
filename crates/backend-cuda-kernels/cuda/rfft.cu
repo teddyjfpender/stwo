@@ -1540,6 +1540,36 @@ extern "C" int stwo_ntt_n2b_columns_from_stage_two_on(
     return cudaSuccess;
 }
 
+extern "C" int stwo_ntt_n2b_columns_from_stage_two_before_circle_on(
+    uint32_t **device_values,
+    unsigned log_n,
+    unsigned num_poly,
+    uint32_t *g_twiddles,
+    unsigned twiddles_size,
+    unsigned eval_domain_size,
+    void *stream
+) {
+    if (device_values == nullptr || g_twiddles == nullptr || stream == nullptr ||
+        log_n < 3 || log_n > 30 || num_poly == 0 ||
+        eval_domain_size != (1u << (log_n - 1)) ||
+        eval_domain_size > twiddles_size) {
+        return cudaErrorInvalidValue;
+    }
+
+    cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    for (unsigned base = 0; base < num_poly; base += MAX_NTT_BATCH_COLUMNS) {
+        const unsigned chunk = min(num_poly - base, MAX_NTT_BATCH_COLUMNS);
+        cudaError_t err = ntt_n2b_columns_dispatch_from_stage_on(
+            reinterpret_cast<m31 **>(device_values + base), log_n, chunk,
+            g_twiddles, twiddles_size, eval_domain_size, 2, cuda_stream,
+            false, false);
+        if (err != cudaSuccess) {
+            return err;
+        }
+    }
+    return cudaSuccess;
+}
+
 __global__ void stage_lde_columns(
     const uint32_t *const *coefficient_values,
     const uint32_t *coefficient_sizes,

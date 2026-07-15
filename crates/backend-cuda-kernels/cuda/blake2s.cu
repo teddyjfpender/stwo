@@ -1,5 +1,6 @@
 #include "blake2s.cuh"
 #include "blake2s_progressive_scalar.cuh"
+#include "n2b_terminal.cuh"
 #include <cstdio>
 #include <cstdlib>
 #include "poly_utils.cuh"
@@ -760,12 +761,10 @@ __device__ __forceinline__ uint32_t n2b_final_value(
     uint32_t twiddle_words
 ) {
     const uint32_t half_domain = 1u << (evaluation_log_size - 1);
-    m31 *domain_twiddles = reinterpret_cast<m31 *>(twiddles + twiddle_words - half_domain);
     const uint32_t pair = evaluation_index >> 1;
-    const m31 left = prefinal[2 * pair];
-    const m31 right = prefinal[2 * pair + 1];
-    const m31 product = mul(get_circle_twiddle(domain_twiddles, pair), right);
-    return (evaluation_index & 1) == 0 ? add(left, product) : sub(left, product);
+    const StwoN2bFinalPair values = stwo_n2b_final_pair(
+        prefinal, pair, half_domain, twiddles, twiddle_words);
+    return (evaluation_index & 1) == 0 ? values.even : values.odd;
 }
 
 // Hash-from-tile fusion. One bounded block owns 256 lifted leaves and performs

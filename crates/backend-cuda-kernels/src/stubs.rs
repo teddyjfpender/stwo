@@ -1302,6 +1302,22 @@ pub unsafe extern "C" fn stwo_blake2s_compact_absorb_quad_on(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_blake2s_compact_absorb_n2b_terminal_pair_on(
+    _size: u32,
+    _number_of_columns: u32,
+    _absorbed_columns_before: u32,
+    _prefinal_columns: *const *mut u32,
+    _initializes_state: u32,
+    _tail: *const CompactBlake2sTailDescriptor,
+    _twiddles: *mut u32,
+    _twiddle_words: u32,
+    _states: *mut Blake2sHash,
+    _stream: *mut c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_blake2s_compact_absorb_n2b_terminal_pair_on")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stwo_blake2s_progressive_expand_on(
     _from_log_size: u32,
     _to_log_size: u32,
@@ -2051,6 +2067,19 @@ pub unsafe extern "C" fn stwo_ntt_n2b_columns_from_stage_two_on(
     _stream: *mut core::ffi::c_void,
 ) -> i32 {
     no_cuda_symbol("stwo_ntt_n2b_columns_from_stage_two_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_ntt_n2b_columns_from_stage_two_before_circle_on(
+    _device_values: *const *mut u32,
+    _log_n: u32,
+    _num_poly: u32,
+    _g_twiddles: *mut u32,
+    _twiddles_size: u32,
+    _eval_domain_size: u32,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_ntt_n2b_columns_from_stage_two_before_circle_on")
 }
 
 #[unsafe(no_mangle)]

@@ -1,4 +1,5 @@
 #include "blake2s.cuh"
+#include "n2b_terminal.cuh"
 
 // Low-register streaming Blake2s leaf update. The scalar implementation keeps
 // h[8], m[16], and v[16] in one thread and reaches the SM90 255-register
@@ -10,7 +11,10 @@ namespace {
 
 constexpr uint32_t kBlockThreads = 256;
 constexpr uint32_t kQuadWidth = 4;
+constexpr uint32_t kTerminalPairWidth = 8;
 constexpr uint32_t kLeavesPerBlock = kBlockThreads / kQuadWidth;
+constexpr uint32_t kTerminalPairsPerBlock =
+    kBlockThreads / kTerminalPairWidth;
 constexpr uint32_t kMaxQuadRows = 1u << 30;
 #ifndef STWO_BLAKE2S_QUAD_MIN_BLOCKS
 #define STWO_BLAKE2S_QUAD_MIN_BLOCKS 6
@@ -328,6 +332,95 @@ void compact_leaf_absorb_quad(
     states[row].s[quad_lane + 4] = h_high;
 }
 
+// Direct retained N2B stops before the final circle butterfly. One eight-lane
+// owner covers an adjacent row pair: its lower quad loads each pre-final pair
+// once and stages both results, all eight lanes rendezvous, then and only then
+// are the canonical retained words written. The two quads subsequently run
+// the exact compact absorb stream for their respective rows.
+__global__ __launch_bounds__(kBlockThreads,
+                             STWO_BLAKE2S_PROGRESSIVE_QUAD_MIN_BLOCKS)
+void compact_leaf_absorb_n2b_terminal_pair(
+    uint32_t size,
+    uint32_t number_of_columns,
+    uint32_t absorbed_columns_before,
+    uint32_t **prefinal_columns,
+    uint32_t initializes_state,
+    CompactBlake2sTailDescriptor tail,
+    uint32_t *twiddles,
+    uint32_t twiddle_words,
+    Blake2sHash *states) {
+    const uint32_t thread = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t pair = thread / kTerminalPairWidth;
+    if (pair >= size / 2) return;
+
+    const uint32_t lane_in_pair = threadIdx.x & 7u;
+    const uint32_t row_in_pair = lane_in_pair / kQuadWidth;
+    const uint32_t quad_lane = lane_in_pair & 3u;
+    const uint32_t row = 2 * pair + row_in_pair;
+    const uint32_t lane_in_warp = threadIdx.x & 31u;
+    const uint32_t pair_mask = 0xffu << (lane_in_warp & ~7u);
+    const uint32_t quad_mask = 0xfu << (lane_in_warp & ~3u);
+    const uint32_t local_pair = threadIdx.x / kTerminalPairWidth;
+    __shared__ uint32_t messages[kTerminalPairsPerBlock][2][16];
+
+    uint32_t h_low = initializes_state != 0
+        ? kIv[quad_lane] ^ (quad_lane == 0 ? 0x01010020u : 0u)
+        : states[row].s[quad_lane];
+    uint32_t h_high = initializes_state != 0
+        ? kIv[quad_lane + 4]
+        : states[row].s[quad_lane + 4];
+    uint32_t pending_words = progressive_pending_words(absorbed_columns_before);
+    for (uint32_t word = quad_lane; word < pending_words;
+         word += kQuadWidth) {
+        const uint32_t *column = reinterpret_cast<const uint32_t *>(
+            tail.column_addresses[word]);
+        messages[local_pair][row_in_pair][word] =
+            column[lifted_index(row, tail.log_ratios[word])];
+    }
+    __syncwarp(pair_mask);
+
+    uint32_t compressed_bytes =
+        4u * (absorbed_columns_before - pending_words);
+    uint32_t consumed = 0;
+    const uint32_t half_domain = size / 2;
+    while (consumed < number_of_columns) {
+        if (pending_words == 16) {
+            compressed_bytes += 64;
+            compress_quad(quad_mask, quad_lane, h_low, h_high,
+                          messages[local_pair][row_in_pair], compressed_bytes, 0);
+            pending_words = 0;
+            __syncwarp(pair_mask);
+        }
+        const uint32_t available = 16 - pending_words;
+        const uint32_t remaining = number_of_columns - consumed;
+        const uint32_t fill = available < remaining ? available : remaining;
+        for (uint32_t first = 0; first < fill; first += kQuadWidth) {
+            const uint32_t local = first + quad_lane;
+            if (row_in_pair == 0 && local < fill) {
+                const uint32_t column_index = consumed + local;
+                const StwoN2bFinalPair values = stwo_n2b_final_pair(
+                    prefinal_columns[column_index], pair, half_domain,
+                    twiddles, twiddle_words);
+                messages[local_pair][0][pending_words + local] = values.even;
+                messages[local_pair][1][pending_words + local] = values.odd;
+            }
+            // Ordering proof: every sibling load in this four-column tranche
+            // completes before either half of the pair reaches the write.
+            __syncwarp(pair_mask);
+            if (local < fill) {
+                prefinal_columns[consumed + local][row] =
+                    messages[local_pair][row_in_pair][pending_words + local];
+            }
+            __syncwarp(pair_mask);
+        }
+        pending_words += fill;
+        consumed += fill;
+    }
+
+    states[row].s[quad_lane] = h_low;
+    states[row].s[quad_lane + 4] = h_high;
+}
+
 __global__ __launch_bounds__(kBlockThreads,
                              STWO_BLAKE2S_PROGRESSIVE_QUAD_MIN_BLOCKS)
 void compact_leaf_finalize_quad_in_place(
@@ -445,6 +538,43 @@ extern "C" int stwo_blake2s_compact_absorb_quad_on(
                                reinterpret_cast<cudaStream_t>(stream)>>>(
         size, number_of_columns, absorbed_columns_before, columns,
         initializes_state, descriptor, states);
+    return cudaGetLastError();
+}
+
+extern "C" int stwo_blake2s_compact_absorb_n2b_terminal_pair_on(
+    uint32_t size,
+    uint32_t number_of_columns,
+    uint32_t absorbed_columns_before,
+    uint32_t **prefinal_columns,
+    uint32_t initializes_state,
+    const CompactBlake2sTailDescriptor *tail,
+    uint32_t *twiddles,
+    uint32_t twiddle_words,
+    Blake2sHash *states,
+    void *stream) {
+    constexpr uint32_t kMaxCounterColumns = 0x3fffffffu;
+    if (size < 8 || size > kMaxQuadRows || (size & (size - 1)) != 0 ||
+        number_of_columns == 0 || prefinal_columns == nullptr ||
+        initializes_state > 1 ||
+        ((initializes_state != 0) != (absorbed_columns_before == 0)) ||
+        number_of_columns > kMaxCounterColumns ||
+        absorbed_columns_before > kMaxCounterColumns - number_of_columns ||
+        tail == nullptr || twiddles == nullptr || twiddle_words < size / 2 ||
+        states == nullptr || stream == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    const CompactBlake2sTailDescriptor descriptor = *tail;
+    if (!compact_tail_descriptor_valid(
+            size, absorbed_columns_before, descriptor)) {
+        return cudaErrorInvalidValue;
+    }
+    const uint32_t pairs = size / 2;
+    const uint32_t blocks =
+        1 + (pairs - 1) / kTerminalPairsPerBlock;
+    compact_leaf_absorb_n2b_terminal_pair<<<
+        blocks, kBlockThreads, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
+        size, number_of_columns, absorbed_columns_before, prefinal_columns,
+        initializes_state, descriptor, twiddles, twiddle_words, states);
     return cudaGetLastError();
 }
 
