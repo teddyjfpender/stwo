@@ -24,6 +24,16 @@ pub fn loaded_manifest_hash() -> u64 {
     hash
 }
 
+/// Exact number of kernels embedded across every target architecture.
+pub fn loaded_kernel_count() -> usize {
+    stwo_backend_cuda_kernels::aot_pack::aot_pack_entries()
+}
+
+/// Exact number of kernels embedded for one target architecture.
+pub fn loaded_kernel_count_for_arch(sm_major: u32, sm_minor: u32) -> usize {
+    stwo_backend_cuda_kernels::aot_pack::aot_pack_entries_for_arch(sm_major, sm_minor)
+}
+
 /// Exact constraint split cap used by the loaded AOT pack. Zero means the
 /// current binary has no pack and is invalid for resident composition planning.
 pub fn loaded_constraint_max_instrs() -> usize {

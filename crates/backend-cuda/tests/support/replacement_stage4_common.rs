@@ -196,7 +196,17 @@ pub fn receipt(
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|error| format!("system clock: {error}"))?
         .as_secs();
-    let git_commit = command_output("git", &["rev-parse", "HEAD"])?;
+    let git_commit = std::env::var("STWO_STAGE4_GIT_COMMIT")
+        .map_err(|_| "STWO_STAGE4_GIT_COMMIT must seal the synced source head".to_owned())?;
+    if git_commit.len() != 40
+        || !git_commit
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(format!(
+            "STWO_STAGE4_GIT_COMMIT must be 40 lowercase hex digits: {git_commit}"
+        ));
+    }
     let executable_blake3 =
         hash_file(&std::env::current_exe().map_err(|error| error.to_string())?)?;
     let source_blake3 = source_hash()?;

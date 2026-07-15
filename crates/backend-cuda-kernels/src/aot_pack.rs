@@ -39,6 +39,12 @@ pub fn aot_pack_entries() -> usize {
     AOT_INDEX.len()
 }
 
+/// Number of embedded kernels for one exact device architecture.
+pub fn aot_pack_entries_for_arch(sm_major: u32, sm_minor: u32) -> usize {
+    let sm = sm_major * 10 + sm_minor;
+    AOT_INDEX.iter().filter(|entry| entry.1 == sm).count()
+}
+
 /// Stable identity of the AOT modules embedded in this binary.
 ///
 /// The graph cache needs the semantic cache keys and target architectures, not
