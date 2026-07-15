@@ -164,10 +164,6 @@ if [[ "$MODE" == "resources" ]]; then
       '
     ")
   echo "$out"
-  if echo "$out" | grep -E '[1-9][0-9]* bytes spill (stores|loads)' >/dev/null; then
-    echo '[cuda_compile_check] resources FAIL: spills detected'
-    exit 1
-  fi
   if [[ "$ARCH" == "sm_90" ]] && printf '%s\n' "${FILES[@]}" \
       | grep -Fxq "${KERNELS_DIR}/cuda/ifft.cu"; then
     # The exact composition/B2N launchers use (32, 2^LOG_VALUES_PER_THREAD).
@@ -192,6 +188,10 @@ if [[ "$MODE" == "resources" ]]; then
       --launch-threads 512 --registers-per-sm 65536
     rm -f "$receipt"
     trap - EXIT
+  fi
+  if echo "$out" | grep -E '[1-9][0-9]* bytes spill (stores|loads)' >/dev/null; then
+    echo '[cuda_compile_check] resources FAIL: spills detected'
+    exit 1
   fi
   echo '[cuda_compile_check] resources PASS (zero spills)'
   exit 0
