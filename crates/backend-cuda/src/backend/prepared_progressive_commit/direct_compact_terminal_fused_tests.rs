@@ -1,4 +1,8 @@
 use super::*;
+use crate::backend::prepared_decommit::TraceTreeRole;
+use crate::backend::progressive_commit::{
+    ProgressiveCommitGeometry, ProgressiveCommitGroupGeometry,
+};
 
 const P: u64 = 2_147_483_647;
 
@@ -43,6 +47,168 @@ fn lde_absorb(batch: &DirectRetainedB2nBatchPlan) -> [CompactDomainStep; 2] {
             traffic: CommitProgramTraffic::default(),
         },
     ]
+}
+
+fn public_programs(
+    coefficient_log_sizes: Vec<u32>,
+) -> (CompactDomainProgram, DirectRetainedB2nProgram) {
+    let lifting_log_size = coefficient_log_sizes.iter().copied().max().unwrap() + 1;
+    let base = CommitProgram::compile(
+        CommitWorkspaceConfig {
+            log_blowup_factor: 1,
+            lifting_log_size,
+            unretained_bottom_layers: 4,
+            max_fused_tail_levels: 0,
+        },
+        ProgressiveCommitGeometry {
+            lifting_log_size,
+            log_blowup_factor: 1,
+            groups: vec![ProgressiveCommitGroupGeometry {
+                coefficient_log_sizes,
+                retain_evaluations: true,
+            }],
+        },
+        ProgressiveNttLeafFusionMode::Separate,
+        false,
+    )
+    .unwrap();
+    let domain = DomainCooperativeProgram::compile_mode_a(&base).unwrap();
+    let compact = CompactDomainProgram::compile(&base, &domain).unwrap();
+    let direct = DirectRetainedB2nProgram::compile(TraceTreeRole::Base, &base).unwrap();
+    (compact, direct)
+}
+
+fn assert_receipt_invariants(receipt: &DirectCompactTerminalReceipt) {
+    macro_rules! sum {
+        ($field:ident) => {
+            receipt.batches.iter().map(|batch| batch.$field).sum::<_>()
+        };
+    }
+
+    for batch in &receipt.batches {
+        assert_eq!(
+            batch.canonical_retained_write_bytes,
+            (1u64 << batch.log_size)
+                * u64::from(batch.columns)
+                * core::mem::size_of::<u32>() as u64
+        );
+    }
+    assert_eq!(
+        receipt.separate_absorb_reread_bytes_removed,
+        sum!(separate_absorb_reread_bytes_removed)
+    );
+    assert_eq!(
+        receipt.terminal_prefinal_read_bytes_added,
+        sum!(terminal_prefinal_read_bytes_added)
+    );
+    assert_eq!(
+        receipt.compact_tail_reread_bytes_added,
+        sum!(compact_tail_reread_bytes_added)
+    );
+    assert_eq!(receipt.net_read_bytes_removed, sum!(net_read_bytes_removed));
+    assert_eq!(
+        receipt.terminal_prefinal_write_bytes_added,
+        sum!(terminal_prefinal_write_bytes_added)
+    );
+    assert_eq!(
+        receipt.net_device_bytes_removed,
+        sum!(net_device_bytes_removed)
+    );
+    assert_eq!(
+        receipt.canonical_retained_write_bytes_before,
+        sum!(canonical_retained_write_bytes)
+    );
+    assert_eq!(
+        receipt.canonical_retained_write_bytes_after,
+        receipt.canonical_retained_write_bytes_before
+    );
+    assert_eq!(
+        receipt.separate_absorb_launches_removed,
+        sum!(separate_absorb_launches_removed)
+    );
+    assert_eq!(
+        receipt.fixed_terminal_launches,
+        sum!(fixed_terminal_launches)
+    );
+    assert_eq!(
+        receipt.extra_remainder_interval_launches,
+        sum!(extra_remainder_interval_launches)
+    );
+    assert_eq!(
+        receipt.generic_remainder_terminal_launches,
+        sum!(generic_remainder_terminal_launches)
+    );
+    assert_eq!(
+        receipt.net_cuda_launches_removed,
+        sum!(net_cuda_launches_removed)
+    );
+    assert_eq!(
+        receipt.cooperative_quad_blake2s_batches,
+        receipt
+            .batches
+            .iter()
+            .filter(|batch| batch.cooperative_quad_blake2s_sink)
+            .count() as u32
+    );
+    assert!(receipt.merkle_suffix_unchanged);
+    assert!(!receipt.same_gpu_timing_credit_applied);
+}
+
+#[test]
+fn public_program_seals_fused_hybrid_and_materialized_shapes() {
+    let (compact, direct) = public_programs(vec![12; 16]);
+    let fused = DirectCompactTerminalProgram::compile(&compact, &direct).unwrap();
+    assert_eq!(
+        fused.receipt().batches[0].mode,
+        DirectCompactTerminalBatchMode::Fixed16Hybrid {
+            fixed_columns: 16,
+            tiles: 1,
+            generic_remainder_columns: 0,
+        }
+    );
+    assert_eq!(fused.receipt().cooperative_quad_blake2s_batches, 1);
+    assert_receipt_invariants(fused.receipt());
+
+    let (compact, direct) = public_programs([vec![4; 5], vec![12; 19]].concat());
+    let hybrid = DirectCompactTerminalProgram::compile(&compact, &direct).unwrap();
+    assert_eq!(
+        hybrid
+            .receipt()
+            .batches
+            .iter()
+            .map(|batch| batch.mode)
+            .collect::<Vec<_>>(),
+        vec![
+            DirectCompactTerminalBatchMode::Materialized,
+            DirectCompactTerminalBatchMode::Fixed16Hybrid {
+                fixed_columns: 16,
+                tiles: 1,
+                generic_remainder_columns: 3,
+            },
+        ]
+    );
+    assert_receipt_invariants(hybrid.receipt());
+
+    let (compact, direct) = public_programs(vec![11; 16]);
+    let materialized = DirectCompactTerminalProgram::compile(&compact, &direct).unwrap();
+    assert_eq!(
+        materialized.receipt().batches[0].mode,
+        DirectCompactTerminalBatchMode::Materialized
+    );
+    assert_eq!(materialized.receipt().cooperative_quad_blake2s_batches, 0);
+    assert_eq!(materialized.receipt().net_device_bytes_removed, 0);
+    assert_receipt_invariants(materialized.receipt());
+}
+
+#[test]
+fn sealed_program_rejects_a_different_compact_direct_identity() {
+    let (compact, direct) = public_programs(vec![12; 16]);
+    let terminal = DirectCompactTerminalProgram::compile(&compact, &direct).unwrap();
+    let (other_compact, other_direct) = public_programs(vec![11; 16]);
+    assert_eq!(
+        terminal.validate_against(&other_compact, &other_direct),
+        Err(DirectCompactTerminalError::ProgramIdentity)
+    );
 }
 
 #[test]
@@ -91,6 +257,7 @@ fn exact_pairs_compile_in_order_and_receipt_is_byte_exact() {
     );
     assert!(program.receipt.merkle_suffix_unchanged);
     assert!(!program.receipt.same_gpu_timing_credit_applied);
+    assert_receipt_invariants(&program.receipt);
 }
 
 #[test]

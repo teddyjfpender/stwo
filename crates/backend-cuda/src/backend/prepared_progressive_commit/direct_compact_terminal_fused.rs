@@ -5,8 +5,9 @@
 //! evaluations, and advances compact state. A profitable non-16 remainder
 //! uses the paired circle sink. Every other batch executes the materialized
 //! path in the same program order. Expansion, finalization, and Merkle remain
-//! the existing qualified launches. The candidate stays crate-private until
-//! CUDA parity, narrow-SASS, and register/spill/stack gates pass.
+//! the existing qualified launches. Selection is explicit: callers compile a
+//! pure program, inspect its exact receipt, then consume that sealed program at
+//! the prepared binding boundary. The materialized binding remains separate.
 
 use super::direct_retained_b2n::PreparedBatch as DirectPreparedBatch;
 use super::domain_compact_binding::{bind_tail_descriptor, CompactStatePreparedLaunch};
@@ -31,17 +32,35 @@ enum DirectCompactTerminalOperation {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct DirectCompactTerminalProgram {
+pub struct DirectCompactTerminalProgram {
     operations: Vec<DirectCompactTerminalOperation>,
     receipt: DirectCompactTerminalReceipt,
 }
 
 impl DirectCompactTerminalProgram {
-    fn compile(
+    /// Seal terminal-fusion eligibility and its exact traffic/write receipt
+    /// without allocating CUDA resources or selecting a fallback graph.
+    pub fn compile(
         compact: &CompactDomainProgram,
         direct: &DirectRetainedB2nProgram,
     ) -> Result<Self, DirectCompactTerminalError> {
         Self::compile_steps(compact.steps(), direct.batches())
+    }
+
+    pub fn validate_against(
+        &self,
+        compact: &CompactDomainProgram,
+        direct: &DirectRetainedB2nProgram,
+    ) -> Result<(), DirectCompactTerminalError> {
+        if *self == Self::compile(compact, direct)? {
+            Ok(())
+        } else {
+            Err(DirectCompactTerminalError::ProgramIdentity)
+        }
+    }
+
+    pub fn receipt(&self) -> &DirectCompactTerminalReceipt {
+        &self.receipt
     }
 
     fn compile_steps(
@@ -52,42 +71,64 @@ impl DirectCompactTerminalProgram {
         let canonical_logs = canonical_logs(batches)?;
         let mut operations = Vec::with_capacity(steps.len().saturating_sub(batches.len()));
         let mut receipts = Vec::with_capacity(batches.len());
-        let mut step_index = 0usize;
         let mut expansion_launches = 0u32;
         let mut finalize_launches = 0u32;
+        let mut lde_steps = vec![None; batches.len()];
 
-        while step_index < steps.len() {
-            match steps[step_index].operation {
-                CompactDomainOperation::LdeBatch {
+        for (step_index, step) in steps.iter().enumerate() {
+            let CompactDomainOperation::LdeBatch {
+                batch_index,
+                first_column,
+                columns,
+                log_size,
+            } = step.operation
+            else {
+                continue;
+            };
+            exact_batch(batches, batch_index, first_column, columns, log_size)?;
+            admit_batch(log_size, columns, support)?;
+            let slot = lde_steps
+                .get_mut(batch_index as usize)
+                .ok_or_else(|| fallback(DirectCompactTerminalFallbackReason::NonCanonicalBatch))?;
+            if slot.replace(step_index).is_some() {
+                return Err(fallback(
+                    DirectCompactTerminalFallbackReason::NonCanonicalBatch,
+                ));
+            }
+        }
+        if lde_steps.iter().any(Option::is_none) {
+            return Err(fallback(
+                DirectCompactTerminalFallbackReason::NonAdjacentAbsorb,
+            ));
+        }
+
+        for (step_index, step) in steps.iter().enumerate() {
+            match step.operation {
+                CompactDomainOperation::LdeBatch { .. } => {}
+                CompactDomainOperation::AbsorbDomainBatch {
                     batch_index,
                     first_column,
                     columns,
                     log_size,
+                    absorbed_columns_before,
+                    initializes_state,
+                    reconstructed_tail,
+                    ..
                 } => {
                     let batch = exact_batch(batches, batch_index, first_column, columns, log_size)?;
-                    admit_batch(log_size, columns, support)?;
-                    let Some(next) = steps.get(step_index + 1) else {
+                    let lde_step = lde_steps
+                        .get(batch_index as usize)
+                        .copied()
+                        .flatten()
+                        .ok_or_else(|| {
+                            fallback(DirectCompactTerminalFallbackReason::NonAdjacentAbsorb)
+                        })?;
+                    if lde_step >= step_index {
                         return Err(fallback(
                             DirectCompactTerminalFallbackReason::NonAdjacentAbsorb,
                         ));
-                    };
-                    let CompactDomainOperation::AbsorbDomainBatch {
-                        batch_index: absorb_batch,
-                        first_column: absorb_first,
-                        columns: absorb_columns,
-                        log_size: absorb_log,
-                        absorbed_columns_before,
-                        initializes_state,
-                        reconstructed_tail,
-                        ..
-                    } = next.operation
-                    else {
-                        return Err(fallback(
-                            DirectCompactTerminalFallbackReason::NonAdjacentAbsorb,
-                        ));
-                    };
-                    if (absorb_batch, absorb_first, absorb_columns, absorb_log)
-                        != (batch_index, first_column, columns, log_size)
+                    }
+                    if batch_index as usize != receipts.len()
                         || absorbed_columns_before != first_column
                     {
                         return Err(fallback(
@@ -121,12 +162,6 @@ impl DirectCompactTerminalProgram {
                         mode,
                     });
                     receipts.push(batch_receipt(batch, mode)?);
-                    step_index += 2;
-                }
-                CompactDomainOperation::AbsorbDomainBatch { .. } => {
-                    return Err(fallback(
-                        DirectCompactTerminalFallbackReason::NonAdjacentAbsorb,
-                    ));
                 }
                 CompactDomainOperation::StateExpandInPlace {
                     from_log_size,
@@ -145,7 +180,6 @@ impl DirectCompactTerminalProgram {
                     expansion_launches = expansion_launches
                         .checked_add(1)
                         .ok_or(DirectCompactTerminalError::SizeOverflow)?;
-                    step_index += 1;
                 }
                 CompactDomainOperation::FinalizeInPlace {
                     log_size,
@@ -169,7 +203,6 @@ impl DirectCompactTerminalProgram {
                     finalize_launches = finalize_launches
                         .checked_add(1)
                         .ok_or(DirectCompactTerminalError::SizeOverflow)?;
-                    step_index += 1;
                 }
             }
         }
@@ -521,23 +554,23 @@ impl PreparedDirectCompactTerminalExecution {
 }
 
 impl CompactDomainProgram {
-    /// Bind the opt-in terminal fusion. Call [`Self::bind_prepared_direct`] for
-    /// the explicit materialized fallback when this fail-closed admission
-    /// rejects a shape.
+    /// Bind a caller-selected terminal fusion program. Call
+    /// [`Self::bind_prepared_direct`] for the explicit materialized path when
+    /// pure admission rejects a shape or the caller declines its receipt.
     #[allow(clippy::too_many_arguments)]
-    #[allow(dead_code)]
-    fn bind_prepared_direct_terminal_fused<'a>(
+    pub fn bind_prepared_direct_terminal_fused<'a>(
         &self,
         arena: &'a DeviceArena,
         base: &CommitProgram,
         domain: &DomainCooperativeProgram,
         direct_program: &DirectRetainedB2nProgram,
+        terminal: DirectCompactTerminalProgram,
         slots: &ProgressiveCommitWorkspaceSlots,
         columns: &[DirectRetainedB2nColumn],
         inverse_twiddles: ArenaSlice,
         forward_twiddles: ArenaSlice,
     ) -> Result<PreparedDirectCompactDomainCommitGraph<'a>, DirectCompactDomainBindingError> {
-        let terminal = DirectCompactTerminalProgram::compile(self, direct_program)?;
+        terminal.validate_against(self, direct_program)?;
         let mut graph = self.bind_prepared_direct(
             arena,
             base,

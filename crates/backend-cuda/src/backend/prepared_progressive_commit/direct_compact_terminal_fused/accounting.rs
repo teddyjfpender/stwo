@@ -113,6 +113,7 @@ pub struct DirectCompactTerminalReceipt {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DirectCompactTerminalError {
     Fallback(DirectCompactTerminalFallbackReason),
+    ProgramIdentity,
     SizeOverflow,
     PreparedBatch,
     Launch(DirectRetainedB2nError),

@@ -54,7 +54,9 @@ pub use direct_compact_domain_binding::{
     PreparedDirectCompactDomainCommitGraph,
 };
 pub use direct_compact_terminal_fused::{
-    DirectCompactTerminalError, DirectCompactTerminalReceipt,
+    DirectCompactTerminalBatchMode, DirectCompactTerminalBatchReceipt, DirectCompactTerminalError,
+    DirectCompactTerminalFallbackReason, DirectCompactTerminalProgram,
+    DirectCompactTerminalReceipt, DirectCompactTerminalSupport,
 };
 pub use direct_retained_b2n::{
     DirectRetainedB2nBatchPlan, DirectRetainedB2nColumn, DirectRetainedB2nError,
