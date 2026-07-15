@@ -1,6 +1,8 @@
+#include <cuda.h>
 #include <cuda_runtime.h>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <new>
 #include <vector>
 
@@ -41,6 +43,89 @@ StwoExecContext *context_from(void *handle) {
 
 cudaError_t first_error(cudaError_t current, cudaError_t candidate) {
     return current == cudaSuccess ? candidate : current;
+}
+
+void report_graph_kernel_node(
+    const char *role,
+    size_t index,
+    cudaGraphNode_t node
+) {
+    CUDA_KERNEL_NODE_PARAMS params{};
+    CUresult params_err = cuGraphKernelNodeGetParams(
+        reinterpret_cast<CUgraphNode>(node),
+        &params);
+    if (params_err != CUDA_SUCCESS) {
+        std::fprintf(
+            stderr,
+            "stwo graph: %s kernel_node=%zu params_status=%d\n",
+            role,
+            index,
+            static_cast<int>(params_err));
+        return;
+    }
+
+    int registers = 0;
+    int static_shared_bytes = 0;
+    int local_bytes = 0;
+    int max_threads = 0;
+    CUresult registers_err = cuFuncGetAttribute(
+        &registers,
+        CU_FUNC_ATTRIBUTE_NUM_REGS,
+        params.func);
+    CUresult shared_err = cuFuncGetAttribute(
+        &static_shared_bytes,
+        CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES,
+        params.func);
+    CUresult local_err = cuFuncGetAttribute(
+        &local_bytes,
+        CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES,
+        params.func);
+    CUresult threads_err = cuFuncGetAttribute(
+        &max_threads,
+        CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
+        params.func);
+    if (registers_err != CUDA_SUCCESS || shared_err != CUDA_SUCCESS ||
+        local_err != CUDA_SUCCESS || threads_err != CUDA_SUCCESS) {
+        std::fprintf(
+            stderr,
+            "stwo graph: %s kernel_node=%zu grid=%ux%ux%u block=%ux%ux%u "
+            "dynamic_smem=%u attribute_statuses=%d,%d,%d,%d func=%p\n",
+            role,
+            index,
+            params.gridDimX,
+            params.gridDimY,
+            params.gridDimZ,
+            params.blockDimX,
+            params.blockDimY,
+            params.blockDimZ,
+            params.sharedMemBytes,
+            static_cast<int>(registers_err),
+            static_cast<int>(shared_err),
+            static_cast<int>(local_err),
+            static_cast<int>(threads_err),
+            reinterpret_cast<void *>(params.func));
+        return;
+    }
+
+    std::fprintf(
+        stderr,
+        "stwo graph: %s kernel_node=%zu grid=%ux%ux%u block=%ux%ux%u "
+        "dynamic_smem=%u regs=%d static_smem=%d local_bytes=%d "
+        "max_threads=%d func=%p\n",
+        role,
+        index,
+        params.gridDimX,
+        params.gridDimY,
+        params.gridDimZ,
+        params.blockDimX,
+        params.blockDimY,
+        params.blockDimZ,
+        params.sharedMemBytes,
+        registers,
+        static_shared_bytes,
+        local_bytes,
+        max_threads,
+        reinterpret_cast<void *>(params.func));
 }
 
 __global__ void fill_u32_kernel(uint32_t *dst, uint32_t value, size_t count) {
@@ -485,18 +570,28 @@ extern "C" int stwo_graph_capture_end(void *handle, void **out_exec,
     cudaGraph_t graph = nullptr;
     cudaError_t err = cudaStreamEndCapture(context_from(handle)->stream, &graph);
     if (err != cudaSuccess) {
+        std::fprintf(
+            stderr,
+            "stwo graph: cudaStreamEndCapture failed status=%d graph=%p\n",
+            static_cast<int>(err),
+            static_cast<void *>(graph));
         if (graph != nullptr) {
             cudaGraphDestroy(graph);
         }
         return err;
     }
     if (graph == nullptr) {
+        std::fprintf(stderr, "stwo graph: cudaStreamEndCapture returned a null graph\n");
         return cudaErrorInvalidResourceHandle;
     }
 
     size_t node_count = 0;
     err = cudaGraphGetNodes(graph, nullptr, &node_count);
     if (err != cudaSuccess) {
+        std::fprintf(
+            stderr,
+            "stwo graph: cudaGraphGetNodes(count) failed status=%d\n",
+            static_cast<int>(err));
         cudaGraphDestroy(graph);
         return err;
     }
@@ -504,15 +599,25 @@ extern "C" int stwo_graph_capture_end(void *handle, void **out_exec,
     if (node_count != 0) {
         err = cudaGraphGetNodes(graph, nodes.data(), &node_count);
         if (err != cudaSuccess) {
+            std::fprintf(
+                stderr,
+                "stwo graph: cudaGraphGetNodes(nodes) failed status=%d\n",
+                static_cast<int>(err));
             cudaGraphDestroy(graph);
             return err;
         }
     }
     uint64_t kernel_nodes = 0;
-    for (cudaGraphNode_t node : nodes) {
+    for (size_t index = 0; index < node_count; ++index) {
+        cudaGraphNode_t node = nodes[index];
         cudaGraphNodeType type;
         err = cudaGraphNodeGetType(node, &type);
         if (err != cudaSuccess) {
+            std::fprintf(
+                stderr,
+                "stwo graph: cudaGraphNodeGetType failed status=%d node=%zu\n",
+                static_cast<int>(err),
+                index);
             cudaGraphDestroy(graph);
             return err;
         }
@@ -520,16 +625,67 @@ extern "C" int stwo_graph_capture_end(void *handle, void **out_exec,
     }
 
     cudaGraphExec_t exec = nullptr;
-    err = cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0);
+    cudaGraphNode_t error_node = nullptr;
+    char instantiate_log[4096] = {};
+    err = cudaGraphInstantiate(
+        &exec,
+        graph,
+        &error_node,
+        instantiate_log,
+        sizeof(instantiate_log));
+    instantiate_log[sizeof(instantiate_log) - 1] = '\0';
+    if (err != cudaSuccess) {
+        size_t error_index = node_count;
+        for (size_t index = 0; index < node_count; ++index) {
+            if (nodes[index] == error_node) {
+                error_index = index;
+                break;
+            }
+        }
+        std::fprintf(
+            stderr,
+            "stwo graph: cudaGraphInstantiate failed status=%d nodes=%zu "
+            "error_node=%p error_index=%zu log=%s\n",
+            static_cast<int>(err),
+            node_count,
+            static_cast<void *>(error_node),
+            error_index,
+            instantiate_log[0] == '\0' ? "<empty>" : instantiate_log);
+        if (error_index < node_count) {
+            cudaGraphNodeType type;
+            cudaError_t type_err = cudaGraphNodeGetType(error_node, &type);
+            std::fprintf(
+                stderr,
+                "stwo graph: instantiate error_node_type_status=%d type=%d\n",
+                static_cast<int>(type_err),
+                type_err == cudaSuccess ? static_cast<int>(type) : -1);
+            if (type_err == cudaSuccess && type == cudaGraphNodeTypeKernel) {
+                report_graph_kernel_node("instantiate_error", error_index, error_node);
+            }
+        } else {
+            for (size_t index = 0; index < node_count; ++index) {
+                cudaGraphNodeType type;
+                if (cudaGraphNodeGetType(nodes[index], &type) == cudaSuccess &&
+                    type == cudaGraphNodeTypeKernel) {
+                    report_graph_kernel_node("instantiate_candidate", index, nodes[index]);
+                }
+            }
+        }
+    }
     cudaError_t destroy_err = cudaGraphDestroy(graph);
     if (err != cudaSuccess) {
         return err;
     }
     if (destroy_err != cudaSuccess) {
+        std::fprintf(
+            stderr,
+            "stwo graph: cudaGraphDestroy failed status=%d\n",
+            static_cast<int>(destroy_err));
         cudaGraphExecDestroy(exec);
         return destroy_err;
     }
     if (exec == nullptr) {
+        std::fprintf(stderr, "stwo graph: cudaGraphInstantiate returned a null executable\n");
         return cudaErrorInvalidResourceHandle;
     }
     *out_exec = reinterpret_cast<void *>(exec);
