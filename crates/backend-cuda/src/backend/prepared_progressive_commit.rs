@@ -15,7 +15,7 @@ use super::prepared_commit::{
     bind_slot, merkle_from_leaves_requirements, CommitArenaSlotRequirement,
     CommitCoefficientColumn, CommitWorkspaceConfig, CommitWorkspaceRequirements,
     CommitWorkspaceSlots, MerkleFromLeavesRequirements, MerkleFromLeavesSlots,
-    PreparedMerkleFromLeaves,
+    PreparedMerkleFromLeaves, COMMIT_HASH_ALIGNMENT_WORDS,
 };
 use super::progressive_commit::{
     plan_progressive_commit, validate_progressive_plan, ProgressiveCommitError,
@@ -92,6 +92,12 @@ const WORD_BYTES: usize = core::mem::size_of::<u32>();
 const POINTER_WORDS: usize = core::mem::size_of::<*mut u32>().div_ceil(WORD_BYTES);
 const HASH_WORDS: usize = core::mem::size_of::<Blake2sHash>() / WORD_BYTES;
 const STATE_WORDS: usize = PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES / WORD_BYTES;
+// The 96-byte state extent is a stride, not an alignment. Keep every state row
+// 32-byte aligned so the one-slab lane can safely become aligned Blake2sHash
+// storage without moving it; 96 is an exact multiple of 32.
+const STATE_ALIGNMENT_WORDS: usize = COMMIT_HASH_ALIGNMENT_WORDS;
+const _: () = assert!(STATE_ALIGNMENT_WORDS.is_power_of_two());
+const _: () = assert!(STATE_WORDS % STATE_ALIGNMENT_WORDS == 0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProgressiveBatchRequirements {
@@ -466,10 +472,10 @@ impl ProgressiveLeafWorkspaceRequirements {
         output.push(slot_requirement(
             slots.state_ping,
             self.state_ping_words,
-            STATE_WORDS,
+            STATE_ALIGNMENT_WORDS,
         ));
         if let (Some(id), Some(len_words)) = (slots.state_pong, self.state_pong_words) {
-            output.push(slot_requirement(id, len_words, STATE_WORDS));
+            output.push(slot_requirement(id, len_words, STATE_ALIGNMENT_WORDS));
         }
         output.push(slot_requirement(
             slots.leaf_hashes,
@@ -993,10 +999,12 @@ impl<'a> PreparedProgressiveLeaves<'a> {
                     arena,
                     slots.state_ping,
                     requirements.state_ping_words,
-                    STATE_WORDS,
+                    STATE_ALIGNMENT_WORDS,
                 )?;
                 let pong = match (slots.state_pong, requirements.state_pong_words) {
-                    (Some(id), Some(words)) => Some(bind_slot(arena, id, words, STATE_WORDS)?),
+                    (Some(id), Some(words)) => {
+                        Some(bind_slot(arena, id, words, STATE_ALIGNMENT_WORDS)?)
+                    }
                     (None, None) => None,
                     _ => return Err(PreparedProgressiveCommitError::InvalidSlotShape),
                 };
@@ -1010,7 +1018,7 @@ impl<'a> PreparedProgressiveLeaves<'a> {
             }
             ProgressiveCommitStorageMode::InPlaceSlab => {
                 let slab_words = requirements.in_place_slab_words()?;
-                let slab = bind_slot(arena, slots.state_ping, slab_words, STATE_WORDS)?;
+                let slab = bind_slot(arena, slots.state_ping, slab_words, STATE_ALIGNMENT_WORDS)?;
                 let scratch_offset = slab_words
                     .checked_sub(
                         super::progressive_commit_in_place::PROGRESSIVE_IN_PLACE_SCRATCH_WORDS,

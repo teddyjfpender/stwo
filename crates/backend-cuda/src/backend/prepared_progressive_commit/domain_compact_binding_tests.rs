@@ -256,7 +256,7 @@ fn compact_admission_derives_legacy_shape_then_narrows_only_the_shared_slab() {
         compact_slab.len_words,
         base.requirements().merkle.leaf_words + PROGRESSIVE_IN_PLACE_SCRATCH_WORDS
     );
-    assert_eq!(legacy_slab.alignment_words, STATE_WORDS);
+    assert_eq!(legacy_slab.alignment_words, STATE_ALIGNMENT_WORDS);
     assert_eq!(compact_slab.alignment_words, HASH_WORDS);
     assert_eq!(
         legacy_slab.len_words - compact_slab.len_words,

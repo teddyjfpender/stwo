@@ -29,7 +29,7 @@ impl ProgressiveLeafWorkspaceRequirements {
         output.push(slot_requirement(
             slab,
             self.in_place_slab_words()?,
-            STATE_WORDS,
+            STATE_ALIGNMENT_WORDS,
         ));
         for (batch, batch_slots) in self.batches.iter().zip(&slots.batches) {
             output.push(slot_requirement(
@@ -107,9 +107,30 @@ impl ProgressiveCommitWorkspaceRequirements {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::exec_context::{ArenaLayout, ArenaSlotSpec};
     use crate::backend::progressive_commit::{
         ProgressiveCommitGeometry, ProgressiveCommitGroupGeometry,
     };
+
+    fn admit_layout(requirements: &[CommitArenaSlotRequirement]) {
+        let mut offset_words = 0usize;
+        let specs = requirements
+            .iter()
+            .map(|requirement| {
+                assert!(requirement.alignment_words.is_power_of_two());
+                offset_words = offset_words.next_multiple_of(requirement.alignment_words);
+                let spec = ArenaSlotSpec {
+                    id: requirement.id,
+                    offset_words,
+                    len_words: requirement.len_words,
+                    alignment_words: requirement.alignment_words,
+                };
+                offset_words += requirement.len_words;
+                spec
+            })
+            .collect::<Vec<_>>();
+        ArenaLayout::new(offset_words, &specs).unwrap();
+    }
 
     fn requirements() -> ProgressiveLeafWorkspaceRequirements {
         progressive_leaf_workspace_requirements_for_mode(
@@ -177,6 +198,23 @@ mod tests {
                 .len_words,
             in_place_words
         );
+        assert_eq!(
+            physical
+                .iter()
+                .find(|requirement| requirement.id == ArenaSlotId(1))
+                .unwrap()
+                .alignment_words,
+            8
+        );
+        admit_layout(&physical);
+
+        let mut separate_slots = slots;
+        separate_slots.state_pong = Some(ArenaSlotId(3));
+        separate_slots.leaf_hashes = ArenaSlotId(4);
+        let separate = requirements
+            .arena_slot_requirements(&separate_slots)
+            .unwrap();
+        admit_layout(&separate);
     }
 
     #[test]
@@ -286,11 +324,13 @@ mod tests {
         let physical = requirements
             .arena_slot_requirements_in_place(&slots)
             .unwrap();
+        admit_layout(&physical);
         let slab = physical
             .iter()
             .filter(|requirement| requirement.id == ArenaSlotId(1))
             .collect::<Vec<_>>();
         assert_eq!(slab.len(), 1);
+        assert_eq!(slab[0].alignment_words, 8);
         assert_eq!(
             slab[0].len_words,
             requirements.leaves.state_ping_words
