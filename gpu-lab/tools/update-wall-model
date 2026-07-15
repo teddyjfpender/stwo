@@ -1,0 +1,315 @@
+#!/usr/bin/env python3
+"""Update the bounded H100 wall model without cross-architecture scaling."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+from decimal import Decimal, ROUND_HALF_UP
+from pathlib import Path
+from typing import Any
+
+MODEL_SCHEMA = "gpu-prover-h100-wall-model-input-v1"
+CHEAP_AB_SCHEMA = "gpu-lab-cheap-gpu-ab-v1"
+OUTPUT_SCHEMA = "gpu-prover-h100-wall-model-result-v1"
+NANOSECOND = Decimal("0.000000001")
+
+
+def decimal(value: Any, label: str) -> Decimal:
+    try:
+        result = Decimal(str(value))
+    except Exception as error:
+        raise ValueError(f"{label} is not a decimal") from error
+    if not result.is_finite():
+        raise ValueError(f"{label} must be finite")
+    return result
+
+
+def seconds(value: Decimal) -> float:
+    return float(value.quantize(NANOSECOND, rounding=ROUND_HALF_UP))
+
+
+def sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def require_mapping(value: Any, label: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be an object")
+    return value
+
+
+def require_list(value: Any, label: str) -> list[Any]:
+    if not isinstance(value, list):
+        raise ValueError(f"{label} must be an array")
+    return value
+
+
+def eligible_families(model: dict[str, Any]) -> set[str]:
+    candidates = require_list(model.get("candidate_work"), "candidate_work")
+    result: set[str] = set()
+    for index, raw in enumerate(candidates):
+        candidate = require_mapping(raw, f"candidate_work[{index}]")
+        if candidate.get("exact_work_gate_passed") is not True:
+            continue
+        family = candidate.get("h100_family")
+        if not isinstance(family, str) or not family:
+            raise ValueError(f"candidate_work[{index}].h100_family must be a name")
+        result.add(family)
+    return result
+
+
+def scenario_result(
+    name: str,
+    raw: Any,
+    family_ceilings: dict[str, Any],
+    families: set[str],
+    useful_steps: Decimal,
+    host_override: Decimal | None = None,
+) -> dict[str, Any]:
+    scenario = require_mapping(raw, f"h100.scenarios.{name}")
+    graph = decimal(scenario.get("graph_residual_s"), f"{name}.graph_residual_s")
+    host = (
+        host_override
+        if host_override is not None
+        else decimal(scenario.get("host_residual_s"), f"{name}.host_residual_s")
+    )
+    credited = require_mapping(scenario.get("credited_h100_family_s"), f"{name}.credited")
+    if graph < 0 or host < 0:
+        raise ValueError(f"{name} residuals must be non-negative")
+
+    caps: dict[str, float] = {}
+    total_cap = Decimal(0)
+    for family in sorted(families):
+        ceiling = decimal(family_ceilings.get(family), f"family ceiling {family}")
+        prior_credit = decimal(credited.get(family, 0), f"{name} prior credit {family}")
+        if ceiling < 0 or prior_credit < 0 or prior_credit > ceiling:
+            raise ValueError(f"{name} has an invalid {family} ceiling/credit")
+        cap = ceiling - prior_credit
+        caps[family] = seconds(cap)
+        total_cap += cap
+
+    # Exact work enables a family ceiling; it never determines a time fraction.
+    total_cap = min(total_cap, graph)
+    no_new_credit = graph + host
+    family_ceiling_best = graph - total_cap + host
+    return {
+        "h100_additional_credit_ceiling_by_family_s": caps,
+        "h100_additional_credit_ceiling_total_s": seconds(total_cap),
+        "wall_range_s": {
+            "family_ceiling_best_case": seconds(family_ceiling_best),
+            "no_new_candidate_credit": seconds(no_new_credit),
+        },
+        "useful_mhz_range": {
+            "no_new_candidate_credit": seconds(useful_steps / no_new_credit / Decimal(1_000_000)),
+            "family_ceiling_best_case": seconds(
+                useful_steps / family_ceiling_best / Decimal(1_000_000)
+            ),
+        },
+    }
+
+
+def cheap_gpu_evidence(raw: Any) -> dict[str, Any]:
+    evidence = require_mapping(raw, "cheap GPU A/B")
+    if evidence.get("schema") != CHEAP_AB_SCHEMA:
+        raise ValueError(f"cheap GPU A/B schema must be {CHEAP_AB_SCHEMA}")
+    metrics = require_mapping(evidence.get("metrics"), "cheap GPU A/B metrics")
+    legacy = decimal(metrics.get("legacy_median_ms"), "legacy_median_ms")
+    candidate = decimal(metrics.get("candidate_median_ms"), "candidate_median_ms")
+    if legacy <= 0 or candidate <= 0:
+        raise ValueError("cheap GPU medians must be positive")
+    ratio = candidate / legacy
+    direction = "candidate_faster" if ratio < 1 else "candidate_slower" if ratio > 1 else "tie"
+    trusted_direction = (
+        evidence.get("identity_match") is True and evidence.get("correctness_pass") is True
+    )
+    return {
+        "device": evidence.get("device"),
+        "fixture_sha256": evidence.get("fixture_sha256"),
+        "legacy_module_sha256": evidence.get("legacy_module_sha256"),
+        "candidate_module_sha256": evidence.get("candidate_module_sha256"),
+        "legacy_samples": metrics.get("legacy_samples"),
+        "candidate_samples": metrics.get("candidate_samples"),
+        "legacy_median_ms": seconds(legacy),
+        "candidate_median_ms": seconds(candidate),
+        "candidate_over_legacy_ratio": seconds(ratio),
+        "direction": direction,
+        "direction_admissible": trusted_direction,
+        "used_in_h100_arithmetic": False,
+        "policy": "directional/correctness evidence only; never transfer a cheap-GPU ratio to H100",
+    }
+
+
+def update(model: dict[str, Any], cheap_ab: Any | None = None) -> dict[str, Any]:
+    if model.get("schema") != MODEL_SCHEMA:
+        raise ValueError(f"model schema must be {MODEL_SCHEMA}")
+    h100 = require_mapping(model.get("h100"), "h100")
+    useful_steps = decimal(h100.get("useful_steps"), "h100.useful_steps")
+    threshold = decimal(h100.get("promotion_threshold_wall_s"), "promotion threshold")
+    host_floor = decimal(h100.get("research_host_floor_s"), "research host floor")
+    if useful_steps <= 0 or threshold <= 0 or host_floor < 0:
+        raise ValueError("H100 steps/threshold must be positive and host floor non-negative")
+    family_ceilings = require_mapping(h100.get("family_ceilings_s"), "family ceilings")
+    scenarios = require_mapping(h100.get("scenarios"), "h100 scenarios")
+    families = eligible_families(model)
+    profile_ids = []
+    for index, raw in enumerate(require_list(model.get("profiles"), "profiles")):
+        profile = require_mapping(raw, f"profiles[{index}]")
+        profile_id = profile.get("pie")
+        if not isinstance(profile_id, str) or not profile_id:
+            raise ValueError(f"profiles[{index}].pie must be a name")
+        profile_ids.append(profile_id)
+
+    current = {
+        name: scenario_result(
+            name,
+            scenarios.get(name),
+            family_ceilings,
+            families,
+            useful_steps,
+        )
+        for name in ("central", "optimistic")
+    }
+    host_floor_result = {
+        name: scenario_result(
+            name,
+            scenarios.get(name),
+            family_ceilings,
+            families,
+            useful_steps,
+            host_floor,
+        )
+        for name in ("central", "optimistic")
+    }
+    central_best = decimal(
+        current["central"]["wall_range_s"]["family_ceiling_best_case"], "central best"
+    )
+    central_floor_best = decimal(
+        host_floor_result["central"]["wall_range_s"]["family_ceiling_best_case"],
+        "central host-floor best",
+    )
+    same_h100_ab = h100.get("same_h100_segment_ab_complete") is True
+    threshold_possible = central_best <= threshold and central_floor_best <= threshold
+    promoted = threshold_possible and same_h100_ab
+    reasons = []
+    if not threshold_possible:
+        reasons.append(
+            f"central family-ceiling best case remains above {seconds(threshold)} s"
+        )
+    if not same_h100_ab:
+        reasons.append("same-H100 bounded segment A/B is missing")
+
+    return {
+        "schema": OUTPUT_SCHEMA,
+        "source_identity": model.get("identity"),
+        "exact_work_profile_ids": profile_ids,
+        "promotion": {
+            "threshold_wall_s": seconds(threshold),
+            "central_threshold_possible": threshold_possible,
+            "same_h100_segment_ab_complete": same_h100_ab,
+            "full_sn_h100_run_admitted": promoted,
+            "reasons": reasons,
+            "next_h100_step": None if promoted else "bounded same-H100 segment A/B",
+        },
+        "h100_scenarios": {
+            "current_host_model": current,
+            "research_host_floor_s": seconds(host_floor),
+            "host_floor_model": host_floor_result,
+            "policy": "ranges are capped by old H100 family time; exact bytes/passes never become seconds",
+        },
+        "cheap_gpu_directional_evidence": None if cheap_ab is None else cheap_gpu_evidence(cheap_ab),
+    }
+
+
+def self_test() -> None:
+    model = {
+        "schema": MODEL_SCHEMA,
+        "identity": {"test": True},
+        "profiles": [],
+        "candidate_work": [
+            {"id": "mode-a", "h100_family": "commitment_merkle", "exact_work_gate_passed": True},
+            {"id": "packed", "h100_family": "quotient_oods", "exact_work_gate_passed": True},
+        ],
+        "h100": {
+            "useful_steps": 7706864,
+            "promotion_threshold_wall_s": 0.6936178,
+            "research_host_floor_s": 0.2,
+            "same_h100_segment_ab_complete": False,
+            "family_ceilings_s": {
+                "commitment_merkle": 0.290111348,
+                "quotient_oods": 0.442058283,
+            },
+            "scenarios": {
+                "central": {
+                    "graph_residual_s": 1.441106,
+                    "host_residual_s": 1.8,
+                    "credited_h100_family_s": {
+                        "commitment_merkle": 0.065,
+                        "quotient_oods": 0.138,
+                    },
+                },
+                "optimistic": {
+                    "graph_residual_s": 0.933106,
+                    "host_residual_s": 1.1,
+                    "credited_h100_family_s": {
+                        "commitment_merkle": 0.160,
+                        "quotient_oods": 0.272,
+                    },
+                },
+            },
+        },
+    }
+    cheap = {
+        "schema": CHEAP_AB_SCHEMA,
+        "identity_match": True,
+        "correctness_pass": True,
+        "metrics": {"legacy_median_ms": 10, "candidate_median_ms": 8},
+    }
+    result = update(model, cheap)
+    without_cheap = update(model)
+    assert (
+        result["h100_scenarios"]["current_host_model"]["central"]["wall_range_s"]
+        ["family_ceiling_best_case"]
+        == 2.711936369
+    )
+    assert (
+        result["h100_scenarios"]["host_floor_model"]["optimistic"]["wall_range_s"]
+        ["family_ceiling_best_case"]
+        == 0.832936369
+    )
+    assert result["promotion"]["full_sn_h100_run_admitted"] is False
+    assert result["cheap_gpu_directional_evidence"]["candidate_over_legacy_ratio"] == 0.8
+    assert result["cheap_gpu_directional_evidence"]["used_in_h100_arithmetic"] is False
+    assert result["h100_scenarios"] == without_cheap["h100_scenarios"]
+    assert result["promotion"] == without_cheap["promotion"]
+    print("wall-model self-test: PASS")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("model", nargs="?", type=Path)
+    parser.add_argument("--cheap-ab", type=Path)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--self-test", action="store_true")
+    args = parser.parse_args()
+    if args.self_test:
+        self_test()
+        return
+    if args.model is None:
+        parser.error("model is required unless --self-test is used")
+    model = json.loads(args.model.read_text())
+    cheap_ab = None if args.cheap_ab is None else json.loads(args.cheap_ab.read_text())
+    result = update(model, cheap_ab)
+    result["model_input_sha256"] = sha256(args.model)
+    if args.cheap_ab is not None:
+        result["cheap_ab_input_sha256"] = sha256(args.cheap_ab)
+    payload = json.dumps(result, indent=2, sort_keys=True) + "\n"
+    if args.output is None:
+        print(payload, end="")
+    else:
+        args.output.write_text(payload)
+
+
+if __name__ == "__main__":
+    main()
