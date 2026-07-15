@@ -50,6 +50,7 @@ pub mod proof_assembly;
 mod quotient;
 pub mod quotient_numerator_single_write;
 pub mod quotient_numerator_staged_single_write;
+pub mod quotient_producer_b2n;
 pub mod relation_graph;
 mod secure_column;
 

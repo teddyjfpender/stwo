@@ -1659,6 +1659,33 @@ pub unsafe extern "C" fn stwo_combine_quotients_from_numerators_on(
 }
 
 #[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn stwo_combine_quotients_b2n_init7_on(
+    _half_coset_initial_index: u32,
+    _half_coset_step_size: u32,
+    _domain_size: u32,
+    _domain_log_size: u32,
+    _sample_points: *const u32,
+    _sample_size: u32,
+    _first_linear_term_accs: *const CudaSecureField,
+    _partial_numerator_log_sizes: *const u32,
+    _partial_numerators_0: *const *const u32,
+    _partial_numerators_1: *const *const u32,
+    _partial_numerators_2: *const *const u32,
+    _partial_numerators_3: *const *const u32,
+    _result_column_0: *mut u32,
+    _result_column_1: *mut u32,
+    _result_column_2: *mut u32,
+    _result_column_3: *mut u32,
+    _inverse_twiddles: *const u32,
+    _inverse_twiddle_words: u32,
+    _eval_domain_size: u32,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_combine_quotients_b2n_init7_on")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stwo_prepare_quotient_numerator_terms_on(
     _term_descriptors: *const u32,
     _term_count: u32,
@@ -2001,6 +2028,19 @@ pub unsafe extern "C" fn stwo_ntt_b2n_columns_on(
     _stream: *mut core::ffi::c_void,
 ) -> i32 {
     no_cuda_symbol("stwo_ntt_b2n_columns_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_ntt_b2n_columns_after_first_seven_on(
+    _device_values: *const *mut u32,
+    _log_n: u32,
+    _num_poly: u32,
+    _g_twiddles: *const u32,
+    _twiddles_size: u32,
+    _eval_domain_size: u32,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_ntt_b2n_columns_after_first_seven_on")
 }
 
 #[unsafe(no_mangle)]

@@ -1231,6 +1231,31 @@ extern "C" {
         stream: *mut c_void,
     ) -> i32;
 
+    /// Exact SN2 quotient producer fused through B2N stages 1..7.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stwo_combine_quotients_b2n_init7_on(
+        half_coset_initial_index: u32,
+        half_coset_step_size: u32,
+        domain_size: u32,
+        domain_log_size: u32,
+        sample_points: *const u32,
+        sample_size: u32,
+        first_linear_term_accs: *const CudaSecureField,
+        partial_numerator_log_sizes: *const u32,
+        partial_numerators_0: *const *const u32,
+        partial_numerators_1: *const *const u32,
+        partial_numerators_2: *const *const u32,
+        partial_numerators_3: *const *const u32,
+        result_column_0: *mut u32,
+        result_column_1: *mut u32,
+        result_column_2: *mut u32,
+        result_column_3: *mut u32,
+        inverse_twiddles: *const u32,
+        inverse_twiddle_words: u32,
+        eval_domain_size: u32,
+        stream: *mut c_void,
+    ) -> i32;
+
     pub fn stwo_prepare_quotient_numerator_terms_on(
         term_descriptors: *const u32,
         term_count: u32,
@@ -1497,6 +1522,17 @@ extern "C" {
         log_n: u32,
         num_poly: u32,
         g_twiddles: *mut u32,
+        twiddles_size: u32,
+        eval_domain_size: u32,
+        stream: *mut c_void,
+    ) -> i32;
+
+    /// Exact log-23 continuation after producer-owned B2N stages 1..7.
+    pub fn stwo_ntt_b2n_columns_after_first_seven_on(
+        device_values: *const *mut u32,
+        log_n: u32,
+        num_poly: u32,
+        g_twiddles: *const u32,
         twiddles_size: u32,
         eval_domain_size: u32,
         stream: *mut c_void,

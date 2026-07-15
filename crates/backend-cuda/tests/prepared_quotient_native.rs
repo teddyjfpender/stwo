@@ -16,8 +16,8 @@ use stwo::prover::secure_column::SecureColumnByCoords;
 use stwo_backend_cuda::{
     quotient_workspace_requirements, ArenaLayout, ArenaSlice, ArenaSlotId, ArenaSlotSpec,
     CudaExecContext, DeviceArena, PreparedQuotientGraph, QuotientArenaSlotRequirement,
-    QuotientNumeratorSource, QuotientSampleConstants, QuotientWorkspaceConfig,
-    QuotientWorkspaceSlots,
+    QuotientNumeratorSource, QuotientProducerB2nProgram, QuotientSampleConstants,
+    QuotientWorkspaceConfig, QuotientWorkspaceSlots,
 };
 
 const FORWARD_TWIDDLES: ArenaSlotId = ArenaSlotId(50_000);
@@ -127,6 +127,47 @@ fn read(arena: &DeviceArena, source: ArenaSlice, words: usize) -> Vec<u32> {
     }
     arena.context().sync().unwrap();
     host
+}
+
+fn compare_outputs(
+    left_arena: &DeviceArena,
+    left: ArenaSlice,
+    right_arena: &DeviceArena,
+    right: ArenaSlice,
+) -> u64 {
+    assert_eq!(left.len_words(), right.len_words());
+    const CHUNK_WORDS: usize = 4 * 1024 * 1024;
+    let mut digest = 0xcbf2_9ce4_8422_2325u64;
+    for first in (0..left.len_words()).step_by(CHUNK_WORDS) {
+        let count = CHUNK_WORDS.min(left.len_words() - first);
+        let left_words = read(
+            left_arena,
+            left.checked_subslice(first, count).unwrap(),
+            count,
+        );
+        let right_words = read(
+            right_arena,
+            right.checked_subslice(first, count).unwrap(),
+            count,
+        );
+        if let Some(index) = left_words
+            .iter()
+            .zip(&right_words)
+            .position(|(left, right)| left != right)
+        {
+            panic!(
+                "quotient output mismatch at word {}: fallback={} candidate={}",
+                first + index,
+                left_words[index],
+                right_words[index]
+            );
+        }
+        for word in right_words {
+            digest ^= u64::from(word);
+            digest = digest.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    digest
 }
 
 fn secure_words(values: &[SecureField]) -> Vec<u32> {
@@ -378,4 +419,138 @@ fn quotient_eager_and_capture_match_cpu_constants_partials_and_fri_input() {
         &second_partials,
         &cpu_output(config, &second_constants, &second_partials, &twiddles),
     );
+}
+
+#[test]
+#[ignore = "requires exact log23 native CUDA execution"]
+fn quotient_producer_b2n_exact_sn2_eager_and_graph_match_fallback() {
+    let config = QuotientWorkspaceConfig {
+        lifting_log_size: 25,
+        log_blowup_factor: 2,
+    };
+    let logs = (0..19)
+        .map(|source| [10, 9, 7][source % 3])
+        .collect::<Vec<_>>();
+    let requirements = quotient_workspace_requirements(config, &logs).unwrap();
+    let slots = workspace_slots();
+    let fallback_arena = arena(&requirements, &slots, &logs);
+    let candidate_arena = arena(&requirements, &slots, &logs);
+
+    let full_domain = CanonicCoset::new(config.lifting_log_size).circle_domain();
+    let twiddles = CpuBackend::precompute_twiddles(full_domain.half_coset);
+    let inverse_subdomain = twiddles
+        .itwiddles
+        .extract_subdomain_twiddles(config.lifting_log_size, requirements.subdomain_log_size);
+    let forward_words = twiddles
+        .twiddles
+        .iter()
+        .map(|value| value.0)
+        .collect::<Vec<_>>();
+    let inverse_words = inverse_subdomain
+        .iter()
+        .map(|value| value.0)
+        .collect::<Vec<_>>();
+    for arena in [&fallback_arena, &candidate_arena] {
+        upload(arena, FORWARD_TWIDDLES, &forward_words);
+        upload(arena, INVERSE_TWIDDLES, &inverse_words);
+    }
+
+    let constants = (0..logs.len())
+        .map(|source| {
+            let value = 101u32.wrapping_mul(source as u32 + 1);
+            QuotientSampleConstants {
+                sample_point: SECURE_FIELD_CIRCLE_GEN.mul(2 * source as u128 + 3),
+                first_linear_term_acc: SecureField::from_u32_unchecked(
+                    value,
+                    value + 1,
+                    value + 3,
+                    value + 7,
+                ),
+            }
+        })
+        .collect::<Vec<_>>();
+    let sources = |arena: &DeviceArena| {
+        logs.iter()
+            .enumerate()
+            .map(|(source, &log_size)| QuotientNumeratorSource {
+                constants: constants[source],
+                log_size,
+                coordinates: std::array::from_fn(|coordinate| {
+                    arena.bind(partial_id(source, coordinate)).unwrap()
+                }),
+            })
+            .collect::<Vec<_>>()
+    };
+    let fallback_sources = sources(&fallback_arena);
+    let candidate_sources = sources(&candidate_arena);
+    let fallback = PreparedQuotientGraph::prepare(
+        &fallback_arena,
+        config,
+        &fallback_sources,
+        fallback_arena.bind(FORWARD_TWIDDLES).unwrap(),
+        fallback_arena.bind(INVERSE_TWIDDLES).unwrap(),
+        &slots,
+    )
+    .unwrap();
+    let program = QuotientProducerB2nProgram::compile(config, &logs).unwrap();
+    let candidate = PreparedQuotientGraph::prepare_with_producer_b2n(
+        &candidate_arena,
+        config,
+        &candidate_sources,
+        candidate_arena.bind(FORWARD_TWIDDLES).unwrap(),
+        candidate_arena.bind(INVERSE_TWIDDLES).unwrap(),
+        &slots,
+        program.clone(),
+    )
+    .unwrap();
+    assert_eq!(candidate.producer_b2n_receipt(), Some(program.receipt()));
+
+    let eager_partials = partial_values(&logs, 23);
+    upload_partials(&fallback_arena, &eager_partials);
+    upload_partials(&candidate_arena, &eager_partials);
+    fallback.launch().unwrap();
+    candidate.launch().unwrap();
+    let eager_digest = compare_outputs(
+        &fallback_arena,
+        fallback.output_evaluation(),
+        &candidate_arena,
+        candidate.output_evaluation(),
+    );
+
+    let fallback_capture = fallback_arena.context().capture().unwrap();
+    fallback.launch().unwrap();
+    let fallback_graph = fallback_capture.finish().unwrap();
+    let candidate_capture = candidate_arena.context().capture().unwrap();
+    candidate.launch().unwrap();
+    let candidate_graph = candidate_capture.finish().unwrap();
+    assert_eq!(fallback_graph.kernel_nodes(), 28);
+    assert_eq!(candidate_graph.kernel_nodes(), 7);
+
+    let replay_partials = partial_values(&logs, 0x1234_5678);
+    upload_partials(&fallback_arena, &replay_partials);
+    upload_partials(&candidate_arena, &replay_partials);
+    let replay_constants = constants
+        .iter()
+        .enumerate()
+        .map(|(source, constants)| QuotientSampleConstants {
+            sample_point: SECURE_FIELD_CIRCLE_GEN.mul(2 * source as u128 + 43),
+            first_linear_term_acc: constants.first_linear_term_acc
+                + SecureField::from_u32_unchecked(109, 113, 127, 131),
+        })
+        .collect::<Vec<_>>();
+    fallback
+        .upload_constants_at_transcript_boundary(&replay_constants)
+        .unwrap();
+    candidate
+        .upload_constants_at_transcript_boundary(&replay_constants)
+        .unwrap();
+    fallback_graph.launch(fallback_arena.context()).unwrap();
+    candidate_graph.launch(candidate_arena.context()).unwrap();
+    let replay_digest = compare_outputs(
+        &fallback_arena,
+        fallback.output_evaluation(),
+        &candidate_arena,
+        candidate.output_evaluation(),
+    );
+    assert_ne!(eager_digest, replay_digest);
 }

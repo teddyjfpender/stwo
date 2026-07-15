@@ -55,6 +55,19 @@ int stwo_ntt_b2n_columns_on(
         void *stream
 );
 
+// Exact SN2 continuation after the producer-owned stages 1..7. The log-23
+// schedule is completed as two qualified 8-stage in-place intervals.
+extern "C"
+int stwo_ntt_b2n_columns_after_first_seven_on(
+        uint32_t **device_values,
+        uint32_t log_n,
+        uint32_t num_poly,
+        const uint32_t *g_twiddles,
+        uint32_t twiddles_size,
+        uint32_t eval_domain_size,
+        void *stream
+);
+
 // Allocation-free inverse transform for 3 <= log_n <= 30 with separate pointer
 // tables. An input may exactly alias its paired output: each init tile completes
 // all reads before its first write. Partial and cross-column aliases are

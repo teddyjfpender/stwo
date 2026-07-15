@@ -1,4 +1,5 @@
 #include "quotients.cuh"
+#include "poly_utils.cuh"
 #include <cstdio>
 
 
@@ -92,6 +93,8 @@ __global__ void column_line_and_batch_random_coeffs(
 constexpr uint32_t ACCUMULATE_QUOTIENT_INVERSE_CHUNK = 4;
 constexpr uint32_t COMBINE_QUOTIENT_INVERSE_CHUNK = 8;
 constexpr int QUOTIENT_COMBINE_BLOCK_DIM = 512;
+constexpr int QUOTIENT_PRODUCER_B2N_BLOCK_DIM = 128;
+constexpr uint32_t QUOTIENT_PRODUCER_B2N_FIRST_STAGES = 7;
 
 DEVICE_FORCEINLINE cm31 denominator_for_sample(
         const secure_field_point sample_point,
@@ -283,6 +286,77 @@ __global__ void accumulate_partial_quotient_numerators_in_gpu(
     }
 }
 
+DEVICE_FORCEINLINE qm31 combine_quotient_row(
+        uint32_t half_coset_initial_index,
+        uint32_t half_coset_step_size,
+        uint32_t domain_size,
+        uint32_t domain_log_size,
+        const secure_field_point *sample_points,
+        uint32_t sample_size,
+        const qm31 *first_linear_term_accs,
+        const uint32_t *partial_numerator_log_sizes,
+        const m31 *const *partial_numerators_0,
+        const m31 *const *partial_numerators_1,
+        const m31 *const *partial_numerators_2,
+        const m31 *const *partial_numerators_3,
+        uint32_t row
+) {
+    uint32_t domain_index = bit_reverse(row, domain_log_size);
+    point domain_point = domain_at_index(
+            half_coset_initial_index,
+            half_coset_step_size,
+            domain_index,
+            domain_size
+    );
+
+    qm31 quotient = qm31{cm31{0, 0}, cm31{0, 0}};
+    for (uint32_t sample_start = 0; sample_start < sample_size;
+         sample_start += COMBINE_QUOTIENT_INVERSE_CHUNK) {
+        const uint32_t remaining = sample_size - sample_start;
+        const uint32_t sample_count = remaining < COMBINE_QUOTIENT_INVERSE_CHUNK
+            ? remaining
+            : COMBINE_QUOTIENT_INVERSE_CHUNK;
+        cm31 denominator_inverses[COMBINE_QUOTIENT_INVERSE_CHUNK];
+        quotient_inverse_chunk<COMBINE_QUOTIENT_INVERSE_CHUNK>(
+                sample_points,
+                sample_start,
+                sample_count,
+                domain_point,
+                denominator_inverses);
+
+#pragma unroll
+        for (uint32_t offset = 0; offset < COMBINE_QUOTIENT_INVERSE_CHUNK;
+             ++offset) {
+            if (offset >= sample_count) {
+                continue;
+            }
+            const uint32_t sample = sample_start + offset;
+            uint32_t partial_log_size = partial_numerator_log_sizes[sample];
+            uint32_t log_ratio = domain_log_size - partial_log_size;
+            uint32_t lifted_idx = (row >> (log_ratio + 1) << 1) + (row & 1);
+
+            qm31 partial_numerator = qm31{
+                    cm31{
+                            partial_numerators_0[sample][lifted_idx],
+                            partial_numerators_1[sample][lifted_idx]
+                    },
+                    cm31{
+                            partial_numerators_2[sample][lifted_idx],
+                            partial_numerators_3[sample][lifted_idx]
+                    }
+            };
+            qm31 full_numerator = sub(
+                    partial_numerator,
+                    mul_by_scalar(first_linear_term_accs[sample], domain_point.y)
+            );
+            quotient = add(
+                    quotient,
+                    mul(full_numerator, denominator_inverses[offset]));
+        }
+    }
+    return quotient;
+}
+
 __global__ void __launch_bounds__(QUOTIENT_COMBINE_BLOCK_DIM, 1)
 combine_quotients_from_numerators_in_gpu(
         uint32_t half_coset_initial_index,
@@ -302,67 +376,116 @@ combine_quotients_from_numerators_in_gpu(
         uint32_t *result_column_2,
         uint32_t *result_column_3
 ) {
-    int row = threadIdx.x + blockDim.x * blockIdx.x;
+    const uint32_t row = threadIdx.x + blockDim.x * blockIdx.x;
     if (row < domain_size) {
-        uint32_t domain_index = bit_reverse(row, domain_log_size);
-        point domain_point = domain_at_index(
+        const qm31 quotient = combine_quotient_row(
                 half_coset_initial_index,
                 half_coset_step_size,
-                domain_index,
-                domain_size
-        );
-
-        qm31 quotient = qm31{cm31{0, 0}, cm31{0, 0}};
-        for (uint32_t sample_start = 0; sample_start < sample_size;
-             sample_start += COMBINE_QUOTIENT_INVERSE_CHUNK) {
-            const uint32_t remaining = sample_size - sample_start;
-            const uint32_t sample_count = remaining < COMBINE_QUOTIENT_INVERSE_CHUNK
-                ? remaining
-                : COMBINE_QUOTIENT_INVERSE_CHUNK;
-            cm31 denominator_inverses[COMBINE_QUOTIENT_INVERSE_CHUNK];
-            quotient_inverse_chunk<COMBINE_QUOTIENT_INVERSE_CHUNK>(
-                    sample_points,
-                    sample_start,
-                    sample_count,
-                    domain_point,
-                    denominator_inverses);
-
-#pragma unroll
-            for (uint32_t offset = 0; offset < COMBINE_QUOTIENT_INVERSE_CHUNK;
-                 ++offset) {
-                if (offset >= sample_count) {
-                    continue;
-                }
-                const uint32_t sample = sample_start + offset;
-                uint32_t partial_log_size = partial_numerator_log_sizes[sample];
-                uint32_t log_ratio = domain_log_size - partial_log_size;
-                uint32_t lifted_idx = (row >> (log_ratio + 1) << 1) + (row & 1);
-
-                qm31 partial_numerator = qm31{
-                        cm31{
-                                partial_numerators_0[sample][lifted_idx],
-                                partial_numerators_1[sample][lifted_idx]
-                        },
-                        cm31{
-                                partial_numerators_2[sample][lifted_idx],
-                                partial_numerators_3[sample][lifted_idx]
-                        }
-                };
-                qm31 full_numerator = sub(
-                        partial_numerator,
-                        mul_by_scalar(first_linear_term_accs[sample], domain_point.y)
-                );
-                quotient = add(
-                        quotient,
-                        mul(full_numerator, denominator_inverses[offset]));
-            }
-        }
+                domain_size,
+                domain_log_size,
+                sample_points,
+                sample_size,
+                first_linear_term_accs,
+                partial_numerator_log_sizes,
+                partial_numerators_0,
+                partial_numerators_1,
+                partial_numerators_2,
+                partial_numerators_3,
+                row);
 
         result_column_0[row] = quotient.a.a;
         result_column_1[row] = quotient.a.b;
         result_column_2[row] = quotient.b.a;
         result_column_3[row] = quotient.b.b;
     }
+}
+
+// Exact SN2 producer boundary. One row thread computes all four quotient
+// coordinates once, then the CTA retains the 128-row tile through inverse
+// stages 1..7. This retires the standalone quotient write and the first seven
+// full-image B2N reads/writes without recomputing any lifted numerator.
+__global__ void __launch_bounds__(QUOTIENT_PRODUCER_B2N_BLOCK_DIM, 4)
+combine_quotients_b2n_init7_in_gpu(
+        uint32_t half_coset_initial_index,
+        uint32_t half_coset_step_size,
+        uint32_t domain_size,
+        uint32_t domain_log_size,
+        const secure_field_point *sample_points,
+        uint32_t sample_size,
+        const qm31 *first_linear_term_accs,
+        const uint32_t *partial_numerator_log_sizes,
+        const m31 *const *partial_numerators_0,
+        const m31 *const *partial_numerators_1,
+        const m31 *const *partial_numerators_2,
+        const m31 *const *partial_numerators_3,
+        m31 *result_column_0,
+        m31 *result_column_1,
+        m31 *result_column_2,
+        m31 *result_column_3,
+        m31 *inverse_twiddles
+) {
+    static_assert(
+            QUOTIENT_PRODUCER_B2N_BLOCK_DIM ==
+                    (1 << QUOTIENT_PRODUCER_B2N_FIRST_STAGES));
+    const uint32_t local_row = threadIdx.x;
+    const uint32_t row = blockIdx.x * QUOTIENT_PRODUCER_B2N_BLOCK_DIM + local_row;
+    const qm31 quotient = combine_quotient_row(
+            half_coset_initial_index,
+            half_coset_step_size,
+            domain_size,
+            domain_log_size,
+            sample_points,
+            sample_size,
+            first_linear_term_accs,
+            partial_numerator_log_sizes,
+            partial_numerators_0,
+            partial_numerators_1,
+            partial_numerators_2,
+            partial_numerators_3,
+            row);
+
+    __shared__ m31 tile[4][QUOTIENT_PRODUCER_B2N_BLOCK_DIM];
+    tile[0][local_row] = quotient.a.a;
+    tile[1][local_row] = quotient.a.b;
+    tile[2][local_row] = quotient.b.a;
+    tile[3][local_row] = quotient.b.b;
+    __syncthreads();
+
+    uint32_t layer_size = domain_size >> 1;
+    uint32_t layer_offset = 0;
+#pragma unroll
+    for (uint32_t stage = 1; stage <= QUOTIENT_PRODUCER_B2N_FIRST_STAGES; ++stage) {
+        if (local_row < QUOTIENT_PRODUCER_B2N_BLOCK_DIM / 2) {
+            const uint32_t stride = 1u << (stage - 1);
+            const uint32_t group = local_row & (stride - 1);
+            const uint32_t pair_in_tile = local_row >> (stage - 1);
+            const uint32_t left = group + pair_in_tile * 2 * stride;
+            const uint32_t right = left + stride;
+            const uint32_t global_pair =
+                    (blockIdx.x * (QUOTIENT_PRODUCER_B2N_BLOCK_DIM / 2) + local_row)
+                    >> (stage - 1);
+            const m31 twiddle = stage == 1
+                    ? get_circle_twiddle(inverse_twiddles, global_pair)
+                    : inverse_twiddles[layer_offset + global_pair];
+#pragma unroll
+            for (uint32_t coordinate = 0; coordinate < 4; ++coordinate) {
+                const m31 left_value = tile[coordinate][left];
+                const m31 right_value = tile[coordinate][right];
+                tile[coordinate][left] = add(left_value, right_value);
+                tile[coordinate][right] = mul(sub(left_value, right_value), twiddle);
+            }
+        }
+        __syncthreads();
+        if (stage >= 2) {
+            layer_size >>= 1;
+            layer_offset += layer_size;
+        }
+    }
+
+    result_column_0[row] = tile[0][local_row];
+    result_column_1[row] = tile[1][local_row];
+    result_column_2[row] = tile[2][local_row];
+    result_column_3[row] = tile[3][local_row];
 }
 
 void accumulate_quotients(
@@ -606,6 +729,70 @@ extern "C" int stwo_combine_quotients_from_numerators_on(
             result_column_1,
             result_column_2,
             result_column_3);
+    return cudaGetLastError();
+}
+
+extern "C" int stwo_combine_quotients_b2n_init7_on(
+        uint32_t half_coset_initial_index,
+        uint32_t half_coset_step_size,
+        uint32_t domain_size,
+        uint32_t domain_log_size,
+        const secure_field_point *sample_points,
+        uint32_t sample_size,
+        const qm31 *first_linear_term_accs,
+        const uint32_t *partial_numerator_log_sizes,
+        const m31 *const *partial_numerators_0,
+        const m31 *const *partial_numerators_1,
+        const m31 *const *partial_numerators_2,
+        const m31 *const *partial_numerators_3,
+        uint32_t *result_column_0,
+        uint32_t *result_column_1,
+        uint32_t *result_column_2,
+        uint32_t *result_column_3,
+        const uint32_t *inverse_twiddles,
+        uint32_t inverse_twiddle_words,
+        uint32_t eval_domain_size,
+        void *stream
+) {
+    constexpr uint32_t production_log = 23;
+    constexpr uint32_t production_size = 1u << production_log;
+    if (half_coset_step_size == 0 || domain_size != production_size ||
+        domain_log_size != production_log || sample_size == 0 ||
+        sample_points == nullptr || first_linear_term_accs == nullptr ||
+        partial_numerator_log_sizes == nullptr || partial_numerators_0 == nullptr ||
+        partial_numerators_1 == nullptr || partial_numerators_2 == nullptr ||
+        partial_numerators_3 == nullptr || result_column_0 == nullptr ||
+        result_column_1 == nullptr || result_column_2 == nullptr ||
+        result_column_3 == nullptr || inverse_twiddles == nullptr || stream == nullptr ||
+        eval_domain_size != (production_size >> 1) ||
+        eval_domain_size > inverse_twiddle_words) {
+        return cudaErrorInvalidValue;
+    }
+
+    const auto twiddles = reinterpret_cast<m31 *>(const_cast<uint32_t *>(
+            inverse_twiddles + inverse_twiddle_words - eval_domain_size));
+    combine_quotients_b2n_init7_in_gpu<<<
+        production_size / QUOTIENT_PRODUCER_B2N_BLOCK_DIM,
+        QUOTIENT_PRODUCER_B2N_BLOCK_DIM,
+        0,
+        reinterpret_cast<cudaStream_t>(stream)>>>(
+            half_coset_initial_index,
+            half_coset_step_size,
+            domain_size,
+            domain_log_size,
+            sample_points,
+            sample_size,
+            first_linear_term_accs,
+            partial_numerator_log_sizes,
+            partial_numerators_0,
+            partial_numerators_1,
+            partial_numerators_2,
+            partial_numerators_3,
+            reinterpret_cast<m31 *>(result_column_0),
+            reinterpret_cast<m31 *>(result_column_1),
+            reinterpret_cast<m31 *>(result_column_2),
+            reinterpret_cast<m31 *>(result_column_3),
+            twiddles);
     return cudaGetLastError();
 }
 

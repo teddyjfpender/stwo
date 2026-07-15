@@ -1274,6 +1274,26 @@ extern "C" int stwo_ntt_b2n_columns_out_of_place_on(
         eval_domain_size, stream_raw);
 }
 
+extern "C" int stwo_ntt_b2n_columns_after_first_seven_on(
+    uint32_t **device_values, uint32_t log_n, uint32_t num_poly,
+    const uint32_t *g_twiddles, uint32_t twiddles_size,
+    uint32_t eval_domain_size, void *stream_raw) {
+    if (device_values == nullptr || g_twiddles == nullptr || stream_raw == nullptr ||
+        log_n != 23 || num_poly != 4 || eval_domain_size != (1u << 22) ||
+        eval_domain_size > twiddles_size)
+        return (int)cudaErrorInvalidValue;
+
+    auto twiddles = reinterpret_cast<m31 *>(const_cast<uint32_t *>(
+        g_twiddles + twiddles_size - eval_domain_size));
+    auto values = reinterpret_cast<m31 **>(device_values);
+    auto stream = reinterpret_cast<cudaStream_t>(stream_raw);
+    cudaError_t error = b2n_dispatch_noinit_interval_on<false>(
+        values, log_n, num_poly, 8, 8, twiddles, stream);
+    if (error != cudaSuccess) return (int)error;
+    return (int)b2n_dispatch_noinit_interval_on<false>(
+        values, log_n, num_poly, 16, 8, twiddles, stream);
+}
+
 extern "C" int stwo_ntt_b2n_columns_to_retained_on(
     const uint32_t *const *inputs, uint32_t *const *retained_outputs,
     uint32_t log_n, uint32_t num_poly, const uint32_t *g_twiddles,

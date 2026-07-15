@@ -227,6 +227,12 @@ pub use backend::quotient_numerator_staged_single_write::{
     QuotientNumeratorStagedSingleWritePlan, QuotientNumeratorStagedSingleWriteReport,
     QuotientNumeratorStagedSource, QuotientNumeratorStagingRole,
 };
+pub use backend::quotient_producer_b2n::{
+    quotient_producer_b2n_oracle, QuotientProducerB2nError, QuotientProducerB2nProgram,
+    QuotientProducerB2nReceipt, QuotientProducerB2nResourceContract, QuotientProducerB2nSchedule,
+    QuotientProducerB2nTraffic, QUOTIENT_PRODUCER_B2N_FIRST_STAGES,
+    QUOTIENT_PRODUCER_B2N_LAUNCH_THREADS, QUOTIENT_PRODUCER_BATCH_INVERSE_CHUNK,
+};
 pub use backend::relation_graph::{
     relation_batch_fused_eligible, relation_batch_one_read_eligible, relation_graph_requirements,
     PreparedRelationGraph, PreparedRelationOutput, RelationArenaSlotRequirement,

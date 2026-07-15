@@ -17,6 +17,7 @@ use super::exec_context::{
     check_cuda, ArenaError, ArenaSlice, ArenaSlotId, CudaRuntimeError, DeviceArena,
 };
 use super::prepared_interpolation::is_supported_interpolation_log_size;
+use super::quotient_producer_b2n::{QuotientProducerB2nProgram, QuotientProducerB2nReceipt};
 use crate::columns::bindings::{CirclePointSecureField, CudaSecureField};
 
 const WORD_BYTES: usize = core::mem::size_of::<u32>();
@@ -120,6 +121,7 @@ pub enum PreparedQuotientError {
         expected: usize,
         actual: usize,
     },
+    ProducerB2nProgramMismatch,
     DuplicateSlot(ArenaSlotId),
     ContextMismatch(ArenaSlotId),
     SourceAliasesWorkspace(ArenaSlotId),
@@ -345,6 +347,7 @@ pub struct PreparedQuotientGraph<'a> {
     output_values: ArenaSlice,
     forward_twiddles: ArenaSlice,
     inverse_twiddles: ArenaSlice,
+    producer_b2n: Option<QuotientProducerB2nProgram>,
 }
 
 impl<'a> PreparedQuotientGraph<'a> {
@@ -356,7 +359,55 @@ impl<'a> PreparedQuotientGraph<'a> {
         inverse_subdomain_twiddles: ArenaSlice,
         slots: &QuotientWorkspaceSlots,
     ) -> Result<Self, PreparedQuotientError> {
+        Self::prepare_inner(
+            arena,
+            config,
+            sources,
+            forward_twiddles,
+            inverse_subdomain_twiddles,
+            slots,
+            None,
+        )
+    }
+
+    /// Prepare the exact-shape producer-owned inverse boundary. The ordinary
+    /// [`Self::prepare`] constructor remains the byte-identical fallback.
+    pub fn prepare_with_producer_b2n(
+        arena: &'a DeviceArena,
+        config: QuotientWorkspaceConfig,
+        sources: &[QuotientNumeratorSource],
+        forward_twiddles: ArenaSlice,
+        inverse_subdomain_twiddles: ArenaSlice,
+        slots: &QuotientWorkspaceSlots,
+        program: QuotientProducerB2nProgram,
+    ) -> Result<Self, PreparedQuotientError> {
+        Self::prepare_inner(
+            arena,
+            config,
+            sources,
+            forward_twiddles,
+            inverse_subdomain_twiddles,
+            slots,
+            Some(program),
+        )
+    }
+
+    fn prepare_inner(
+        arena: &'a DeviceArena,
+        config: QuotientWorkspaceConfig,
+        sources: &[QuotientNumeratorSource],
+        forward_twiddles: ArenaSlice,
+        inverse_subdomain_twiddles: ArenaSlice,
+        slots: &QuotientWorkspaceSlots,
+        producer_b2n: Option<QuotientProducerB2nProgram>,
+    ) -> Result<Self, PreparedQuotientError> {
         let logs: Vec<_> = sources.iter().map(|source| source.log_size).collect();
+        if producer_b2n
+            .as_ref()
+            .is_some_and(|program| !program.matches(config, &logs))
+        {
+            return Err(PreparedQuotientError::ProducerB2nProgramMismatch);
+        }
         let requirements = quotient_workspace_requirements(config, &logs)?;
         let slot_requirements = requirements.arena_slot_requirements(slots)?;
         let workspace_ids: BTreeSet<_> = slot_requirements.iter().map(|entry| entry.id).collect();
@@ -522,6 +573,7 @@ impl<'a> PreparedQuotientGraph<'a> {
             output_values,
             forward_twiddles,
             inverse_twiddles: inverse_subdomain_twiddles,
+            producer_b2n,
         })
     }
 
@@ -586,43 +638,83 @@ impl<'a> PreparedQuotientGraph<'a> {
                 .add(coordinate * subdomain_size as usize)
         };
 
-        let code = unsafe {
-            stwo_backend_cuda_kernels::raw::stwo_combine_quotients_from_numerators_on(
-                self.requirements.half_coset_initial_index,
-                self.requirements.half_coset_step_size,
-                subdomain_size,
-                self.requirements.subdomain_log_size,
-                self.sample_points.as_u32_ptr().cast_const(),
-                sample_count,
-                self.first_linear_terms.as_u32_ptr().cast(),
-                self.partial_log_sizes.as_u32_ptr().cast_const(),
-                partials(0),
-                partials(1),
-                partials(2),
-                partials(3),
-                subdomain_coordinate(0),
-                subdomain_coordinate(1),
-                subdomain_coordinate(2),
-                subdomain_coordinate(3),
-                stream,
-            )
-        };
-        check_cuda("prepared_quotient_combine", code)?;
-
         let inverse_words = u32::try_from(self.inverse_twiddles.len_words())
             .map_err(|_| PreparedQuotientError::SizeOverflow)?;
-        let code = unsafe {
-            stwo_backend_cuda_kernels::raw::stwo_ntt_b2n_columns_on(
-                subdomain_ptrs,
-                self.requirements.subdomain_log_size,
-                SECURE_COORDINATES as u32,
-                self.inverse_twiddles.as_u32_ptr(),
-                inverse_words,
-                1u32 << (self.requirements.subdomain_log_size - 1),
-                stream,
-            )
-        };
-        check_cuda("prepared_quotient_interpolate", code)?;
+        let inverse_domain_size = 1u32 << (self.requirements.subdomain_log_size - 1);
+        if self.producer_b2n.is_some() {
+            let code = unsafe {
+                stwo_backend_cuda_kernels::raw::stwo_combine_quotients_b2n_init7_on(
+                    self.requirements.half_coset_initial_index,
+                    self.requirements.half_coset_step_size,
+                    subdomain_size,
+                    self.requirements.subdomain_log_size,
+                    self.sample_points.as_u32_ptr().cast_const(),
+                    sample_count,
+                    self.first_linear_terms.as_u32_ptr().cast(),
+                    self.partial_log_sizes.as_u32_ptr().cast_const(),
+                    partials(0),
+                    partials(1),
+                    partials(2),
+                    partials(3),
+                    subdomain_coordinate(0),
+                    subdomain_coordinate(1),
+                    subdomain_coordinate(2),
+                    subdomain_coordinate(3),
+                    self.inverse_twiddles.as_u32_ptr(),
+                    inverse_words,
+                    inverse_domain_size,
+                    stream,
+                )
+            };
+            check_cuda("prepared_quotient_producer_b2n_init7", code)?;
+            let code = unsafe {
+                stwo_backend_cuda_kernels::raw::stwo_ntt_b2n_columns_after_first_seven_on(
+                    subdomain_ptrs,
+                    self.requirements.subdomain_log_size,
+                    SECURE_COORDINATES as u32,
+                    self.inverse_twiddles.as_u32_ptr(),
+                    inverse_words,
+                    inverse_domain_size,
+                    stream,
+                )
+            };
+            check_cuda("prepared_quotient_b2n_continuation", code)?;
+        } else {
+            let code = unsafe {
+                stwo_backend_cuda_kernels::raw::stwo_combine_quotients_from_numerators_on(
+                    self.requirements.half_coset_initial_index,
+                    self.requirements.half_coset_step_size,
+                    subdomain_size,
+                    self.requirements.subdomain_log_size,
+                    self.sample_points.as_u32_ptr().cast_const(),
+                    sample_count,
+                    self.first_linear_terms.as_u32_ptr().cast(),
+                    self.partial_log_sizes.as_u32_ptr().cast_const(),
+                    partials(0),
+                    partials(1),
+                    partials(2),
+                    partials(3),
+                    subdomain_coordinate(0),
+                    subdomain_coordinate(1),
+                    subdomain_coordinate(2),
+                    subdomain_coordinate(3),
+                    stream,
+                )
+            };
+            check_cuda("prepared_quotient_combine", code)?;
+            let code = unsafe {
+                stwo_backend_cuda_kernels::raw::stwo_ntt_b2n_columns_on(
+                    subdomain_ptrs,
+                    self.requirements.subdomain_log_size,
+                    SECURE_COORDINATES as u32,
+                    self.inverse_twiddles.as_u32_ptr(),
+                    inverse_words,
+                    inverse_domain_size,
+                    stream,
+                )
+            };
+            check_cuda("prepared_quotient_interpolate", code)?;
+        }
 
         let forward_words = u32::try_from(self.forward_twiddles.len_words())
             .map_err(|_| PreparedQuotientError::SizeOverflow)?;
@@ -646,6 +738,10 @@ impl<'a> PreparedQuotientGraph<'a> {
     /// Contiguous `[coord0 | coord1 | coord2 | coord3]` full-domain evaluation.
     pub const fn output_evaluation(&self) -> ArenaSlice {
         self.output_values
+    }
+
+    pub fn producer_b2n_receipt(&self) -> Option<QuotientProducerB2nReceipt> {
+        self.producer_b2n.as_ref().map(|program| program.receipt())
     }
 }
 

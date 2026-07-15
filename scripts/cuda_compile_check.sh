@@ -193,6 +193,20 @@ if [[ "$MODE" == "resources" ]]; then
     rm -f "$receipt"
     trap - EXIT
   fi
+  if [[ "$ARCH" == "sm_90" ]] && printf '%s\n' "${FILES[@]}" \
+      | grep -Fxq "${KERNELS_DIR}/cuda/quotients.cu"; then
+    receipt=$(mktemp)
+    trap 'rm -f "$receipt"' EXIT
+    printf '%s\n' "$out" > "$receipt"
+    # The kernel launches 128 threads with __launch_bounds__(128, 4). Checking
+    # the four-block register envelope as 512 threads fails closed above 128
+    # registers/thread; ptxas must additionally report zero stack and spills.
+    gpu-lab/tools/check-cuda-resources "$receipt" \
+      --kernel '_Z34combine_quotients_b2n_init7_in_gpu' \
+      --launch-threads 512 --registers-per-sm 65536
+    rm -f "$receipt"
+    trap - EXIT
+  fi
   if echo "$out" | grep -E '[1-9][0-9]* bytes spill (stores|loads)' >/dev/null; then
     echo '[cuda_compile_check] resources FAIL: spills detected'
     exit 1

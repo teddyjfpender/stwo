@@ -86,6 +86,32 @@ int stwo_combine_quotients_from_numerators_on(
         void *stream
 );
 
+// Exact SN2 producer boundary: combine every quotient row once and retain the
+// four-coordinate tile through B2N stages 1..7 before its only global write.
+extern "C"
+int stwo_combine_quotients_b2n_init7_on(
+        uint32_t half_coset_initial_index,
+        uint32_t half_coset_step_size,
+        uint32_t domain_size,
+        uint32_t domain_log_size,
+        const secure_field_point *sample_points,
+        uint32_t sample_size,
+        const qm31 *first_linear_term_accs,
+        const uint32_t *partial_numerator_log_sizes,
+        const m31 *const *partial_numerators_0,
+        const m31 *const *partial_numerators_1,
+        const m31 *const *partial_numerators_2,
+        const m31 *const *partial_numerators_3,
+        uint32_t *result_column_0,
+        uint32_t *result_column_1,
+        uint32_t *result_column_2,
+        uint32_t *result_column_3,
+        const uint32_t *inverse_twiddles,
+        uint32_t inverse_twiddle_words,
+        uint32_t eval_domain_size,
+        void *stream
+);
+
 // Prepared FRI-quotient numerator pipeline. All topology tables and scratch
 // buffers are caller-owned device memory; every launch stays on `stream`.
 extern "C"

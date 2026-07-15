@@ -76,6 +76,7 @@ mod tests {
     #[test]
     fn prepared_quotient_symbols_are_linked_in_cuda_and_stub_builds() {
         assert_ne!(raw::stwo_combine_quotients_from_numerators_on as usize, 0);
+        assert_ne!(raw::stwo_combine_quotients_b2n_init7_on as usize, 0);
         assert_ne!(raw::stwo_prepare_quotient_numerator_terms_on as usize, 0);
         assert_ne!(raw::stwo_finalize_quotient_numerator_groups_on as usize, 0);
         assert_ne!(raw::stwo_zero_quotient_numerator_outputs_on as usize, 0);
@@ -89,6 +90,7 @@ mod tests {
             0
         );
         assert_ne!(raw::stwo_ntt_b2n_columns_on as usize, 0);
+        assert_ne!(raw::stwo_ntt_b2n_columns_after_first_seven_on as usize, 0);
         assert_ne!(raw::stwo_lde_n2b_columns_on as usize, 0);
     }
 
@@ -115,6 +117,41 @@ mod tests {
         ) -> i32;
         let _: CombineFn = raw::stwo_combine_quotients_from_numerators_on;
 
+        type ProducerB2nFn = unsafe extern "C" fn(
+            u32,
+            u32,
+            u32,
+            u32,
+            *const u32,
+            u32,
+            *const raw::CudaSecureField,
+            *const u32,
+            *const *const u32,
+            *const *const u32,
+            *const *const u32,
+            *const *const u32,
+            *mut u32,
+            *mut u32,
+            *mut u32,
+            *mut u32,
+            *const u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32;
+        let _: ProducerB2nFn = raw::stwo_combine_quotients_b2n_init7_on;
+
+        type B2nContinuationFn = unsafe extern "C" fn(
+            *const *mut u32,
+            u32,
+            u32,
+            *const u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32;
+        let _: B2nContinuationFn = raw::stwo_ntt_b2n_columns_after_first_seven_on;
+
         let source = include_str!("../cuda/quotients.cu");
         assert_eq!(source.matches("quotient_inverse_chunk").count(), 3);
         assert_eq!(source.matches("denominator_for_sample(").count(), 3);
@@ -134,6 +171,30 @@ mod tests {
         assert!(!source.contains("__shfl_down_sync"));
         assert!(!source.contains("cm31 *denominator_inverses"));
         assert!(!source.contains("cuda_proving_malloc<cm31>(sample_size * domain_size)"));
+
+        for required in [
+            "constexpr int QUOTIENT_PRODUCER_B2N_BLOCK_DIM = 128;",
+            "constexpr uint32_t QUOTIENT_PRODUCER_B2N_FIRST_STAGES = 7;",
+            "__launch_bounds__(QUOTIENT_PRODUCER_B2N_BLOCK_DIM, 4)",
+            "stage <= QUOTIENT_PRODUCER_B2N_FIRST_STAGES",
+        ] {
+            assert!(
+                source.contains(required),
+                "missing producer contract: {required}"
+            );
+        }
+
+        let inverse_source = include_str!("../cuda/ifft.cu");
+        for required in [
+            "log_n != 23 || num_poly != 4",
+            "values, log_n, num_poly, 8, 8, twiddles, stream",
+            "values, log_n, num_poly, 16, 8, twiddles, stream",
+        ] {
+            assert!(
+                inverse_source.contains(required),
+                "missing exact B2N continuation: {required}"
+            );
+        }
     }
 
     #[test]
