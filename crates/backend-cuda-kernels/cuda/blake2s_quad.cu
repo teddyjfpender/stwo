@@ -11,12 +11,18 @@ namespace {
 constexpr uint32_t kBlockThreads = 256;
 constexpr uint32_t kQuadWidth = 4;
 constexpr uint32_t kLeavesPerBlock = kBlockThreads / kQuadWidth;
+constexpr uint32_t kMaxQuadRows = 1u << 30;
 #ifndef STWO_BLAKE2S_QUAD_MIN_BLOCKS
 #define STWO_BLAKE2S_QUAD_MIN_BLOCKS 6
+#endif
+#ifndef STWO_BLAKE2S_PROGRESSIVE_QUAD_MIN_BLOCKS
+#define STWO_BLAKE2S_PROGRESSIVE_QUAD_MIN_BLOCKS 5
 #endif
 static_assert(kBlockThreads % 32 == 0, "quad block must contain complete warps");
 static_assert(32 % kQuadWidth == 0, "quad width must partition a warp");
 static_assert(STWO_BLAKE2S_QUAD_MIN_BLOCKS >= 1, "invalid occupancy target");
+static_assert(STWO_BLAKE2S_PROGRESSIVE_QUAD_MIN_BLOCKS >= 1,
+              "invalid progressive occupancy target");
 
 __device__ __constant__ uint32_t kIv[8] = {
     0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
@@ -161,6 +167,78 @@ void stream_leaf_update_quad(
     states[leaf].s[quad_lane + 4] = h_high;
 }
 
+__device__ __forceinline__ uint32_t progressive_pending_words(
+    uint32_t absorbed_columns) {
+    return absorbed_columns == 0 ? 0 : (absorbed_columns - 1) % 16 + 1;
+}
+
+// One quad owns one native-domain row. The chaining value and lazy pending
+// block remain distributed across its four lanes for the complete canonical
+// batch; HBM sees one state read and one state write, irrespective of width.
+__global__ __launch_bounds__(kBlockThreads,
+                             STWO_BLAKE2S_PROGRESSIVE_QUAD_MIN_BLOCKS)
+void progressive_leaf_absorb_quad(
+    uint32_t size,
+    uint32_t number_of_columns,
+    uint32_t absorbed_columns_before,
+    uint32_t **columns,
+    uint32_t initializes_state,
+    ProgressiveBlake2sState *states) {
+    const uint32_t thread = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t row = thread / kQuadWidth;
+    const uint32_t quad_lane = threadIdx.x & 3u;
+    if (row >= size) return;
+
+    const uint32_t lane_in_warp = threadIdx.x & 31u;
+    const uint32_t mask = 0xFu << (lane_in_warp & ~3u);
+    const uint32_t local_row = threadIdx.x / kQuadWidth;
+    __shared__ uint32_t messages[kLeavesPerBlock][16];
+
+    uint32_t h_low = initializes_state != 0
+        ? kIv[quad_lane] ^ (quad_lane == 0 ? 0x01010020u : 0u)
+        : states[row].h[quad_lane];
+    uint32_t h_high = initializes_state != 0
+        ? kIv[quad_lane + 4]
+        : states[row].h[quad_lane + 4];
+    #pragma unroll
+    for (uint32_t word = quad_lane; word < 16; word += kQuadWidth) {
+        messages[local_row][word] = initializes_state != 0
+            ? 0u
+            : states[row].pending[word];
+    }
+    __syncwarp(mask);
+
+    uint32_t pending_words = progressive_pending_words(absorbed_columns_before);
+    uint32_t compressed_bytes = 4u * (absorbed_columns_before - pending_words);
+    uint32_t consumed = 0;
+    while (consumed < number_of_columns) {
+        if (pending_words == 16) {
+            compressed_bytes += 64;
+            compress_quad(mask, quad_lane, h_low, h_high,
+                          messages[local_row], compressed_bytes, 0);
+            pending_words = 0;
+            __syncwarp(mask);
+        }
+        const uint32_t available = 16 - pending_words;
+        const uint32_t remaining = number_of_columns - consumed;
+        const uint32_t fill = available < remaining ? available : remaining;
+        for (uint32_t local = quad_lane; local < fill; local += kQuadWidth) {
+            messages[local_row][pending_words + local] =
+                columns[consumed + local][row];
+        }
+        __syncwarp(mask);
+        pending_words += fill;
+        consumed += fill;
+    }
+
+    states[row].h[quad_lane] = h_low;
+    states[row].h[quad_lane + 4] = h_high;
+    #pragma unroll
+    for (uint32_t word = quad_lane; word < 16; word += kQuadWidth) {
+        states[row].pending[word] = messages[local_row][word];
+    }
+}
+
 }  // namespace
 
 extern "C" int stwo_blake2s_leaf_update_quad_on(
@@ -183,5 +261,31 @@ extern "C" int stwo_blake2s_leaf_update_quad_on(
                               reinterpret_cast<cudaStream_t>(stream)>>>(
         size, group_columns, columns, column_log_sizes, lifting_log_size,
         columns_done, states);
+    return cudaGetLastError();
+}
+
+extern "C" int stwo_blake2s_progressive_absorb_quad_on(
+    uint32_t size,
+    uint32_t number_of_columns,
+    uint32_t absorbed_columns_before,
+    uint32_t **columns,
+    uint32_t initializes_state,
+    ProgressiveBlake2sState *states,
+    void *stream) {
+    constexpr uint32_t kMaxCounterColumns = 0x3fffffffu;
+    if (size == 0 || size > kMaxQuadRows || (size & (size - 1)) != 0 ||
+        number_of_columns == 0 ||
+        columns == nullptr || initializes_state > 1 ||
+        (initializes_state != 0 && absorbed_columns_before != 0) ||
+        number_of_columns > kMaxCounterColumns ||
+        absorbed_columns_before > kMaxCounterColumns - number_of_columns ||
+        states == nullptr || stream == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    const uint32_t blocks = 1 + (size - 1) / kLeavesPerBlock;
+    progressive_leaf_absorb_quad<<<blocks, kBlockThreads, 0,
+                                   reinterpret_cast<cudaStream_t>(stream)>>>(
+        size, number_of_columns, absorbed_columns_before, columns,
+        initializes_state, states);
     return cudaGetLastError();
 }

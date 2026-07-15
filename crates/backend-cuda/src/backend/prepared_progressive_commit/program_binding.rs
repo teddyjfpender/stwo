@@ -334,7 +334,8 @@ fn prepared_steps(
                 bands: band_count(&finalize_band_plan(words(log_size)?)?)?,
             },
             ProgressiveLeafLaunchKind::Expand { .. }
-            | ProgressiveLeafLaunchKind::Finalize { .. } => {
+            | ProgressiveLeafLaunchKind::Finalize { .. }
+            | ProgressiveLeafLaunchKind::DomainAbsorb { .. } => {
                 return Err(CommitProgramBindingError::UnsupportedPreparedLaunch)
             }
         };

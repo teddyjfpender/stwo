@@ -75,6 +75,8 @@ pub struct DomainCooperativeResourceModel {
     pub threads_per_row: u32,
     pub rows_per_block: u32,
     pub threads_per_block: u32,
+    /// Native `__launch_bounds__` contract for the progressive quad kernel.
+    pub launch_bounds_min_blocks_per_sm: u32,
     pub persistent_state_words_per_thread: u32,
     /// The existing spill-free quad is the reference, not a claim about the
     /// new kernel. Native admission must still enforce this ptxas ceiling.
@@ -355,6 +357,7 @@ impl DomainCooperativeProgram {
                 threads_per_row: 4,
                 rows_per_block: 64,
                 threads_per_block: 256,
+                launch_bounds_min_blocks_per_sm: 5,
                 persistent_state_words_per_thread: 6,
                 register_ceiling_per_thread: 48,
             },

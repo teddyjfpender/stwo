@@ -118,6 +118,18 @@ int stwo_blake2s_progressive_absorb_on(
     uint32_t **columns,
     ProgressiveBlake2sState *states,
     void *stream);
+// Four-lane retained-domain twin. Unlike the aligned Blake2sHash quad, this
+// consumes arbitrary lazy prefixes through ProgressiveBlake2sState and may
+// initialize the first domain in the same launch.
+extern "C"
+int stwo_blake2s_progressive_absorb_quad_on(
+    uint32_t size,
+    uint32_t number_of_columns,
+    uint32_t absorbed_columns_before,
+    uint32_t **columns,
+    uint32_t initializes_state,
+    ProgressiveBlake2sState *states,
+    void *stream);
 extern "C"
 int stwo_blake2s_progressive_expand_on(
     uint32_t from_log_size,

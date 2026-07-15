@@ -196,9 +196,18 @@ fn mode_a_charges_readback_and_preserves_the_qualified_suffix() {
             threads_per_row: 4,
             rows_per_block: 64,
             threads_per_block: 256,
+            launch_bounds_min_blocks_per_sm: 5,
             persistent_state_words_per_thread: 6,
             register_ceiling_per_thread: 48,
         }
+    );
+    let resource = program.resource_model();
+    let launch_bound_registers =
+        65_536 / (resource.threads_per_block * resource.launch_bounds_min_blocks_per_sm);
+    assert_eq!(launch_bound_registers, 51);
+    assert!(
+        resource.register_ceiling_per_thread <= launch_bound_registers,
+        "the explicit 48-register policy must satisfy the five-block native launch bound"
     );
 }
 

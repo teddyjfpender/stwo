@@ -57,9 +57,31 @@ pub struct ProgressiveBlake2sState {
 const _: () = assert!(core::mem::size_of::<ProgressiveBlake2sState>() == 96);
 const _: () = assert!(core::mem::offset_of!(ProgressiveBlake2sState, pending) == 32);
 
+/// Largest canonical word prefix whose byte counter fits the low 32-bit
+/// counter implemented by the four-lane compressor.
+pub const BLAKE2S_PROGRESSIVE_QUAD_MAX_COUNTER_COLUMNS: u32 = 0x3fff_ffff;
+
+/// Address-free half of the native ABI admission. Pointer and stream checks
+/// remain in the C wrapper; keeping the counter predicate here makes boundary
+/// behavior executable in no-CUDA builds and available to prepared binders.
+pub const fn blake2s_progressive_absorb_quad_counts_valid(
+    number_of_columns: u32,
+    absorbed_columns_before: u32,
+    initializes_state: bool,
+) -> bool {
+    number_of_columns != 0
+        && (!initializes_state || absorbed_columns_before == 0)
+        && number_of_columns <= BLAKE2S_PROGRESSIVE_QUAD_MAX_COUNTER_COLUMNS
+        && absorbed_columns_before
+            <= BLAKE2S_PROGRESSIVE_QUAD_MAX_COUNTER_COLUMNS - number_of_columns
+}
+
 #[cfg(test)]
 mod progressive_blake2s_state_tests {
-    use super::ProgressiveBlake2sState;
+    use super::{
+        blake2s_progressive_absorb_quad_counts_valid, ProgressiveBlake2sState,
+        BLAKE2S_PROGRESSIVE_QUAD_MAX_COUNTER_COLUMNS,
+    };
 
     #[test]
     fn compact_layout_preserves_legacy_hash_and_pending_words_little_endian() {
@@ -85,6 +107,41 @@ mod progressive_blake2s_state_tests {
             assert_eq!(word.to_ne_bytes(), legacy[48 + 4 * index..52 + 4 * index]);
         }
         assert_eq!(128 - core::mem::size_of_val(&state), 32);
+    }
+
+    #[test]
+    fn progressive_quad_counter_admission_rejects_max_plus_one_and_sum_overflow() {
+        let max = BLAKE2S_PROGRESSIVE_QUAD_MAX_COUNTER_COLUMNS;
+        assert!(blake2s_progressive_absorb_quad_counts_valid(max, 0, true));
+        assert!(blake2s_progressive_absorb_quad_counts_valid(
+            1,
+            max - 1,
+            false
+        ));
+        assert!(!blake2s_progressive_absorb_quad_counts_valid(0, 0, true));
+        assert!(!blake2s_progressive_absorb_quad_counts_valid(
+            max + 1,
+            0,
+            true
+        ));
+        assert!(!blake2s_progressive_absorb_quad_counts_valid(1, max, false));
+        assert!(!blake2s_progressive_absorb_quad_counts_valid(1, 1, true));
+
+        type AbsorbQuadFn = unsafe extern "C" fn(
+            u32,
+            u32,
+            u32,
+            *const *mut u32,
+            u32,
+            *mut ProgressiveBlake2sState,
+            *mut core::ffi::c_void,
+        ) -> i32;
+        let _: AbsorbQuadFn = super::stwo_blake2s_progressive_absorb_quad_on;
+
+        let native = include_str!("../cuda/blake2s_quad.cu");
+        assert!(native.contains("constexpr uint32_t kMaxQuadRows = 1u << 30;"));
+        assert!(native.contains("size > kMaxQuadRows"));
+        assert!(native.contains("number_of_columns > kMaxCounterColumns"));
     }
 }
 
@@ -588,6 +645,16 @@ extern "C" {
         number_of_columns: u32,
         absorbed_columns_before: u32,
         columns: *const *mut u32,
+        states: *mut ProgressiveBlake2sState,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+    /// Four-lane retained-domain absorb with exact lazy-pending semantics.
+    pub fn stwo_blake2s_progressive_absorb_quad_on(
+        size: u32,
+        number_of_columns: u32,
+        absorbed_columns_before: u32,
+        columns: *const *mut u32,
+        initializes_state: u32,
         states: *mut ProgressiveBlake2sState,
         stream: *mut core::ffi::c_void,
     ) -> i32;

@@ -27,21 +27,23 @@ use super::progressive_ntt_leaf_fusion::{
     ProgressiveNttLeafFusionTelemetry,
 };
 
-mod in_place;
 mod domain_cooperative;
+mod domain_cooperative_binding;
+mod in_place;
 mod program;
 mod program_binding;
 mod program_oracle;
 mod shape_wide;
 
-pub use program::{
-    CommitProgram, CommitProgramError, CommitProgramIdentity, CommitProgramLayer,
-    CommitProgramOperation, CommitProgramStep, CommitProgramTraffic,
-};
 pub use domain_cooperative::{
     DomainCooperativeComparison, DomainCooperativeOperation, DomainCooperativeProgram,
     DomainCooperativeProgramError, DomainCooperativeResourceModel, DomainCooperativeSlabSlice,
     DomainCooperativeStep,
+};
+pub use domain_cooperative_binding::DomainCooperativeBindingError;
+pub use program::{
+    CommitProgram, CommitProgramError, CommitProgramIdentity, CommitProgramLayer,
+    CommitProgramOperation, CommitProgramStep, CommitProgramTraffic,
 };
 pub use program_binding::{CommitProgramBindingError, PreparedCommitProgramView};
 pub use program_oracle::{CommitProgramFixture, CommitProgramOracle, CommitProgramOracleLayer};
@@ -141,6 +143,13 @@ pub enum ProgressiveLeafLaunchKind {
         log_size: u32,
         columns: u32,
         absorbed_columns_before: u32,
+    },
+    DomainAbsorb {
+        batch_index: u32,
+        log_size: u32,
+        columns: u32,
+        absorbed_columns_before: u32,
+        initializes_state: bool,
     },
     FusedLdeAbsorb {
         batch_index: u32,
@@ -584,6 +593,12 @@ enum Launch {
     Absorb {
         log_size: u32,
         batch: PreparedBatch,
+        states: ArenaSlice,
+    },
+    DomainAbsorb {
+        log_size: u32,
+        batch: PreparedBatch,
+        initializes_state: bool,
         states: ArenaSlice,
     },
     FusedLdeAbsorb {
@@ -1167,6 +1182,28 @@ impl<'a> PreparedProgressiveLeaves<'a> {
                             stream,
                         ),
                     ),
+                    Launch::DomainAbsorb {
+                        log_size,
+                        batch,
+                        initializes_state,
+                        states,
+                    } => {
+                        if log_size >= 31 {
+                            return Err(PreparedProgressiveCommitError::SizeOverflow);
+                        }
+                        (
+                            "progressive_leaf_absorb_quad",
+                            stwo_backend_cuda_kernels::raw::stwo_blake2s_progressive_absorb_quad_on(
+                                1u32 << log_size,
+                                batch.columns,
+                                batch.absorbed_columns_before,
+                                batch.output_ptrs.as_u32_ptr().cast(),
+                                u32::from(initializes_state),
+                                states.as_u32_ptr().cast(),
+                                stream,
+                            ),
+                        )
+                    }
                     Launch::FusedLdeAbsorb {
                         batch,
                         retained_write_mask,
@@ -1253,6 +1290,18 @@ impl<'a> PreparedProgressiveLeaves<'a> {
                 log_size,
                 columns: batch.columns,
                 absorbed_columns_before: batch.absorbed_columns_before,
+            },
+            Launch::DomainAbsorb {
+                log_size,
+                batch,
+                initializes_state,
+                ..
+            } => ProgressiveLeafLaunchKind::DomainAbsorb {
+                batch_index: batch.batch_index,
+                log_size,
+                columns: batch.columns,
+                absorbed_columns_before: batch.absorbed_columns_before,
+                initializes_state,
             },
             Launch::FusedLdeAbsorb {
                 batch,

@@ -1274,6 +1274,19 @@ pub unsafe extern "C" fn stwo_blake2s_progressive_absorb_on(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_blake2s_progressive_absorb_quad_on(
+    _size: u32,
+    _number_of_columns: u32,
+    _absorbed_columns_before: u32,
+    _columns: *const *mut u32,
+    _initializes_state: u32,
+    _states: *mut crate::raw::ProgressiveBlake2sState,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_blake2s_progressive_absorb_quad_on")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stwo_blake2s_progressive_expand_on(
     _from_log_size: u32,
     _to_log_size: u32,
