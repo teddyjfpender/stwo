@@ -28,6 +28,7 @@ use super::progressive_ntt_leaf_fusion::{
 };
 
 mod in_place;
+mod domain_cooperative;
 mod program;
 mod program_binding;
 mod program_oracle;
@@ -36,6 +37,11 @@ mod shape_wide;
 pub use program::{
     CommitProgram, CommitProgramError, CommitProgramIdentity, CommitProgramLayer,
     CommitProgramOperation, CommitProgramStep, CommitProgramTraffic,
+};
+pub use domain_cooperative::{
+    DomainCooperativeComparison, DomainCooperativeOperation, DomainCooperativeProgram,
+    DomainCooperativeProgramError, DomainCooperativeResourceModel, DomainCooperativeSlabSlice,
+    DomainCooperativeStep,
 };
 pub use program_binding::{CommitProgramBindingError, PreparedCommitProgramView};
 pub use program_oracle::{CommitProgramFixture, CommitProgramOracle, CommitProgramOracleLayer};
