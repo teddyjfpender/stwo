@@ -164,6 +164,13 @@ pub enum CommitLaunchKind {
         level: u32,
         output_hashes: u32,
     },
+    /// One destructive column-free level in the explicit single-slab lane.
+    /// The ABI saves the first child pair in the slab tail, then executes the
+    /// proven low-to-high disjoint bands.
+    InteriorLayerInPlace {
+        level: u32,
+        output_hashes: u32,
+    },
     /// Four column-free interior levels in one launch (Step 3.2 fused interior
     /// lane, opt-in via `STWO_CUDA_BLAKE2S_INTERIOR_FUSED=1`). `first_level` is
     /// the first of the four fused levels; `output_hashes` counts the deepest
@@ -231,6 +238,7 @@ pub enum CommitGraphError {
     MisalignedHashBuffer(&'static str),
     AliasedArenaSlot(ArenaSlotId),
     InPlaceInteriorLayer(ArenaSlotId),
+    InvalidInPlaceScratch,
     PrematureArenaSlotReuse(ArenaSlotId),
     InvalidUnretainedBottomLayers {
         lifting_log_size: u32,
@@ -322,6 +330,12 @@ enum CommitLaunch {
         output: ArenaSlice,
         output_hashes: u32,
     },
+    InteriorLayerInPlace {
+        level: u32,
+        hashes: ArenaSlice,
+        scratch_pair: ArenaSlice,
+        output_hashes: u32,
+    },
     FusedInterior4 {
         first_level: u32,
         input: ArenaSlice,
@@ -388,6 +402,14 @@ impl CommitLaunch {
                 output_hashes,
                 ..
             } => CommitLaunchKind::InteriorLayer {
+                level,
+                output_hashes,
+            },
+            Self::InteriorLayerInPlace {
+                level,
+                output_hashes,
+                ..
+            } => CommitLaunchKind::InteriorLayerInPlace {
                 level,
                 output_hashes,
             },
@@ -772,6 +794,7 @@ impl CommitGraphPlan {
             tail,
             interior_fused,
             &input_slots,
+            None,
         )?;
         launches.extend(suffix.launches);
         Ok(Self {
@@ -822,6 +845,52 @@ impl CommitGraphPlan {
             tail,
             interior_fused,
             &BTreeSet::new(),
+            None,
+        )?;
+        Ok(Self {
+            context_token: leaf_hashes.context_token(),
+            launches: suffix.launches,
+            root: suffix.root,
+            hash_from_tile: CommitHashFromTileTelemetry::default(),
+            producer_fused_log_sizes: Vec::new(),
+            retained_fused_log_sizes: Vec::new(),
+        })
+    }
+
+    /// Explicit single-slab Merkle suffix. Only bottom layers excluded from
+    /// decommit retention may overwrite the leaf slab; legacy constructors
+    /// continue to reject every in-place interior alias.
+    pub fn new_merkle_from_leaves_in_place(
+        lifting_log_size: u32,
+        unretained_bottom_layers: u32,
+        leaf_hashes: ArenaSlice,
+        scratch_pair: ArenaSlice,
+        interior_outputs: Vec<ArenaSlice>,
+        tail: Option<CommitTailPlan>,
+    ) -> Result<Self, CommitGraphError> {
+        if unretained_bottom_layers == 0
+            || scratch_pair.id() != leaf_hashes.id()
+            || scratch_pair.len_words()
+                < super::progressive_commit_in_place::PROGRESSIVE_IN_PLACE_SCRATCH_WORDS
+        {
+            return Err(CommitGraphError::InvalidInPlaceScratch);
+        }
+        let leaf_start = leaf_hashes.as_u32_ptr() as usize;
+        let leaf_end = leaf_start
+            .checked_add(leaf_hashes.len_words() * core::mem::size_of::<u32>())
+            .ok_or(CommitGraphError::InvalidInPlaceScratch)?;
+        if (scratch_pair.as_u32_ptr() as usize) < leaf_end {
+            return Err(CommitGraphError::InvalidInPlaceScratch);
+        }
+        let suffix = build_merkle_from_leaves(
+            lifting_log_size,
+            unretained_bottom_layers,
+            leaf_hashes,
+            interior_outputs,
+            tail,
+            false,
+            &BTreeSet::new(),
+            Some(scratch_pair),
         )?;
         Ok(Self {
             context_token: leaf_hashes.context_token(),
@@ -1073,6 +1142,20 @@ impl CommitGraphPlan {
                             stream,
                         ),
                     ),
+                    CommitLaunch::InteriorLayerInPlace {
+                        hashes,
+                        scratch_pair,
+                        output_hashes,
+                        ..
+                    } => (
+                        "commit_interior_layer_in_place",
+                        raw::stwo_blake2s_layer_in_place_on(
+                            output_hashes,
+                            hashes.as_u32_ptr().cast(),
+                            scratch_pair.as_u32_ptr().cast(),
+                            stream,
+                        ),
+                    ),
                     CommitLaunch::FusedInterior4 {
                         input,
                         output,
@@ -1124,6 +1207,7 @@ fn build_merkle_from_leaves(
     tail: Option<CommitTailPlan>,
     interior_fused: bool,
     forbidden_input_slots: &BTreeSet<ArenaSlotId>,
+    in_place_scratch: Option<ArenaSlice>,
 ) -> Result<MerkleFromLeavesBuild, CommitGraphError> {
     if lifting_log_size >= 31 {
         return Err(CommitGraphError::InvalidLiftingLogSize(lifting_log_size));
@@ -1154,7 +1238,10 @@ fn build_merkle_from_leaves(
         if current_hashes < 2 {
             return Err(CommitGraphError::InteriorPastRoot(level as u32));
         }
-        if output.id() == current.id() {
+        let aliases_input = output.id() == current.id();
+        if aliases_input
+            && (in_place_scratch.is_none() || (level as u32 + 1) >= unretained_bottom_layers)
+        {
             return Err(CommitGraphError::InPlaceInteriorLayer(output.id()));
         }
         if retained_slots.contains(&output.id()) {
@@ -1163,11 +1250,20 @@ fn build_merkle_from_leaves(
         hash_slots.insert(output.id());
         let output_hashes = current_hashes / 2;
         require_hash_capacity("interior_output", output, output_hashes)?;
-        interior_levels.push(CommitLaunch::InteriorLayer {
-            level: level as u32,
-            input: current,
-            output,
-            output_hashes,
+        interior_levels.push(if aliases_input {
+            CommitLaunch::InteriorLayerInPlace {
+                level: level as u32,
+                hashes: current,
+                scratch_pair: in_place_scratch.expect("alias admission checked"),
+                output_hashes,
+            }
+        } else {
+            CommitLaunch::InteriorLayer {
+                level: level as u32,
+                input: current,
+                output,
+                output_hashes,
+            }
         });
         current = output;
         current_hashes = output_hashes;
@@ -1180,7 +1276,9 @@ fn build_merkle_from_leaves(
     let mut level = 0usize;
     while level < interior_levels.len() {
         let CommitLaunch::InteriorLayer { input, .. } = interior_levels[level] else {
-            unreachable!("interior_levels holds only InteriorLayer records");
+            launches.push(interior_levels[level]);
+            level += 1;
+            continue;
         };
         if interior_fused
             && interior4_window_fusible(level, interior_levels.len(), unretained_bottom_layers)
@@ -1992,6 +2090,119 @@ mod tests {
         assert!(interior4_window_fusible(0, 10, 8));
         assert!(interior4_window_fusible(4, 10, 8));
         assert!(!interior4_window_fusible(5, 10, 8));
+    }
+
+    #[test]
+    fn explicit_in_place_suffix_only_aliases_unretained_bottom_levels() {
+        let leaf = slice(1, 16 * HASH_WORDS);
+        let scratch = ArenaSlice::dangling_at_for_test(
+            1,
+            256,
+            super::super::progressive_commit_in_place::PROGRESSIVE_IN_PLACE_SCRATCH_WORDS,
+        );
+        let outputs = vec![
+            slice(1, 8 * HASH_WORDS),
+            slice(2, 4 * HASH_WORDS),
+            slice(3, 2 * HASH_WORDS),
+            slice(4, HASH_WORDS),
+        ];
+        let plan = CommitGraphPlan::new_merkle_from_leaves_in_place(
+            4,
+            2,
+            leaf,
+            scratch,
+            outputs.clone(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            plan.launch_sequence().collect::<Vec<_>>(),
+            vec![
+                CommitLaunchKind::InteriorLayerInPlace {
+                    level: 0,
+                    output_hashes: 8,
+                },
+                CommitLaunchKind::InteriorLayer {
+                    level: 1,
+                    output_hashes: 4,
+                },
+                CommitLaunchKind::InteriorLayer {
+                    level: 2,
+                    output_hashes: 2,
+                },
+                CommitLaunchKind::InteriorLayer {
+                    level: 3,
+                    output_hashes: 1,
+                },
+            ]
+        );
+        assert_eq!(plan.root().id(), ArenaSlotId(4));
+        assert_eq!(
+            CommitGraphPlan::new_merkle_from_leaves(4, 2, leaf, outputs, None).unwrap_err(),
+            CommitGraphError::InPlaceInteriorLayer(ArenaSlotId(1))
+        );
+    }
+
+    #[test]
+    fn in_place_suffix_rejects_retained_alias_and_invalid_scratch() {
+        let leaf = slice(1, 16 * HASH_WORDS);
+        let scratch = ArenaSlice::dangling_at_for_test(
+            1,
+            256,
+            super::super::progressive_commit_in_place::PROGRESSIVE_IN_PLACE_SCRATCH_WORDS,
+        );
+        let retained_alias = vec![
+            slice(1, 8 * HASH_WORDS),
+            slice(1, 4 * HASH_WORDS),
+            slice(3, 2 * HASH_WORDS),
+            slice(4, HASH_WORDS),
+        ];
+        assert_eq!(
+            CommitGraphPlan::new_merkle_from_leaves_in_place(
+                4,
+                2,
+                leaf,
+                scratch,
+                retained_alias,
+                None,
+            )
+            .unwrap_err(),
+            CommitGraphError::InPlaceInteriorLayer(ArenaSlotId(1))
+        );
+        let outputs = vec![
+            slice(1, 8 * HASH_WORDS),
+            slice(2, 4 * HASH_WORDS),
+            slice(3, 2 * HASH_WORDS),
+            slice(4, HASH_WORDS),
+        ];
+        assert_eq!(
+            CommitGraphPlan::new_merkle_from_leaves_in_place(
+                4,
+                0,
+                leaf,
+                scratch,
+                outputs.clone(),
+                None,
+            )
+            .unwrap_err(),
+            CommitGraphError::InvalidInPlaceScratch
+        );
+        assert_eq!(
+            CommitGraphPlan::new_merkle_from_leaves_in_place(
+                4,
+                2,
+                leaf,
+                ArenaSlice::dangling_at_for_test(
+                    1,
+                    32,
+                    super::super::progressive_commit_in_place::PROGRESSIVE_IN_PLACE_SCRATCH_WORDS,
+                ),
+                outputs,
+                None,
+            )
+            .unwrap_err(),
+            CommitGraphError::InvalidInPlaceScratch
+        );
     }
 
     #[test]
