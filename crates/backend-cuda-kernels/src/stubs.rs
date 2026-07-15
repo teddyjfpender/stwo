@@ -2285,6 +2285,24 @@ pub unsafe extern "C" fn stwo_cuda_jit_eval_fused_on(
 }
 
 #[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn stwo_cuda_jit_eval_composition_wave_on(
+    _source: *const core::ffi::c_char,
+    _kernel_name: *const core::ffi::c_char,
+    _cache_key: u64,
+    _parts: *const crate::raw::CudaCompositionWavePart,
+    _random_coeff_powers: *const u32,
+    _coord_0: *mut u32,
+    _coord_1: *mut u32,
+    _coord_2: *mut u32,
+    _coord_3: *mut u32,
+    _row_count: u32,
+    _stream: *mut core::ffi::c_void,
+) -> bool {
+    no_cuda_symbol("stwo_cuda_jit_eval_composition_wave_on")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stwo_composition_generate_descending_powers_on(
     _random_coefficient: *const CudaSecureField,
     _powers: *mut CudaSecureField,

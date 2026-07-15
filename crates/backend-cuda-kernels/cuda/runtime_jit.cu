@@ -81,6 +81,20 @@ struct StwoCudaJitAotStats {
     uint64_t strict_rejections;
 };
 
+struct StwoCudaCompositionWavePart {
+    const uint32_t *const *trace_cols;
+    const uint32_t *interaction_offsets;
+    const uint32_t *base_params;
+    const uint32_t *ext_params;
+    const uint32_t *denom_inv;
+    uint32_t log_n_rows;
+    uint32_t rc_base;
+};
+static_assert(sizeof(StwoCudaCompositionWavePart) == 48,
+              "composition wave part ABI");
+static_assert(alignof(StwoCudaCompositionWavePart) == 8,
+              "composition wave part alignment");
+
 struct AotCounters {
     std::atomic<uint64_t> aot_loads{0};
     std::atomic<uint64_t> aot_cache_hits{0};
@@ -1048,6 +1062,46 @@ extern "C" bool stwo_cuda_jit_eval_fused_on(
     if (cuLaunchKernel(function, grid, 1, 1, block, 1, 1, 0, (CUstream)stream, args,
                        nullptr) != CUDA_SUCCESS) {
         fprintf(stderr, "stwo resident AOT: cuLaunchKernel failed for %s\n", kernel_name);
+        return false;
+    }
+    return true;
+}
+
+// Resident explicit-stream launch for one generated same-domain composition
+// wave. The generated kernel bakes in the exact descriptor count and canonical
+// call order, so this sibling ABI intentionally has no runtime part-count
+// parameter which could drift or silently truncate work.
+extern "C" bool stwo_cuda_jit_eval_composition_wave_on(
+    const char *source,
+    const char *kernel_name,
+    uint64_t cache_key,
+    const StwoCudaCompositionWavePart *parts,
+    const uint32_t *random_coeff_powers,
+    uint32_t *coord_0,
+    uint32_t *coord_1,
+    uint32_t *coord_2,
+    uint32_t *coord_3,
+    uint32_t row_count,
+    void *stream
+) {
+    JitOperationAdmission launch_admission;
+    CUfunction function = nullptr;
+    if (!get_or_compile(source, kernel_name, cache_key, false, &function)) {
+        return false;
+    }
+    if (row_count == 0) return true;
+    void *args[] = {
+        (void *)&parts,               (void *)&random_coeff_powers,
+        (void *)&coord_0,             (void *)&coord_1,
+        (void *)&coord_2,             (void *)&coord_3,
+        (void *)&row_count,
+    };
+    const unsigned block = 128;
+    const unsigned grid = (row_count + block - 1) / block;
+    if (cuLaunchKernel(function, grid, 1, 1, block, 1, 1, 0, (CUstream)stream, args,
+                       nullptr) != CUDA_SUCCESS) {
+        fprintf(stderr, "stwo resident AOT: composition wave launch failed for %s\n",
+                kernel_name);
         return false;
     }
     return true;

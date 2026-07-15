@@ -329,6 +329,88 @@ pub struct CudaJitAotStats {
     pub strict_rejections: u64,
 }
 
+/// Exact host/device ABI for one already-bound constraint part inside a
+/// same-domain composition wave. Keep in sync with
+/// `StwoCudaCompositionWavePart` emitted by `cuda_codegen.rs`.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct CudaCompositionWavePart {
+    pub trace_cols: *const *const u32,
+    pub interaction_offsets: *const u32,
+    pub base_params: *const u32,
+    pub ext_params: *const u32,
+    pub denom_inv: *const u32,
+    pub log_n_rows: u32,
+    /// Proof-global start of this part's descending coefficient span.
+    pub rc_base: u32,
+}
+
+const _: () = assert!(core::mem::size_of::<CudaCompositionWavePart>() == 48);
+const _: () = assert!(core::mem::align_of::<CudaCompositionWavePart>() == 8);
+const _: () = assert!(core::mem::offset_of!(CudaCompositionWavePart, trace_cols) == 0);
+const _: () = assert!(core::mem::offset_of!(CudaCompositionWavePart, interaction_offsets) == 8);
+const _: () = assert!(core::mem::offset_of!(CudaCompositionWavePart, base_params) == 16);
+const _: () = assert!(core::mem::offset_of!(CudaCompositionWavePart, ext_params) == 24);
+const _: () = assert!(core::mem::offset_of!(CudaCompositionWavePart, denom_inv) == 32);
+const _: () = assert!(core::mem::offset_of!(CudaCompositionWavePart, log_n_rows) == 40);
+const _: () = assert!(core::mem::offset_of!(CudaCompositionWavePart, rc_base) == 44);
+
+#[cfg(test)]
+mod composition_wave_abi_tests {
+    use super::CudaCompositionWavePart;
+
+    #[test]
+    fn composition_wave_descriptor_and_launch_abi_are_exact() {
+        assert_eq!(core::mem::size_of::<CudaCompositionWavePart>(), 48);
+        assert_eq!(core::mem::align_of::<CudaCompositionWavePart>(), 8);
+        assert_eq!(
+            core::mem::offset_of!(CudaCompositionWavePart, trace_cols),
+            0
+        );
+        assert_eq!(
+            core::mem::offset_of!(CudaCompositionWavePart, interaction_offsets),
+            8
+        );
+        assert_eq!(
+            core::mem::offset_of!(CudaCompositionWavePart, base_params),
+            16
+        );
+        assert_eq!(
+            core::mem::offset_of!(CudaCompositionWavePart, ext_params),
+            24
+        );
+        assert_eq!(
+            core::mem::offset_of!(CudaCompositionWavePart, denom_inv),
+            32
+        );
+        assert_eq!(
+            core::mem::offset_of!(CudaCompositionWavePart, log_n_rows),
+            40
+        );
+        assert_eq!(core::mem::offset_of!(CudaCompositionWavePart, rc_base), 44);
+
+        type LaunchFn = unsafe extern "C" fn(
+            *const core::ffi::c_char,
+            *const core::ffi::c_char,
+            u64,
+            *const CudaCompositionWavePart,
+            *const u32,
+            *mut u32,
+            *mut u32,
+            *mut u32,
+            *mut u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> bool;
+        let _: LaunchFn = super::stwo_cuda_jit_eval_composition_wave_on;
+
+        let native = include_str!("../cuda/runtime_jit.cu");
+        assert!(native.contains("sizeof(StwoCudaCompositionWavePart) == 48"));
+        assert!(native.contains("alignof(StwoCudaCompositionWavePart) == 8"));
+        assert!(!native.contains("composition_wave_on(\n    const char *source,\n    const char *kernel_name,\n    uint64_t cache_key,\n    uint32_t part_count"));
+    }
+}
+
 #[cfg_attr(stwo_cuda_link, link(name = "stwo_cuda_kernels", kind = "static"))]
 extern "C" {
     /// Returns a CUDA error code (0 = success). Sets the default mem pool's release
@@ -435,6 +517,23 @@ extern "C" {
         log_n_rows: u32,
         rc_base: u32,
         relax_opt: bool,
+        stream: *mut c_void,
+    ) -> bool;
+    /// Launch one precompiled same-domain composition wave. The generated
+    /// kernel fixes the descriptor count and order in its source; callers must
+    /// validate the plan identity before binding this raw ABI.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stwo_cuda_jit_eval_composition_wave_on(
+        source: *const core::ffi::c_char,
+        kernel_name: *const core::ffi::c_char,
+        cache_key: u64,
+        parts: *const CudaCompositionWavePart,
+        random_coeff_powers: *const u32,
+        coord_0: *mut u32,
+        coord_1: *mut u32,
+        coord_2: *mut u32,
+        coord_3: *mut u32,
+        row_count: u32,
         stream: *mut c_void,
     ) -> bool;
     /// Generate `[alpha^(count-1), ..., alpha, 1]` from a device-resident
