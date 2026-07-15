@@ -62,6 +62,17 @@ fn production_schedules_are_exact_and_fail_closed() {
 }
 
 #[test]
+fn production_launch_mode_admission_is_exact() {
+    let log24 = CompositionSplitProgram::compile(24).unwrap();
+    assert!(log24.admits_launch_mode(CompositionSplitLaunchMode::TerminalFallback));
+    assert!(!log24.admits_launch_mode(CompositionSplitLaunchMode::FusedFirstForward));
+
+    let log25 = CompositionSplitProgram::compile(25).unwrap();
+    assert!(log25.admits_launch_mode(CompositionSplitLaunchMode::TerminalFallback));
+    assert!(log25.admits_launch_mode(CompositionSplitLaunchMode::FusedFirstForward));
+}
+
+#[test]
 fn traffic_and_launch_receipts_are_exact() {
     let log24 = CompositionSplitProgram::compile(24).unwrap().traffic();
     assert_eq!(log24.source_image_bytes, 268_435_456);

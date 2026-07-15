@@ -1,9 +1,10 @@
 //! Exact-shape native CUDA differential for Composition coefficient splitting.
 //!
-//! Qualification runs both production logs through the terminal fallback and
-//! fused-first-forward paths, then compares every retained and source word.
-//! It covers eager execution, one captured replay, a mutated replay of the same
-//! graph, and red-zone preservation. Run on a >=8 GiB CUDA device with:
+//! Qualification rejects the unlaunchable log-24 fused path before binding any
+//! resources. At log 25 it compares the terminal fallback and fused paths over
+//! every retained and source word in eager execution, one captured replay, a
+//! mutated replay, and the red zones. The log-24 terminal path is qualified
+//! end-to-end in `composition_split_commit_native`. Run on a CUDA device with:
 //!
 //! ```text
 //! /usr/bin/time -v cargo test -p stwo-backend-cuda \
@@ -363,6 +364,7 @@ fn columns(arena: &DeviceArena, source_base: u32, output_base: u32) -> Compositi
 }
 
 fn run_case(log_size: u32) -> CaseReceipt {
+    assert_eq!(log_size, 25, "only log 25 admits the fused differential");
     let started = Instant::now();
     let program = CompositionSplitProgram::compile(log_size).unwrap();
     let arena = build_arena(log_size, program);
@@ -438,6 +440,44 @@ fn run_case(log_size: u32) -> CaseReceipt {
     }
 }
 
+fn assert_log24_fused_rejected_before_binding() {
+    const DUMMY: ArenaSlotId = ArenaSlotId(9_999);
+    let layout = ArenaLayout::new(
+        1,
+        &[ArenaSlotSpec {
+            id: DUMMY,
+            offset_words: 0,
+            len_words: 1,
+            alignment_words: 1,
+        }],
+    )
+    .unwrap();
+    let arena = DeviceArena::new(CudaExecContext::new().unwrap(), layout).unwrap();
+    let dummy = arena.bind(DUMMY).unwrap();
+    let result = PreparedCompositionSplitGraph::prepare(
+        &arena,
+        CompositionSplitProgram::compile(24).unwrap(),
+        CompositionSplitLaunchMode::FusedFirstForward,
+        CompositionSplitPointerSlots {
+            source_pointers: DUMMY,
+            retained_pointers: DUMMY,
+        },
+        CompositionSplitColumns {
+            source_evaluations: [dummy; COMPOSITION_SOURCE_COORDINATES],
+            retained_evaluations: [dummy; COMPOSITION_RETAINED_COLUMNS],
+        },
+        dummy,
+        dummy,
+    );
+    assert!(matches!(
+        result,
+        Err(CompositionSplitError::UnsupportedLaunchMode {
+            evaluation_log_size: 24,
+            mode: CompositionSplitLaunchMode::FusedFirstForward,
+        })
+    ));
+}
+
 fn requested_logs() -> Vec<u32> {
     let mut logs = std::env::var("STWO_COMPOSITION_SPLIT_LOGS")
         .unwrap_or_else(|_| "24,25".to_owned())
@@ -463,9 +503,15 @@ fn composition_split_exact_shape_fallback_matches_fused_eager_and_graph() {
         Err(CompositionSplitError::UnsupportedProductionLog(26))
     ));
     assert!(stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT);
+    let requested_logs = requested_logs();
+    let log24_fused_rejected = requested_logs.contains(&24);
+    if log24_fused_rejected {
+        assert_log24_fused_rejected_before_binding();
+    }
     let memory_before = gpu_memory_info();
-    let receipts = requested_logs()
+    let receipts = requested_logs
         .into_iter()
+        .filter(|&log_size| log_size == 25)
         .map(run_case)
         .collect::<Vec<_>>();
     let memory_after = gpu_memory_info();
@@ -490,6 +536,8 @@ fn composition_split_exact_shape_fallback_matches_fused_eager_and_graph() {
         serde_json::json!({
             "schema": "stwo.composition-split-native.v1",
             "passed": true,
+            "log24_fused_rejected": log24_fused_rejected,
+            "log24_terminal_qualification": "composition_split_commit_native",
             "all_retained_bytes_equal": true,
             "source_clobber_bytes_equal": true,
             "guards_preserved": true,

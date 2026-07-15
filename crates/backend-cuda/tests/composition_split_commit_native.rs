@@ -2,7 +2,8 @@
 //!
 //! The reference is the production predecessor: full B2N, eight coefficient
 //! half copies, ordinary compact LDE, leaf hashing, and Merkle. The candidate
-//! is the fused split followed directly by compact hashing of its evaluations.
+//! uses the qualified terminal split at log 24 and the fused split at log 25,
+//! followed directly by compact hashing of its evaluations.
 //! gpu-lab-cohesion-review: one native gate must bind both graph lifetimes and compare every
 //! boundary. Run on a >=16 GiB CUDA device with:
 //!
@@ -76,6 +77,7 @@ struct PreparedCase<'a> {
 #[derive(Debug)]
 struct CaseReceipt {
     log_size: u32,
+    candidate_launch_mode: CompositionSplitLaunchMode,
     arena_bytes: usize,
     baseline_graph_kernel_nodes: u64,
     candidate_graph_kernel_nodes: u64,
@@ -251,10 +253,15 @@ fn prepare<'a>(
             arena.bind(FORWARD_TWIDDLES).unwrap(),
         )
         .unwrap();
+    let candidate_launch_mode = match log_size {
+        24 => CompositionSplitLaunchMode::TerminalFallback,
+        25 => CompositionSplitLaunchMode::FusedFirstForward,
+        _ => unreachable!("production Composition log"),
+    };
     let candidate_split = PreparedCompositionSplitGraph::prepare(
         arena,
         split,
-        CompositionSplitLaunchMode::FusedFirstForward,
+        candidate_launch_mode,
         CompositionSplitPointerSlots {
             source_pointers: CANDIDATE_SOURCE_POINTERS,
             retained_pointers: CANDIDATE_OUTPUT_POINTERS,
@@ -298,8 +305,13 @@ fn prepare<'a>(
         + merkle_nodes;
     let expected_baseline_kernel_nodes =
         u64::from(split.schedule().inverse_intervals) + baseline_commit_nodes;
-    let expected_candidate_kernel_nodes =
-        u64::from(split.traffic().fused_kernel_launches) + candidate_commit_nodes;
+    let candidate_split_nodes = match candidate_launch_mode {
+        CompositionSplitLaunchMode::TerminalFallback => {
+            split.traffic().terminal_fallback_kernel_launches
+        }
+        CompositionSplitLaunchMode::FusedFirstForward => split.traffic().fused_kernel_launches,
+    };
+    let expected_candidate_kernel_nodes = u64::from(candidate_split_nodes) + candidate_commit_nodes;
     PreparedCase {
         baseline,
         candidate_split,
@@ -627,9 +639,15 @@ fn run_case(log_size: u32) -> CaseReceipt {
         .kernel_nodes()
         .checked_sub(candidate_graph.kernel_nodes())
         .expect("candidate graph added kernel nodes");
+    let candidate_split_nodes = match prepared.candidate_split.mode() {
+        CompositionSplitLaunchMode::TerminalFallback => {
+            split.traffic().terminal_fallback_kernel_launches
+        }
+        CompositionSplitLaunchMode::FusedFirstForward => split.traffic().fused_kernel_launches,
+    };
     assert_eq!(
         observed_kernel_nodes_saved,
-        u64::from(split.traffic().current_kernel_launches - split.traffic().fused_kernel_launches)
+        u64::from(split.traffic().current_kernel_launches - candidate_split_nodes)
     );
     let captured_d2d_bytes = telemetry_after.d2d_bytes - telemetry_before.d2d_bytes;
     assert_eq!(
@@ -652,13 +670,19 @@ fn run_case(log_size: u32) -> CaseReceipt {
 
     CaseReceipt {
         log_size,
+        candidate_launch_mode: prepared.candidate_split.mode(),
         arena_bytes,
         baseline_graph_kernel_nodes: baseline_graph.kernel_nodes(),
         candidate_graph_kernel_nodes: candidate_graph.kernel_nodes(),
         expected_baseline_kernel_nodes: prepared.expected_baseline_kernel_nodes,
         expected_candidate_kernel_nodes: prepared.expected_candidate_kernel_nodes,
         modeled_current_logical_bytes: split.traffic().current_logical_bytes,
-        modeled_candidate_logical_bytes: split.traffic().fused_logical_bytes,
+        modeled_candidate_logical_bytes: match prepared.candidate_split.mode() {
+            CompositionSplitLaunchMode::TerminalFallback => {
+                split.traffic().terminal_fallback_logical_bytes
+            }
+            CompositionSplitLaunchMode::FusedFirstForward => split.traffic().fused_logical_bytes,
+        },
         expected_captured_d2d_nodes: split.traffic().current_d2d_nodes,
         captured_d2d_bytes,
         baseline_leaf_api_calls,
@@ -699,6 +723,7 @@ fn fused_split_precomputed_commit_matches_legacy_pipeline_exactly() {
         .map(|receipt| {
             serde_json::json!({
                 "log_size": receipt.log_size,
+                "candidate_launch_mode": format!("{:?}", receipt.candidate_launch_mode),
                 "arena_bytes": receipt.arena_bytes,
                 "baseline_graph_kernel_nodes": receipt.baseline_graph_kernel_nodes,
                 "candidate_graph_kernel_nodes": receipt.candidate_graph_kernel_nodes,
@@ -726,7 +751,9 @@ fn fused_split_precomputed_commit_matches_legacy_pipeline_exactly() {
             "schema": "stwo.composition-split-commit-native.v1",
             "passed": true,
             "baseline": "b2n-plus-eight-d2d-plus-ordinary-compact-commit",
-            "candidate": "fused-split-plus-precomputed-compact-commit",
+            "candidate": "qualified-split-plus-precomputed-compact-commit",
+            "log24_candidate_launch_mode": "TerminalFallback",
+            "log25_candidate_launch_mode": "FusedFirstForward",
             "source_postimages_equal": true,
             "coefficient_halves_equal": true,
             "retained_evaluations_equal": true,
