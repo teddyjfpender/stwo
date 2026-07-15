@@ -89,4 +89,36 @@ int stwo_ntt_b2n_columns_to_retained_on(
         void *stream
 );
 
+// Exact four-to-eight Composition fallback. It runs the qualified B2N prefix,
+// splits the final coefficient image into canonical left/right coordinates,
+// and writes each coefficient to both partners of the omitted first N2B
+// butterfly. Outputs are ready for the ordinary stage-two successor.
+extern "C"
+int stwo_ntt_b2n_composition_to_retained_on(
+        uint32_t **source_values,
+        uint32_t **retained_outputs,
+        uint32_t log_n,
+        const uint32_t *inverse_twiddles,
+        uint32_t inverse_twiddle_words,
+        uint32_t eval_domain_size,
+        void *stream
+);
+
+// Strong production boundary for log 24/25 only. In addition to the exact
+// split above, this executes the first stage-two-successor N2B interval before
+// the only retained global write. The caller must continue at stage 9 for log
+// 24 and stage 7 for log 25.
+extern "C"
+int stwo_ntt_b2n_composition_fused_first_forward_on(
+        uint32_t **source_values,
+        uint32_t **retained_outputs,
+        uint32_t log_n,
+        const uint32_t *inverse_twiddles,
+        uint32_t inverse_twiddle_words,
+        const uint32_t *forward_twiddles,
+        uint32_t forward_twiddle_words,
+        uint32_t eval_domain_size,
+        void *stream
+);
+
 #endif // POLY_IFFT_H

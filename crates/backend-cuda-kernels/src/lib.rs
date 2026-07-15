@@ -152,6 +152,33 @@ mod tests {
     }
 
     #[test]
+    fn composition_split_symbols_and_exact_continuation_are_linked() {
+        assert_ne!(raw::stwo_ntt_b2n_composition_to_retained_on as usize, 0);
+        assert_ne!(
+            raw::stwo_ntt_b2n_composition_fused_first_forward_on as usize,
+            0
+        );
+        assert_ne!(
+            raw::stwo_ntt_n2b_columns_after_first_stage_two_interval_on as usize,
+            0
+        );
+        let source = include_str!("../cuda/rfft.cu");
+        for required in [
+            "(log_n != 24 && log_n != 25) || num_poly != 8",
+            "middle_start = 9",
+            "final_start = 17",
+            "middle_start = 7",
+            "final_start = 15",
+            "ntt_n2b_final_11_stage_batch_on<true>",
+        ] {
+            assert!(
+                source.contains(required),
+                "missing continuation: {required}"
+            );
+        }
+    }
+
+    #[test]
     fn progressive_ntt_leaf_sink_preserves_lazy_block_and_retained_write_contract() {
         let source = include_str!("../cuda/ntt_leaf_fused.cu");
         assert!(source.contains("SINK == FusedLeafSink::Progressive"));

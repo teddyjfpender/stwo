@@ -27,6 +27,7 @@ use super::progressive_ntt_leaf_fusion::{
     ProgressiveNttLeafFusionMode, ProgressiveNttLeafFusionTelemetry,
 };
 
+mod composition_split;
 mod direct_compact_domain_binding;
 mod direct_compact_terminal_fused;
 mod direct_retained_b2n;
@@ -40,6 +41,12 @@ mod program_binding;
 mod program_oracle;
 mod shape_wide;
 
+pub use composition_split::{
+    CompositionSplitColumns, CompositionSplitError, CompositionSplitLaunchMode,
+    CompositionSplitOracle, CompositionSplitPointerSlots, CompositionSplitProgram,
+    CompositionSplitSchedule, CompositionSplitTraffic, PreparedCompositionSplitGraph,
+    COMPOSITION_RETAINED_COLUMNS, COMPOSITION_SOURCE_COORDINATES,
+};
 pub use direct_compact_domain_binding::{
     direct_compact_domain_arena_slot_requirements, DirectCompactDomainBindingError,
     PreparedDirectCompactDomainCommitGraph,

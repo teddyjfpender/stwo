@@ -1455,6 +1455,51 @@ static cudaError_t ntt_n2b_final_interval_before_circle_dispatch_on(
     }
 }
 
+// Composition's fused inverse boundary already materialized the exact output
+// after the first stage-two-successor interval. Only the two table-pinned
+// production continuations are valid here.
+static cudaError_t ntt_n2b_after_first_stage_two_interval_dispatch_on(
+    m31 **values,
+    unsigned log_n,
+    unsigned num_poly,
+    m31 *twiddles,
+    unsigned twiddle_words,
+    unsigned eval_domain_size,
+    cudaStream_t stream
+) {
+    unsigned middle_start = 0;
+    unsigned final_start = 0;
+    unsigned final_stages = 0;
+    if (log_n == 24) {
+        const auto &config = LAUNCH_N2B_CONFIG_20_27[4];
+        if (config[0] != 8 || config[1] != 8 || config[2] != 8)
+            return cudaErrorInvalidConfiguration;
+        middle_start = 9;
+        final_start = 17;
+        final_stages = 8;
+    } else if (log_n == 25) {
+        const auto &config = LAUNCH_N2B_CONFIG_20_27[5];
+        if (config[0] != 6 || config[1] != 8 || config[2] != 11)
+            return cudaErrorInvalidConfiguration;
+        middle_start = 7;
+        final_start = 15;
+        final_stages = 11;
+    } else {
+        return cudaErrorInvalidValue;
+    }
+    cudaError_t status = ntt_n2b_nofinal_8_stage_batch_on(
+        values, values, log_n, num_poly, middle_start, twiddles,
+        twiddle_words, eval_domain_size, stream);
+    if (status != cudaSuccess) return status;
+    return final_stages == 8
+        ? ntt_n2b_final_8_stage_batch_on<true>(
+              values, values, log_n, num_poly, final_start, twiddles,
+              twiddle_words, eval_domain_size, stream)
+        : ntt_n2b_final_11_stage_batch_on<true>(
+              values, values, log_n, num_poly, final_start, twiddles,
+              twiddle_words, eval_domain_size, stream);
+}
+
 static cudaError_t ntt_n2b_hash16_dispatch_on(
     m31 **values,
     unsigned log_n,
@@ -1706,6 +1751,27 @@ extern "C" int stwo_ntt_n2b_columns_final_interval_before_circle_on(
         if (err != cudaSuccess) return err;
     }
     return cudaSuccess;
+}
+
+extern "C" int stwo_ntt_n2b_columns_after_first_stage_two_interval_on(
+    uint32_t **device_values,
+    unsigned log_n,
+    unsigned num_poly,
+    uint32_t *g_twiddles,
+    unsigned twiddles_size,
+    unsigned eval_domain_size,
+    void *stream
+) {
+    if (device_values == nullptr || g_twiddles == nullptr || stream == nullptr ||
+        (log_n != 24 && log_n != 25) || num_poly != 8 ||
+        eval_domain_size != (1u << (log_n - 1)) ||
+        eval_domain_size > twiddles_size) {
+        return cudaErrorInvalidValue;
+    }
+    return ntt_n2b_after_first_stage_two_interval_dispatch_on(
+        reinterpret_cast<m31 **>(device_values), log_n, num_poly,
+        reinterpret_cast<m31 *>(g_twiddles), twiddles_size,
+        eval_domain_size, reinterpret_cast<cudaStream_t>(stream));
 }
 
 __global__ void stage_lde_columns(

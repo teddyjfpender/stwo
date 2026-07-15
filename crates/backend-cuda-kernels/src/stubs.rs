@@ -2032,6 +2032,34 @@ pub unsafe extern "C" fn stwo_ntt_b2n_columns_to_retained_on(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_ntt_b2n_composition_to_retained_on(
+    _source_values: *const *mut u32,
+    _retained_outputs: *const *mut u32,
+    _log_n: u32,
+    _inverse_twiddles: *const u32,
+    _inverse_twiddle_words: u32,
+    _eval_domain_size: u32,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_ntt_b2n_composition_to_retained_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_ntt_b2n_composition_fused_first_forward_on(
+    _source_values: *const *mut u32,
+    _retained_outputs: *const *mut u32,
+    _log_n: u32,
+    _inverse_twiddles: *const u32,
+    _inverse_twiddle_words: u32,
+    _forward_twiddles: *const u32,
+    _forward_twiddle_words: u32,
+    _eval_domain_size: u32,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_ntt_b2n_composition_fused_first_forward_on")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ntt_n2b_columns(
     values_columns: *mut *mut u32,
     log_n: u32,
@@ -2106,6 +2134,19 @@ pub unsafe extern "C" fn stwo_ntt_n2b_columns_final_interval_before_circle_on(
     _stream: *mut core::ffi::c_void,
 ) -> i32 {
     no_cuda_symbol("stwo_ntt_n2b_columns_final_interval_before_circle_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_ntt_n2b_columns_after_first_stage_two_interval_on(
+    _device_values: *const *mut u32,
+    _log_n: u32,
+    _num_poly: u32,
+    _g_twiddles: *mut u32,
+    _twiddles_size: u32,
+    _eval_domain_size: u32,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_ntt_n2b_columns_after_first_stage_two_interval_on")
 }
 
 #[unsafe(no_mangle)]

@@ -1530,6 +1530,33 @@ extern "C" {
         stream: *mut c_void,
     ) -> i32;
 
+    /// Exact four-coordinate Composition fallback to eight duplicated
+    /// stage-two retained columns.
+    pub fn stwo_ntt_b2n_composition_to_retained_on(
+        source_values: *const *mut u32,
+        retained_outputs: *const *mut u32,
+        log_n: u32,
+        inverse_twiddles: *const u32,
+        inverse_twiddle_words: u32,
+        eval_domain_size: u32,
+        stream: *mut c_void,
+    ) -> i32;
+
+    /// Log24/25 Composition boundary that also executes the first forward
+    /// interval before its only retained global write.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stwo_ntt_b2n_composition_fused_first_forward_on(
+        source_values: *const *mut u32,
+        retained_outputs: *const *mut u32,
+        log_n: u32,
+        inverse_twiddles: *const u32,
+        inverse_twiddle_words: u32,
+        forward_twiddles: *const u32,
+        forward_twiddle_words: u32,
+        eval_domain_size: u32,
+        stream: *mut c_void,
+    ) -> i32;
+
     pub fn ntt_n2b_columns(
         values_columns: *mut *mut u32,
         log_n: u32,
@@ -1590,6 +1617,18 @@ extern "C" {
     /// Complete only the configured final interval while leaving the circle
     /// butterfly for the paired compact remainder sink.
     pub fn stwo_ntt_n2b_columns_final_interval_before_circle_on(
+        device_values: *const *mut u32,
+        log_n: u32,
+        num_poly: u32,
+        g_twiddles: *mut u32,
+        twiddles_size: u32,
+        eval_domain_size: u32,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
+    /// Exact eight-column Composition continuation after the fused first
+    /// forward interval. Only log24 and log25 are admitted.
+    pub fn stwo_ntt_n2b_columns_after_first_stage_two_interval_on(
         device_values: *const *mut u32,
         log_n: u32,
         num_poly: u32,

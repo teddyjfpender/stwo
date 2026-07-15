@@ -1,4 +1,5 @@
 #include "ifft.cuh"
+#include "composition_split.cuh"
 #include "point.cuh"
 #include "poly_utils.cuh"
 #include "utils.cuh"
@@ -1141,6 +1142,101 @@ cudaError_t b2n_fused_out_of_place_on(m31 **input, m31 **output,
     return error;
 }
 
+template <unsigned LOG_VALUES_PER_THREAD, bool FUSE_FIRST_FORWARD>
+cudaError_t launch_composition_split_boundary_on(
+    m31 **sources, m31 **retained_outputs, unsigned log_n,
+    unsigned start_stage, m31 *inverse_twiddles, m31 *forward_twiddles,
+    cudaStream_t stream) {
+    constexpr unsigned stages = 2 * LOG_VALUES_PER_THREAD;
+    if (start_stage + stages - 1 != log_n)
+        return cudaErrorInvalidConfiguration;
+    constexpr unsigned warp = 32;
+    dim3 block{warp, 1u << LOG_VALUES_PER_THREAD, 1};
+    const unsigned min_stride = 1u << (start_stage - 1);
+    dim3 grid{min_stride / warp, 1, 4};
+    const m31 rescale_factor = inv(pow(m31{2}, log_n));
+    composition_split_boundary_batch<
+        LOG_VALUES_PER_THREAD, FUSE_FIRST_FORWARD>
+        <<<grid, block, 0, stream>>>(
+            sources, retained_outputs, log_n, start_stage, inverse_twiddles,
+            forward_twiddles, rescale_factor);
+    return cudaGetLastError();
+}
+
+template <bool FUSE_FIRST_FORWARD>
+cudaError_t b2n_composition_split_on(
+    m31 **sources, m31 **retained_outputs, unsigned log_n,
+    m31 *inverse_twiddles, m31 *forward_twiddles, cudaStream_t stream) {
+    const size_t *parts = nullptr;
+    size_t count = 0;
+    if (log_n == 24) {
+        parts = LAUNCH_B2N_CONFIG_19_24[5];
+        count = 3;
+    } else if (log_n == 25) {
+        parts = LAUNCH_B2N_CONFIG_25_29[0];
+        count = 4;
+    } else {
+        return cudaErrorInvalidValue;
+    }
+    if (!b2n_partition_is_exact(parts, count, log_n))
+        return cudaErrorInvalidConfiguration;
+
+    cudaError_t error = b2n_dispatch_init_interval_on(
+        sources, sources, log_n, 4, static_cast<unsigned>(parts[0]),
+        inverse_twiddles, stream);
+    unsigned start_stage = 1u + static_cast<unsigned>(parts[0]);
+    for (size_t index = 1;
+         error == cudaSuccess && index + 1 < count; ++index) {
+        const unsigned stages = static_cast<unsigned>(parts[index]);
+        error = b2n_dispatch_noinit_interval_on<false>(
+            sources, log_n, 4, start_stage, stages, inverse_twiddles, stream);
+        start_stage += stages;
+    }
+    if (error != cudaSuccess) return error;
+
+    const unsigned final_stages = static_cast<unsigned>(parts[count - 1]);
+    if (start_stage + final_stages - 1 != log_n)
+        return cudaErrorInvalidConfiguration;
+    if (log_n == 24 && final_stages == 8)
+        return launch_composition_split_boundary_on<4, FUSE_FIRST_FORWARD>(
+            sources, retained_outputs, log_n, start_stage, inverse_twiddles,
+            forward_twiddles, stream);
+    if (log_n == 25 && final_stages == 6)
+        return launch_composition_split_boundary_on<3, FUSE_FIRST_FORWARD>(
+            sources, retained_outputs, log_n, start_stage, inverse_twiddles,
+            forward_twiddles, stream);
+    return cudaErrorInvalidConfiguration;
+}
+
+template <bool FUSE_FIRST_FORWARD>
+int b2n_composition_split_entry(
+    uint32_t **source_values, uint32_t **retained_outputs, uint32_t log_n,
+    const uint32_t *inverse_twiddles, uint32_t inverse_twiddle_words,
+    const uint32_t *forward_twiddles, uint32_t forward_twiddle_words,
+    uint32_t eval_domain_size, void *stream_raw) {
+    if (source_values == nullptr || retained_outputs == nullptr ||
+        inverse_twiddles == nullptr || stream_raw == nullptr ||
+        (log_n != 24 && log_n != 25) ||
+        eval_domain_size != (1u << (log_n - 1)) ||
+        eval_domain_size > inverse_twiddle_words ||
+        (FUSE_FIRST_FORWARD &&
+         (forward_twiddles == nullptr ||
+          eval_domain_size > forward_twiddle_words)))
+        return (int)cudaErrorInvalidValue;
+
+    auto inverse = reinterpret_cast<m31 *>(const_cast<uint32_t *>(
+        inverse_twiddles + inverse_twiddle_words - eval_domain_size));
+    m31 *forward = nullptr;
+    if constexpr (FUSE_FIRST_FORWARD) {
+        forward = reinterpret_cast<m31 *>(const_cast<uint32_t *>(
+            forward_twiddles + forward_twiddle_words - eval_domain_size));
+    }
+    return (int)b2n_composition_split_on<FUSE_FIRST_FORWARD>(
+        reinterpret_cast<m31 **>(source_values),
+        reinterpret_cast<m31 **>(retained_outputs), log_n, inverse, forward,
+        reinterpret_cast<cudaStream_t>(stream_raw));
+}
+
 template <bool DUPLICATE_TO_RETAINED>
 int b2n_columns_out_of_place_entry(
     const uint32_t *const *inputs, uint32_t *const *outputs, uint32_t log_n,
@@ -1183,6 +1279,26 @@ extern "C" int stwo_ntt_b2n_columns_to_retained_on(
     uint32_t twiddles_size, uint32_t eval_domain_size, void *stream_raw) {
     return b2n_columns_out_of_place_entry<true>(
         inputs, retained_outputs, log_n, num_poly, g_twiddles, twiddles_size,
+        eval_domain_size, stream_raw);
+}
+
+extern "C" int stwo_ntt_b2n_composition_to_retained_on(
+    uint32_t **source_values, uint32_t **retained_outputs, uint32_t log_n,
+    const uint32_t *inverse_twiddles, uint32_t inverse_twiddle_words,
+    uint32_t eval_domain_size, void *stream_raw) {
+    return b2n_composition_split_entry<false>(
+        source_values, retained_outputs, log_n, inverse_twiddles,
+        inverse_twiddle_words, nullptr, 0, eval_domain_size, stream_raw);
+}
+
+extern "C" int stwo_ntt_b2n_composition_fused_first_forward_on(
+    uint32_t **source_values, uint32_t **retained_outputs, uint32_t log_n,
+    const uint32_t *inverse_twiddles, uint32_t inverse_twiddle_words,
+    const uint32_t *forward_twiddles, uint32_t forward_twiddle_words,
+    uint32_t eval_domain_size, void *stream_raw) {
+    return b2n_composition_split_entry<true>(
+        source_values, retained_outputs, log_n, inverse_twiddles,
+        inverse_twiddle_words, forward_twiddles, forward_twiddle_words,
         eval_domain_size, stream_raw);
 }
 
