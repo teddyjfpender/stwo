@@ -78,6 +78,108 @@ fn exact_layout_replaces_state_without_aliasing_live_evaluations() {
 }
 
 #[test]
+fn mixed_retention_is_bound_to_each_exact_batch_descriptor_slice() {
+    let base = CommitProgram::compile(
+        CommitWorkspaceConfig {
+            log_blowup_factor: 1,
+            lifting_log_size: 6,
+            unretained_bottom_layers: 4,
+            max_fused_tail_levels: 2,
+        },
+        ProgressiveCommitGeometry {
+            lifting_log_size: 6,
+            log_blowup_factor: 1,
+            groups: vec![
+                ProgressiveCommitGroupGeometry {
+                    coefficient_log_sizes: vec![3, 3],
+                    retain_evaluations: false,
+                },
+                ProgressiveCommitGroupGeometry {
+                    coefficient_log_sizes: vec![3, 3],
+                    retain_evaluations: true,
+                },
+                ProgressiveCommitGroupGeometry {
+                    coefficient_log_sizes: vec![4],
+                    retain_evaluations: false,
+                },
+            ],
+        },
+        ProgressiveNttLeafFusionMode::Fused16,
+        true,
+    )
+    .unwrap();
+    let shape = ShapeWideCommitProgram::compile_replacement_v1(&base).unwrap();
+    let stage_steps = shape
+        .leaf_steps()
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| matches!(step.operation, ShapeWideLeafOperation::StageLdeBatch { .. }))
+        .collect::<Vec<_>>();
+    assert_eq!(stage_steps.len(), 2);
+    assert_eq!(
+        stage_steps[0].1.operation,
+        ShapeWideLeafOperation::StageLdeBatch {
+            batch_index: 0,
+            first_column: 0,
+            log_size: 4,
+            columns: 4,
+        }
+    );
+    assert_eq!(
+        shape
+            .columns_for_leaf_step(stage_steps[0].0)
+            .unwrap()
+            .iter()
+            .map(|column| column.storage)
+            .collect::<Vec<_>>(),
+        vec![
+            ShapeWideColumnStorage::Staged {
+                offset_words: 64 * HASH_WORDS,
+            },
+            ShapeWideColumnStorage::Staged {
+                offset_words: 64 * HASH_WORDS + 16,
+            },
+            ShapeWideColumnStorage::Retained {
+                group: 1,
+                column: 0,
+            },
+            ShapeWideColumnStorage::Retained {
+                group: 1,
+                column: 1,
+            },
+        ]
+    );
+    assert_eq!(
+        shape
+            .columns_for_leaf_step(stage_steps[1].0)
+            .unwrap()
+            .iter()
+            .map(|column| (column.canonical_index, column.storage))
+            .collect::<Vec<_>>(),
+        vec![(
+            4,
+            ShapeWideColumnStorage::Staged {
+                offset_words: 64 * HASH_WORDS + 32,
+            },
+        )]
+    );
+    assert_eq!(core::mem::size_of::<ShapeWideColumnDescriptorAbi>(), 16);
+    assert_eq!(core::mem::align_of::<ShapeWideColumnDescriptorAbi>(), 8);
+    assert_eq!(
+        core::mem::offset_of!(ShapeWideColumnDescriptorAbi, column),
+        0
+    );
+    assert_eq!(
+        core::mem::offset_of!(ShapeWideColumnDescriptorAbi, evaluation_log_size),
+        8
+    );
+    assert_eq!(
+        core::mem::offset_of!(ShapeWideColumnDescriptorAbi, reserved),
+        12
+    );
+}
+
+#[test]
 fn final_width_is_lazy_blake_exact_at_every_block_boundary() {
     for (columns, update, final_width, calls) in [
         (1usize, 0u32, 1u32, 1u32),
@@ -169,11 +271,39 @@ fn excessive_native_staging_fails_before_arena_binding() {
 
 #[test]
 fn canonical_shape_wide_bytes_match_progressive_across_mutation() {
-    let base = program(
-        &[3, 3, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5],
+    let base = CommitProgram::compile(
+        CommitWorkspaceConfig {
+            log_blowup_factor: 1,
+            lifting_log_size: 6,
+            unretained_bottom_layers: 4,
+            max_fused_tail_levels: 2,
+        },
+        ProgressiveCommitGeometry {
+            lifting_log_size: 6,
+            log_blowup_factor: 1,
+            groups: vec![
+                ProgressiveCommitGroupGeometry {
+                    coefficient_log_sizes: vec![3, 3, 3],
+                    retain_evaluations: false,
+                },
+                ProgressiveCommitGroupGeometry {
+                    coefficient_log_sizes: vec![3, 4, 4],
+                    retain_evaluations: true,
+                },
+                ProgressiveCommitGroupGeometry {
+                    coefficient_log_sizes: vec![4, 5, 5, 5],
+                    retain_evaluations: false,
+                },
+                ProgressiveCommitGroupGeometry {
+                    coefficient_log_sizes: vec![5, 5, 5, 5, 5, 5, 5],
+                    retain_evaluations: true,
+                },
+            ],
+        },
+        ProgressiveNttLeafFusionMode::Fused16,
         true,
-        6,
-    );
+    )
+    .unwrap();
     let shape = ShapeWideCommitProgram::compile_replacement_v1(&base).unwrap();
     let plan = &base.requirements().leaves.plan;
     for salt in [0u32, 1, 0x7fff_fffe, 0x5a17_91d3] {

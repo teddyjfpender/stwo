@@ -40,8 +40,9 @@ pub use program::{
 pub use program_binding::{CommitProgramBindingError, PreparedCommitProgramView};
 pub use program_oracle::{CommitProgramFixture, CommitProgramOracle, CommitProgramOracleLayer};
 pub use shape_wide::{
-    ShapeWideColumn, ShapeWideColumnStorage, ShapeWideCommitComparison, ShapeWideCommitProgram,
-    ShapeWideCommitProgramError, ShapeWideLeafOperation, ShapeWideLeafStep, ShapeWideSlabLayout,
+    ShapeWideColumn, ShapeWideColumnDescriptorAbi, ShapeWideColumnStorage,
+    ShapeWideCommitComparison, ShapeWideCommitProgram, ShapeWideCommitProgramError,
+    ShapeWideLeafOperation, ShapeWideLeafStep, ShapeWideSlabLayout,
 };
 
 const WORD_BYTES: usize = core::mem::size_of::<u32>();

@@ -13,9 +13,23 @@ use crate::backend::progressive_commit_in_place::PROGRESSIVE_IN_PLACE_SCRATCH_WO
 const WORD_BYTES: u64 = core::mem::size_of::<u32>() as u64;
 const HASH_WORDS: usize = core::mem::size_of::<Blake2sHash>() / core::mem::size_of::<u32>();
 const HASH_BYTES: u64 = core::mem::size_of::<Blake2sHash>() as u64;
-const COMBINED_DESCRIPTOR_WORDS: usize = 4;
 const MAX_NTT_BATCH_COLUMNS: u64 = 65_535;
 const CACHE_TAG: &[u8] = b"stwo-shape-wide-commit-replacement-v1";
+
+/// Native pointer/log record consumed by the shape-wide leaf kernels. The pad
+/// is required and must be zero; sealing it keeps Rust/CUDA strides identical.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ShapeWideColumnDescriptorAbi {
+    pub column: *const u32,
+    pub evaluation_log_size: u32,
+    pub reserved: u32,
+}
+
+const _: () = assert!(core::mem::size_of::<ShapeWideColumnDescriptorAbi>() == 16);
+const _: () = assert!(core::mem::align_of::<ShapeWideColumnDescriptorAbi>() == 8);
+const COMBINED_DESCRIPTOR_WORDS: usize =
+    core::mem::size_of::<ShapeWideColumnDescriptorAbi>() / core::mem::size_of::<u32>();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ShapeWideColumnStorage {
@@ -37,6 +51,7 @@ pub struct ShapeWideColumn {
 pub enum ShapeWideLeafOperation {
     StageLdeBatch {
         batch_index: u32,
+        first_column: u32,
         log_size: u32,
         columns: u32,
     },
@@ -72,8 +87,12 @@ pub struct ShapeWideSlabLayout {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ShapeWideCommitComparison {
+    /// Complete pre-Merkle program traffic. Both sides include their NTT
+    /// passes, so this model claims no NTT saving and cannot double-credit one.
     pub current_leaf_traffic: CommitProgramTraffic,
     pub replacement_leaf_traffic: CommitProgramTraffic,
+    /// Algorithmic state transitions only. Final leaf-output writes are
+    /// excluded from both sides. This is a byte credit, not a wall-time claim.
     pub current_state_transition_bytes: u64,
     pub replacement_state_transition_bytes: u64,
     pub state_transition_bytes_eliminated: u64,
@@ -236,6 +255,21 @@ impl ShapeWideCommitProgram {
         &self.leaf_steps
     }
 
+    /// Exact canonical descriptor slice consumed by one staged LDE API call.
+    pub fn columns_for_leaf_step(&self, step: usize) -> Option<&[ShapeWideColumn]> {
+        let ShapeWideLeafOperation::StageLdeBatch {
+            first_column,
+            columns,
+            ..
+        } = self.leaf_steps.get(step)?.operation
+        else {
+            return None;
+        };
+        let begin = first_column as usize;
+        self.columns
+            .get(begin..begin.checked_add(columns as usize)?)
+    }
+
     pub fn merkle_suffix(&self) -> &[CommitProgramStep] {
         &self.merkle_suffix
     }
@@ -307,6 +341,13 @@ fn leaf_steps(
             operation: ShapeWideLeafOperation::StageLdeBatch {
                 batch_index: u32::try_from(batch_index)
                     .map_err(|_| ShapeWideCommitProgramError::SizeOverflow)?,
+                first_column: u32::try_from(
+                    *batch
+                        .columns
+                        .first()
+                        .ok_or(ShapeWideCommitProgramError::SizeOverflow)?,
+                )
+                .map_err(|_| ShapeWideCommitProgramError::SizeOverflow)?,
                 log_size: batch.evaluation_log_size,
                 columns,
             },
