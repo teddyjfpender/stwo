@@ -181,6 +181,28 @@ fn abstract_h8_tail_reconstruction_matches_progressive_and_full_lifting() {
 }
 
 #[test]
+fn lifted_tail_mapping_composes_for_every_small_domain_chain() {
+    for target_log in 1..=10 {
+        for middle_log in 1..=target_log {
+            for source_log in 1..=middle_log {
+                for row in 0..1usize << target_log {
+                    let through_middle = lifted_column_index(
+                        lifted_column_index(row, middle_log, target_log),
+                        source_log,
+                        middle_log,
+                    );
+                    assert_eq!(
+                        through_middle,
+                        lifted_column_index(row, source_log, target_log),
+                        "source={source_log} middle={middle_log} target={target_log} row={row}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn stale_or_mutated_compact_program_is_rejected() {
     let base = base_program(&[3; 17], 6);
     let domain = DomainCooperativeProgram::compile_mode_a(&base).unwrap();

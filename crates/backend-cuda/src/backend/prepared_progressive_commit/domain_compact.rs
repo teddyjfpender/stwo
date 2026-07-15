@@ -3,8 +3,10 @@
 //! The qualified Mode-A program keeps `h[8]` plus the lazy 16-word Blake2s
 //! block for every native-domain row. This model keeps only `h[8]`. At each
 //! later absorb or finalization it reconstructs the exact lazy tail from the
-//! already-retained evaluation columns. It never lifts column hashing to the
-//! largest domain and it preserves every progressive compression boundary.
+//! already-retained evaluation columns using the ordinary lifted-row mapping.
+//! There is no separate "periodic column" representation in the commitment
+//! path. It never lifts column hashing to the largest domain and it preserves
+//! every progressive compression boundary.
 
 use super::*;
 
