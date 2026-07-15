@@ -33,6 +33,7 @@ const OUTPUT_BASE: u32 = 200;
 pub(super) const OVERFLOW: ArenaSlotId = ArenaSlotId(300);
 pub(super) const GUARD: ArenaSlotId = ArenaSlotId(301);
 const GUARD_WORDS: usize = 64;
+const COEFFICIENT_LOGS: [u32; 4] = [3, 3, 5, 3];
 
 pub fn run() -> FixtureReceipt {
     let config = QuotientNumeratorWorkspaceConfig {
@@ -264,6 +265,53 @@ fn compact_forward_twiddles_match_lifting_tree_tail() {
     );
 }
 
+#[test]
+fn corrected_oracle_reproduces_h100_row_mapping() {
+    let config = QuotientNumeratorWorkspaceConfig {
+        lifting_log_size: 10,
+        log_blowup_factor: 2,
+        max_lde_tile_words: 32 * (1 << 10),
+    };
+    let points = [
+        SECURE_FIELD_CIRCLE_GEN.mul(3),
+        SECURE_FIELD_CIRCLE_GEN.mul(5),
+        SECURE_FIELD_CIRCLE_GEN.mul(7),
+        SECURE_FIELD_CIRCLE_GEN.mul(11),
+    ];
+    let requirements =
+        quotient_numerator_workspace_requirements(config, &topology(points)).unwrap();
+    let values = [
+        SecureField::from_u32_unchecked(2, 3, 5, 7),
+        SecureField::from_u32_unchecked(11, 13, 17, 19),
+        SecureField::from_u32_unchecked(23, 29, 31, 37),
+        SecureField::from_u32_unchecked(41, 43, 47, 53),
+        SecureField::from_u32_unchecked(59, 61, 67, 71),
+    ];
+    let coefficient_sources = source_set(0x1234_5678);
+    let sources = evaluations(config, &coefficient_sources);
+    let terms = oracle_terms(config, points, &values, &sources);
+    let (_, output) = expected_group(
+        requirements.groups[0].shape_point,
+        requirements.groups[0].log_size,
+        SecureField::from_u32_unchecked(73, 79, 83, 89),
+        &terms,
+    );
+
+    assert_eq!(
+        output[0],
+        [
+            1_790_766_119,
+            1_387_108_145,
+            1_876_986_603,
+            176_746_994,
+            1_407_476_242,
+            1_406_155_035,
+            1_738_690_807,
+            457_455_165,
+        ]
+    );
+}
+
 #[cfg(stwo_cuda_link)]
 pub fn benchmark(lifting_log_size: u32, warmups: usize, iterations: usize) -> PerformanceReceipt {
     super::replacement_stage4_bench::benchmark_quotient(lifting_log_size, warmups, iterations)
@@ -276,22 +324,22 @@ fn topology(points: [CirclePoint<SecureField>; 4]) -> Vec<QuotientNumeratorColum
     };
     vec![
         QuotientNumeratorColumnTopology {
-            coefficient_log_size: 3,
+            coefficient_log_size: COEFFICIENT_LOGS[0],
             source_kind: QuotientNumeratorSourceKind::Coefficients,
             samples: vec![sample(0, points[0]), sample(1, points[1])],
         },
         QuotientNumeratorColumnTopology {
-            coefficient_log_size: 3,
+            coefficient_log_size: COEFFICIENT_LOGS[1],
             source_kind: QuotientNumeratorSourceKind::Evaluation,
             samples: vec![sample(2, points[0])],
         },
         QuotientNumeratorColumnTopology {
-            coefficient_log_size: 5,
+            coefficient_log_size: COEFFICIENT_LOGS[2],
             source_kind: QuotientNumeratorSourceKind::Coefficients,
             samples: vec![sample(3, points[2])],
         },
         QuotientNumeratorColumnTopology {
-            coefficient_log_size: 3,
+            coefficient_log_size: COEFFICIENT_LOGS[3],
             source_kind: QuotientNumeratorSourceKind::Coefficients,
             samples: vec![sample(4, points[3])],
         },
@@ -473,7 +521,7 @@ fn evaluations(config: QuotientNumeratorWorkspaceConfig, sources: &[Vec<u32>; 4]
         if column == 1 {
             return sources[column].clone();
         }
-        let log_size = if column == 2 { 5 } else { 3 };
+        let log_size = COEFFICIENT_LOGS[column];
         CircleCoefficients::<CpuBackend>::new(
             sources[column]
                 .iter()
@@ -490,6 +538,63 @@ fn evaluations(config: QuotientNumeratorWorkspaceConfig, sources: &[Vec<u32>; 4]
         .map(|value| value.0)
         .collect()
     })
+}
+
+fn oracle_terms<'a>(
+    config: QuotientNumeratorWorkspaceConfig,
+    points: [CirclePoint<SecureField>; 4],
+    values: &'a [SecureField; 5],
+    sources: &'a [Vec<u32>; 4],
+) -> [OracleTerm<'a>; 6] {
+    let periodic_second = points[1]
+        + CanonicCoset::new(config.lifting_log_size)
+            .step()
+            .repeated_double(COEFFICIENT_LOGS[0] + config.log_blowup_factor)
+            .into_ef();
+    [
+        OracleTerm {
+            exponent: 0,
+            source_log: COEFFICIENT_LOGS[0],
+            value: values[1],
+            point: periodic_second,
+            source: &sources[0],
+        },
+        OracleTerm {
+            exponent: 1,
+            source_log: COEFFICIENT_LOGS[0],
+            value: values[0],
+            point: points[0],
+            source: &sources[0],
+        },
+        OracleTerm {
+            exponent: 2,
+            source_log: COEFFICIENT_LOGS[0],
+            value: values[1],
+            point: points[1],
+            source: &sources[0],
+        },
+        OracleTerm {
+            exponent: 3,
+            source_log: COEFFICIENT_LOGS[1],
+            value: values[2],
+            point: points[0],
+            source: &sources[1],
+        },
+        OracleTerm {
+            exponent: 4,
+            source_log: COEFFICIENT_LOGS[2],
+            value: values[3],
+            point: points[2],
+            source: &sources[2],
+        },
+        OracleTerm {
+            exponent: 5,
+            source_log: COEFFICIENT_LOGS[3],
+            value: values[4],
+            point: points[3],
+            source: &sources[3],
+        },
+    ]
 }
 
 fn snapshot(
@@ -516,52 +621,7 @@ fn snapshot(
         SECURE_FIELD_CIRCLE_GEN.mul(7),
         SECURE_FIELD_CIRCLE_GEN.mul(11),
     ];
-    let period = CanonicCoset::new(10).step().repeated_double(5);
-    let periodic_second = points[1] + period.into_ef();
-    let terms = [
-        OracleTerm {
-            exponent: 0,
-            source_log: 5,
-            value: values[1],
-            point: periodic_second,
-            source: &sources[0],
-        },
-        OracleTerm {
-            exponent: 1,
-            source_log: 5,
-            value: values[0],
-            point: points[0],
-            source: &sources[0],
-        },
-        OracleTerm {
-            exponent: 2,
-            source_log: 5,
-            value: values[1],
-            point: points[1],
-            source: &sources[0],
-        },
-        OracleTerm {
-            exponent: 3,
-            source_log: 5,
-            value: values[2],
-            point: points[0],
-            source: &sources[1],
-        },
-        OracleTerm {
-            exponent: 4,
-            source_log: 7,
-            value: values[3],
-            point: points[2],
-            source: &sources[2],
-        },
-        OracleTerm {
-            exponent: 5,
-            source_log: 5,
-            value: values[4],
-            point: points[3],
-            source: &sources[3],
-        },
-    ];
+    let terms = oracle_terms(requirements.config, points, values, sources);
     let mut result = Vec::new();
     result.extend_from_slice(&point_output);
     result.extend_from_slice(&first_output);

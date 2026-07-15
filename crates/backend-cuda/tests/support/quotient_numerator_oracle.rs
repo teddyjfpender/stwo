@@ -41,7 +41,9 @@ pub fn expected_group(
     for row in 0..size {
         let mut numerator = SecureField::from(0u32);
         for (term, (_, b, c)) in matching.iter().zip(&coefficients) {
-            let ratio = group_log - term.source_log;
+            let ratio = group_log
+                .checked_sub(term.source_log)
+                .expect("quotient oracle source log exceeds group log");
             let source_row = (row >> (ratio + 1) << 1) + (row & 1);
             numerator += BaseField::from_u32_unchecked(term.source[source_row]) * *c - *b;
         }

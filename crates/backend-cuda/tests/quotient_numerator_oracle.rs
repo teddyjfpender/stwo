@@ -34,3 +34,18 @@ fn one_term_oracle_accumulates_the_term_exactly_once() {
         }
     }
 }
+
+#[test]
+#[should_panic(expected = "quotient oracle source log exceeds group log")]
+fn oracle_rejects_source_log_larger_than_group() {
+    let point = SECURE_FIELD_CIRCLE_GEN.mul(3);
+    let term = OracleTerm {
+        exponent: 0,
+        source_log: 3,
+        value: SecureField::from(0u32),
+        point,
+        source: &[0; 8],
+    };
+
+    expected_group(point, 2, SecureField::from(1u32), &[term]);
+}
