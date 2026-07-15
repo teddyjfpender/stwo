@@ -31,6 +31,7 @@ mod in_place;
 mod program;
 mod program_binding;
 mod program_oracle;
+mod shape_wide;
 
 pub use program::{
     CommitProgram, CommitProgramError, CommitProgramIdentity, CommitProgramLayer,
@@ -38,6 +39,10 @@ pub use program::{
 };
 pub use program_binding::{CommitProgramBindingError, PreparedCommitProgramView};
 pub use program_oracle::{CommitProgramFixture, CommitProgramOracle, CommitProgramOracleLayer};
+pub use shape_wide::{
+    ShapeWideColumn, ShapeWideColumnStorage, ShapeWideCommitComparison, ShapeWideCommitProgram,
+    ShapeWideCommitProgramError, ShapeWideLeafOperation, ShapeWideLeafStep, ShapeWideSlabLayout,
+};
 
 const WORD_BYTES: usize = core::mem::size_of::<u32>();
 const POINTER_WORDS: usize = core::mem::size_of::<*mut u32>().div_ceil(WORD_BYTES);
