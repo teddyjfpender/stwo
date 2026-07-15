@@ -29,12 +29,14 @@ use super::progressive_ntt_leaf_fusion::{
 
 mod in_place;
 mod program;
+mod program_binding;
 mod program_oracle;
 
 pub use program::{
     CommitProgram, CommitProgramError, CommitProgramIdentity, CommitProgramLayer,
     CommitProgramOperation, CommitProgramStep, CommitProgramTraffic,
 };
+pub use program_binding::{CommitProgramBindingError, PreparedCommitProgramView};
 pub use program_oracle::{CommitProgramFixture, CommitProgramOracle, CommitProgramOracleLayer};
 
 const WORD_BYTES: usize = core::mem::size_of::<u32>();
@@ -116,15 +118,21 @@ pub enum ProgressiveLeafLaunchKind {
         to_log_size: u32,
     },
     Lde {
+        batch_index: u32,
+        segment_offset: u32,
         log_size: u32,
         columns: u32,
     },
     Absorb {
+        batch_index: u32,
+        segment_offset: u32,
         log_size: u32,
         columns: u32,
         absorbed_columns_before: u32,
     },
     FusedLdeAbsorb {
+        batch_index: u32,
+        segment_offset: u32,
         log_size: u32,
         columns: u32,
         absorbed_columns_before: u32,
@@ -446,7 +454,7 @@ impl ProgressiveLeafWorkspaceRequirements {
         let mut launches = vec![ProgressiveLeafLaunchKind::Init {
             log_size: first_log,
         }];
-        for batch in &self.plan.lde_batches {
+        for (batch_index, batch) in self.plan.lde_batches.iter().enumerate() {
             if batch.evaluation_log_size > current_log {
                 launches.push(ProgressiveLeafLaunchKind::Expand {
                     from_log_size: current_log,
@@ -456,11 +464,16 @@ impl ProgressiveLeafWorkspaceRequirements {
             }
             let columns =
                 u32::try_from(batch.columns.len()).expect("planner column count fits u32");
+            let batch_index = u32::try_from(batch_index).expect("planner batch count fits u32");
             launches.push(ProgressiveLeafLaunchKind::Lde {
+                batch_index,
+                segment_offset: 0,
                 log_size: current_log,
                 columns,
             });
             launches.push(ProgressiveLeafLaunchKind::Absorb {
+                batch_index,
+                segment_offset: 0,
                 log_size: current_log,
                 columns,
                 absorbed_columns_before: absorbed_columns,
@@ -488,6 +501,8 @@ struct PreparedBatch {
     coefficient_ptrs: ArenaSlice,
     coefficient_sizes: ArenaSlice,
     output_ptrs: ArenaSlice,
+    batch_index: u32,
+    segment_offset: u32,
     log_size: u32,
     columns: u32,
     absorbed_columns_before: u32,
@@ -513,6 +528,14 @@ impl PreparedBatch {
             output_ptrs: self
                 .output_ptrs
                 .checked_subslice(pointer_offset, pointer_words)?,
+            batch_index: self.batch_index,
+            segment_offset: self
+                .segment_offset
+                .checked_add(
+                    u32::try_from(offset)
+                        .map_err(|_| PreparedProgressiveCommitError::SizeOverflow)?,
+                )
+                .ok_or(PreparedProgressiveCommitError::SizeOverflow)?,
             log_size: self.log_size,
             columns: u32::try_from(columns)
                 .map_err(|_| PreparedProgressiveCommitError::SizeOverflow)?,
@@ -778,12 +801,13 @@ impl<'a> PreparedProgressiveLeaves<'a> {
         let mut prepared_batches = Vec::with_capacity(requirements.batches.len());
         let mut fusion_telemetry = ProgressiveNttLeafFusionTelemetry::default();
         let mut absorbed_columns = 0u32;
-        for ((batch, batch_requirement), batch_slots) in requirements
+        for (batch_index, ((batch, batch_requirement), batch_slots)) in requirements
             .plan
             .lde_batches
             .iter()
             .zip(&requirements.batches)
             .zip(&slots.batches)
+            .enumerate()
         {
             let coefficient_ptrs = bind_slot(
                 arena,
@@ -903,6 +927,9 @@ impl<'a> PreparedProgressiveLeaves<'a> {
                     coefficient_ptrs,
                     coefficient_sizes,
                     output_ptrs,
+                    batch_index: u32::try_from(batch_index)
+                        .map_err(|_| PreparedProgressiveCommitError::SizeOverflow)?,
+                    segment_offset: 0,
                     log_size: batch.evaluation_log_size,
                     columns: u32::try_from(batch.columns.len())
                         .map_err(|_| PreparedProgressiveCommitError::SizeOverflow)?,
@@ -1201,12 +1228,16 @@ impl<'a> PreparedProgressiveLeaves<'a> {
                 to_log_size: to_log,
             },
             Launch::Lde(batch) => ProgressiveLeafLaunchKind::Lde {
+                batch_index: batch.batch_index,
+                segment_offset: batch.segment_offset,
                 log_size: batch.log_size,
                 columns: batch.columns,
             },
             Launch::Absorb {
                 log_size, batch, ..
             } => ProgressiveLeafLaunchKind::Absorb {
+                batch_index: batch.batch_index,
+                segment_offset: batch.segment_offset,
                 log_size,
                 columns: batch.columns,
                 absorbed_columns_before: batch.absorbed_columns_before,
@@ -1216,6 +1247,8 @@ impl<'a> PreparedProgressiveLeaves<'a> {
                 retained_write_mask,
                 ..
             } => ProgressiveLeafLaunchKind::FusedLdeAbsorb {
+                batch_index: batch.batch_index,
+                segment_offset: batch.segment_offset,
                 log_size: batch.log_size,
                 columns: batch.columns,
                 absorbed_columns_before: batch.absorbed_columns_before,
@@ -1426,9 +1459,8 @@ impl<'a> PreparedProgressiveCommitGraph<'a> {
         })
     }
 
-    /// Dormant complete one-slab constructor. Interior fusion is deliberately
-    /// rejected: this storage topology uses the qualified disjoint-band
-    /// interior lane and must be part of immutable runtime identity.
+    /// Dormant complete one-slab constructor. Interior fusion is pinned by the
+    /// caller and admitted only across the unretained-to-retained boundary.
     #[allow(clippy::too_many_arguments)]
     pub fn prepare_in_place_slab_with_modes_and_ntt_fusion(
         arena: &'a DeviceArena,
@@ -1442,9 +1474,6 @@ impl<'a> PreparedProgressiveCommitGraph<'a> {
         interior_fused: bool,
         ntt_leaf_fusion: ProgressiveNttLeafFusionMode,
     ) -> Result<Self, PreparedProgressiveCommitError> {
-        if interior_fused {
-            return Err(PreparedProgressiveCommitError::InvalidSlotShape);
-        }
         progressive_prepare_mode_admission_for_mode(progressive_mode, &requirements.leaves)?;
         let workspace = requirements.arena_slot_requirements_in_place(slots)?;
         let workspace_ids = workspace
@@ -1475,12 +1504,13 @@ impl<'a> PreparedProgressiveCommitGraph<'a> {
         let scratch_pair = leaves
             .in_place_scratch_pair()
             .ok_or(PreparedProgressiveCommitError::InvalidSlotShape)?;
-        let merkle = PreparedMerkleFromLeaves::prepare_in_place_slab(
+        let merkle = PreparedMerkleFromLeaves::prepare_in_place_slab_with_interior_mode(
             arena,
             config,
             &requirements.merkle,
             &slots.merkle,
             scratch_pair,
+            interior_fused,
         )?;
         if leaves.leaf_hashes().id() != merkle.leaves().id()
             || leaves.leaf_hashes().as_u32_ptr() != merkle.leaves().as_u32_ptr()
@@ -1635,10 +1665,14 @@ mod tests {
             vec![
                 ProgressiveLeafLaunchKind::Init { log_size: 5 },
                 ProgressiveLeafLaunchKind::Lde {
+                    batch_index: 0,
+                    segment_offset: 0,
                     log_size: 5,
                     columns: 2
                 },
                 ProgressiveLeafLaunchKind::Absorb {
+                    batch_index: 0,
+                    segment_offset: 0,
                     log_size: 5,
                     columns: 2,
                     absorbed_columns_before: 0,
@@ -1648,10 +1682,14 @@ mod tests {
                     to_log_size: 7
                 },
                 ProgressiveLeafLaunchKind::Lde {
+                    batch_index: 1,
+                    segment_offset: 0,
                     log_size: 7,
                     columns: 1
                 },
                 ProgressiveLeafLaunchKind::Absorb {
+                    batch_index: 1,
+                    segment_offset: 0,
                     log_size: 7,
                     columns: 1,
                     absorbed_columns_before: 2,

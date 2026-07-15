@@ -63,6 +63,24 @@ impl<'a> PreparedMerkleFromLeaves<'a> {
         slots: &MerkleFromLeavesSlots,
         scratch_pair: ArenaSlice,
     ) -> Result<Self, PreparedCommitError> {
+        Self::prepare_in_place_slab_with_interior_mode(
+            arena,
+            config,
+            requirements,
+            slots,
+            scratch_pair,
+            false,
+        )
+    }
+
+    pub(crate) fn prepare_in_place_slab_with_interior_mode(
+        arena: &'a DeviceArena,
+        config: CommitWorkspaceConfig,
+        requirements: &MerkleFromLeavesRequirements,
+        slots: &MerkleFromLeavesSlots,
+        scratch_pair: ArenaSlice,
+        interior_fused: bool,
+    ) -> Result<Self, PreparedCommitError> {
         if config.unretained_bottom_layers == 0
             || merkle_from_leaves_requirements(config)? != *requirements
         {
@@ -127,13 +145,14 @@ impl<'a> PreparedMerkleFromLeaves<'a> {
             })
         };
         arena.context().sync()?;
-        let plan = CommitGraphPlan::new_merkle_from_leaves_in_place(
+        let plan = CommitGraphPlan::new_merkle_from_leaves_in_place_with_mode(
             config.lifting_log_size,
             config.unretained_bottom_layers,
             leaves,
             scratch_pair,
             interior_outputs,
             tail,
+            interior_fused,
         )?;
         let mut retained_layers_bottom_up = retained;
         retained_layers_bottom_up.extend(tail_outputs);

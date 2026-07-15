@@ -868,6 +868,29 @@ impl CommitGraphPlan {
         interior_outputs: Vec<ArenaSlice>,
         tail: Option<CommitTailPlan>,
     ) -> Result<Self, CommitGraphError> {
+        Self::new_merkle_from_leaves_in_place_with_mode(
+            lifting_log_size,
+            unretained_bottom_layers,
+            leaf_hashes,
+            scratch_pair,
+            interior_outputs,
+            tail,
+            false,
+        )
+    }
+
+    /// Explicit-mode twin for the immutable one-slab program. A fused window
+    /// may cross the destructive bottom bands only when its three intermediate
+    /// levels are unretained and its level-four destination is distinct.
+    pub(crate) fn new_merkle_from_leaves_in_place_with_mode(
+        lifting_log_size: u32,
+        unretained_bottom_layers: u32,
+        leaf_hashes: ArenaSlice,
+        scratch_pair: ArenaSlice,
+        interior_outputs: Vec<ArenaSlice>,
+        tail: Option<CommitTailPlan>,
+        interior_fused: bool,
+    ) -> Result<Self, CommitGraphError> {
         if unretained_bottom_layers == 0
             || scratch_pair.id() != leaf_hashes.id()
             || scratch_pair.len_words()
@@ -888,7 +911,7 @@ impl CommitGraphPlan {
             leaf_hashes,
             interior_outputs,
             tail,
-            false,
+            interior_fused,
             &BTreeSet::new(),
             Some(scratch_pair),
         )?;
@@ -1275,31 +1298,30 @@ fn build_merkle_from_leaves(
     // Emission is byte-for-byte the legacy qualified suffix.
     let mut level = 0usize;
     while level < interior_levels.len() {
-        let CommitLaunch::InteriorLayer { input, .. } = interior_levels[level] else {
-            launches.push(interior_levels[level]);
-            level += 1;
-            continue;
+        let input = match interior_levels[level] {
+            CommitLaunch::InteriorLayer { input, .. } => input,
+            CommitLaunch::InteriorLayerInPlace { hashes, .. } => hashes,
+            _ => unreachable!("interior_levels contains only interior records"),
         };
         if interior_fused
             && interior4_window_fusible(level, interior_levels.len(), unretained_bottom_layers)
         {
-            let CommitLaunch::InteriorLayer {
+            if let CommitLaunch::InteriorLayer {
                 output,
                 output_hashes,
                 ..
             } = interior_levels[level + 3]
-            else {
-                unreachable!("interior_levels holds only InteriorLayer records");
-            };
-            if output.id() != input.id() {
-                launches.push(CommitLaunch::FusedInterior4 {
-                    first_level: level as u32,
-                    input,
-                    output,
-                    output_hashes,
-                });
-                level += 4;
-                continue;
+            {
+                if output.id() != input.id() {
+                    launches.push(CommitLaunch::FusedInterior4 {
+                        first_level: level as u32,
+                        input,
+                        output,
+                        output_hashes,
+                    });
+                    level += 4;
+                    continue;
+                }
             }
         }
         launches.push(interior_levels[level]);
@@ -2140,6 +2162,75 @@ mod tests {
         assert_eq!(
             CommitGraphPlan::new_merkle_from_leaves(4, 2, leaf, outputs, None).unwrap_err(),
             CommitGraphError::InPlaceInteriorLayer(ArenaSlotId(1))
+        );
+    }
+
+    #[test]
+    fn explicit_in_place_fusion_crosses_only_the_retained_boundary() {
+        let leaf = slice(1, 64 * HASH_WORDS);
+        let scratch = ArenaSlice::dangling_at_for_test(
+            1,
+            1024,
+            super::super::progressive_commit_in_place::PROGRESSIVE_IN_PLACE_SCRATCH_WORDS,
+        );
+        let outputs = vec![
+            slice(1, 32 * HASH_WORDS),
+            slice(1, 16 * HASH_WORDS),
+            slice(1, 8 * HASH_WORDS),
+            slice(2, 4 * HASH_WORDS),
+            slice(3, 2 * HASH_WORDS),
+            slice(4, HASH_WORDS),
+        ];
+        let plan = CommitGraphPlan::new_merkle_from_leaves_in_place_with_mode(
+            6, 4, leaf, scratch, outputs, None, true,
+        )
+        .unwrap();
+        assert_eq!(
+            plan.launch_sequence().collect::<Vec<_>>(),
+            vec![
+                CommitLaunchKind::FusedInterior4 {
+                    first_level: 0,
+                    output_hashes: 4,
+                },
+                CommitLaunchKind::InteriorLayer {
+                    level: 4,
+                    output_hashes: 2,
+                },
+                CommitLaunchKind::InteriorLayer {
+                    level: 5,
+                    output_hashes: 1,
+                },
+            ]
+        );
+
+        let deeper = vec![
+            slice(1, 32 * HASH_WORDS),
+            slice(1, 16 * HASH_WORDS),
+            slice(1, 8 * HASH_WORDS),
+            slice(1, 4 * HASH_WORDS),
+            slice(3, 2 * HASH_WORDS),
+            slice(4, HASH_WORDS),
+        ];
+        let plan = CommitGraphPlan::new_merkle_from_leaves_in_place_with_mode(
+            6, 5, leaf, scratch, deeper, None, true,
+        )
+        .unwrap();
+        assert_eq!(
+            plan.launch_sequence().collect::<Vec<_>>(),
+            vec![
+                CommitLaunchKind::InteriorLayerInPlace {
+                    level: 0,
+                    output_hashes: 32,
+                },
+                CommitLaunchKind::FusedInterior4 {
+                    first_level: 1,
+                    output_hashes: 2,
+                },
+                CommitLaunchKind::InteriorLayer {
+                    level: 5,
+                    output_hashes: 1,
+                },
+            ]
         );
     }
 
