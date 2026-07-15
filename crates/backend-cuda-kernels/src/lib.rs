@@ -210,6 +210,19 @@ mod tests {
     }
 
     #[test]
+    fn progressive_in_place_symbols_are_linked_in_cuda_and_stub_builds() {
+        assert_ne!(
+            raw::stwo_blake2s_progressive_expand_in_place_on as usize,
+            0
+        );
+        assert_ne!(
+            raw::stwo_blake2s_progressive_finalize_in_place_on as usize,
+            0
+        );
+        assert_ne!(raw::stwo_blake2s_layer_in_place_on as usize, 0);
+    }
+
+    #[test]
     fn gpu_lab_fri_entry_names_are_stable() {
         let sources = [
             include_str!("../cuda/fold_line.cu"),

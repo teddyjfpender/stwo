@@ -598,11 +598,25 @@ extern "C" {
         states_out: *mut ProgressiveBlake2sState,
         stream: *mut core::ffi::c_void,
     ) -> i32;
+    pub fn stwo_blake2s_progressive_expand_in_place_on(
+        from_log_size: u32,
+        to_log_size: u32,
+        states: *mut ProgressiveBlake2sState,
+        scratch_pair: *mut ProgressiveBlake2sState,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
     pub fn stwo_blake2s_progressive_finalize_on(
         size: u32,
         absorbed_columns: u32,
         states: *const ProgressiveBlake2sState,
         result: *mut Blake2sHash,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+    pub fn stwo_blake2s_progressive_finalize_in_place_on(
+        size: u32,
+        absorbed_columns: u32,
+        states_and_hashes: *mut ProgressiveBlake2sState,
+        scratch_pair: *mut ProgressiveBlake2sState,
         stream: *mut core::ffi::c_void,
     ) -> i32;
     pub fn stwo_blake2s_leaf_update_on(
@@ -669,6 +683,12 @@ extern "C" {
         previous_layer: *const Blake2sHash,
         output_size: u32,
         result: *mut Blake2sHash,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+    pub fn stwo_blake2s_layer_in_place_on(
+        output_size: u32,
+        hashes: *mut Blake2sHash,
+        scratch_pair: *mut ProgressiveBlake2sState,
         stream: *mut core::ffi::c_void,
     ) -> i32;
     /// Four column-free interior Merkle levels in ONE launch (Step 3.2 fused
