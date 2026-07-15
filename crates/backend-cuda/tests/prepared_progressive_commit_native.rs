@@ -17,6 +17,7 @@ use stwo_backend_cuda::{
     DeviceArena, PreparedProgressiveLeaves, ProgressiveBatchSlots, ProgressiveCommitGeometry,
     ProgressiveCommitGroupGeometry, ProgressiveCommitMode, ProgressiveLeafLaunchKind,
     ProgressiveLeafWorkspaceRequirements, ProgressiveLeafWorkspaceSlots,
+    ProgressiveNttLeafFusionMode,
 };
 
 const TWIDDLES: ArenaSlotId = ArenaSlotId(50_000);
@@ -463,6 +464,155 @@ fn progressive_lazy_block_boundaries_rises_retention_and_replay_match_cpu() {
         .map(|column| (8..41).contains(&column))
         .collect::<Vec<_>>();
     run_boundary_case(49, None, &retained, &[49], 16 * (1 << 4));
+}
+
+#[test]
+fn progressive_final_ntt_fusion_matches_separate_eager_capture_and_retained_outputs() {
+    let retained_flags = (0..32)
+        .map(|column| (4..24).contains(&column))
+        .collect::<Vec<_>>();
+    let mut groups = Vec::new();
+    for run in retained_flags.chunk_by(|left, right| left == right) {
+        groups.push(ProgressiveCommitGroupGeometry {
+            coefficient_log_sizes: vec![12; run.len()],
+            retain_evaluations: run[0],
+        });
+    }
+    let requirements = progressive_leaf_workspace_requirements_for_mode(
+        ProgressiveCommitMode::DomainProgressive,
+        ProgressiveCommitGeometry {
+            lifting_log_size: 13,
+            log_blowup_factor: 1,
+            groups,
+        },
+    )
+    .unwrap();
+    assert_eq!(requirements.plan.lde_batches.len(), 1);
+    let slots = workspace_slots(&requirements);
+    let arena = arena(&requirements, &slots);
+    let twiddles =
+        CpuBackend::precompute_twiddles(CanonicCoset::new(13).circle_domain().half_coset);
+    upload(
+        &arena,
+        TWIDDLES,
+        &twiddles
+            .twiddles
+            .iter()
+            .map(|value| value.0)
+            .collect::<Vec<_>>(),
+    );
+    let first_coefficients = coefficient_set(&requirements, 67_891);
+    let coefficients = requirements
+        .plan
+        .columns
+        .iter()
+        .zip(&first_coefficients)
+        .map(|(column, words)| {
+            let slot = ArenaSlotId(SOURCE_BASE + column.canonical_index as u32);
+            upload(&arena, slot, words);
+            CommitCoefficientColumn {
+                coefficients: arena.bind(slot).unwrap(),
+                log_size: column.coefficient_log_size,
+            }
+        })
+        .collect::<Vec<_>>();
+    let retained = requirements
+        .plan
+        .columns
+        .iter()
+        .map(|column| {
+            column.retained_evaluation.then(|| {
+                arena
+                    .bind(ArenaSlotId(OUTPUT_BASE + column.canonical_index as u32))
+                    .unwrap()
+            })
+        })
+        .collect::<Vec<_>>();
+    arena.context().sync().unwrap();
+
+    let separate = PreparedProgressiveLeaves::prepare_with_mode_and_ntt_fusion(
+        &arena,
+        &requirements,
+        &slots,
+        &coefficients,
+        &retained,
+        arena.bind(TWIDDLES).unwrap(),
+        ProgressiveCommitMode::DomainProgressive,
+        ProgressiveNttLeafFusionMode::Separate,
+    )
+    .unwrap();
+    let first_evaluations = expected_evaluations(&requirements, &first_coefficients);
+    separate.launch().unwrap();
+    let separate_leaves = assert_outputs(
+        &arena,
+        &separate,
+        &requirements,
+        &retained,
+        &first_evaluations,
+    );
+
+    let fused = PreparedProgressiveLeaves::prepare_with_mode_and_ntt_fusion(
+        &arena,
+        &requirements,
+        &slots,
+        &coefficients,
+        &retained,
+        arena.bind(TWIDDLES).unwrap(),
+        ProgressiveCommitMode::DomainProgressive,
+        ProgressiveNttLeafFusionMode::Fused16,
+    )
+    .unwrap();
+    let topology = fused.launch_sequence().collect::<Vec<_>>();
+    assert_eq!(
+        topology
+            .iter()
+            .filter(|launch| matches!(launch, ProgressiveLeafLaunchKind::FusedLdeAbsorb { .. }))
+            .count(),
+        2
+    );
+    assert!(!topology.iter().any(|launch| matches!(
+        launch,
+        ProgressiveLeafLaunchKind::Lde { .. } | ProgressiveLeafLaunchKind::Absorb { .. }
+    )));
+    let telemetry = fused.ntt_leaf_fusion_telemetry();
+    assert_eq!(telemetry.fused_blocks, 2);
+    assert_eq!(telemetry.fused_columns, 32);
+    assert_eq!(telemetry.separate_columns, 0);
+    assert_eq!(telemetry.completed_lde_hash_read_bytes_avoided, 1 << 20);
+    assert_eq!(telemetry.completed_lde_write_bytes_avoided, 12 * (1 << 15));
+    assert_eq!(telemetry.retained_completed_lde_write_bytes, 20 * (1 << 15));
+    fused.launch().unwrap();
+    let fused_eager = assert_outputs(&arena, &fused, &requirements, &retained, &first_evaluations);
+    assert_eq!(fused_eager, separate_leaves);
+
+    let capture = arena.context().capture().unwrap();
+    fused.launch().unwrap();
+    let graph = capture.finish().unwrap();
+    graph.launch(arena.context()).unwrap();
+    assert_eq!(
+        assert_outputs(&arena, &fused, &requirements, &retained, &first_evaluations,),
+        fused_eager
+    );
+
+    let second_coefficients = coefficient_set(&requirements, 91_337_123);
+    for (column, words) in requirements.plan.columns.iter().zip(&second_coefficients) {
+        upload(
+            &arena,
+            ArenaSlotId(SOURCE_BASE + column.canonical_index as u32),
+            words,
+        );
+    }
+    graph.launch(arena.context()).unwrap();
+    let second_evaluations = expected_evaluations(&requirements, &second_coefficients);
+    let replayed = assert_outputs(
+        &arena,
+        &fused,
+        &requirements,
+        &retained,
+        &second_evaluations,
+    );
+    assert_ne!(replayed, fused_eager);
+    assert_eq!(fused.launch_sequence().collect::<Vec<_>>(), topology);
 }
 
 #[test]

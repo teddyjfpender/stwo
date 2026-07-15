@@ -2306,4 +2306,28 @@ extern "C" {
         states: *mut Blake2sHash,
         stream: *mut c_void,
     ) -> i32;
+
+    /// Setup-time shared-memory admission for the domain-progressive final NTT
+    /// tile sink. This is distinct from the retained streaming-leaf entry point
+    /// so enabling one topology cannot mutate the other's admission contract.
+    pub fn stwo_ntt_progressive_leaf_fused_configure(log_n: u32) -> i32;
+
+    /// Transform one canonical 16-column same-log tile and place its final
+    /// values directly into the progressive BLAKE2s pending block. Retained
+    /// outputs selected by `retained_write_mask` are materialized byte-exactly;
+    /// zero bits omit a dead completed-LDE write.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stwo_ntt_progressive_leaf_fused_on(
+        coefficient_values: *const *const u32,
+        coefficient_sizes: *const u32,
+        device_values: *const *mut u32,
+        log_n: u32,
+        g_twiddles: *mut u32,
+        twiddles_size: u32,
+        eval_domain_size: u32,
+        cols_done: u32,
+        retained_write_mask: u32,
+        states: *mut ProgressiveBlake2sState,
+        stream: *mut c_void,
+    ) -> i32;
 }

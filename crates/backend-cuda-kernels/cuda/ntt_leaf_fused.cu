@@ -47,6 +47,17 @@
 // group is a full-lifting same-log tile, so the leaf row index IS the
 // evaluation index (lifted_column_index is the identity) and the absorb
 // order coincides with the canonical committed order by construction.
+//
+// The domain-progressive twin reuses the identical transform and transpose
+// under a different sink contract. Rust admits only a globally 16-aligned
+// canonical block at one evaluation log >= 13. Its predecessor prefix is
+// therefore empty or a whole number of BLAKE2s blocks. The kernel compresses
+// the old pending block when non-empty, then installs the register-resident
+// final NTT tile as the new lazy pending block. A later progressive absorb or
+// finalize observes exactly the state produced by the separate absorb kernel.
+// Retained columns keep the identical final uint64 stores; dead unretained
+// columns omit only that final materialization. The message transpose and
+// canonical absorb are independent of this write mask.
 
 #include "ntt_leaf_fused.cuh"
 #include "blake2s.cuh"
@@ -55,6 +66,11 @@
 #include "utils.cuh"
 
 namespace {
+
+static_assert(offsetof(ProgressiveBlake2sState, h) == 0,
+              "progressive chaining value must prefix the state");
+static_assert(sizeof(Blake2sHash) == sizeof(uint32_t) * 8,
+              "progressive chaining value must match Blake2sHash");
 
 // Duplicate of rfft.cu's file-local shfl_xor_bf (the butterfly operand
 // exchange for the in-register final stages), under a unique name so the two
@@ -73,10 +89,54 @@ DEVICE_FORCEINLINE void shfl_xor_bf_fused(m31 *vals, const unsigned log_stride,
   }
 }
 
+// Both consumers see the same register-resident canonical row message. The
+// streaming leaf consumes it immediately; the progressive leaf keeps the
+// newest full block pending, exactly matching Blake2sHasher's lazy update
+// rule. At an aligned boundary, a non-empty progressive state necessarily has
+// one previous full block pending, so compress that block before replacing it.
+template <bool PROGRESSIVE>
+DEVICE_FORCEINLINE void consume_fused_leaf_message(
+    void *raw_states,
+    unsigned row,
+    const uint32_t message[16],
+    uint32_t cols_done,
+    uint32_t is_final
+) {
+    if constexpr (PROGRESSIVE) {
+        ProgressiveBlake2sState *state =
+            &reinterpret_cast<ProgressiveBlake2sState *>(raw_states)[row];
+        if (cols_done != 0) {
+            stwo_blake2s_compress_leaf_block_device(
+                reinterpret_cast<Blake2sHash *>(state), state->pending,
+                4u * cols_done, 0u);
+        }
+        #pragma unroll
+        for (unsigned word = 0; word < 16; ++word) {
+            state->pending[word] = message[word];
+        }
+    } else {
+        const uint32_t total_bytes = 4u * (cols_done + 16u);
+        const uint32_t lastblock = is_final != 0 ? 0xffffffffu : 0u;
+        stwo_blake2s_compress_leaf_block_device(
+            &reinterpret_cast<Blake2sHash *>(raw_states)[row], message,
+            total_bytes, lastblock);
+    }
+}
+
+template <bool PROGRESSIVE>
+DEVICE_FORCEINLINE bool writes_completed_evaluation(
+    uint32_t retained_write_mask, unsigned column
+) {
+    if constexpr (PROGRESSIVE) {
+        return (retained_write_mask & (1u << column)) != 0;
+    }
+    return true;
+}
+
 // n2b_final_warp_hash16_batch (rfft.cu) + the evaluation writeback. Rows
 // [global_warp_start, global_warp_start + VALUES_PER_WARP) are owned by one
 // warp for both the store and the absorb.
-template <unsigned LOG_VALS_PER_THREAD>
+template <unsigned LOG_VALS_PER_THREAD, bool PROGRESSIVE>
 __global__ void n2b_final_warp_hash16_write_batch(
     m31 **values,   // in: prefinal state; out: completed evaluations
     const unsigned log_n,
@@ -84,7 +144,8 @@ __global__ void n2b_final_warp_hash16_write_batch(
     m31 *g_twiddles,
     uint32_t cols_done,
     uint32_t is_final,
-    Blake2sHash *states
+    uint32_t retained_write_mask,
+    void *states
 ) {
     extern __shared__ uint32_t messages[];
     const unsigned lane = threadIdx.x;
@@ -159,7 +220,7 @@ __global__ void n2b_final_warp_hash16_write_batch(
         // n2b_final_warp_batch performs, so the retained buffer holds
         // exactly the unfused lane's bytes. Safe in place: all loads of
         // this column happened before the shfl __syncwarp barriers above.
-        {
+        if (writes_completed_evaluation<PROGRESSIVE>(retained_write_mask, column)) {
             uint64_t *src = reinterpret_cast<uint64_t *>(vals);
             uint64_t *dst = reinterpret_cast<uint64_t *>(
                 column_values + global_warp_start + 2 * lane);
@@ -178,8 +239,6 @@ __global__ void n2b_final_warp_hash16_write_batch(
     }
     __syncthreads();
 
-    const uint32_t total_bytes = 4u * (cols_done + 16u);
-    const uint32_t lastblock = is_final != 0 ? 0xffffffffu : 0u;
     #pragma unroll
     for (unsigned i = 0; i < (1 << (LOG_VALS_PER_THREAD - 1)); ++i) {
         #pragma unroll
@@ -191,14 +250,14 @@ __global__ void n2b_final_warp_hash16_write_batch(
             for (unsigned k = 0; k < 16; ++k) {
                 message[k] = messages[local_row * 16 + k];
             }
-            stwo_blake2s_compress_leaf_block_device(
-                &states[global_row], message, total_bytes, lastblock);
+            consume_fused_leaf_message<PROGRESSIVE>(
+                states, global_row, message, cols_done, is_final);
         }
     }
 }
 
 // n2b_final_block_warp_hash16_batch (rfft.cu) + the evaluation writeback.
-template <unsigned LOG_WARP_PER_BLOCK>
+template <unsigned LOG_WARP_PER_BLOCK, bool PROGRESSIVE>
 __global__ void n2b_final_block_warp_hash16_write_batch(
     m31 **values,   // in: prefinal state; out: completed evaluations
     const unsigned log_n,
@@ -206,7 +265,8 @@ __global__ void n2b_final_block_warp_hash16_write_batch(
     m31 *g_twiddles,
     uint32_t cols_done,
     uint32_t is_final,
-    Blake2sHash *states
+    uint32_t retained_write_mask,
+    void *states
 ) {
     constexpr unsigned LOG_VALS_PER_THREAD = 3;
     constexpr unsigned VALUES_PER_WARP = 1 << (LOG_WARP + LOG_VALS_PER_THREAD);
@@ -328,7 +388,7 @@ __global__ void n2b_final_block_warp_hash16_write_batch(
         // n2b_final_block_warp_batch performs. Safe in place: every warp's
         // loads of this column precede the smem __syncthreads above, and the
         // written rows are disjoint per warp/block.
-        {
+        if (writes_completed_evaluation<PROGRESSIVE>(retained_write_mask, column)) {
             uint64_t *src = reinterpret_cast<uint64_t *>(vals);
             uint64_t *dst = reinterpret_cast<uint64_t *>(
                 column_values + global_warp_start + 2 * lane);
@@ -347,8 +407,6 @@ __global__ void n2b_final_block_warp_hash16_write_batch(
         __syncthreads();
     }
 
-    const uint32_t total_bytes = 4u * (cols_done + 16u);
-    const uint32_t lastblock = is_final != 0 ? 0xffffffffu : 0u;
     #pragma unroll
     for (unsigned i = 0; i < (1 << (LOG_VALS_PER_THREAD - 1)); ++i) {
         #pragma unroll
@@ -360,8 +418,8 @@ __global__ void n2b_final_block_warp_hash16_write_batch(
             for (unsigned k = 0; k < 16; ++k) {
                 message[k] = messages[local_row * 16 + k];
             }
-            stwo_blake2s_compress_leaf_block_device(
-                &states[global_row], message, total_bytes, lastblock);
+            consume_fused_leaf_message<PROGRESSIVE>(
+                states, global_row, message, cols_done, is_final);
         }
     }
 }
@@ -381,7 +439,7 @@ unsigned leaf_fused_final_stages(unsigned log_n) {
     return 0;
 }
 
-template <unsigned LOG_VALS_PER_THREAD>
+template <unsigned LOG_VALS_PER_THREAD, bool PROGRESSIVE>
 cudaError_t leaf_fused_final_warp_on(
     m31 **values,
     unsigned log_n,
@@ -391,7 +449,8 @@ cudaError_t leaf_fused_final_warp_on(
     unsigned eval_domain_size,
     uint32_t cols_done,
     uint32_t is_final,
-    Blake2sHash *states,
+    uint32_t retained_write_mask,
+    void *states,
     cudaStream_t stream
 ) {
     if (log_n + 1 - (LOG_VALS_PER_THREAD + LOG_WARP) != start_stage) {
@@ -403,13 +462,14 @@ cudaError_t leaf_fused_final_warp_on(
     dim3 grid_dim{num_warps / block_dim.y, 1, 1};
     const size_t shared_bytes = size_t(block_dim.y)
         * (1u << (LOG_WARP + LOG_VALS_PER_THREAD)) * 16u * sizeof(uint32_t);
-    n2b_final_warp_hash16_write_batch<LOG_VALS_PER_THREAD>
+    n2b_final_warp_hash16_write_batch<LOG_VALS_PER_THREAD, PROGRESSIVE>
         <<<grid_dim, block_dim, shared_bytes, stream>>>(
-            values, log_n, start_stage, twiddles, cols_done, is_final, states);
+            values, log_n, start_stage, twiddles, cols_done, is_final,
+            retained_write_mask, states);
     return cudaGetLastError();
 }
 
-template <unsigned LOG_WARP_PER_BLOCK>
+template <unsigned LOG_WARP_PER_BLOCK, bool PROGRESSIVE>
 cudaError_t leaf_fused_final_block_on(
     m31 **values,
     unsigned log_n,
@@ -419,7 +479,8 @@ cudaError_t leaf_fused_final_block_on(
     unsigned eval_domain_size,
     uint32_t cols_done,
     uint32_t is_final,
-    Blake2sHash *states,
+    uint32_t retained_write_mask,
+    void *states,
     cudaStream_t stream
 ) {
     constexpr unsigned LOG_VALS_PER_THREAD = 3;
@@ -434,10 +495,87 @@ cudaError_t leaf_fused_final_block_on(
     constexpr size_t values_per_block =
         32u << (LOG_WARP_PER_BLOCK + LOG_VALS_PER_THREAD);
     constexpr size_t shared_bytes = values_per_block * 17u * sizeof(uint32_t);
-    n2b_final_block_warp_hash16_write_batch<LOG_WARP_PER_BLOCK>
+    n2b_final_block_warp_hash16_write_batch<LOG_WARP_PER_BLOCK, PROGRESSIVE>
         <<<grid_dim, block_dim, shared_bytes, stream>>>(
-            values, log_n, start_stage, twiddles, cols_done, is_final, states);
+            values, log_n, start_stage, twiddles, cols_done, is_final,
+            retained_write_mask, states);
     return cudaGetLastError();
+}
+
+template <bool PROGRESSIVE>
+cudaError_t configure_leaf_fused(unsigned log_n) {
+    switch (leaf_fused_final_stages(log_n)) {
+        case 7:
+            return cudaFuncSetAttribute(
+                n2b_final_warp_hash16_write_batch<2, PROGRESSIVE>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, 32 * 1024);
+        case 8:
+            return cudaFuncSetAttribute(
+                n2b_final_warp_hash16_write_batch<3, PROGRESSIVE>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024);
+        case 10:
+            return cudaFuncSetAttribute(
+                n2b_final_block_warp_hash16_write_batch<2, PROGRESSIVE>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, 68 * 1024);
+        case 11:
+            return cudaFuncSetAttribute(
+                n2b_final_block_warp_hash16_write_batch<3, PROGRESSIVE>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, 136 * 1024);
+        default:
+            return cudaErrorInvalidValue;
+    }
+}
+
+template <bool PROGRESSIVE>
+int launch_leaf_fused(
+    const uint32_t *const *coefficient_values,
+    const uint32_t *coefficient_sizes,
+    uint32_t **device_values,
+    unsigned log_n,
+    uint32_t *twiddles,
+    unsigned twiddle_words,
+    unsigned eval_domain_size,
+    uint32_t cols_done,
+    uint32_t is_final,
+    uint32_t retained_write_mask,
+    void *states,
+    void *stream
+) {
+    int err = stwo_lde_n2b_prefinal16_on(
+        coefficient_values, coefficient_sizes, device_values, log_n, twiddles,
+        twiddle_words, eval_domain_size, stream);
+    if (err != (int)cudaSuccess) {
+        return err;
+    }
+
+    const unsigned final_stages = leaf_fused_final_stages(log_n);
+    const unsigned final_start = log_n + 1 - final_stages;
+    m31 **values = reinterpret_cast<m31 **>(device_values);
+    cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    switch (final_stages) {
+        case 7:
+            return leaf_fused_final_warp_on<2, PROGRESSIVE>(
+                values, log_n, final_start, twiddles, twiddle_words,
+                eval_domain_size, cols_done, is_final, retained_write_mask,
+                states, cuda_stream);
+        case 8:
+            return leaf_fused_final_warp_on<3, PROGRESSIVE>(
+                values, log_n, final_start, twiddles, twiddle_words,
+                eval_domain_size, cols_done, is_final, retained_write_mask,
+                states, cuda_stream);
+        case 10:
+            return leaf_fused_final_block_on<2, PROGRESSIVE>(
+                values, log_n, final_start, twiddles, twiddle_words,
+                eval_domain_size, cols_done, is_final, retained_write_mask,
+                states, cuda_stream);
+        case 11:
+            return leaf_fused_final_block_on<3, PROGRESSIVE>(
+                values, log_n, final_start, twiddles, twiddle_words,
+                eval_domain_size, cols_done, is_final, retained_write_mask,
+                states, cuda_stream);
+        default:
+            return cudaErrorInvalidConfiguration;
+    }
 }
 
 } // namespace
@@ -445,26 +583,7 @@ cudaError_t leaf_fused_final_block_on(
 // Same dynamic shared-memory ceilings as rfft.cu's
 // configure_n2b_hash16_kernel, applied to the write+hash twins.
 extern "C" int stwo_ntt_leaf_fused_configure(unsigned log_n) {
-    switch (leaf_fused_final_stages(log_n)) {
-        case 7:
-            return cudaFuncSetAttribute(
-                n2b_final_warp_hash16_write_batch<2>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, 32 * 1024);
-        case 8:
-            return cudaFuncSetAttribute(
-                n2b_final_warp_hash16_write_batch<3>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024);
-        case 10:
-            return cudaFuncSetAttribute(
-                n2b_final_block_warp_hash16_write_batch<2>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, 68 * 1024);
-        case 11:
-            return cudaFuncSetAttribute(
-                n2b_final_block_warp_hash16_write_batch<3>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, 136 * 1024);
-        default:
-            return cudaErrorInvalidValue;
-    }
+    return configure_leaf_fused<false>(log_n);
 }
 
 extern "C" int stwo_ntt_leaf_fused_on(
@@ -489,35 +608,39 @@ extern "C" int stwo_ntt_leaf_fused_on(
         return cudaErrorInvalidValue;
     }
 
-    int err = stwo_lde_n2b_prefinal16_on(
+    return launch_leaf_fused<false>(
         coefficient_values, coefficient_sizes, device_values, log_n, twiddles,
-        twiddle_words, eval_domain_size, stream);
-    if (err != (int)cudaSuccess) {
-        return err;
-    }
+        twiddle_words, eval_domain_size, cols_done, is_final, 0xffffu, states,
+        stream);
+}
 
-    const unsigned final_stages = leaf_fused_final_stages(log_n);
-    const unsigned final_start = log_n + 1 - final_stages;
-    m31 **values = reinterpret_cast<m31 **>(device_values);
-    cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
-    switch (final_stages) {
-        case 7:
-            return leaf_fused_final_warp_on<2>(
-                values, log_n, final_start, twiddles, twiddle_words,
-                eval_domain_size, cols_done, is_final, states, cuda_stream);
-        case 8:
-            return leaf_fused_final_warp_on<3>(
-                values, log_n, final_start, twiddles, twiddle_words,
-                eval_domain_size, cols_done, is_final, states, cuda_stream);
-        case 10:
-            return leaf_fused_final_block_on<2>(
-                values, log_n, final_start, twiddles, twiddle_words,
-                eval_domain_size, cols_done, is_final, states, cuda_stream);
-        case 11:
-            return leaf_fused_final_block_on<3>(
-                values, log_n, final_start, twiddles, twiddle_words,
-                eval_domain_size, cols_done, is_final, states, cuda_stream);
-        default:
-            return cudaErrorInvalidConfiguration;
+extern "C" int stwo_ntt_progressive_leaf_fused_configure(unsigned log_n) {
+    return configure_leaf_fused<true>(log_n);
+}
+
+extern "C" int stwo_ntt_progressive_leaf_fused_on(
+    const uint32_t *const *coefficient_values,
+    const uint32_t *coefficient_sizes,
+    uint32_t **device_values,
+    unsigned log_n,
+    uint32_t *twiddles,
+    unsigned twiddle_words,
+    unsigned eval_domain_size,
+    uint32_t cols_done,
+    uint32_t retained_write_mask,
+    ProgressiveBlake2sState *states,
+    void *stream
+) {
+    if (coefficient_values == nullptr || coefficient_sizes == nullptr ||
+        device_values == nullptr || log_n < 13 || log_n > 30 ||
+        twiddles == nullptr || eval_domain_size != (1u << (log_n - 1)) ||
+        eval_domain_size > twiddle_words || (cols_done % 16) != 0 ||
+        (retained_write_mask & ~0xffffu) != 0 || states == nullptr ||
+        stream == nullptr) {
+        return cudaErrorInvalidValue;
     }
+    return launch_leaf_fused<true>(
+        coefficient_values, coefficient_sizes, device_values, log_n, twiddles,
+        twiddle_words, eval_domain_size, cols_done, 0u, retained_write_mask,
+        states, stream);
 }

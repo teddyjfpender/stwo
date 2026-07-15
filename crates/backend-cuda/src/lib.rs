@@ -171,6 +171,11 @@ pub use backend::progressive_commit::{
     PROGRESSIVE_BLAKE2S_H_OFFSET, PROGRESSIVE_BLAKE2S_PENDING_BLOCK_OFFSET,
     PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES,
 };
+pub use backend::progressive_ntt_leaf_fusion::{
+    progressive_ntt_leaf_fusion_telemetry, ProgressiveNttLeafFusionMode,
+    ProgressiveNttLeafFusionTelemetry, PROGRESSIVE_NTT_LEAF_FUSED_COLUMNS,
+    PROGRESSIVE_NTT_LEAF_FUSED_MIN_LOG_SIZE,
+};
 pub use backend::proof_assembly::{
     assemble_blake2s_stark_proof, Blake2sFriAssemblyShape, Blake2sProofAssemblyError,
     Blake2sProofAssemblyInput, Blake2sProofAssemblyShape, Blake2sTraceAssemblyShape,

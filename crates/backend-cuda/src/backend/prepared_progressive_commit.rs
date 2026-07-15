@@ -22,6 +22,10 @@ use super::progressive_commit::{
     ProgressiveCommitGeometry, ProgressiveCommitMode, ProgressiveCommitPlan,
     PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES,
 };
+use super::progressive_ntt_leaf_fusion::{
+    progressive_lde_segments, ProgressiveLdeSegmentKind, ProgressiveNttLeafFusionMode,
+    ProgressiveNttLeafFusionTelemetry,
+};
 
 const WORD_BYTES: usize = core::mem::size_of::<u32>();
 const POINTER_WORDS: usize = core::mem::size_of::<*mut u32>().div_ceil(WORD_BYTES);
@@ -105,6 +109,12 @@ pub enum ProgressiveLeafLaunchKind {
         log_size: u32,
         columns: u32,
         absorbed_columns_before: u32,
+    },
+    FusedLdeAbsorb {
+        log_size: u32,
+        columns: u32,
+        absorbed_columns_before: u32,
+        retained_write_mask: u32,
     },
     Finalize {
         log_size: u32,
@@ -457,6 +467,40 @@ struct PreparedBatch {
     absorbed_columns_before: u32,
 }
 
+impl PreparedBatch {
+    fn checked_subbatch(
+        self,
+        offset: usize,
+        columns: usize,
+    ) -> Result<Self, PreparedProgressiveCommitError> {
+        let pointer_offset = offset
+            .checked_mul(POINTER_WORDS)
+            .ok_or(PreparedProgressiveCommitError::SizeOverflow)?;
+        let pointer_words = columns
+            .checked_mul(POINTER_WORDS)
+            .ok_or(PreparedProgressiveCommitError::SizeOverflow)?;
+        Ok(Self {
+            coefficient_ptrs: self
+                .coefficient_ptrs
+                .checked_subslice(pointer_offset, pointer_words)?,
+            coefficient_sizes: self.coefficient_sizes.checked_subslice(offset, columns)?,
+            output_ptrs: self
+                .output_ptrs
+                .checked_subslice(pointer_offset, pointer_words)?,
+            log_size: self.log_size,
+            columns: u32::try_from(columns)
+                .map_err(|_| PreparedProgressiveCommitError::SizeOverflow)?,
+            absorbed_columns_before: self
+                .absorbed_columns_before
+                .checked_add(
+                    u32::try_from(offset)
+                        .map_err(|_| PreparedProgressiveCommitError::SizeOverflow)?,
+                )
+                .ok_or(PreparedProgressiveCommitError::SizeOverflow)?,
+        })
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Launch {
     Init {
@@ -475,6 +519,11 @@ enum Launch {
         batch: PreparedBatch,
         states: ArenaSlice,
     },
+    FusedLdeAbsorb {
+        batch: PreparedBatch,
+        retained_write_mask: u32,
+        states: ArenaSlice,
+    },
     Finalize {
         log_size: u32,
         absorbed_columns: u32,
@@ -490,6 +539,7 @@ pub struct PreparedProgressiveLeaves<'a> {
     twiddles: ArenaSlice,
     twiddle_words: u32,
     cache_key: u64,
+    ntt_leaf_fusion: ProgressiveNttLeafFusionTelemetry,
 }
 
 impl<'a> PreparedProgressiveLeaves<'a> {
@@ -526,6 +576,32 @@ impl<'a> PreparedProgressiveLeaves<'a> {
         retained_outputs: &[Option<ArenaSlice>],
         twiddles: ArenaSlice,
         mode: ProgressiveCommitMode,
+    ) -> Result<Self, PreparedProgressiveCommitError> {
+        Self::prepare_with_mode_and_ntt_fusion(
+            arena,
+            requirements,
+            slots,
+            coefficients,
+            retained_outputs,
+            twiddles,
+            mode,
+            ProgressiveNttLeafFusionMode::Separate,
+        )
+    }
+
+    /// Bind an explicitly selected progressive topology and final-NTT sink.
+    /// Fusion is sealed into the prepared launch vector; no launch-time ambient
+    /// state can change eager or captured topology.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_with_mode_and_ntt_fusion(
+        arena: &'a DeviceArena,
+        requirements: &ProgressiveLeafWorkspaceRequirements,
+        slots: &ProgressiveLeafWorkspaceSlots,
+        coefficients: &[CommitCoefficientColumn],
+        retained_outputs: &[Option<ArenaSlice>],
+        twiddles: ArenaSlice,
+        mode: ProgressiveCommitMode,
+        ntt_leaf_fusion: ProgressiveNttLeafFusionMode,
     ) -> Result<Self, PreparedProgressiveCommitError> {
         progressive_prepare_mode_admission_for_mode(mode, requirements)?;
         let workspace = requirements.arena_slot_requirements(slots)?;
@@ -579,6 +655,7 @@ impl<'a> PreparedProgressiveLeaves<'a> {
         let mut uploads: Vec<(ArenaSlice, HostDescriptor)> = Vec::new();
         let mut external_ids = BTreeSet::from([twiddles.id()]);
         let mut prepared_batches = Vec::with_capacity(requirements.batches.len());
+        let mut fusion_telemetry = ProgressiveNttLeafFusionTelemetry::default();
         let mut absorbed_columns = 0u32;
         for ((batch, batch_requirement), batch_slots) in requirements
             .plan
@@ -698,15 +775,20 @@ impl<'a> PreparedProgressiveLeaves<'a> {
             ));
             uploads.push((coefficient_sizes, HostDescriptor::U32(coefficient_lengths)));
             uploads.push((output_ptrs, HostDescriptor::Pointers(output_addresses)));
-            prepared_batches.push(PreparedBatch {
-                coefficient_ptrs,
-                coefficient_sizes,
-                output_ptrs,
-                log_size: batch.evaluation_log_size,
-                columns: u32::try_from(batch.columns.len())
-                    .map_err(|_| PreparedProgressiveCommitError::SizeOverflow)?,
-                absorbed_columns_before: absorbed_columns,
-            });
+            let (segments, batch_telemetry) = progressive_lde_segments(batch, ntt_leaf_fusion)?;
+            fusion_telemetry = fusion_telemetry.checked_add(batch_telemetry)?;
+            prepared_batches.push((
+                PreparedBatch {
+                    coefficient_ptrs,
+                    coefficient_sizes,
+                    output_ptrs,
+                    log_size: batch.evaluation_log_size,
+                    columns: u32::try_from(batch.columns.len())
+                        .map_err(|_| PreparedProgressiveCommitError::SizeOverflow)?,
+                    absorbed_columns_before: absorbed_columns,
+                },
+                segments,
+            ));
             absorbed_columns = absorbed_columns
                 .checked_add(
                     u32::try_from(batch.columns.len())
@@ -720,11 +802,12 @@ impl<'a> PreparedProgressiveLeaves<'a> {
         let mut current_log = first_log;
         let mut current = ping;
         let mut next = pong;
+        let mut fused_log_sizes = BTreeSet::new();
         launches.push(Launch::Init {
             log_size: first_log,
             states: current,
         });
-        for batch in prepared_batches {
+        for (batch, segments) in prepared_batches {
             if batch.log_size > current_log {
                 let output = next.ok_or(PreparedProgressiveCommitError::InvalidSlotShape)?;
                 launches.push(Launch::Expand {
@@ -737,12 +820,29 @@ impl<'a> PreparedProgressiveLeaves<'a> {
                 current = output;
                 current_log = batch.log_size;
             }
-            launches.push(Launch::Lde(batch));
-            launches.push(Launch::Absorb {
-                log_size: current_log,
-                batch,
-                states: current,
-            });
+            for segment in segments {
+                let subbatch = batch.checked_subbatch(segment.offset, segment.columns)?;
+                match segment.kind {
+                    ProgressiveLdeSegmentKind::Separate => {
+                        launches.push(Launch::Lde(subbatch));
+                        launches.push(Launch::Absorb {
+                            log_size: current_log,
+                            batch: subbatch,
+                            states: current,
+                        });
+                    }
+                    ProgressiveLdeSegmentKind::Fused16 {
+                        retained_write_mask,
+                    } => {
+                        fused_log_sizes.insert(subbatch.log_size);
+                        launches.push(Launch::FusedLdeAbsorb {
+                            batch: subbatch,
+                            retained_write_mask,
+                            states: current,
+                        });
+                    }
+                }
+            }
         }
         if current_log < requirements.plan.geometry.lifting_log_size {
             let output = next.ok_or(PreparedProgressiveCommitError::InvalidSlotShape)?;
@@ -761,6 +861,15 @@ impl<'a> PreparedProgressiveLeaves<'a> {
             output: leaf_hashes,
         });
 
+        // Dynamic shared-memory admission is setup-only and occurs before any
+        // capture. Unsupported devices reject the selected topology here.
+        for log_size in fused_log_sizes {
+            let code = unsafe {
+                stwo_backend_cuda_kernels::raw::stwo_ntt_progressive_leaf_fused_configure(log_size)
+            };
+            check_cuda("progressive_ntt_leaf_fused_configure", code)?;
+        }
+
         for (destination, descriptor) in &uploads {
             let (source, bytes) = descriptor.bytes();
             unsafe {
@@ -777,6 +886,7 @@ impl<'a> PreparedProgressiveLeaves<'a> {
             twiddles,
             twiddle_words,
             cache_key: requirements.plan.cache_key,
+            ntt_leaf_fusion: fusion_telemetry,
         })
     }
 
@@ -837,6 +947,26 @@ impl<'a> PreparedProgressiveLeaves<'a> {
                             stream,
                         ),
                     ),
+                    Launch::FusedLdeAbsorb {
+                        batch,
+                        retained_write_mask,
+                        states,
+                    } => (
+                        "progressive_ntt_leaf_fused",
+                        stwo_backend_cuda_kernels::raw::stwo_ntt_progressive_leaf_fused_on(
+                            batch.coefficient_ptrs.as_u32_ptr().cast(),
+                            batch.coefficient_sizes.as_u32_ptr(),
+                            batch.output_ptrs.as_u32_ptr().cast(),
+                            batch.log_size,
+                            self.twiddles.as_u32_ptr(),
+                            self.twiddle_words,
+                            1u32 << (batch.log_size - 1),
+                            batch.absorbed_columns_before,
+                            retained_write_mask,
+                            states.as_u32_ptr().cast(),
+                            stream,
+                        ),
+                    ),
                     Launch::Finalize {
                         log_size,
                         absorbed_columns,
@@ -879,6 +1009,16 @@ impl<'a> PreparedProgressiveLeaves<'a> {
                 columns: batch.columns,
                 absorbed_columns_before: batch.absorbed_columns_before,
             },
+            Launch::FusedLdeAbsorb {
+                batch,
+                retained_write_mask,
+                ..
+            } => ProgressiveLeafLaunchKind::FusedLdeAbsorb {
+                log_size: batch.log_size,
+                columns: batch.columns,
+                absorbed_columns_before: batch.absorbed_columns_before,
+                retained_write_mask,
+            },
             Launch::Finalize {
                 log_size,
                 absorbed_columns,
@@ -894,6 +1034,9 @@ impl<'a> PreparedProgressiveLeaves<'a> {
     }
     pub fn cache_key(&self) -> u64 {
         self.cache_key
+    }
+    pub fn ntt_leaf_fusion_telemetry(&self) -> ProgressiveNttLeafFusionTelemetry {
+        self.ntt_leaf_fusion
     }
 }
 
@@ -993,6 +1136,34 @@ impl<'a> PreparedProgressiveCommitGraph<'a> {
         progressive_mode: ProgressiveCommitMode,
         interior_fused: bool,
     ) -> Result<Self, PreparedProgressiveCommitError> {
+        Self::prepare_with_modes_and_ntt_fusion(
+            arena,
+            config,
+            requirements,
+            slots,
+            coefficients,
+            retained_outputs,
+            twiddles,
+            progressive_mode,
+            interior_fused,
+            ProgressiveNttLeafFusionMode::Separate,
+        )
+    }
+
+    /// Immutable-generation constructor including the final NTT sink topology.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_with_modes_and_ntt_fusion(
+        arena: &'a DeviceArena,
+        config: CommitWorkspaceConfig,
+        requirements: &ProgressiveCommitWorkspaceRequirements,
+        slots: &ProgressiveCommitWorkspaceSlots,
+        coefficients: &[CommitCoefficientColumn],
+        retained_outputs: &[Option<ArenaSlice>],
+        twiddles: ArenaSlice,
+        progressive_mode: ProgressiveCommitMode,
+        interior_fused: bool,
+        ntt_leaf_fusion: ProgressiveNttLeafFusionMode,
+    ) -> Result<Self, PreparedProgressiveCommitError> {
         progressive_prepare_mode_admission_for_mode(progressive_mode, &requirements.leaves)?;
         let workspace = requirements.arena_slot_requirements(slots)?;
         let workspace_ids = workspace
@@ -1010,7 +1181,7 @@ impl<'a> PreparedProgressiveCommitGraph<'a> {
                 return Err(PreparedProgressiveCommitError::AliasedSlot(source.id()));
             }
         }
-        let leaves = PreparedProgressiveLeaves::prepare_with_mode(
+        let leaves = PreparedProgressiveLeaves::prepare_with_mode_and_ntt_fusion(
             arena,
             &requirements.leaves,
             &slots.leaves,
@@ -1018,6 +1189,7 @@ impl<'a> PreparedProgressiveCommitGraph<'a> {
             retained_outputs,
             twiddles,
             progressive_mode,
+            ntt_leaf_fusion,
         )?;
         let merkle = PreparedMerkleFromLeaves::prepare_with_interior_mode(
             arena,
@@ -1070,6 +1242,10 @@ impl<'a> PreparedProgressiveCommitGraph<'a> {
 
     pub fn retained_evaluations(&self) -> &[Option<ArenaSlice>] {
         &self.retained_evaluations
+    }
+
+    pub fn ntt_leaf_fusion_telemetry(&self) -> ProgressiveNttLeafFusionTelemetry {
+        self.leaves.ntt_leaf_fusion_telemetry()
     }
 
     pub fn read_root_at_transcript_boundary(

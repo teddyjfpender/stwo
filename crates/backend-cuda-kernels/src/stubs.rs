@@ -5,7 +5,9 @@
 
 use core::ffi::c_void;
 
-use crate::raw::{Blake2sHash, CirclePointBaseField, CudaSecureField, LayerIndexPair};
+use crate::raw::{
+    Blake2sHash, CirclePointBaseField, CudaSecureField, LayerIndexPair, ProgressiveBlake2sState,
+};
 
 const CUDA_ERROR_NOT_SUPPORTED: i32 = 801;
 
@@ -3089,4 +3091,26 @@ pub unsafe extern "C" fn stwo_ntt_leaf_fused_on(
     _stream: *mut c_void,
 ) -> i32 {
     no_cuda_symbol("stwo_ntt_leaf_fused_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_ntt_progressive_leaf_fused_configure(_log_n: u32) -> i32 {
+    no_cuda_symbol("stwo_ntt_progressive_leaf_fused_configure")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_ntt_progressive_leaf_fused_on(
+    _coefficient_values: *const *const u32,
+    _coefficient_sizes: *const u32,
+    _device_values: *const *mut u32,
+    _log_n: u32,
+    _g_twiddles: *mut u32,
+    _twiddles_size: u32,
+    _eval_domain_size: u32,
+    _cols_done: u32,
+    _retained_write_mask: u32,
+    _states: *mut ProgressiveBlake2sState,
+    _stream: *mut c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_ntt_progressive_leaf_fused_on")
 }

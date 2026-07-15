@@ -139,6 +139,24 @@ mod tests {
     fn ntt_leaf_fused_symbols_are_linked_in_cuda_and_stub_builds() {
         assert_ne!(raw::stwo_ntt_leaf_fused_configure as usize, 0);
         assert_ne!(raw::stwo_ntt_leaf_fused_on as usize, 0);
+        assert_ne!(raw::stwo_ntt_progressive_leaf_fused_configure as usize, 0);
+        assert_ne!(raw::stwo_ntt_progressive_leaf_fused_on as usize, 0);
+    }
+
+    #[test]
+    fn progressive_ntt_leaf_sink_preserves_lazy_block_and_retained_write_contract() {
+        let source = include_str!("../cuda/ntt_leaf_fused.cu");
+        assert!(source.contains("if constexpr (PROGRESSIVE)"));
+        assert!(source.contains("4u * cols_done, 0u"));
+        assert!(source.contains("state->pending[word] = message[word]"));
+        assert_eq!(
+            source
+                .matches("writes_completed_evaluation<PROGRESSIVE>")
+                .count(),
+            2
+        );
+        assert!(source.contains("(retained_write_mask & ~0xffffu) != 0"));
+        assert!(source.contains("uint32_t retained_write_mask"));
     }
 
     #[test]
