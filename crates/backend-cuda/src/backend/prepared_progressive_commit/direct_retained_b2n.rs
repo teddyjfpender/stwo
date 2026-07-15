@@ -1,9 +1,9 @@
 //! Direct Base/Interaction interpolation into the retained LDE slab.
 //!
-//! This is the first executable edge of coefficient-image retirement. It
-//! performs only B2N and the exact zero-extension first-layer duplication;
-//! the remaining N2B stages are a separate, explicit successor. Failure never
-//! selects the coefficient-backed LDE path.
+//! It performs B2N, writes the exact zero-extension stage-one image directly
+//! into the retained slab, then completes forward N2B from stage two. The
+//! resulting bytes are ready for the existing absorb/Merkle consumer. Runtime
+//! selection remains separate; failure never selects coefficient-backed LDE.
 
 use core::ffi::c_void;
 use std::collections::BTreeSet;
@@ -51,6 +51,8 @@ pub struct DirectRetainedB2nOracle {
     /// canonical column order. These are the exact bytes consumed by N2B at
     /// stage two.
     pub retained_stage_two_inputs: Vec<Vec<u32>>,
+    /// Full canonical LDE words after the forward stage-two successor.
+    pub retained_evaluations: Vec<Vec<u32>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -63,6 +65,8 @@ pub struct DirectRetainedB2nLaunchKind {
     /// Full caller-supplied logical tree extent. CUDA selects each smaller
     /// source tree from its suffix.
     pub inverse_twiddle_words: u32,
+    /// Full caller-supplied forward tree extent used by the N2B successor.
+    pub forward_twiddle_words: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -150,12 +154,33 @@ struct PreparedBatch {
     columns: u32,
 }
 
+impl PreparedBatch {
+    fn launch_kind(
+        self,
+        role: TraceTreeRole,
+        inverse_twiddle_words: u32,
+        forward_twiddle_words: u32,
+    ) -> DirectRetainedB2nLaunchKind {
+        DirectRetainedB2nLaunchKind {
+            role,
+            batch_index: self.batch_index,
+            source_log_size: self.source_log_size,
+            retained_log_size: self.retained_log_size,
+            columns: self.columns,
+            inverse_twiddle_words,
+            forward_twiddle_words,
+        }
+    }
+}
+
 pub struct PreparedDirectRetainedB2nGraph<'a> {
     arena: &'a DeviceArena,
     role: TraceTreeRole,
     commit_cache_key: u64,
     inverse_twiddles: ArenaSlice,
     inverse_twiddle_words: u32,
+    forward_twiddles: ArenaSlice,
+    forward_twiddle_words: u32,
     batches: Vec<PreparedBatch>,
     exact_lower_prefix_aliases: usize,
 }
@@ -297,10 +322,16 @@ impl DirectRetainedB2nProgram {
             .map(|batch| batch.source_log_size)
             .max()
             .ok_or(DirectRetainedB2nError::InvalidProgram)?;
-        let twiddles = CpuBackend::precompute_twiddles(
+        let inverse_twiddles = CpuBackend::precompute_twiddles(
             CanonicCoset::new(max_source_log).circle_domain().half_coset,
         );
-        let mut output = vec![Vec::new(); self.column_count];
+        let forward_twiddles = CpuBackend::precompute_twiddles(
+            CanonicCoset::new(max_source_log + 1)
+                .circle_domain()
+                .half_coset,
+        );
+        let mut stage_two = vec![Vec::new(); self.column_count];
+        let mut evaluations = vec![Vec::new(); self.column_count];
         for batch in &self.batches {
             let required_words = words(batch.source_log_size)?;
             for &canonical in &batch.canonical_columns {
@@ -330,19 +361,30 @@ impl DirectRetainedB2nProgram {
                             .map(BaseField::from_u32_unchecked)
                             .collect(),
                     )
-                    .interpolate_with_twiddles(&twiddles)
+                    .interpolate_with_twiddles(&inverse_twiddles);
+                evaluations[canonical] = coefficients
+                    .evaluate_with_twiddles(
+                        CanonicCoset::new(batch.retained_log_size).circle_domain(),
+                        &forward_twiddles,
+                    )
+                    .values
+                    .into_iter()
+                    .map(|value| value.0)
+                    .collect();
+                let coefficient_words = coefficients
                     .coeffs
                     .into_iter()
                     .map(|value| value.0)
                     .collect::<Vec<_>>();
-                let mut retained = Vec::with_capacity(2 * coefficients.len());
-                retained.extend_from_slice(&coefficients);
-                retained.extend_from_slice(&coefficients);
-                output[canonical] = retained;
+                let mut retained = Vec::with_capacity(2 * coefficient_words.len());
+                retained.extend_from_slice(&coefficient_words);
+                retained.extend_from_slice(&coefficient_words);
+                stage_two[canonical] = retained;
             }
         }
         Ok(DirectRetainedB2nOracle {
-            retained_stage_two_inputs: output,
+            retained_stage_two_inputs: stage_two,
+            retained_evaluations: evaluations,
         })
     }
 }
@@ -358,6 +400,7 @@ impl<'a> PreparedDirectRetainedB2nGraph<'a> {
         slots: &ProgressiveCommitWorkspaceSlots,
         columns: &[DirectRetainedB2nColumn],
         inverse_twiddles: ArenaSlice,
+        forward_twiddles: ArenaSlice,
     ) -> Result<Self, DirectRetainedB2nError> {
         if columns.len() != program.column_count {
             return Err(DirectRetainedB2nError::ColumnCount {
@@ -366,9 +409,10 @@ impl<'a> PreparedDirectRetainedB2nGraph<'a> {
             });
         }
         let token = arena.context().identity_token();
-        let inverse_twiddle_words = admit_inverse_twiddles(program, inverse_twiddles, token)?;
+        let inverse_twiddle_words = admit_twiddles(program, inverse_twiddles, token)?;
+        let forward_twiddle_words = admit_twiddles(program, forward_twiddles, token)?;
         let logical = bind_logical_columns(program, columns, token)?;
-        validate_value_aliases(&logical, inverse_twiddles)?;
+        validate_value_aliases(&logical, inverse_twiddles, forward_twiddles)?;
 
         let requirements = program.arena_slot_requirements(slots)?;
         let mut prepared = Vec::with_capacity(program.batches.len());
@@ -414,7 +458,12 @@ impl<'a> PreparedDirectRetainedB2nGraph<'a> {
                     .map_err(|_| DirectRetainedB2nError::SizeOverflow)?,
             });
         }
-        validate_pointer_aliases(&pointer_tables, &logical, inverse_twiddles)?;
+        validate_pointer_aliases(
+            &pointer_tables,
+            &logical,
+            inverse_twiddles,
+            forward_twiddles,
+        )?;
         for (destination, addresses) in &uploads {
             let bytes = addresses
                 .len()
@@ -436,6 +485,8 @@ impl<'a> PreparedDirectRetainedB2nGraph<'a> {
             commit_cache_key: program.commit_cache_key,
             inverse_twiddles,
             inverse_twiddle_words,
+            forward_twiddles,
+            forward_twiddle_words,
             batches: prepared,
             exact_lower_prefix_aliases: logical
                 .iter()
@@ -463,6 +514,22 @@ impl<'a> PreparedDirectRetainedB2nGraph<'a> {
                 )
             };
             check_cuda("direct_retained_b2n", code)?;
+
+            let eval_domain_size = 1u32
+                .checked_shl(batch.retained_log_size - 1)
+                .ok_or(DirectRetainedB2nError::SizeOverflow)?;
+            let code = unsafe {
+                stwo_backend_cuda_kernels::raw::stwo_ntt_n2b_columns_from_stage_two_on(
+                    batch.output_pointers.as_u32_ptr().cast(),
+                    batch.retained_log_size,
+                    batch.columns,
+                    self.forward_twiddles.as_u32_ptr(),
+                    self.forward_twiddle_words,
+                    eval_domain_size,
+                    stream,
+                )
+            };
+            check_cuda("direct_retained_n2b_stage_two", code)?;
         }
         Ok(())
     }
@@ -470,16 +537,13 @@ impl<'a> PreparedDirectRetainedB2nGraph<'a> {
     pub fn launch_sequence(
         &self,
     ) -> impl ExactSizeIterator<Item = DirectRetainedB2nLaunchKind> + '_ {
-        self.batches
-            .iter()
-            .map(|batch| DirectRetainedB2nLaunchKind {
-                role: self.role,
-                batch_index: batch.batch_index,
-                source_log_size: batch.source_log_size,
-                retained_log_size: batch.retained_log_size,
-                columns: batch.columns,
-                inverse_twiddle_words: self.inverse_twiddle_words,
-            })
+        self.batches.iter().copied().map(|batch| {
+            batch.launch_kind(
+                self.role,
+                self.inverse_twiddle_words,
+                self.forward_twiddle_words,
+            )
+        })
     }
 
     pub fn commit_cache_key(&self) -> u64 {
@@ -491,23 +555,21 @@ impl<'a> PreparedDirectRetainedB2nGraph<'a> {
     }
 }
 
-fn admit_inverse_twiddles(
+fn admit_twiddles(
     program: &DirectRetainedB2nProgram,
-    inverse_twiddles: ArenaSlice,
+    twiddles: ArenaSlice,
     token: core::ptr::NonNull<c_void>,
 ) -> Result<u32, DirectRetainedB2nError> {
-    if inverse_twiddles.context_token() != token {
-        return Err(DirectRetainedB2nError::ContextMismatch(
-            inverse_twiddles.id(),
-        ));
+    if twiddles.context_token() != token {
+        return Err(DirectRetainedB2nError::ContextMismatch(twiddles.id()));
     }
-    if inverse_twiddles.len_words() < program.twiddle_words {
+    if twiddles.len_words() < program.twiddle_words {
         return Err(DirectRetainedB2nError::TwiddlesTooSmall {
             required_words: program.twiddle_words,
-            actual_words: inverse_twiddles.len_words(),
+            actual_words: twiddles.len_words(),
         });
     }
-    u32::try_from(inverse_twiddles.len_words()).map_err(|_| DirectRetainedB2nError::SizeOverflow)
+    u32::try_from(twiddles.len_words()).map_err(|_| DirectRetainedB2nError::SizeOverflow)
 }
 
 fn bind_logical_columns(
@@ -555,7 +617,19 @@ fn bind_logical_columns(
 fn validate_value_aliases(
     columns: &[LogicalColumn],
     inverse_twiddles: ArenaSlice,
+    forward_twiddles: ArenaSlice,
 ) -> Result<(), DirectRetainedB2nError> {
+    if inverse_twiddles.id() == forward_twiddles.id()
+        || ranges_overlap(
+            address_range(inverse_twiddles)?,
+            address_range(forward_twiddles)?,
+        )
+    {
+        return Err(DirectRetainedB2nError::InvalidAlias {
+            first: inverse_twiddles.id(),
+            second: forward_twiddles.id(),
+        });
+    }
     let mut ranges = Vec::with_capacity(2 * columns.len());
     for (canonical, column) in columns.iter().enumerate() {
         ranges.push((
@@ -583,13 +657,13 @@ fn validate_value_aliases(
                 });
             }
         }
-        if slice.id() == inverse_twiddles.id()
-            || ranges_overlap(range, address_range(inverse_twiddles)?)
-        {
-            return Err(DirectRetainedB2nError::InvalidAlias {
-                first: slice.id(),
-                second: inverse_twiddles.id(),
-            });
+        for twiddles in [inverse_twiddles, forward_twiddles] {
+            if slice.id() == twiddles.id() || ranges_overlap(range, address_range(twiddles)?) {
+                return Err(DirectRetainedB2nError::InvalidAlias {
+                    first: slice.id(),
+                    second: twiddles.id(),
+                });
+            }
         }
     }
     Ok(())
@@ -599,6 +673,7 @@ fn validate_pointer_aliases(
     pointer_tables: &[ArenaSlice],
     columns: &[LogicalColumn],
     inverse_twiddles: ArenaSlice,
+    forward_twiddles: ArenaSlice,
 ) -> Result<(), DirectRetainedB2nError> {
     for (index, &table) in pointer_tables.iter().enumerate() {
         let range = address_range(table)?;
@@ -613,7 +688,7 @@ fn validate_pointer_aliases(
         for value in columns
             .iter()
             .flat_map(|column| [column.source, column.retained])
-            .chain(core::iter::once(inverse_twiddles))
+            .chain([inverse_twiddles, forward_twiddles])
         {
             if table.id() == value.id() || ranges_overlap(range, address_range(value)?) {
                 return Err(DirectRetainedB2nError::InvalidAlias {

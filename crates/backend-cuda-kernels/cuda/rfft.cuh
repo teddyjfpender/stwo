@@ -52,6 +52,19 @@ int stwo_ntt_n2b_columns_on(
     void *stream
 );
 
+// Continue an in-place N2B from the exact post-stage-one image `[c, c]`.
+// Stages 2..log_n run on `stream`; no staging, allocation, or sync occurs.
+extern "C"
+int stwo_ntt_n2b_columns_from_stage_two_on(
+    uint32_t **device_values,
+    unsigned log_n,
+    unsigned num_poly,
+    uint32_t *g_twiddles,
+    unsigned twiddles_size,
+    unsigned eval_domain_size,
+    void *stream
+);
+
 // Allocation-free explicit-stream LDE. Both pointer tables live on the device.
 // `coefficient_sizes[i]` is the exact source length and may be smaller than
 // `eval_domain_size` when blowup > 1. Each destination has

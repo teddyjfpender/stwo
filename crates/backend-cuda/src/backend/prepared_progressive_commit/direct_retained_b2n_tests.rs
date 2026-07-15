@@ -54,6 +54,188 @@ fn slots(batch_count: usize) -> ProgressiveCommitWorkspaceSlots {
     }
 }
 
+fn layer_offset(log_n: u32, stage: u32) -> usize {
+    let mut layer_size = 1usize;
+    let mut offset = (1usize << log_n) / 2 - 2;
+    for _ in 1..stage {
+        layer_size <<= 1;
+        offset -= layer_size;
+    }
+    offset
+}
+
+fn stagewise_n2b_interval(
+    values: &[BaseField],
+    log_n: u32,
+    first_stage: u32,
+    last_stage: u32,
+    twiddles: &[BaseField],
+) -> Vec<BaseField> {
+    let mut output = values.to_vec();
+    for stage in first_stage..=last_stage {
+        let stride = 1usize << (log_n - stage);
+        let offset = layer_offset(log_n, stage);
+        for gid in 0..output.len() / 2 {
+            let group = gid & (stride - 1);
+            let pair = gid >> (log_n - stage);
+            let left_index = group + pair * 2 * stride;
+            let right_index = left_index + stride;
+            let left = output[left_index];
+            let product = twiddles[offset + pair] * output[right_index];
+            output[left_index] = left + product;
+            output[right_index] = left - product;
+        }
+    }
+    output
+}
+
+fn rectangular_n2b_interval(
+    values: &[BaseField],
+    log_n: u32,
+    log_values_per_thread: u32,
+    log_warps_per_block: u32,
+    twiddles: &[BaseField],
+) -> Vec<BaseField> {
+    let first_stage = 2;
+    let stages = log_values_per_thread + log_warps_per_block;
+    let last_stage = first_stage + stages - 1;
+    let min_stride = 1usize << (log_n - last_stage);
+    let values_per_thread = 1usize << log_values_per_thread;
+    let warps = 1usize << log_warps_per_block;
+    let grid_x = min_stride / 32;
+    let grid_y = values.len() / (min_stride << stages);
+    let mut output = vec![BaseField::from_u32_unchecked(0); values.len()];
+    let mut written = vec![false; values.len()];
+
+    for block_y in 0..grid_y {
+        for block_x in 0..grid_x {
+            let block_start = (block_x << 5) + (block_y << (log_n - last_stage + stages));
+            let mut shared = vec![BaseField::from_u32_unchecked(0); 32usize << stages];
+
+            for old_warp in 0..warps {
+                for lane in 0..32usize {
+                    let offset = old_warp * min_stride + lane;
+                    let mut registers = (0..values_per_thread)
+                        .map(|i| {
+                            values[block_start + i * (min_stride << log_warps_per_block) + offset]
+                        })
+                        .collect::<Vec<_>>();
+                    for stage in first_stage..first_stage + log_values_per_thread {
+                        let log_stride = log_values_per_thread - 1 - (stage - first_stage);
+                        let stride = 1usize << log_stride;
+                        for gid in 0..values_per_thread / 2 {
+                            let group = gid & (stride - 1);
+                            let pair = gid >> log_stride;
+                            let left_index = group + (pair << (log_stride + 1));
+                            let right_index = left_index + stride;
+                            let outer = (block_start + offset) >> (1 + log_n - stage);
+                            let product = twiddles[layer_offset(log_n, stage) + pair + outer]
+                                * registers[right_index];
+                            let left = registers[left_index];
+                            registers[left_index] = left + product;
+                            registers[right_index] = left - product;
+                        }
+                    }
+                    for (i, value) in registers.into_iter().enumerate() {
+                        shared[lane + (i << (5 + log_warps_per_block)) + (old_warp << 5)] = value;
+                    }
+                }
+            }
+
+            for new_warp in 0..warps {
+                for lane in 0..32usize {
+                    let mut registers = (0..values_per_thread)
+                        .map(|i| {
+                            shared[lane + (i << 5) + (new_warp << (5 + log_values_per_thread))]
+                        })
+                        .collect::<Vec<_>>();
+                    let offset = new_warp * (min_stride << log_values_per_thread) + lane;
+                    for stage in first_stage + log_values_per_thread..=last_stage {
+                        let log_stride =
+                            log_warps_per_block - 1 - (stage - first_stage - log_values_per_thread);
+                        let stride = 1usize << log_stride;
+                        for gid in 0..values_per_thread / 2 {
+                            let group = gid & (stride - 1);
+                            let pair = gid >> log_stride;
+                            let left_index = group + (pair << (log_stride + 1));
+                            let right_index = left_index + stride;
+                            let outer = (block_start + offset) >> (1 + log_n - stage);
+                            let product = twiddles[layer_offset(log_n, stage) + pair + outer]
+                                * registers[right_index];
+                            let left = registers[left_index];
+                            registers[left_index] = left + product;
+                            registers[right_index] = left - product;
+                        }
+                    }
+                    for (i, value) in registers.into_iter().enumerate() {
+                        let address = block_start + i * min_stride + offset;
+                        assert!(!written[address]);
+                        output[address] = value;
+                        written[address] = true;
+                    }
+                }
+            }
+        }
+    }
+    assert!(written.into_iter().all(|value| value));
+    output
+}
+
+fn stage_one_images(words: usize) -> Vec<Vec<BaseField>> {
+    let half = words / 2;
+    let zero = vec![0u32; half];
+    let mut impulse = zero.clone();
+    impulse[half / 3] = 1;
+    let carry_heavy = (0..half)
+        .map(|index| if index % 2 == 0 { P - 1 } else { P - 2 })
+        .collect::<Vec<_>>();
+    let mut state = 0x9e37_79b9u32;
+    let random = (0..half)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state % P
+        })
+        .collect::<Vec<_>>();
+    [zero, impulse, carry_heavy, random]
+        .into_iter()
+        .map(|half| {
+            half.iter()
+                .chain(&half)
+                .copied()
+                .map(BaseField::from_u32_unchecked)
+                .collect()
+        })
+        .collect()
+}
+
+#[test]
+fn rectangular_first_intervals_match_independent_stagewise_arithmetic() {
+    for (log_n, log_values_per_thread, log_warps_per_block) in [(13, 3, 2), (15, 4, 3)] {
+        let words = 1usize << log_n;
+        let twiddles = (0..words / 2)
+            .map(|index| {
+                BaseField::from_u32_unchecked(
+                    ((index as u64 * 0x45d9_f3b + 17) % u64::from(P)) as u32,
+                )
+            })
+            .collect::<Vec<_>>();
+        let last_stage = 1 + log_values_per_thread + log_warps_per_block;
+        for (case, stage_one) in stage_one_images(words).into_iter().enumerate() {
+            let expected = stagewise_n2b_interval(&stage_one, log_n, 2, last_stage, &twiddles);
+            let actual = rectangular_n2b_interval(
+                &stage_one,
+                log_n,
+                log_values_per_thread,
+                log_warps_per_block,
+                &twiddles,
+            );
+            assert_eq!(actual, expected, "log_n={log_n}, case={case}");
+        }
+    }
+}
+
 #[test]
 fn program_is_base_or_interaction_only_and_seals_exact_batches() {
     let admitted = commit(1);
@@ -105,24 +287,46 @@ fn pointer_tables_exclusively_replace_the_existing_lde_tables() {
 }
 
 #[test]
-fn global_inverse_tree_extent_is_preserved_for_suffix_selection() {
+fn both_global_tree_extents_are_preserved_and_reported_without_transposition() {
     let direct = DirectRetainedB2nProgram::compile(TraceTreeRole::Base, &commit(1)).unwrap();
-    let global_words = direct.twiddle_words * 4;
-    let twiddles = ArenaSlice::dangling_at_for_test(9, 700, global_words);
-    let admitted = admit_inverse_twiddles(&direct, twiddles, twiddles.context_token()).unwrap();
-    assert_eq!(admitted, u32::try_from(global_words).unwrap());
-    assert!(usize::try_from(admitted).unwrap() > direct.twiddle_words);
+    let inverse_words = direct.twiddle_words * 4;
+    let forward_words = direct.twiddle_words * 8;
+    let inverse = ArenaSlice::dangling_at_for_test(9, 700, inverse_words);
+    let forward = ArenaSlice::dangling_at_for_test(10, 700 + inverse_words, forward_words);
+    let admitted_inverse = admit_twiddles(&direct, inverse, inverse.context_token()).unwrap();
+    let admitted_forward = admit_twiddles(&direct, forward, forward.context_token()).unwrap();
+    assert_eq!(admitted_inverse, u32::try_from(inverse_words).unwrap());
+    assert_eq!(admitted_forward, u32::try_from(forward_words).unwrap());
+    assert!(inverse_words > direct.twiddle_words);
+    assert!(forward_words > inverse_words);
+
+    let batch = &direct.batches()[0];
+    let telemetry = PreparedBatch {
+        input_pointers: ArenaSlice::dangling_at_for_test(11, 30_000, batch.pointer_words),
+        output_pointers: ArenaSlice::dangling_at_for_test(12, 31_000, batch.pointer_words),
+        batch_index: batch.batch_index,
+        source_log_size: batch.source_log_size,
+        retained_log_size: batch.retained_log_size,
+        columns: u32::try_from(batch.canonical_columns.len()).unwrap(),
+    }
+    .launch_kind(TraceTreeRole::Base, admitted_inverse, admitted_forward);
+    assert_eq!(telemetry.inverse_twiddle_words, admitted_inverse);
+    assert_eq!(telemetry.forward_twiddle_words, admitted_forward);
+    assert_ne!(
+        telemetry.inverse_twiddle_words,
+        telemetry.forward_twiddle_words
+    );
 
     let oversized =
-        ArenaSlice::dangling_at_for_test(10, 800, usize::try_from(u32::MAX).unwrap() + 1);
+        ArenaSlice::dangling_at_for_test(13, 40_000, usize::try_from(u32::MAX).unwrap() + 1);
     assert_eq!(
-        admit_inverse_twiddles(&direct, oversized, oversized.context_token()),
+        admit_twiddles(&direct, oversized, oversized.context_token()),
         Err(DirectRetainedB2nError::SizeOverflow)
     );
 }
 
 #[test]
-fn cpu_oracle_runs_real_b2n_and_duplicates_exact_words() {
+fn cpu_oracle_matches_full_lde_and_detects_one_word_mutation() {
     let direct = DirectRetainedB2nProgram::compile(TraceTreeRole::Base, &commit(1)).unwrap();
     let sources = direct
         .batches()
@@ -140,6 +344,40 @@ fn cpu_oracle_runs_real_b2n_and_duplicates_exact_words() {
         let half = retained.len() / 2;
         assert_ne!(retained[..half], sources[column]);
         assert_eq!(retained[..half], retained[half..]);
+
+        let source_log = sources[column].len().ilog2();
+        let expected = CircleEvaluation::<CpuBackend, BaseField, BitReversedOrder>::new(
+            CanonicCoset::new(source_log).circle_domain(),
+            sources[column]
+                .iter()
+                .copied()
+                .map(BaseField::from_u32_unchecked)
+                .collect(),
+        )
+        .interpolate()
+        .evaluate(CanonicCoset::new(source_log + 1).circle_domain())
+        .values
+        .into_iter()
+        .map(|value| value.0)
+        .collect::<Vec<_>>();
+        assert_eq!(oracle.retained_evaluations[column], expected);
+    }
+
+    let mut mutated_sources = sources.clone();
+    mutated_sources[1][3] = (mutated_sources[1][3] + 1) % P;
+    let mutated = direct.oracle(&mutated_sources).unwrap();
+    for column in 0..sources.len() {
+        if column == 1 {
+            assert_ne!(
+                mutated.retained_evaluations[column],
+                oracle.retained_evaluations[column]
+            );
+        } else {
+            assert_eq!(
+                mutated.retained_evaluations[column],
+                oracle.retained_evaluations[column]
+            );
+        }
     }
 }
 
@@ -162,21 +400,33 @@ fn value_aliases_allow_only_the_same_owner_lower_prefix() {
     ];
     let token = columns[0].source_evaluations.context_token();
     let logical = bind_logical_columns(&direct, &columns, token).unwrap();
-    let twiddles = ArenaSlice::dangling_at_for_test(9, 700, 64);
-    validate_value_aliases(&logical, twiddles).unwrap();
+    let inverse_twiddles = ArenaSlice::dangling_at_for_test(9, 700, 64);
+    let forward_twiddles = ArenaSlice::dangling_at_for_test(10, 900, 64);
+    validate_value_aliases(&logical, inverse_twiddles, forward_twiddles).unwrap();
     assert!(exact_lower_prefix_alias(logical[0]));
+
+    assert!(matches!(
+        validate_value_aliases(&logical, inverse_twiddles, inverse_twiddles),
+        Err(DirectRetainedB2nError::InvalidAlias { .. })
+    ));
+
+    let overlapping_forward = ArenaSlice::dangling_at_for_test(11, 710, 64);
+    assert!(matches!(
+        validate_value_aliases(&logical, inverse_twiddles, overlapping_forward),
+        Err(DirectRetainedB2nError::InvalidAlias { .. })
+    ));
 
     columns[0].source_evaluations = ArenaSlice::dangling_at_for_test(1, 101, 8);
     let logical = bind_logical_columns(&direct, &columns, token).unwrap();
     assert!(matches!(
-        validate_value_aliases(&logical, twiddles),
+        validate_value_aliases(&logical, inverse_twiddles, forward_twiddles),
         Err(DirectRetainedB2nError::InvalidAlias { .. })
     ));
 
     columns[0].source_evaluations = ArenaSlice::dangling_at_for_test(6, 100, 8);
     let logical = bind_logical_columns(&direct, &columns, token).unwrap();
     assert!(matches!(
-        validate_value_aliases(&logical, twiddles),
+        validate_value_aliases(&logical, inverse_twiddles, forward_twiddles),
         Err(DirectRetainedB2nError::InvalidAlias { .. })
     ));
 }

@@ -1518,6 +1518,18 @@ extern "C" {
         stream: *mut core::ffi::c_void,
     ) -> i32;
 
+    /// Continue N2B in place from the exact stage-one image `[c, c]` through
+    /// stages 2..=`log_n`, using the device pointer table and `stream`.
+    pub fn stwo_ntt_n2b_columns_from_stage_two_on(
+        device_values: *const *mut u32,
+        log_n: u32,
+        num_poly: u32,
+        g_twiddles: *mut u32,
+        twiddles_size: u32,
+        eval_domain_size: u32,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
     /// Allocation-free LDE. Pointer and exact coefficient-size tables are
     /// device-resident; staging and N2B use `stream`.
     pub fn stwo_lde_n2b_columns_on(
@@ -2771,9 +2783,102 @@ mod direct_retained_b2n_contract_tests {
         *mut c_void,
     ) -> i32;
 
+    type StageTwoN2bFn =
+        unsafe extern "C" fn(*const *mut u32, u32, u32, *mut u32, u32, u32, *mut c_void) -> i32;
+
     #[test]
     fn direct_retained_b2n_abi_is_linked() {
         let _: DirectRetainedB2nFn = stwo_ntt_b2n_columns_to_retained_on;
+        let _: StageTwoN2bFn = stwo_ntt_n2b_columns_from_stage_two_on;
+    }
+
+    fn optimized_partition(log_n: u32) -> Vec<u32> {
+        match log_n {
+            3..=12 => vec![log_n],
+            13..=19 => [[6, 7], [6, 8], [8, 7], [8, 8], [6, 11], [8, 10], [8, 11]]
+                [usize::try_from(log_n - 13).unwrap()]
+            .to_vec(),
+            20..=27 => [
+                [6, 6, 8],
+                [6, 8, 7],
+                [6, 8, 8],
+                [8, 8, 7],
+                [8, 8, 8],
+                [6, 8, 11],
+                [8, 8, 10],
+                [8, 8, 11],
+            ][usize::try_from(log_n - 20).unwrap()]
+            .to_vec(),
+            28..=30 => [[6, 6, 6, 10], [6, 6, 6, 11], [6, 6, 8, 10]]
+                [usize::try_from(log_n - 28).unwrap()]
+            .to_vec(),
+            _ => panic!("unsupported test log {log_n}"),
+        }
+    }
+
+    #[test]
+    fn stage_two_partition_covers_every_stage_once_and_keeps_later_boundaries() {
+        for log_n in 3..=30 {
+            let full = optimized_partition(log_n);
+            assert_eq!(full.iter().sum::<u32>(), log_n);
+
+            let mut direct = full.clone();
+            direct[0] -= 1;
+            assert_eq!(direct.iter().sum::<u32>(), log_n - 1);
+            assert!(log_n < 13 || matches!(direct[0], 5 | 7));
+
+            let mut stage = 2;
+            for (index, stages) in direct.into_iter().enumerate() {
+                let end = stage + stages - 1;
+                if index > 0 {
+                    assert_eq!(stage, 1 + full[..index].iter().sum::<u32>());
+                }
+                assert!(end <= log_n);
+                stage = end + 1;
+            }
+            assert_eq!(stage, log_n + 1);
+        }
+    }
+
+    #[test]
+    fn rectangular_first_interval_transpose_is_a_total_address_permutation() {
+        for (log_values_per_thread, log_warps_per_block) in [(3, 2), (4, 3)] {
+            let values_per_thread = 1usize << log_values_per_thread;
+            let warps = 1usize << log_warps_per_block;
+            let groups = values_per_thread * warps;
+            let mut loaded = vec![false; groups];
+
+            for new_warp in 0..warps {
+                for register in 0..values_per_thread {
+                    let flat = new_warp * values_per_thread + register;
+                    let old_i = flat >> log_warps_per_block;
+                    let old_warp = flat & (warps - 1);
+                    let stored = old_i * warps + old_warp;
+                    let output = new_warp * values_per_thread + register;
+
+                    assert_eq!(stored, flat);
+                    assert_eq!(output, flat);
+                    assert!(!loaded[stored]);
+                    loaded[stored] = true;
+                }
+            }
+            assert!(loaded.into_iter().all(|seen| seen));
+
+            for log_stride in (0..log_warps_per_block).rev() {
+                let stride = 1usize << log_stride;
+                let mut touched = vec![false; values_per_thread];
+                for gid in 0..values_per_thread / 2 {
+                    let inner_group = gid & (stride - 1);
+                    let inner_pair = gid >> log_stride;
+                    let left = inner_group + (inner_pair << (log_stride + 1));
+                    let right = left + stride;
+                    assert!(!touched[left] && !touched[right]);
+                    touched[left] = true;
+                    touched[right] = true;
+                }
+                assert!(touched.into_iter().all(|seen| seen));
+            }
+        }
     }
 
     #[test]
@@ -2809,6 +2914,25 @@ mod direct_retained_b2n_contract_tests {
             assert!(
                 source.contains(required),
                 "missing CUDA contract: {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn cuda_stage_two_successor_is_rectangular_exact_and_fail_closed() {
+        let source = include_str!("../cuda/rfft.cu");
+        for required in [
+            "ntt_n2b_nofinal_stage_batch_on<3, 2>",
+            "ntt_n2b_nofinal_stage_batch_on<4, 3>",
+            "config[0] - skipped_stages",
+            "first_stage > 2",
+            "eval_domain_size != (1u << (log_n - 1))",
+            "stwo_ntt_n2b_columns_from_stage_two_on",
+            "eval_domain_size, 2, cuda_stream",
+        ] {
+            assert!(
+                source.contains(required),
+                "missing CUDA stage-two contract: {required}"
             );
         }
     }

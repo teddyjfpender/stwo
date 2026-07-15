@@ -2041,6 +2041,19 @@ pub unsafe extern "C" fn stwo_ntt_n2b_columns_on(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_ntt_n2b_columns_from_stage_two_on(
+    _device_values: *const *mut u32,
+    _log_n: u32,
+    _num_poly: u32,
+    _g_twiddles: *mut u32,
+    _twiddles_size: u32,
+    _eval_domain_size: u32,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_ntt_n2b_columns_from_stage_two_on")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stwo_lde_n2b_columns_on(
     _coefficient_values: *const *const u32,
     _coefficient_sizes: *const u32,
