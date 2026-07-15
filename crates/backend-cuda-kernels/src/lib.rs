@@ -47,6 +47,7 @@ mod tests {
         assert_ne!(raw::stwo_preprocessed_gen_xor_checked as usize, 0);
         assert_ne!(raw::stwo_preprocessed_stream_sync_checked as usize, 0);
         assert_ne!(raw::stwo_cuda_jit_witness_phase_pair_launch as usize, 0);
+        assert_ne!(raw::stwo_witness_casm_input_scatter_on as usize, 0);
     }
 
     #[test]

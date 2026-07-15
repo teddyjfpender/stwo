@@ -2009,6 +2009,18 @@ extern "C" {
         include_iota: u32,
         stream: *mut c_void,
     ) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    pub fn stwo_witness_casm_input_scatter_on(
+        rows_dev: *const u32,
+        n_real: u32,
+        consumer_rows: u32,
+        pc_dev: *mut u32,
+        ap_dev: *mut u32,
+        fp_dev: *mut u32,
+        enabler_dev: *mut u32,
+        iota_dev: *mut u32,
+        stream: *mut c_void,
+    ) -> i32;
     pub fn stwo_witness_input_compact_sort_temp_bytes(rows: u32) -> usize;
     pub fn stwo_witness_input_compact_scan_temp_bytes(rows: u32) -> usize;
     #[allow(clippy::too_many_arguments)]

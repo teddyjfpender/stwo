@@ -35,6 +35,11 @@ pub use backend::pcs_driver::{
     CudaPcsDriverOutput, CudaPcsDriverTelemetry, CudaPcsGraphHookError, CudaPcsGraphHooks,
     CudaPcsRuntimeMode,
 };
+pub use backend::prepared_casm_input::{
+    witness_casm_input_requirements, PreparedWitnessCasmInputError, PreparedWitnessCasmInputStage,
+    WitnessCasmInputRequirements, WitnessCasmInputSlots, WITNESS_CASM_BASE_INPUT_COLUMNS,
+    WITNESS_CASM_STATE_WORDS,
+};
 pub use backend::prepared_commit::{
     commit_workspace_requirements, merkle_from_leaves_requirements, CommitArenaSlotRequirement,
     CommitBatchRequirements, CommitBatchSlots, CommitCoefficientColumn, CommitCoefficientGroup,

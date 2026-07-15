@@ -25,6 +25,7 @@ pub mod pedersen_table;
 pub mod pedersen_witness;
 mod pointer_vec;
 mod poly;
+pub mod prepared_casm_input;
 pub mod prepared_commit;
 pub mod prepared_decommit;
 pub mod prepared_ec_op;

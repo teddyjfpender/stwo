@@ -2742,6 +2742,22 @@ pub unsafe extern "C" fn stwo_witness_input_seed_on(
 }
 
 #[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn stwo_witness_casm_input_scatter_on(
+    _rows_dev: *const u32,
+    _n_real: u32,
+    _consumer_rows: u32,
+    _pc_dev: *mut u32,
+    _ap_dev: *mut u32,
+    _fp_dev: *mut u32,
+    _enabler_dev: *mut u32,
+    _iota_dev: *mut u32,
+    _stream: *mut c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_witness_casm_input_scatter_on")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stwo_witness_input_compact_sort_temp_bytes(_rows: u32) -> usize {
     no_cuda_symbol("stwo_witness_input_compact_sort_temp_bytes")
 }
