@@ -17,10 +17,10 @@ use super::{
 
 const SECURE_BYTES: usize = SECURE_WORDS * WORD_BYTES;
 const LEGACY_WEIGHT_KERNELS_PER_GROUP: usize = 4;
-const COLLAPSED_WEIGHT_KERNELS_PER_GROUP: usize = 1;
 const EVALUATION_KERNELS_PER_GROUP: usize = 2;
 const DERIVE_KERNELS_PER_GROUP: usize = 1;
 const REDUCTION_RADIX: usize = 512;
+const CUDA_GRID_Y_LIMIT: usize = u16::MAX as usize;
 
 /// One source/mask pair in the exact descriptor order uploaded by production.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -52,7 +52,6 @@ pub struct OodsPassCollapseGroupReceipt {
     pub sample_count: usize,
     pub domain_rows: usize,
     pub legacy_weight_kernel_launches: usize,
-    pub collapsed_weight_kernel_launches: usize,
     pub legacy_weight_logical_bytes: usize,
     pub collapsed_weight_logical_bytes: usize,
     pub logical_bytes_removed: usize,
@@ -66,9 +65,34 @@ pub struct OodsPassCollapseCohortReceipt {
     pub group_count: usize,
     pub sample_count: usize,
     pub domain_rows: usize,
+    pub full_cohort_weight_bytes: usize,
+    pub full_cohort_fusion_admitted: bool,
+    pub max_groups_per_launch: usize,
     pub legacy_weight_kernel_launches: usize,
     pub collapsed_weight_kernel_launches: usize,
     pub logical_bytes_removed: usize,
+    pub batches: Vec<OodsPassCollapseBatchReceipt>,
+    pub full_cohort_rejection: Option<OodsPassCollapseCohortRejection>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OodsPassCollapseBatchReceipt {
+    pub first_group: usize,
+    pub group_count: usize,
+    pub log_size: u32,
+    pub weight_words: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OodsPassCollapseCohortRejection {
+    WorkspaceCapacity {
+        required_weight_words: usize,
+        available_weight_words: usize,
+    },
+    CudaGridY {
+        group_count: usize,
+        limit: usize,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -101,6 +125,7 @@ pub enum OodsPassCollapseError {
     Oods(PreparedOodsError),
     NoEvaluationGroups,
     InvalidDescriptorCoverage,
+    InsufficientNonExpandingWorkspace,
     ProgramIdentity,
     SizeOverflow,
 }
@@ -148,11 +173,22 @@ impl OodsPassCollapseProgram {
             canonical_samples,
         };
         let mut collapsed_requirements = ordinary_requirements.clone();
-        // Keep nonempty aligned compatibility slots until the executable arena
-        // API deletes these roles entirely.
+        // Keep a nonempty aligned compatibility slot until the executable arena
+        // API deletes the numerator role entirely.
         collapsed_requirements.barycentric_numerator_words = SECURE_WORDS;
-        collapsed_requirements.barycentric_scale_words = SECURE_WORDS;
-        let receipt = compile_receipt(&ordinary_requirements, &collapsed_requirements)?;
+        // The retired scale slot becomes an immutable u32 descriptor-offset
+        // table for flattened cohort launches.
+        collapsed_requirements.barycentric_scale_words = ordinary_requirements
+            .evaluation_groups
+            .len()
+            .max(SECURE_WORDS);
+        let schedule = compile_cohort_schedule(
+            &ordinary_requirements,
+            collapsed_requirements.barycentric_numerator_words,
+            collapsed_requirements.barycentric_scale_words,
+        )?;
+        collapsed_requirements.barycentric_weight_words = schedule.weight_words;
+        let receipt = compile_receipt(&ordinary_requirements, &collapsed_requirements, schedule)?;
         Ok(Self {
             identity,
             ordinary_requirements,
@@ -285,6 +321,7 @@ fn validate_descriptor_coverage(
 fn compile_receipt(
     ordinary: &OodsWorkspaceRequirements,
     collapsed: &OodsWorkspaceRequirements,
+    schedule: OodsPassCollapseSchedule,
 ) -> Result<OodsPassCollapseReceipt, OodsPassCollapseError> {
     let mut groups = Vec::with_capacity(ordinary.evaluation_groups.len());
     for group in &ordinary.evaluation_groups {
@@ -301,7 +338,6 @@ fn compile_receipt(
             sample_count: group.sample_count,
             domain_rows,
             legacy_weight_kernel_launches: LEGACY_WEIGHT_KERNELS_PER_GROUP,
-            collapsed_weight_kernel_launches: COLLAPSED_WEIGHT_KERNELS_PER_GROUP,
             legacy_weight_logical_bytes,
             collapsed_weight_logical_bytes,
             logical_bytes_removed: legacy_weight_logical_bytes
@@ -309,7 +345,7 @@ fn compile_receipt(
                 .ok_or(OodsPassCollapseError::SizeOverflow)?,
         });
     }
-    let same_log_cohorts = compile_cohorts(&groups)?;
+    let same_log_cohorts = schedule.cohorts;
     let coefficient_launches = ordinary.groups.iter().try_fold(0usize, |total, group| {
         checked_add(total, coefficient_group_launches(group))
     })?;
@@ -320,8 +356,11 @@ fn compile_receipt(
     )?;
     let legacy_weight_kernel_launches =
         checked_mul(evaluation_group_count, LEGACY_WEIGHT_KERNELS_PER_GROUP)?;
-    let collapsed_weight_kernel_launches =
-        checked_mul(evaluation_group_count, COLLAPSED_WEIGHT_KERNELS_PER_GROUP)?;
+    let collapsed_weight_kernel_launches = checked_sum(
+        same_log_cohorts
+            .iter()
+            .map(|cohort| cohort.collapsed_weight_kernel_launches),
+    )?;
     let legacy_weight_logical_bytes =
         checked_sum(groups.iter().map(|group| group.legacy_weight_logical_bytes))?;
     let collapsed_weight_logical_bytes = checked_sum(
@@ -331,7 +370,7 @@ fn compile_receipt(
     )?;
     let legacy_workspace_bytes = workspace_bytes(ordinary)?;
     let collapsed_workspace_bytes = workspace_bytes(collapsed)?;
-    let retained_weight_bytes = checked_mul(ordinary.barycentric_weight_words, WORD_BYTES)?;
+    let retained_weight_bytes = checked_mul(collapsed.barycentric_weight_words, WORD_BYTES)?;
     Ok(OodsPassCollapseReceipt {
         coefficient_group_count: ordinary.groups.len(),
         evaluation_group_count,
@@ -379,42 +418,113 @@ fn compile_receipt(
     })
 }
 
-fn compile_cohorts(
-    groups: &[OodsPassCollapseGroupReceipt],
-) -> Result<Vec<OodsPassCollapseCohortReceipt>, OodsPassCollapseError> {
-    let mut cohorts = Vec::<OodsPassCollapseCohortReceipt>::new();
-    for (group_index, group) in groups.iter().enumerate() {
-        if let Some(cohort) = cohorts
-            .last_mut()
-            .filter(|cohort| cohort.log_size == group.log_size)
+struct OodsPassCollapseSchedule {
+    cohorts: Vec<OodsPassCollapseCohortReceipt>,
+    weight_words: usize,
+}
+
+fn compile_cohort_schedule(
+    requirements: &OodsWorkspaceRequirements,
+    collapsed_numerator_words: usize,
+    collapsed_metadata_words: usize,
+) -> Result<OodsPassCollapseSchedule, OodsPassCollapseError> {
+    let legacy_words = checked_add(
+        checked_add(
+            requirements.barycentric_numerator_words,
+            requirements.barycentric_weight_words,
+        )?,
+        requirements.barycentric_scale_words,
+    )?;
+    let fixed_collapsed_words = checked_add(collapsed_numerator_words, collapsed_metadata_words)?;
+    let available_weight_words = legacy_words
+        .checked_sub(fixed_collapsed_words)
+        .ok_or(OodsPassCollapseError::InsufficientNonExpandingWorkspace)?;
+
+    let mut cohorts = Vec::new();
+    let mut first_group = 0usize;
+    let mut weight_words = SECURE_WORDS;
+    while first_group < requirements.evaluation_groups.len() {
+        let log_size = requirements.evaluation_groups[first_group].log_size;
+        let mut end_group = first_group + 1;
+        while end_group < requirements.evaluation_groups.len()
+            && requirements.evaluation_groups[end_group].log_size == log_size
         {
-            cohort.group_count = checked_add(cohort.group_count, 1)?;
-            cohort.sample_count = checked_add(cohort.sample_count, group.sample_count)?;
-            cohort.domain_rows = checked_add(cohort.domain_rows, group.domain_rows)?;
-            cohort.legacy_weight_kernel_launches = checked_add(
-                cohort.legacy_weight_kernel_launches,
-                group.legacy_weight_kernel_launches,
-            )?;
-            cohort.collapsed_weight_kernel_launches = checked_add(
-                cohort.collapsed_weight_kernel_launches,
-                group.collapsed_weight_kernel_launches,
-            )?;
-            cohort.logical_bytes_removed =
-                checked_add(cohort.logical_bytes_removed, group.logical_bytes_removed)?;
-        } else {
-            cohorts.push(OodsPassCollapseCohortReceipt {
-                log_size: group.log_size,
-                first_group: group_index,
-                group_count: 1,
-                sample_count: group.sample_count,
-                domain_rows: group.domain_rows,
-                legacy_weight_kernel_launches: group.legacy_weight_kernel_launches,
-                collapsed_weight_kernel_launches: group.collapsed_weight_kernel_launches,
-                logical_bytes_removed: group.logical_bytes_removed,
-            });
+            end_group += 1;
         }
+
+        let group_count = end_group - first_group;
+        let rows_per_group = checked_pow2(log_size)?;
+        let group_weight_words = checked_mul(rows_per_group, SECURE_WORDS)?;
+        if group_weight_words > available_weight_words {
+            return Err(OodsPassCollapseError::InsufficientNonExpandingWorkspace);
+        }
+        let max_groups_per_launch = (available_weight_words / group_weight_words)
+            .min(CUDA_GRID_Y_LIMIT)
+            .max(1);
+        let full_weight_words = checked_mul(group_count, group_weight_words)?;
+        let full_cohort_fusion_admitted = group_count <= max_groups_per_launch;
+        let full_cohort_rejection = if group_count > CUDA_GRID_Y_LIMIT {
+            Some(OodsPassCollapseCohortRejection::CudaGridY {
+                group_count,
+                limit: CUDA_GRID_Y_LIMIT,
+            })
+        } else if full_weight_words > available_weight_words {
+            Some(OodsPassCollapseCohortRejection::WorkspaceCapacity {
+                required_weight_words: full_weight_words,
+                available_weight_words,
+            })
+        } else {
+            None
+        };
+
+        let mut batches = Vec::new();
+        let mut batch_first = first_group;
+        while batch_first < end_group {
+            let batch_group_count = max_groups_per_launch.min(end_group - batch_first);
+            let batch_weight_words = checked_mul(batch_group_count, group_weight_words)?;
+            weight_words = weight_words.max(batch_weight_words);
+            batches.push(OodsPassCollapseBatchReceipt {
+                first_group: batch_first,
+                group_count: batch_group_count,
+                log_size,
+                weight_words: batch_weight_words,
+            });
+            batch_first += batch_group_count;
+        }
+
+        let sample_count = requirements.evaluation_groups[first_group..end_group]
+            .iter()
+            .try_fold(0usize, |sum, group| checked_add(sum, group.sample_count))?;
+        let domain_rows = checked_mul(group_count, rows_per_group)?;
+        let logical_bytes_removed = checked_add(
+            checked_mul(7, checked_mul(domain_rows, SECURE_BYTES)?)?,
+            checked_mul(group_count, 2 * SECURE_BYTES)?,
+        )?;
+        cohorts.push(OodsPassCollapseCohortReceipt {
+            log_size,
+            first_group,
+            group_count,
+            sample_count,
+            domain_rows,
+            full_cohort_weight_bytes: checked_mul(full_weight_words, WORD_BYTES)?,
+            full_cohort_fusion_admitted,
+            max_groups_per_launch,
+            legacy_weight_kernel_launches: checked_mul(
+                group_count,
+                LEGACY_WEIGHT_KERNELS_PER_GROUP,
+            )?,
+            collapsed_weight_kernel_launches: batches.len(),
+            logical_bytes_removed,
+            batches,
+            full_cohort_rejection,
+        });
+        first_group = end_group;
     }
-    Ok(cohorts)
+
+    Ok(OodsPassCollapseSchedule {
+        cohorts,
+        weight_words,
+    })
 }
 
 fn coefficient_group_launches(group: &OodsLogGroupRequirements) -> usize {
@@ -432,7 +542,10 @@ fn workspace_bytes(
 ) -> Result<usize, OodsPassCollapseError> {
     checked_mul(
         checked_add(
-            requirements.barycentric_numerator_words,
+            checked_add(
+                requirements.barycentric_numerator_words,
+                requirements.barycentric_weight_words,
+            )?,
             requirements.barycentric_scale_words,
         )?,
         WORD_BYTES,
@@ -528,15 +641,19 @@ mod tests {
         assert_eq!(receipt.unchanged_coefficient_kernel_launches, 4);
         assert_eq!(receipt.unchanged_evaluation_kernel_launches, 9);
         assert_eq!(receipt.legacy_weight_kernel_launches, 12);
-        assert_eq!(receipt.collapsed_weight_kernel_launches, 3);
-        assert_eq!(receipt.kernel_launches_removed, 9);
+        assert_eq!(receipt.collapsed_weight_kernel_launches, 2);
+        assert_eq!(receipt.kernel_launches_removed, 10);
         assert_eq!(receipt.legacy_total_kernel_launches, 25);
-        assert_eq!(receipt.collapsed_total_kernel_launches, 16);
+        assert_eq!(receipt.collapsed_total_kernel_launches, 15);
         assert_eq!(receipt.legacy_weight_logical_bytes, 196_704);
         assert_eq!(receipt.collapsed_weight_logical_bytes, 24_576);
         assert_eq!(receipt.logical_bytes_removed, 172_128);
         assert_eq!(receipt.workspace_bytes_removed, 16_384);
         assert_eq!(receipt.retained_weight_bytes, 16_384);
+        assert!(receipt
+            .same_log_cohorts
+            .iter()
+            .all(|cohort| cohort.full_cohort_fusion_admitted));
         assert_eq!(
             program.collapsed_requirements().barycentric_numerator_words,
             SECURE_WORDS
@@ -572,6 +689,32 @@ mod tests {
             program.validate_against(config(), &changed_mask),
             Err(OodsPassCollapseError::ProgramIdentity)
         );
+    }
+
+    #[test]
+    fn oversized_same_log_cohort_is_batched_without_workspace_expansion() {
+        let columns = [OodsColumnTopology::evaluation_signed_offsets(
+            10,
+            &[0, 1, 2],
+        )];
+        let program = OodsPassCollapseProgram::compile(config(), &columns).unwrap();
+        let receipt = program.receipt();
+        let cohort = &receipt.same_log_cohorts[0];
+        assert_eq!(cohort.group_count, 3);
+        assert!(!cohort.full_cohort_fusion_admitted);
+        assert_eq!(cohort.max_groups_per_launch, 2);
+        assert_eq!(cohort.collapsed_weight_kernel_launches, 2);
+        assert_eq!(cohort.batches.len(), 2);
+        assert_eq!(
+            cohort.full_cohort_rejection,
+            Some(OodsPassCollapseCohortRejection::WorkspaceCapacity {
+                required_weight_words: 12_288,
+                available_weight_words: 8_192,
+            })
+        );
+        assert_eq!(receipt.legacy_weight_kernel_launches, 12);
+        assert_eq!(receipt.collapsed_weight_kernel_launches, 2);
+        assert_eq!(receipt.workspace_bytes_removed, 0);
     }
 
     #[test]

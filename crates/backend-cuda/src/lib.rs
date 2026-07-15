@@ -105,11 +105,12 @@ pub use backend::prepared_oods::{
     oods_canonical_sample_order, oods_workspace_requirements, OodsArenaSlotRequirement,
     OodsCanonicalSample, OodsCoefficientColumn, OodsColumnSampleRange, OodsColumnSource,
     OodsColumnTopology, OodsEvaluationGroupRequirements, OodsLogGroupRequirements,
-    OodsMaskTopology, OodsPassCollapseCohortReceipt, OodsPassCollapseError,
-    OodsPassCollapseGroupReceipt, OodsPassCollapseIdentity, OodsPassCollapseProgram,
-    OodsPassCollapseReceipt, OodsPolynomialColumn, OodsSourceKind, OodsWorkspaceConfig,
-    OodsWorkspaceRequirements, OodsWorkspaceSlots, PreparedOodsError, PreparedOodsGraph,
-    OODS_PARAMETER_WORDS, OODS_POINTER_ALIGNMENT_WORDS,
+    OodsMaskTopology, OodsPassCollapseBatchReceipt, OodsPassCollapseCohortReceipt,
+    OodsPassCollapseCohortRejection, OodsPassCollapseError, OodsPassCollapseGroupReceipt,
+    OodsPassCollapseIdentity, OodsPassCollapseProgram, OodsPassCollapseReceipt,
+    OodsPolynomialColumn, OodsSourceKind, OodsWorkspaceConfig, OodsWorkspaceRequirements,
+    OodsWorkspaceSlots, PreparedOodsError, PreparedOodsGraph, OODS_PARAMETER_WORDS,
+    OODS_POINTER_ALIGNMENT_WORDS,
 };
 pub use backend::prepared_pow::{
     blake2s_pow_workspace_requirements, pow_index_to_nonce, Blake2sPowArenaSlotRequirement,

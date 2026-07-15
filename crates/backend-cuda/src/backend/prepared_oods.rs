@@ -24,9 +24,10 @@ use super::exec_context::{
 #[path = "prepared_oods/pass_collapse.rs"]
 mod pass_collapse;
 pub use pass_collapse::{
-    oods_canonical_sample_order, OodsCanonicalSample, OodsPassCollapseCohortReceipt,
-    OodsPassCollapseError, OodsPassCollapseGroupReceipt, OodsPassCollapseIdentity,
-    OodsPassCollapseProgram, OodsPassCollapseReceipt,
+    oods_canonical_sample_order, OodsCanonicalSample, OodsPassCollapseBatchReceipt,
+    OodsPassCollapseCohortReceipt, OodsPassCollapseCohortRejection, OodsPassCollapseError,
+    OodsPassCollapseGroupReceipt, OodsPassCollapseIdentity, OodsPassCollapseProgram,
+    OodsPassCollapseReceipt,
 };
 
 const WORD_BYTES: usize = core::mem::size_of::<u32>();
