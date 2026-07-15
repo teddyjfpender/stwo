@@ -60,6 +60,9 @@ pub struct DirectRetainedB2nLaunchKind {
     pub source_log_size: u32,
     pub retained_log_size: u32,
     pub columns: u32,
+    /// Full caller-supplied logical tree extent. CUDA selects each smaller
+    /// source tree from its suffix.
+    pub inverse_twiddle_words: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -152,6 +155,7 @@ pub struct PreparedDirectRetainedB2nGraph<'a> {
     role: TraceTreeRole,
     commit_cache_key: u64,
     inverse_twiddles: ArenaSlice,
+    inverse_twiddle_words: u32,
     batches: Vec<PreparedBatch>,
     exact_lower_prefix_aliases: usize,
 }
@@ -362,18 +366,7 @@ impl<'a> PreparedDirectRetainedB2nGraph<'a> {
             });
         }
         let token = arena.context().identity_token();
-        if inverse_twiddles.context_token() != token {
-            return Err(DirectRetainedB2nError::ContextMismatch(
-                inverse_twiddles.id(),
-            ));
-        }
-        if inverse_twiddles.len_words() < program.twiddle_words {
-            return Err(DirectRetainedB2nError::TwiddlesTooSmall {
-                required_words: program.twiddle_words,
-                actual_words: inverse_twiddles.len_words(),
-            });
-        }
-        let inverse_twiddles = inverse_twiddles.truncated(program.twiddle_words);
+        let inverse_twiddle_words = admit_inverse_twiddles(program, inverse_twiddles, token)?;
         let logical = bind_logical_columns(program, columns, token)?;
         validate_value_aliases(&logical, inverse_twiddles)?;
 
@@ -442,6 +435,7 @@ impl<'a> PreparedDirectRetainedB2nGraph<'a> {
             role: program.role,
             commit_cache_key: program.commit_cache_key,
             inverse_twiddles,
+            inverse_twiddle_words,
             batches: prepared,
             exact_lower_prefix_aliases: logical
                 .iter()
@@ -451,8 +445,6 @@ impl<'a> PreparedDirectRetainedB2nGraph<'a> {
     }
 
     pub fn launch(&self) -> Result<(), DirectRetainedB2nError> {
-        let twiddle_words = u32::try_from(self.inverse_twiddles.len_words())
-            .map_err(|_| DirectRetainedB2nError::SizeOverflow)?;
         let stream = self.arena.context().stream_raw().as_ptr();
         for batch in &self.batches {
             let eval_domain_size = 1u32
@@ -465,7 +457,7 @@ impl<'a> PreparedDirectRetainedB2nGraph<'a> {
                     batch.source_log_size,
                     batch.columns,
                     self.inverse_twiddles.as_u32_ptr(),
-                    twiddle_words,
+                    self.inverse_twiddle_words,
                     eval_domain_size,
                     stream,
                 )
@@ -486,6 +478,7 @@ impl<'a> PreparedDirectRetainedB2nGraph<'a> {
                 source_log_size: batch.source_log_size,
                 retained_log_size: batch.retained_log_size,
                 columns: batch.columns,
+                inverse_twiddle_words: self.inverse_twiddle_words,
             })
     }
 
@@ -496,6 +489,25 @@ impl<'a> PreparedDirectRetainedB2nGraph<'a> {
     pub fn exact_lower_prefix_aliases(&self) -> usize {
         self.exact_lower_prefix_aliases
     }
+}
+
+fn admit_inverse_twiddles(
+    program: &DirectRetainedB2nProgram,
+    inverse_twiddles: ArenaSlice,
+    token: core::ptr::NonNull<c_void>,
+) -> Result<u32, DirectRetainedB2nError> {
+    if inverse_twiddles.context_token() != token {
+        return Err(DirectRetainedB2nError::ContextMismatch(
+            inverse_twiddles.id(),
+        ));
+    }
+    if inverse_twiddles.len_words() < program.twiddle_words {
+        return Err(DirectRetainedB2nError::TwiddlesTooSmall {
+            required_words: program.twiddle_words,
+            actual_words: inverse_twiddles.len_words(),
+        });
+    }
+    u32::try_from(inverse_twiddles.len_words()).map_err(|_| DirectRetainedB2nError::SizeOverflow)
 }
 
 fn bind_logical_columns(

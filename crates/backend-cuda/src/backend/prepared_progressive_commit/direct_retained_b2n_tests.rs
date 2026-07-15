@@ -105,6 +105,23 @@ fn pointer_tables_exclusively_replace_the_existing_lde_tables() {
 }
 
 #[test]
+fn global_inverse_tree_extent_is_preserved_for_suffix_selection() {
+    let direct = DirectRetainedB2nProgram::compile(TraceTreeRole::Base, &commit(1)).unwrap();
+    let global_words = direct.twiddle_words * 4;
+    let twiddles = ArenaSlice::dangling_at_for_test(9, 700, global_words);
+    let admitted = admit_inverse_twiddles(&direct, twiddles, twiddles.context_token()).unwrap();
+    assert_eq!(admitted, u32::try_from(global_words).unwrap());
+    assert!(usize::try_from(admitted).unwrap() > direct.twiddle_words);
+
+    let oversized =
+        ArenaSlice::dangling_at_for_test(10, 800, usize::try_from(u32::MAX).unwrap() + 1);
+    assert_eq!(
+        admit_inverse_twiddles(&direct, oversized, oversized.context_token()),
+        Err(DirectRetainedB2nError::SizeOverflow)
+    );
+}
+
+#[test]
 fn cpu_oracle_runs_real_b2n_and_duplicates_exact_words() {
     let direct = DirectRetainedB2nProgram::compile(TraceTreeRole::Base, &commit(1)).unwrap();
     let sources = direct
