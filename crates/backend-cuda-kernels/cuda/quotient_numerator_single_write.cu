@@ -176,7 +176,7 @@ extern "C" int stwo_accumulate_quotient_numerator_packed_single_write_on(
         uint32_t *const *outputs_3,
         void *stream) {
     if (group_row_offsets == nullptr || group_term_offsets == nullptr ||
-        term_descriptors == nullptr || group_count == 0 || group_count > 65535 ||
+        term_descriptors == nullptr || group_count == 0 ||
         packed_output_rows == 0 || source_evaluations == nullptr ||
         line_coefficients == nullptr || group_log_sizes == nullptr ||
         outputs_0 == nullptr || outputs_1 == nullptr || outputs_2 == nullptr ||

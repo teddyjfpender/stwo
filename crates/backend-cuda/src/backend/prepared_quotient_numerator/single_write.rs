@@ -152,7 +152,9 @@ impl<'a> PreparedQuotientNumeratorGraph<'a> {
     /// Replacement-v1 coefficient-inclusive schedule. Every coefficient LDE
     /// is materialized once into the primary factor-32 tile or one exact
     /// epoch-released overflow role, then one packed 1-D launch writes every
-    /// quotient numerator exactly once.
+    /// quotient numerator exactly once. Overflow roles must be distinct and
+    /// may not name any live workspace, source, destination, OODS, or twiddle
+    /// slot.
     #[allow(clippy::too_many_arguments)]
     pub fn prepare_staged_packed_single_write(
         arena: &'a DeviceArena,
@@ -285,21 +287,30 @@ impl<'a> PreparedQuotientNumeratorGraph<'a> {
             .into_iter()
             .map(|requirement| requirement.id)
             .collect::<BTreeSet<_>>();
+        let external_ids = [
+            oods_sample_points,
+            oods_sample_values,
+            random_coefficient,
+            sample_points_destination,
+            first_linear_terms_destination,
+            forward_twiddles,
+        ]
+        .into_iter()
+        .chain(columns.iter().map(|column| column.source.slice()))
+        .chain(
+            destinations
+                .iter()
+                .flat_map(|destination| destination.coordinates),
+        )
+        .map(ArenaSlice::id)
+        .collect::<BTreeSet<_>>();
         let context_token = arena.context().identity_token();
-        let mut role_ids = BTreeSet::new();
         for role in overflow_roles {
             if role.context_token() != context_token {
                 return Err(PreparedQuotientNumeratorError::ContextMismatch(role.id()).into());
             }
-            if workspace_ids.contains(&role.id()) {
-                return Err(
-                    PreparedQuotientNumeratorError::ExternalAliasesWorkspace(role.id()).into(),
-                );
-            }
-            if !role_ids.insert(role.id()) {
-                return Err(PreparedQuotientNumeratorError::AliasedExternalSlot(role.id()).into());
-            }
         }
+        validate_staged_overflow_role_ids(&workspace_ids, &external_ids, overflow_roles)?;
 
         let mut prepared = Self::prepare(
             arena,
@@ -335,14 +346,21 @@ impl<'a> PreparedQuotientNumeratorGraph<'a> {
             }
         }
 
-        let primary = prepared.lde_tile.ok_or(
-            QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
-                "staged coefficient manifest has no primary LDE role",
-            ),
-        )?;
+        if candidate.coefficient_ldes().is_empty() != prepared.lde_tile.is_none() {
+            return Err(
+                QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+                    "staged coefficient manifest and primary LDE role presence differ",
+                ),
+            );
+        }
+        let primary = prepared.lde_tile;
         let role_slice = |role| -> Result<ArenaSlice, QuotientNumeratorStagedSingleWriteError> {
             match role {
-                QuotientNumeratorStagingRole::Primary => Ok(primary),
+                QuotientNumeratorStagingRole::Primary => primary.ok_or(
+                    QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+                        "staged coefficient manifest has no primary LDE role",
+                    ),
+                ),
                 QuotientNumeratorStagingRole::Overflow(index) => {
                     overflow_roles.get(usize::from(index)).copied().ok_or(
                         QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
@@ -389,23 +407,29 @@ impl<'a> PreparedQuotientNumeratorGraph<'a> {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let coefficient_output_slot = prepared.coefficient_output_ptrs.ok_or(
-            QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
-                "staged coefficient outputs have no pointer table",
+        let mut uploads = vec![
+            upload_u32(prepared.batch_terms, candidate.term_descriptors().to_vec()),
+            upload_u64(
+                prepared.batch_group_offsets,
+                candidate.packed_group_row_offsets().to_vec(),
             ),
-        )?;
-        upload_and_sync(
-            arena,
-            &[
-                upload_u32(prepared.batch_terms, candidate.term_descriptors().to_vec()),
-                upload_u64(
-                    prepared.batch_group_offsets,
-                    candidate.packed_group_row_offsets().to_vec(),
-                ),
-                upload_ptrs(prepared.batch_source_ptrs, source_pointers),
-                upload_ptrs(coefficient_output_slot, coefficient_output_pointers),
-            ],
-        )?;
+            upload_ptrs(prepared.batch_source_ptrs, source_pointers),
+        ];
+        match (
+            prepared.coefficient_output_ptrs,
+            coefficient_output_pointers.is_empty(),
+        ) {
+            (Some(slot), false) => uploads.push(upload_ptrs(slot, coefficient_output_pointers)),
+            (None, true) => {}
+            _ => {
+                return Err(
+                    QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+                        "staged coefficient outputs and pointer-table presence differ",
+                    ),
+                )
+            }
+        }
+        upload_and_sync(arena, &uploads)?;
         prepared.schedule = PreparedNumeratorSchedule::StagedPackedSingleWrite {
             packed_output_rows: candidate.packed_output_rows(),
         };
@@ -478,5 +502,70 @@ impl<'a> PreparedQuotientNumeratorGraph<'a> {
         };
         check_cuda("prepared_quotient_numerator_packed_single_write", code)?;
         Ok(())
+    }
+}
+
+fn validate_staged_overflow_role_ids(
+    workspace_ids: &BTreeSet<ArenaSlotId>,
+    external_ids: &BTreeSet<ArenaSlotId>,
+    overflow_roles: &[ArenaSlice],
+) -> Result<(), QuotientNumeratorStagedSingleWriteError> {
+    let mut role_ids = BTreeSet::new();
+    for role in overflow_roles {
+        if workspace_ids.contains(&role.id()) {
+            return Err(PreparedQuotientNumeratorError::ExternalAliasesWorkspace(role.id()).into());
+        }
+        if external_ids.contains(&role.id()) || !role_ids.insert(role.id()) {
+            return Err(PreparedQuotientNumeratorError::AliasedExternalSlot(role.id()).into());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod staged_binding_tests {
+    use super::*;
+
+    #[test]
+    fn overflow_roles_reject_source_destination_and_twiddle_aliases() {
+        let workspace_ids = BTreeSet::new();
+        let source = ArenaSlice::dangling_for_test(11, 16);
+        let destination = ArenaSlice::dangling_for_test(12, 16);
+        let twiddles = ArenaSlice::dangling_for_test(13, 16);
+        for external in [source, destination, twiddles] {
+            let id = external.id();
+            let external_ids = BTreeSet::from([id]);
+            assert!(matches!(
+                validate_staged_overflow_role_ids(&workspace_ids, &external_ids, &[external]),
+                Err(QuotientNumeratorStagedSingleWriteError::Base(
+                    PreparedQuotientNumeratorError::AliasedExternalSlot(actual)
+                )) if actual == id
+            ));
+        }
+    }
+
+    #[test]
+    fn overflow_roles_reject_workspace_and_role_aliases() {
+        let workspace_id = ArenaSlotId(21);
+        let workspace_ids = BTreeSet::from([workspace_id]);
+        let workspace_role = ArenaSlice::dangling_for_test(21, 16);
+        assert!(matches!(
+            validate_staged_overflow_role_ids(&workspace_ids, &BTreeSet::new(), &[workspace_role]),
+            Err(QuotientNumeratorStagedSingleWriteError::Base(
+                PreparedQuotientNumeratorError::ExternalAliasesWorkspace(actual)
+            )) if actual == workspace_id
+        ));
+
+        let duplicate = ArenaSlice::dangling_for_test(22, 16);
+        assert!(matches!(
+            validate_staged_overflow_role_ids(
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                &[duplicate, duplicate],
+            ),
+            Err(QuotientNumeratorStagedSingleWriteError::Base(
+                PreparedQuotientNumeratorError::AliasedExternalSlot(ArenaSlotId(22))
+            ))
+        ));
     }
 }
