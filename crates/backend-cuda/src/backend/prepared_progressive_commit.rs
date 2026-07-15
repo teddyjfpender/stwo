@@ -35,6 +35,7 @@ mod domain_compact;
 mod domain_compact_binding;
 mod domain_cooperative;
 mod domain_cooperative_binding;
+mod domain_expand_absorb;
 mod in_place;
 mod precomputed_compact_domain_binding;
 mod precomputed_compact_state;
@@ -77,6 +78,10 @@ pub use domain_cooperative::{
     DomainCooperativeStep,
 };
 pub use domain_cooperative_binding::DomainCooperativeBindingError;
+pub use domain_expand_absorb::{
+    FusedCompactDomainOperation, FusedCompactDomainProgram, FusedCompactDomainProgramError,
+    FusedCompactDomainReceipt, FusedCompactDomainStep, FusedCompactDomainTransition,
+};
 pub use precomputed_compact_domain_binding::PreparedPrecomputedCompactDomainCommitGraph;
 pub use program::{
     CommitProgram, CommitProgramError, CommitProgramIdentity, CommitProgramLayer,
