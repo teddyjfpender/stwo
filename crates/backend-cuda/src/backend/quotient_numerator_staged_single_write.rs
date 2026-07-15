@@ -254,6 +254,7 @@ pub enum QuotientNumeratorStagedSingleWriteError {
         column: usize,
         required_words: usize,
     },
+    OverflowCapacitiesNotDescending,
     StagingSizeOverflow {
         column: usize,
         evaluation_log_size: u32,
@@ -296,6 +297,12 @@ pub fn quotient_numerator_staged_single_write_plan_with_overflow_capacities(
     columns: &[QuotientNumeratorColumnTopology],
     overflow_capacities_words: &[usize],
 ) -> Result<QuotientNumeratorStagedSingleWritePlan, QuotientNumeratorStagedSingleWriteError> {
+    if overflow_capacities_words
+        .windows(2)
+        .any(|pair| pair[0] < pair[1])
+    {
+        return Err(QuotientNumeratorStagedSingleWriteError::OverflowCapacitiesNotDescending);
+    }
     let legacy = build_plan(config, columns)?;
     let factor32_words = 1usize
         .checked_shl(config.lifting_log_size)
@@ -493,6 +500,12 @@ fn coefficient_staging_layout(
     primary_capacity_words: usize,
     overflow_capacities_words: &[usize],
 ) -> Result<Vec<QuotientNumeratorStagedLde>, QuotientNumeratorStagedSingleWriteError> {
+    if overflow_capacities_words
+        .windows(2)
+        .any(|pair| pair[0] < pair[1])
+    {
+        return Err(QuotientNumeratorStagedSingleWriteError::OverflowCapacitiesNotDescending);
+    }
     let mut seen = BTreeSet::new();
     let mut offset_words = 0usize;
     let mut primary_offset_words = 0usize;
@@ -558,6 +571,14 @@ fn coefficient_staging_layout(
                             )
                         })?;
                         break (QuotientNumeratorStagingRole::Overflow(role), offset);
+                    }
+                    if *role_offset == 0 {
+                        return Err(
+                            QuotientNumeratorStagedSingleWriteError::InsufficientOverflowCapacity {
+                                column,
+                                required_words: len_words,
+                            },
+                        );
                     }
                     overflow_role = overflow_role.checked_add(1).ok_or(
                         QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
@@ -630,6 +651,17 @@ fn build_report(
             ),
         )
     })?;
+    let overflow_staging_role_count = overflow_roles
+        .keys()
+        .next_back()
+        .map_or(0, |&role| usize::from(role) + 1);
+    if overflow_staging_role_count != overflow_roles.len() {
+        return Err(
+            QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+                "overflow staging roles are not dense",
+            ),
+        );
+    }
     let max_overflow_staging_role_words = overflow_roles.values().copied().max().unwrap_or(0);
     if primary_staging_words > requirements.lde_tile_words
         || primary_staging_words
@@ -709,7 +741,7 @@ fn build_report(
         primary_staging_words,
         unused_factor32_staging_words,
         overflow_staging_words,
-        overflow_staging_role_count: overflow_roles.len(),
+        overflow_staging_role_count,
         max_overflow_staging_role_words,
         incremental_staging_words_over_factor32,
     })

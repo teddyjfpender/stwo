@@ -102,19 +102,27 @@ fn cumulative_staging_layout_is_exact_and_disjoint() {
 }
 
 #[test]
-fn whole_lde_skips_a_role_that_is_one_word_too_small() {
-    let layout = coefficient_staging_layout([(0, 4), (1, 5)], 16, &[31, 32]).unwrap();
+fn overflow_roles_are_dense_and_capacities_are_largest_first() {
+    assert_eq!(
+        coefficient_staging_layout([(0, 4), (1, 5)], 16, &[31, 32]),
+        Err(QuotientNumeratorStagedSingleWriteError::OverflowCapacitiesNotDescending)
+    );
+    let layout = coefficient_staging_layout([(0, 4), (1, 5)], 16, &[32, 31]).unwrap();
     assert_eq!(
         layout[1].staging_role(),
-        QuotientNumeratorStagingRole::Overflow(1)
+        QuotientNumeratorStagingRole::Overflow(0)
     );
     assert_eq!(layout[1].role_offset_words(), 0);
     assert_eq!(layout[1].len_words(), 32);
 
-    let swapped = coefficient_staging_layout([(0, 4), (1, 5)], 16, &[32, 31]).unwrap();
     assert_eq!(
-        swapped[1].staging_role(),
-        QuotientNumeratorStagingRole::Overflow(0)
+        coefficient_staging_layout([(0, 4), (1, 5), (2, 5), (3, 5)], 16, &[64, 31, 16]),
+        Err(
+            QuotientNumeratorStagedSingleWriteError::InsufficientOverflowCapacity {
+                column: 3,
+                required_words: 32,
+            }
+        )
     );
 }
 
@@ -128,6 +136,35 @@ fn whole_lde_fails_closed_when_no_named_role_can_hold_it() {
                 required_words: 32,
             }
         )
+    );
+}
+
+#[test]
+fn multi_role_report_reconciles_dense_used_extents() {
+    let topology = (0..34)
+        .map(|index| {
+            column(
+                8,
+                QuotientNumeratorSourceKind::Coefficients,
+                vec![sample(index, u128::from(index) + 1)],
+            )
+        })
+        .collect::<Vec<_>>();
+    let plan = quotient_numerator_staged_single_write_plan_with_overflow_capacities(
+        config(),
+        &topology,
+        &[1 << 10, 1 << 10],
+    )
+    .unwrap();
+    let report = plan.report();
+    assert_eq!(report.primary_staging_words, 32 << 10);
+    assert_eq!(report.overflow_staging_words, 2 << 10);
+    assert_eq!(report.overflow_staging_role_count, 2);
+    assert_eq!(report.max_overflow_staging_role_words, 1 << 10);
+    assert_eq!(plan.overflow_role_words(), vec![1 << 10, 1 << 10]);
+    assert_eq!(
+        report.primary_staging_words + report.overflow_staging_words,
+        report.total_staging_words
     );
 }
 

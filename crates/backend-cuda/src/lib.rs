@@ -206,9 +206,11 @@ pub use backend::quotient_numerator_single_write::{
     QUOTIENT_NUMERATOR_SINGLE_WRITE_TERM_WORDS,
 };
 pub use backend::quotient_numerator_staged_single_write::{
-    quotient_numerator_staged_single_write_plan, QuotientNumeratorStagedLde,
-    QuotientNumeratorStagedSingleWriteError, QuotientNumeratorStagedSingleWritePlan,
-    QuotientNumeratorStagedSingleWriteReport, QuotientNumeratorStagedSource,
+    quotient_numerator_staged_single_write_plan,
+    quotient_numerator_staged_single_write_plan_with_overflow_capacities,
+    QuotientNumeratorStagedLde, QuotientNumeratorStagedSingleWriteError,
+    QuotientNumeratorStagedSingleWritePlan, QuotientNumeratorStagedSingleWriteReport,
+    QuotientNumeratorStagedSource,
 };
 pub use backend::relation_graph::{
     relation_batch_fused_eligible, relation_graph_requirements, PreparedRelationGraph,
