@@ -317,6 +317,17 @@ mod progressive_blake2s_state_tests {
             *mut Blake2sHash,
             *mut core::ffi::c_void,
         ) -> i32;
+        type ExpandAbsorbFn = unsafe extern "C" fn(
+            u32,
+            u32,
+            u32,
+            u32,
+            *const *mut u32,
+            *const CompactBlake2sTailDescriptor,
+            *const Blake2sHash,
+            *mut Blake2sHash,
+            *mut core::ffi::c_void,
+        ) -> i32;
         type FinalizeFn = unsafe extern "C" fn(
             u32,
             u32,
@@ -337,6 +348,7 @@ mod progressive_blake2s_state_tests {
             *mut core::ffi::c_void,
         ) -> i32;
         let _: AbsorbFn = super::stwo_blake2s_compact_absorb_quad_on;
+        let _: ExpandAbsorbFn = super::stwo_blake2s_compact_expand_absorb_quad_on;
         let _: TerminalPairFn = super::stwo_blake2s_compact_absorb_n2b_terminal_pair_on;
         let _: ExpandFn = super::stwo_blake2s_compact_expand_in_place_on;
         let _: FinalizeFn = super::stwo_blake2s_compact_finalize_quad_in_place_on;
@@ -344,6 +356,8 @@ mod progressive_blake2s_state_tests {
         let native = include_str!("../cuda/blake2s_quad.cu");
         assert!(native.contains("const CompactBlake2sTailDescriptor descriptor = *tail;"));
         assert!(native.contains("CompactBlake2sTailDescriptor tail,"));
+        assert!(native.contains("void compact_leaf_expand_absorb_quad("));
+        assert!(native.contains("2u * (expansion * source_pair + child) + parity"));
         assert!(native.contains("__syncwarp(pair_mask);"));
         assert!(native.contains("prefinal_columns[consumed + local][row]"));
         assert!(native.contains("stwo_n2b_final_pair("));
@@ -977,6 +991,19 @@ extern "C" {
         initializes_state: u32,
         tail: *const CompactBlake2sTailDescriptor,
         states: *mut Blake2sHash,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+    /// Source-major compact state expansion plus absorb. Source and
+    /// destination state spans must be disjoint.
+    pub fn stwo_blake2s_compact_expand_absorb_quad_on(
+        from_log_size: u32,
+        to_log_size: u32,
+        number_of_columns: u32,
+        absorbed_columns_before: u32,
+        columns: *const *mut u32,
+        tail: *const CompactBlake2sTailDescriptor,
+        source_states: *const Blake2sHash,
+        destination_states: *mut Blake2sHash,
         stream: *mut core::ffi::c_void,
     ) -> i32;
     /// Final-circle producer plus compact absorb. The native eight-lane owner

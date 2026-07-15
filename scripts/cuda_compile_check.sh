@@ -233,6 +233,28 @@ if [[ "$MODE" == "resources" ]]; then
     rm -f "$receipt"
     trap - EXIT
   fi
+  if [[ "$ARCH" == "sm_90" ]] && printf '%s\n' "${FILES[@]}" \
+      | grep -Fxq "${KERNELS_DIR}/cuda/blake2s_quad.cu"; then
+    source_file="${KERNELS_DIR}/cuda/blake2s_quad.cu"
+    if [[ "$(grep -Fc 'constexpr uint32_t kBlockThreads = 256;' "$source_file")" -ne 1 ]] \
+        || [[ "$(grep -Fc '#define STWO_BLAKE2S_PROGRESSIVE_QUAD_MIN_BLOCKS 5' "$source_file")" -ne 1 ]] \
+        || ! grep -Fq 'void compact_leaf_expand_absorb_quad(' "$source_file"; then
+      echo '[cuda_compile_check] resources FAIL: compact expand-absorb launch geometry drifted'
+      exit 1
+    fi
+    receipt=$(mktemp)
+    trap 'rm -f "$receipt"' EXIT
+    printf '%s\n' "$out" > "$receipt"
+    gpu-lab/tools/check-cuda-resources "$receipt" \
+      --kernel 'compact_leaf_expand_absorb_quad' \
+      --launch-threads 256 --required-blocks-per-sm 5 \
+      --registers-per-sm 65536 --max-registers 51 \
+      --max-stack-bytes 0 --max-spill-store-bytes 0 \
+      --max-spill-load-bytes 0 \
+      --max-static-shared-bytes 4096
+    rm -f "$receipt"
+    trap - EXIT
+  fi
   if echo "$out" | grep -E '[1-9][0-9]* bytes spill (stores|loads)' >/dev/null; then
     echo '[cuda_compile_check] resources FAIL: spills detected'
     exit 1

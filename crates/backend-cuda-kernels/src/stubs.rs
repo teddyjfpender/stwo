@@ -1302,6 +1302,21 @@ pub unsafe extern "C" fn stwo_blake2s_compact_absorb_quad_on(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_blake2s_compact_expand_absorb_quad_on(
+    _from_log_size: u32,
+    _to_log_size: u32,
+    _number_of_columns: u32,
+    _absorbed_columns_before: u32,
+    _columns: *const *mut u32,
+    _tail: *const CompactBlake2sTailDescriptor,
+    _source_states: *const Blake2sHash,
+    _destination_states: *mut Blake2sHash,
+    _stream: *mut c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_blake2s_compact_expand_absorb_quad_on")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stwo_blake2s_compact_absorb_n2b_terminal_pair_on(
     _size: u32,
     _number_of_columns: u32,

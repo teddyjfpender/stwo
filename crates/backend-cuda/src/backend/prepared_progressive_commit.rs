@@ -36,6 +36,7 @@ mod domain_compact_binding;
 mod domain_cooperative;
 mod domain_cooperative_binding;
 mod domain_expand_absorb;
+mod domain_expand_absorb_binding;
 mod in_place;
 mod precomputed_compact_domain_binding;
 mod precomputed_compact_state;
@@ -81,6 +82,11 @@ pub use domain_cooperative_binding::DomainCooperativeBindingError;
 pub use domain_expand_absorb::{
     FusedCompactDomainOperation, FusedCompactDomainProgram, FusedCompactDomainProgramError,
     FusedCompactDomainReceipt, FusedCompactDomainStep, FusedCompactDomainTransition,
+};
+pub use domain_expand_absorb_binding::{
+    fused_compact_domain_arch_supported, fused_compact_domain_arena_slot_requirements,
+    fused_compact_domain_materialized_only_admission, FusedCompactDomainBindingError,
+    PreparedFusedCompactDomainCommitGraph, FUSED_COMPACT_DOMAIN_MIN_SM_MAJOR,
 };
 pub use precomputed_compact_domain_binding::PreparedPrecomputedCompactDomainCommitGraph;
 pub use program::{
