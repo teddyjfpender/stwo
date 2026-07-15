@@ -44,6 +44,7 @@ pub mod prepared_witness;
 pub mod prepared_witness_feed;
 pub mod prepared_witness_input;
 pub mod progressive_commit;
+pub mod progressive_commit_in_place;
 pub mod progressive_ntt_leaf_fusion;
 pub mod proof_assembly;
 mod quotient;

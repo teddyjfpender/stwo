@@ -176,6 +176,11 @@ pub use backend::progressive_commit::{
     PROGRESSIVE_BLAKE2S_H_OFFSET, PROGRESSIVE_BLAKE2S_PENDING_BLOCK_OFFSET,
     PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES,
 };
+pub use backend::progressive_commit_in_place::{
+    expansion_band_plan, finalize_band_plan, merkle_band_plan, progressive_in_place_slab_words,
+    InPlaceBand, InPlaceBandPlan, InPlacePlanError, PROGRESSIVE_IN_PLACE_SCRATCH_BYTES,
+    PROGRESSIVE_IN_PLACE_SCRATCH_WORDS,
+};
 pub use backend::progressive_ntt_leaf_fusion::{
     progressive_ntt_leaf_fusion_telemetry, ProgressiveNttLeafFusionMode,
     ProgressiveNttLeafFusionTelemetry, PROGRESSIVE_NTT_LEAF_FUSED_COLUMNS,
