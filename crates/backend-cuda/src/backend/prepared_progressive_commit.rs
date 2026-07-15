@@ -23,8 +23,8 @@ use super::progressive_commit::{
     PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES,
 };
 use super::progressive_ntt_leaf_fusion::{
-    progressive_lde_segments, ProgressiveLdeSegmentKind, ProgressiveNttLeafFusionMode,
-    ProgressiveNttLeafFusionTelemetry,
+    progressive_lde_segments, ProgressiveLdeSegment, ProgressiveLdeSegmentKind,
+    ProgressiveNttLeafFusionMode, ProgressiveNttLeafFusionTelemetry,
 };
 
 mod domain_compact;
@@ -576,6 +576,206 @@ impl PreparedBatch {
     }
 }
 
+struct PreparedProgressiveInputs {
+    batches: Vec<(PreparedBatch, Vec<ProgressiveLdeSegment>)>,
+    uploads: Vec<(ArenaSlice, HostDescriptor)>,
+    twiddle_words: u32,
+    fusion_telemetry: ProgressiveNttLeafFusionTelemetry,
+    absorbed_columns: u32,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_progressive_inputs(
+    arena: &DeviceArena,
+    requirements: &ProgressiveLeafWorkspaceRequirements,
+    slots: &ProgressiveLeafWorkspaceSlots,
+    coefficients: &[CommitCoefficientColumn],
+    retained_outputs: &[Option<ArenaSlice>],
+    twiddles: ArenaSlice,
+    ntt_leaf_fusion: ProgressiveNttLeafFusionMode,
+    workspace_ids: &BTreeSet<ArenaSlotId>,
+) -> Result<PreparedProgressiveInputs, PreparedProgressiveCommitError> {
+    if coefficients.len() != requirements.plan.columns.len()
+        || retained_outputs.len() != requirements.plan.columns.len()
+    {
+        return Err(PreparedProgressiveCommitError::InvalidSlotShape);
+    }
+    let token = arena.context().identity_token();
+    if twiddles.context_token() != token {
+        return Err(PreparedProgressiveCommitError::ContextMismatch(
+            twiddles.id(),
+        ));
+    }
+    if workspace_ids.contains(&twiddles.id()) {
+        return Err(PreparedProgressiveCommitError::AliasedSlot(twiddles.id()));
+    }
+    if twiddles.len_words() < requirements.twiddle_words {
+        return Err(PreparedProgressiveCommitError::SlotTooSmall {
+            slot: twiddles.id(),
+            required: requirements.twiddle_words,
+            actual: twiddles.len_words(),
+        });
+    }
+    let twiddle_words = u32::try_from(twiddles.len_words())
+        .map_err(|_| PreparedProgressiveCommitError::SizeOverflow)?;
+    let scratch = match (slots.lde_scratch, requirements.lde_scratch_words) {
+        (Some(id), Some(words)) => Some(bind_slot(arena, id, words, 1)?),
+        (None, None) => None,
+        _ => return Err(PreparedProgressiveCommitError::InvalidSlotShape),
+    };
+
+    let mut uploads = Vec::new();
+    let mut external_ids = BTreeSet::from([twiddles.id()]);
+    let mut batches = Vec::with_capacity(requirements.batches.len());
+    let mut fusion_telemetry = ProgressiveNttLeafFusionTelemetry::default();
+    let mut absorbed_columns = 0u32;
+    for (batch_index, ((batch, batch_requirement), batch_slots)) in requirements
+        .plan
+        .lde_batches
+        .iter()
+        .zip(&requirements.batches)
+        .zip(&slots.batches)
+        .enumerate()
+    {
+        let coefficient_ptrs = bind_slot(
+            arena,
+            batch_slots.coefficient_ptrs,
+            batch_requirement.coefficient_pointer_words,
+            POINTER_WORDS,
+        )?;
+        let coefficient_sizes = bind_slot(
+            arena,
+            batch_slots.coefficient_sizes,
+            batch_requirement.coefficient_size_words,
+            1,
+        )?;
+        let output_ptrs = bind_slot(
+            arena,
+            batch_slots.output_ptrs,
+            batch_requirement.output_pointer_words,
+            POINTER_WORDS,
+        )?;
+        let evaluation_words = pow2(batch.evaluation_log_size)?;
+        let mut scratch_offset = 0usize;
+        let mut coefficient_addresses = Vec::with_capacity(batch.columns.len());
+        let mut coefficient_lengths = Vec::with_capacity(batch.columns.len());
+        let mut output_addresses = Vec::with_capacity(batch.columns.len());
+        for (&canonical, retained_destination) in batch.columns.iter().zip(&batch.retained_columns)
+        {
+            let coefficient = coefficients[canonical];
+            let column = requirements.plan.columns[canonical];
+            if coefficient.log_size != column.coefficient_log_size
+                || coefficient.coefficients.context_token() != token
+            {
+                return Err(PreparedProgressiveCommitError::ContextMismatch(
+                    coefficient.coefficients.id(),
+                ));
+            }
+            if workspace_ids.contains(&coefficient.coefficients.id())
+                || !external_ids.insert(coefficient.coefficients.id())
+            {
+                return Err(PreparedProgressiveCommitError::AliasedSlot(
+                    coefficient.coefficients.id(),
+                ));
+            }
+            let coefficient_words = pow2(column.coefficient_log_size)?;
+            if coefficient.coefficients.len_words() < coefficient_words {
+                return Err(PreparedProgressiveCommitError::SlotTooSmall {
+                    slot: coefficient.coefficients.id(),
+                    required: coefficient_words,
+                    actual: coefficient.coefficients.len_words(),
+                });
+            }
+            coefficient_addresses.push(coefficient.coefficients.as_u32_ptr() as usize);
+            coefficient_lengths.push(
+                u32::try_from(coefficient_words)
+                    .map_err(|_| PreparedProgressiveCommitError::SizeOverflow)?,
+            );
+            let output = match (*retained_destination, retained_outputs[canonical]) {
+                (Some(_), Some(output)) => {
+                    if output.context_token() != token {
+                        return Err(PreparedProgressiveCommitError::ContextMismatch(output.id()));
+                    }
+                    if output.len_words() < evaluation_words {
+                        return Err(PreparedProgressiveCommitError::SlotTooSmall {
+                            slot: output.id(),
+                            required: evaluation_words,
+                            actual: output.len_words(),
+                        });
+                    }
+                    if workspace_ids.contains(&output.id()) || !external_ids.insert(output.id()) {
+                        return Err(PreparedProgressiveCommitError::AliasedSlot(output.id()));
+                    }
+                    output.as_u32_ptr()
+                }
+                (Some(_), None) => {
+                    return Err(PreparedProgressiveCommitError::MissingRetainedOutput(
+                        canonical,
+                    ));
+                }
+                (None, Some(_)) => {
+                    return Err(PreparedProgressiveCommitError::UnexpectedRetainedOutput(
+                        canonical,
+                    ));
+                }
+                (None, None) => {
+                    let base = scratch.ok_or(PreparedProgressiveCommitError::InvalidSlotShape)?;
+                    let next_offset = scratch_offset
+                        .checked_add(evaluation_words)
+                        .ok_or(PreparedProgressiveCommitError::SizeOverflow)?;
+                    if next_offset > base.len_words() {
+                        return Err(PreparedProgressiveCommitError::SlotTooSmall {
+                            slot: base.id(),
+                            required: next_offset,
+                            actual: base.len_words(),
+                        });
+                    }
+                    let pointer = unsafe { base.as_u32_ptr().add(scratch_offset) };
+                    scratch_offset = next_offset;
+                    pointer
+                }
+            };
+            output_addresses.push(output as usize);
+        }
+        uploads.push((
+            coefficient_ptrs,
+            HostDescriptor::Pointers(coefficient_addresses),
+        ));
+        uploads.push((coefficient_sizes, HostDescriptor::U32(coefficient_lengths)));
+        uploads.push((output_ptrs, HostDescriptor::Pointers(output_addresses)));
+        let (segments, batch_telemetry) = progressive_lde_segments(batch, ntt_leaf_fusion)?;
+        fusion_telemetry = fusion_telemetry.checked_add(batch_telemetry)?;
+        batches.push((
+            PreparedBatch {
+                coefficient_ptrs,
+                coefficient_sizes,
+                output_ptrs,
+                batch_index: u32::try_from(batch_index)
+                    .map_err(|_| PreparedProgressiveCommitError::SizeOverflow)?,
+                segment_offset: 0,
+                log_size: batch.evaluation_log_size,
+                columns: u32::try_from(batch.columns.len())
+                    .map_err(|_| PreparedProgressiveCommitError::SizeOverflow)?,
+                absorbed_columns_before: absorbed_columns,
+            },
+            segments,
+        ));
+        absorbed_columns = absorbed_columns
+            .checked_add(
+                u32::try_from(batch.columns.len())
+                    .map_err(|_| PreparedProgressiveCommitError::SizeOverflow)?,
+            )
+            .ok_or(PreparedProgressiveCommitError::SizeOverflow)?;
+    }
+    Ok(PreparedProgressiveInputs {
+        batches,
+        uploads,
+        twiddle_words,
+        fusion_telemetry,
+        absorbed_columns,
+    })
+}
+
 #[derive(Clone, Copy)]
 enum Launch {
     Init {
@@ -757,29 +957,6 @@ impl<'a> PreparedProgressiveLeaves<'a> {
             }
         }?;
         let workspace_ids: BTreeSet<_> = workspace.iter().map(|entry| entry.id).collect();
-        if coefficients.len() != requirements.plan.columns.len()
-            || retained_outputs.len() != requirements.plan.columns.len()
-        {
-            return Err(PreparedProgressiveCommitError::InvalidSlotShape);
-        }
-        let token = arena.context().identity_token();
-        if twiddles.context_token() != token {
-            return Err(PreparedProgressiveCommitError::ContextMismatch(
-                twiddles.id(),
-            ));
-        }
-        if workspace_ids.contains(&twiddles.id()) {
-            return Err(PreparedProgressiveCommitError::AliasedSlot(twiddles.id()));
-        }
-        if twiddles.len_words() < requirements.twiddle_words {
-            return Err(PreparedProgressiveCommitError::SlotTooSmall {
-                slot: twiddles.id(),
-                required: requirements.twiddle_words,
-                actual: twiddles.len_words(),
-            });
-        }
-        let twiddle_words = u32::try_from(twiddles.len_words())
-            .map_err(|_| PreparedProgressiveCommitError::SizeOverflow)?;
         let (ping, pong, leaf_hashes, in_place_scratch) = match storage {
             ProgressiveCommitStorageMode::Separate => {
                 let ping = bind_slot(
@@ -822,160 +999,22 @@ impl<'a> PreparedProgressiveLeaves<'a> {
                 )
             }
         };
-        let scratch = match (slots.lde_scratch, requirements.lde_scratch_words) {
-            (Some(id), Some(words)) => Some(bind_slot(arena, id, words, 1)?),
-            (None, None) => None,
-            _ => return Err(PreparedProgressiveCommitError::InvalidSlotShape),
-        };
-
-        let mut uploads: Vec<(ArenaSlice, HostDescriptor)> = Vec::new();
-        let mut external_ids = BTreeSet::from([twiddles.id()]);
-        let mut prepared_batches = Vec::with_capacity(requirements.batches.len());
-        let mut fusion_telemetry = ProgressiveNttLeafFusionTelemetry::default();
-        let mut absorbed_columns = 0u32;
-        for (batch_index, ((batch, batch_requirement), batch_slots)) in requirements
-            .plan
-            .lde_batches
-            .iter()
-            .zip(&requirements.batches)
-            .zip(&slots.batches)
-            .enumerate()
-        {
-            let coefficient_ptrs = bind_slot(
-                arena,
-                batch_slots.coefficient_ptrs,
-                batch_requirement.coefficient_pointer_words,
-                POINTER_WORDS,
-            )?;
-            let coefficient_sizes = bind_slot(
-                arena,
-                batch_slots.coefficient_sizes,
-                batch_requirement.coefficient_size_words,
-                1,
-            )?;
-            let output_ptrs = bind_slot(
-                arena,
-                batch_slots.output_ptrs,
-                batch_requirement.output_pointer_words,
-                POINTER_WORDS,
-            )?;
-            let evaluation_words = pow2(batch.evaluation_log_size)?;
-            let mut scratch_offset = 0usize;
-            let mut coefficient_addresses = Vec::with_capacity(batch.columns.len());
-            let mut coefficient_lengths = Vec::with_capacity(batch.columns.len());
-            let mut output_addresses = Vec::with_capacity(batch.columns.len());
-            for (&canonical, retained_destination) in
-                batch.columns.iter().zip(&batch.retained_columns)
-            {
-                let coefficient = coefficients[canonical];
-                let column = requirements.plan.columns[canonical];
-                if coefficient.log_size != column.coefficient_log_size
-                    || coefficient.coefficients.context_token() != token
-                {
-                    return Err(PreparedProgressiveCommitError::ContextMismatch(
-                        coefficient.coefficients.id(),
-                    ));
-                }
-                if workspace_ids.contains(&coefficient.coefficients.id())
-                    || !external_ids.insert(coefficient.coefficients.id())
-                {
-                    return Err(PreparedProgressiveCommitError::AliasedSlot(
-                        coefficient.coefficients.id(),
-                    ));
-                }
-                let coefficient_words = pow2(column.coefficient_log_size)?;
-                if coefficient.coefficients.len_words() < coefficient_words {
-                    return Err(PreparedProgressiveCommitError::SlotTooSmall {
-                        slot: coefficient.coefficients.id(),
-                        required: coefficient_words,
-                        actual: coefficient.coefficients.len_words(),
-                    });
-                }
-                coefficient_addresses.push(coefficient.coefficients.as_u32_ptr() as usize);
-                coefficient_lengths.push(
-                    u32::try_from(coefficient_words)
-                        .map_err(|_| PreparedProgressiveCommitError::SizeOverflow)?,
-                );
-                let output = match (*retained_destination, retained_outputs[canonical]) {
-                    (Some(_), Some(output)) => {
-                        if output.context_token() != token {
-                            return Err(PreparedProgressiveCommitError::ContextMismatch(
-                                output.id(),
-                            ));
-                        }
-                        if output.len_words() < evaluation_words {
-                            return Err(PreparedProgressiveCommitError::SlotTooSmall {
-                                slot: output.id(),
-                                required: evaluation_words,
-                                actual: output.len_words(),
-                            });
-                        }
-                        if workspace_ids.contains(&output.id()) || !external_ids.insert(output.id())
-                        {
-                            return Err(PreparedProgressiveCommitError::AliasedSlot(output.id()));
-                        }
-                        output.as_u32_ptr()
-                    }
-                    (Some(_), None) => {
-                        return Err(PreparedProgressiveCommitError::MissingRetainedOutput(
-                            canonical,
-                        ))
-                    }
-                    (None, Some(_)) => {
-                        return Err(PreparedProgressiveCommitError::UnexpectedRetainedOutput(
-                            canonical,
-                        ))
-                    }
-                    (None, None) => {
-                        let base =
-                            scratch.ok_or(PreparedProgressiveCommitError::InvalidSlotShape)?;
-                        let next_offset = scratch_offset
-                            .checked_add(evaluation_words)
-                            .ok_or(PreparedProgressiveCommitError::SizeOverflow)?;
-                        if next_offset > base.len_words() {
-                            return Err(PreparedProgressiveCommitError::SlotTooSmall {
-                                slot: base.id(),
-                                required: next_offset,
-                                actual: base.len_words(),
-                            });
-                        }
-                        let pointer = unsafe { base.as_u32_ptr().add(scratch_offset) };
-                        scratch_offset = next_offset;
-                        pointer
-                    }
-                };
-                output_addresses.push(output as usize);
-            }
-            uploads.push((
-                coefficient_ptrs,
-                HostDescriptor::Pointers(coefficient_addresses),
-            ));
-            uploads.push((coefficient_sizes, HostDescriptor::U32(coefficient_lengths)));
-            uploads.push((output_ptrs, HostDescriptor::Pointers(output_addresses)));
-            let (segments, batch_telemetry) = progressive_lde_segments(batch, ntt_leaf_fusion)?;
-            fusion_telemetry = fusion_telemetry.checked_add(batch_telemetry)?;
-            prepared_batches.push((
-                PreparedBatch {
-                    coefficient_ptrs,
-                    coefficient_sizes,
-                    output_ptrs,
-                    batch_index: u32::try_from(batch_index)
-                        .map_err(|_| PreparedProgressiveCommitError::SizeOverflow)?,
-                    segment_offset: 0,
-                    log_size: batch.evaluation_log_size,
-                    columns: u32::try_from(batch.columns.len())
-                        .map_err(|_| PreparedProgressiveCommitError::SizeOverflow)?,
-                    absorbed_columns_before: absorbed_columns,
-                },
-                segments,
-            ));
-            absorbed_columns = absorbed_columns
-                .checked_add(
-                    u32::try_from(batch.columns.len())
-                        .map_err(|_| PreparedProgressiveCommitError::SizeOverflow)?,
-                )
-                .ok_or(PreparedProgressiveCommitError::SizeOverflow)?;
-        }
+        let PreparedProgressiveInputs {
+            batches: prepared_batches,
+            uploads,
+            twiddle_words,
+            fusion_telemetry,
+            absorbed_columns,
+        } = prepare_progressive_inputs(
+            arena,
+            requirements,
+            slots,
+            coefficients,
+            retained_outputs,
+            twiddles,
+            ntt_leaf_fusion,
+            &workspace_ids,
+        )?;
 
         let mut launches = Vec::new();
         let first_log = requirements.plan.columns[0].evaluation_log_size;
