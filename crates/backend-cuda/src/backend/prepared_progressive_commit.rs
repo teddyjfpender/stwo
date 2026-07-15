@@ -27,6 +27,7 @@ use super::progressive_ntt_leaf_fusion::{
     ProgressiveNttLeafFusionTelemetry,
 };
 
+mod domain_compact;
 mod domain_cooperative;
 mod domain_cooperative_binding;
 mod in_place;
@@ -35,6 +36,10 @@ mod program_binding;
 mod program_oracle;
 mod shape_wide;
 
+pub use domain_compact::{
+    CompactDomainComparison, CompactDomainOperation, CompactDomainProgram,
+    CompactDomainProgramError, CompactDomainStep, CompactDomainTail,
+};
 pub use domain_cooperative::{
     DomainCooperativeComparison, DomainCooperativeOperation, DomainCooperativeProgram,
     DomainCooperativeProgramError, DomainCooperativeResourceModel, DomainCooperativeSlabSlice,
