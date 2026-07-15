@@ -59,6 +59,7 @@ pub struct DirectRetainedB2nOracle {
 pub struct DirectRetainedB2nLaunchKind {
     pub role: TraceTreeRole,
     pub batch_index: u32,
+    pub first_column: u32,
     pub source_log_size: u32,
     pub retained_log_size: u32,
     pub columns: u32,
@@ -145,13 +146,14 @@ struct LogicalColumn {
 }
 
 #[derive(Clone, Copy)]
-struct PreparedBatch {
-    input_pointers: ArenaSlice,
-    output_pointers: ArenaSlice,
-    batch_index: u32,
-    source_log_size: u32,
-    retained_log_size: u32,
-    columns: u32,
+pub(super) struct PreparedBatch {
+    pub(super) input_pointers: ArenaSlice,
+    pub(super) output_pointers: ArenaSlice,
+    pub(super) batch_index: u32,
+    pub(super) first_column: u32,
+    pub(super) source_log_size: u32,
+    pub(super) retained_log_size: u32,
+    pub(super) columns: u32,
 }
 
 impl PreparedBatch {
@@ -164,6 +166,7 @@ impl PreparedBatch {
         DirectRetainedB2nLaunchKind {
             role,
             batch_index: self.batch_index,
+            first_column: self.first_column,
             source_log_size: self.source_log_size,
             retained_log_size: self.retained_log_size,
             columns: self.columns,
@@ -182,6 +185,7 @@ pub struct PreparedDirectRetainedB2nGraph<'a> {
     forward_twiddles: ArenaSlice,
     forward_twiddle_words: u32,
     batches: Vec<PreparedBatch>,
+    retained_evaluations: Vec<ArenaSlice>,
     exact_lower_prefix_aliases: usize,
 }
 
@@ -203,6 +207,7 @@ impl DirectRetainedB2nProgram {
         let columns = &requirements.leaves.plan.columns;
         let mut seen = vec![false; columns.len()];
         let mut batches = Vec::with_capacity(requirements.leaves.plan.lde_batches.len());
+        let mut first_column = 0usize;
         for (batch_index, batch) in requirements.leaves.plan.lde_batches.iter().enumerate() {
             let Some(&first) = batch.columns.first() else {
                 return Err(DirectRetainedB2nError::InvalidProgram);
@@ -211,11 +216,20 @@ impl DirectRetainedB2nProgram {
                 .get(first)
                 .ok_or(DirectRetainedB2nError::InvalidProgram)?
                 .coefficient_log_size;
-            for (&canonical, retained) in batch.columns.iter().zip(&batch.retained_columns) {
+            for (offset, (&canonical, retained)) in batch
+                .columns
+                .iter()
+                .zip(&batch.retained_columns)
+                .enumerate()
+            {
                 let Some(column) = columns.get(canonical) else {
                     return Err(DirectRetainedB2nError::InvalidProgram);
                 };
+                let expected_canonical = first_column
+                    .checked_add(offset)
+                    .ok_or(DirectRetainedB2nError::SizeOverflow)?;
                 if seen[canonical]
+                    || canonical != expected_canonical
                     || !column.retained_evaluation
                     || retained.is_none()
                     || column.coefficient_log_size != source_log_size
@@ -246,6 +260,9 @@ impl DirectRetainedB2nProgram {
                     .checked_mul(POINTER_WORDS)
                     .ok_or(DirectRetainedB2nError::SizeOverflow)?,
             });
+            first_column = first_column
+                .checked_add(batch.columns.len())
+                .ok_or(DirectRetainedB2nError::SizeOverflow)?;
         }
         if seen.iter().any(|covered| !covered) {
             return Err(DirectRetainedB2nError::InvalidProgram);
@@ -413,6 +430,7 @@ impl<'a> PreparedDirectRetainedB2nGraph<'a> {
         let forward_twiddle_words = admit_twiddles(program, forward_twiddles, token)?;
         let logical = bind_logical_columns(program, columns, token)?;
         validate_value_aliases(&logical, inverse_twiddles, forward_twiddles)?;
+        let retained_evaluations = logical.iter().map(|column| column.retained).collect();
 
         let requirements = program.arena_slot_requirements(slots)?;
         let mut prepared = Vec::with_capacity(program.batches.len());
@@ -452,6 +470,8 @@ impl<'a> PreparedDirectRetainedB2nGraph<'a> {
                 input_pointers,
                 output_pointers,
                 batch_index: batch.batch_index,
+                first_column: u32::try_from(batch.canonical_columns[0])
+                    .map_err(|_| DirectRetainedB2nError::SizeOverflow)?,
                 source_log_size: batch.source_log_size,
                 retained_log_size: batch.retained_log_size,
                 columns: u32::try_from(batch.canonical_columns.len())
@@ -488,6 +508,7 @@ impl<'a> PreparedDirectRetainedB2nGraph<'a> {
             forward_twiddles,
             forward_twiddle_words,
             batches: prepared,
+            retained_evaluations,
             exact_lower_prefix_aliases: logical
                 .iter()
                 .filter(|column| exact_lower_prefix_alias(**column))
@@ -548,6 +569,14 @@ impl<'a> PreparedDirectRetainedB2nGraph<'a> {
 
     pub fn commit_cache_key(&self) -> u64 {
         self.commit_cache_key
+    }
+
+    pub fn retained_evaluations(&self) -> &[ArenaSlice] {
+        &self.retained_evaluations
+    }
+
+    pub(super) fn prepared_batches(&self) -> &[PreparedBatch] {
+        &self.batches
     }
 
     pub fn exact_lower_prefix_aliases(&self) -> usize {

@@ -27,17 +27,27 @@ use super::progressive_ntt_leaf_fusion::{
     ProgressiveNttLeafFusionMode, ProgressiveNttLeafFusionTelemetry,
 };
 
+mod direct_compact_domain_binding;
+mod direct_retained_b2n;
 mod domain_compact;
 mod domain_compact_binding;
 mod domain_cooperative;
 mod domain_cooperative_binding;
-mod direct_retained_b2n;
 mod in_place;
 mod program;
 mod program_binding;
 mod program_oracle;
 mod shape_wide;
 
+pub use direct_compact_domain_binding::{
+    direct_compact_domain_arena_slot_requirements, DirectCompactDomainBindingError,
+    PreparedDirectCompactDomainCommitGraph,
+};
+pub use direct_retained_b2n::{
+    DirectRetainedB2nBatchPlan, DirectRetainedB2nColumn, DirectRetainedB2nError,
+    DirectRetainedB2nLaunchKind, DirectRetainedB2nOracle, DirectRetainedB2nProgram,
+    PreparedDirectRetainedB2nGraph,
+};
 pub use domain_compact::{
     CompactDomainComparison, CompactDomainOperation, CompactDomainProgram,
     CompactDomainProgramError, CompactDomainStep, CompactDomainTail,
@@ -52,11 +62,6 @@ pub use domain_cooperative::{
     DomainCooperativeStep,
 };
 pub use domain_cooperative_binding::DomainCooperativeBindingError;
-pub use direct_retained_b2n::{
-    DirectRetainedB2nBatchPlan, DirectRetainedB2nColumn, DirectRetainedB2nError,
-    DirectRetainedB2nLaunchKind, DirectRetainedB2nOracle, DirectRetainedB2nProgram,
-    PreparedDirectRetainedB2nGraph,
-};
 pub use program::{
     CommitProgram, CommitProgramError, CommitProgramIdentity, CommitProgramLayer,
     CommitProgramOperation, CommitProgramStep, CommitProgramTraffic,

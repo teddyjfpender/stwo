@@ -305,11 +305,13 @@ fn both_global_tree_extents_are_preserved_and_reported_without_transposition() {
         input_pointers: ArenaSlice::dangling_at_for_test(11, 30_000, batch.pointer_words),
         output_pointers: ArenaSlice::dangling_at_for_test(12, 31_000, batch.pointer_words),
         batch_index: batch.batch_index,
+        first_column: u32::try_from(batch.canonical_columns[0]).unwrap(),
         source_log_size: batch.source_log_size,
         retained_log_size: batch.retained_log_size,
         columns: u32::try_from(batch.canonical_columns.len()).unwrap(),
     }
     .launch_kind(TraceTreeRole::Base, admitted_inverse, admitted_forward);
+    assert_eq!(telemetry.first_column, 0);
     assert_eq!(telemetry.inverse_twiddle_words, admitted_inverse);
     assert_eq!(telemetry.forward_twiddle_words, admitted_forward);
     assert_ne!(

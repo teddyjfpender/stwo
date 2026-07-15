@@ -309,18 +309,18 @@ fn exact_compact_operations_bind_batches_tails_state_and_shared_scratch() {
 
     for launch in launches {
         match launch {
-            CompactPreparedLaunch::Absorb {
+            CompactPreparedLaunch::State(CompactStatePreparedLaunch::Absorb {
                 tail_columns,
                 tail,
                 states,
                 ..
-            }
-            | CompactPreparedLaunch::FinalizeInPlace {
+            })
+            | CompactPreparedLaunch::State(CompactStatePreparedLaunch::FinalizeInPlace {
                 tail_columns,
                 tail,
                 states_and_hashes: states,
                 ..
-            } => {
+            }) => {
                 assert_eq!(states.as_u32_ptr(), slab.as_u32_ptr());
                 for index in 0..tail_columns as usize {
                     let canonical = retained
@@ -348,11 +348,11 @@ fn exact_compact_operations_bind_batches_tails_state_and_shared_scratch() {
                     .iter()
                     .all(|&ptr| ptr == 0));
             }
-            CompactPreparedLaunch::ExpandInPlace {
+            CompactPreparedLaunch::State(CompactStatePreparedLaunch::ExpandInPlace {
                 states,
                 scratch_pair,
                 ..
-            } => {
+            }) => {
                 assert_eq!(states.as_u32_ptr(), slab.as_u32_ptr());
                 assert_eq!(scratch_pair.as_u32_ptr(), scratch.as_u32_ptr());
                 assert_eq!(scratch_pair.len_words(), PROGRESSIVE_IN_PLACE_SCRATCH_WORDS);

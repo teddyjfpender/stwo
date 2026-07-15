@@ -48,7 +48,10 @@ pub enum CompactDomainBindingError {
     MissingBatch(u32),
     DuplicateBatch(u32),
     InvalidBatch(u32),
+    MissingLdeReceipt(u32),
+    DuplicateLdeReceipt(u32),
     MissingTailOutput(usize),
+    InvalidRetainedOutput(usize),
     InvalidTail,
     InvalidCounter,
     UnsupportedLogSize(u32),
@@ -96,10 +99,30 @@ impl From<super::super::exec_context::CudaRuntimeError> for CompactDomainBinding
 }
 
 #[derive(Clone, Copy)]
-enum CompactPreparedLaunch {
-    Lde(PreparedBatch),
+pub(super) struct CompactOutputBatch {
+    pub(super) output_ptrs: ArenaSlice,
+    pub(super) batch_index: u32,
+    pub(super) first_column: u32,
+    pub(super) columns: u32,
+    pub(super) log_size: u32,
+}
+
+impl From<PreparedBatch> for CompactOutputBatch {
+    fn from(batch: PreparedBatch) -> Self {
+        Self {
+            output_ptrs: batch.output_ptrs,
+            batch_index: batch.batch_index,
+            first_column: batch.absorbed_columns_before,
+            columns: batch.columns,
+            log_size: batch.log_size,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum CompactStatePreparedLaunch {
     Absorb {
-        batch: PreparedBatch,
+        batch: CompactOutputBatch,
         initializes_state: bool,
         tail_columns: u32,
         tail: CompactBlake2sTailDescriptor,
@@ -122,6 +145,12 @@ enum CompactPreparedLaunch {
     },
 }
 
+#[derive(Clone, Copy)]
+enum CompactPreparedLaunch {
+    Lde(PreparedBatch),
+    State(CompactStatePreparedLaunch),
+}
+
 impl CompactPreparedLaunch {
     fn kind(self) -> CompactDomainPreparedLaunchKind {
         match self {
@@ -131,6 +160,21 @@ impl CompactPreparedLaunch {
                 columns: batch.columns,
                 log_size: batch.log_size,
             },
+            Self::State(state) => state.kind(),
+        }
+    }
+
+    fn tail(self) -> Option<(u32, CompactBlake2sTailDescriptor)> {
+        match self {
+            Self::Lde(_) => None,
+            Self::State(state) => state.tail(),
+        }
+    }
+}
+
+impl CompactStatePreparedLaunch {
+    pub(super) fn kind(self) -> CompactDomainPreparedLaunchKind {
+        match self {
             Self::Absorb {
                 batch,
                 initializes_state,
@@ -138,10 +182,10 @@ impl CompactPreparedLaunch {
                 ..
             } => CompactDomainPreparedLaunchKind::AbsorbDomainBatch {
                 batch_index: batch.batch_index,
-                first_column: batch.absorbed_columns_before,
+                first_column: batch.first_column,
                 columns: batch.columns,
                 log_size: batch.log_size,
-                absorbed_columns_before: batch.absorbed_columns_before,
+                absorbed_columns_before: batch.first_column,
                 initializes_state,
                 tail_columns,
             },
@@ -170,7 +214,7 @@ impl CompactPreparedLaunch {
         }
     }
 
-    fn tail(self) -> Option<(u32, CompactBlake2sTailDescriptor)> {
+    pub(super) fn tail(self) -> Option<(u32, CompactBlake2sTailDescriptor)> {
         match self {
             Self::Absorb {
                 tail_columns, tail, ..
@@ -178,8 +222,83 @@ impl CompactPreparedLaunch {
             | Self::FinalizeInPlace {
                 tail_columns, tail, ..
             } => Some((tail_columns, tail)),
-            _ => None,
+            Self::ExpandInPlace { .. } => None,
         }
+    }
+
+    pub(super) fn launch(self, arena: &DeviceArena) -> Result<(), CompactDomainBindingError> {
+        let stream = arena.context().stream_raw().as_ptr();
+        let (operation, code) = unsafe {
+            match self {
+                Self::Absorb {
+                    batch,
+                    initializes_state,
+                    tail,
+                    states,
+                    ..
+                } => {
+                    if !stwo_backend_cuda_kernels::raw::blake2s_compact_absorb_counts_valid(
+                        batch.columns,
+                        batch.first_column,
+                        initializes_state,
+                    ) {
+                        return Err(CompactDomainBindingError::InvalidCounter);
+                    }
+                    (
+                        "compact_progressive_leaf_absorb",
+                        stwo_backend_cuda_kernels::raw::stwo_blake2s_compact_absorb_quad_on(
+                            1u32.checked_shl(batch.log_size).ok_or(
+                                CompactDomainBindingError::UnsupportedLogSize(batch.log_size),
+                            )?,
+                            batch.columns,
+                            batch.first_column,
+                            batch.output_ptrs.as_u32_ptr().cast(),
+                            u32::from(initializes_state),
+                            &tail,
+                            states.as_u32_ptr().cast(),
+                            stream,
+                        ),
+                    )
+                }
+                Self::ExpandInPlace {
+                    from_log,
+                    to_log,
+                    states,
+                    scratch_pair,
+                    ..
+                } => (
+                    "compact_progressive_leaf_expand_in_place",
+                    stwo_backend_cuda_kernels::raw::stwo_blake2s_compact_expand_in_place_on(
+                        from_log,
+                        to_log,
+                        states.as_u32_ptr().cast(),
+                        // The qualified shared tail remains 48 words; compact
+                        // expansion consumes its first 16 only.
+                        scratch_pair.as_u32_ptr().cast(),
+                        stream,
+                    ),
+                ),
+                Self::FinalizeInPlace {
+                    log_size,
+                    absorbed_columns,
+                    tail,
+                    states_and_hashes,
+                    ..
+                } => (
+                    "compact_progressive_leaf_finalize_in_place",
+                    stwo_backend_cuda_kernels::raw::stwo_blake2s_compact_finalize_quad_in_place_on(
+                        1u32.checked_shl(log_size)
+                            .ok_or(CompactDomainBindingError::UnsupportedLogSize(log_size))?,
+                        absorbed_columns,
+                        &tail,
+                        states_and_hashes.as_u32_ptr().cast(),
+                        stream,
+                    ),
+                ),
+            }
+        };
+        check_cuda(operation, code)?;
+        Ok(())
     }
 }
 
@@ -204,10 +323,9 @@ impl PreparedCompactDomainLeaves<'_> {
     fn launch(&self) -> Result<(), CompactDomainBindingError> {
         let stream = self.arena.context().stream_raw().as_ptr();
         for launch in &self.launches {
-            let (operation, code) = unsafe {
-                match *launch {
-                    CompactPreparedLaunch::Lde(batch) => (
-                        "compact_progressive_lde_n2b",
+            match *launch {
+                CompactPreparedLaunch::Lde(batch) => {
+                    let code = unsafe {
                         stwo_backend_cuda_kernels::raw::stwo_lde_n2b_columns_on(
                             batch.coefficient_ptrs.as_u32_ptr().cast(),
                             batch.coefficient_sizes.as_u32_ptr(),
@@ -224,78 +342,12 @@ impl PreparedCompactDomainLeaves<'_> {
                                     batch.log_size,
                                 ))?,
                             stream,
-                        ),
-                    ),
-                    CompactPreparedLaunch::Absorb {
-                        batch,
-                        initializes_state,
-                        tail,
-                        states,
-                        ..
-                    } => {
-                        if !stwo_backend_cuda_kernels::raw::blake2s_compact_absorb_counts_valid(
-                            batch.columns,
-                            batch.absorbed_columns_before,
-                            initializes_state,
-                        ) {
-                            return Err(CompactDomainBindingError::InvalidCounter);
-                        }
-                        (
-                            "compact_progressive_leaf_absorb",
-                            stwo_backend_cuda_kernels::raw::stwo_blake2s_compact_absorb_quad_on(
-                                1u32.checked_shl(batch.log_size).ok_or(
-                                    CompactDomainBindingError::UnsupportedLogSize(batch.log_size),
-                                )?,
-                                batch.columns,
-                                batch.absorbed_columns_before,
-                                batch.output_ptrs.as_u32_ptr().cast(),
-                                u32::from(initializes_state),
-                                &tail,
-                                states.as_u32_ptr().cast(),
-                                stream,
-                            ),
                         )
-                    }
-                    CompactPreparedLaunch::ExpandInPlace {
-                        from_log,
-                        to_log,
-                        states,
-                        scratch_pair,
-                        ..
-                    } => (
-                        "compact_progressive_leaf_expand_in_place",
-                        stwo_backend_cuda_kernels::raw::stwo_blake2s_compact_expand_in_place_on(
-                            from_log,
-                            to_log,
-                            states.as_u32_ptr().cast(),
-                            // The qualified shared tail remains 48 words; the
-                            // compact expansion consumes its first 16 only.
-                            scratch_pair.as_u32_ptr().cast(),
-                            stream,
-                        ),
-                    ),
-                    CompactPreparedLaunch::FinalizeInPlace {
-                        log_size,
-                        absorbed_columns,
-                        tail,
-                        states_and_hashes,
-                        ..
-                    } => (
-                        "compact_progressive_leaf_finalize_in_place",
-                        stwo_backend_cuda_kernels::raw::
-                            stwo_blake2s_compact_finalize_quad_in_place_on(
-                                1u32.checked_shl(log_size).ok_or(
-                                    CompactDomainBindingError::UnsupportedLogSize(log_size),
-                                )?,
-                                absorbed_columns,
-                                &tail,
-                                states_and_hashes.as_u32_ptr().cast(),
-                                stream,
-                            ),
-                    ),
+                    };
+                    check_cuda("compact_progressive_lde_n2b", code)?;
                 }
-            };
-            check_cuda(operation, code)?;
+                CompactPreparedLaunch::State(state) => state.launch(self.arena)?,
+            }
         }
         Ok(())
     }
@@ -363,9 +415,10 @@ impl CompactDomainProgram {
             scratch_pair,
         )?;
         let finalized_columns = launches.iter().find_map(|launch| match *launch {
-            CompactPreparedLaunch::FinalizeInPlace {
-                absorbed_columns, ..
-            } => Some(absorbed_columns),
+            CompactPreparedLaunch::State(CompactStatePreparedLaunch::FinalizeInPlace {
+                absorbed_columns,
+                ..
+            }) => Some(absorbed_columns),
             _ => None,
         });
         if finalized_columns != Some(absorbed_columns) {
@@ -516,7 +569,7 @@ pub fn compact_domain_arena_slot_requirements(
     Ok(workspace)
 }
 
-fn validate_compact_slab(
+pub(super) fn validate_compact_slab(
     compact: &CompactDomainProgram,
     requirements: &ProgressiveCommitWorkspaceRequirements,
     slab: ArenaSlice,
@@ -596,27 +649,27 @@ fn bind_compact_launches(
                     &requirements.leaves.plan,
                     retained_outputs,
                 )?;
-                CompactPreparedLaunch::Absorb {
-                    batch,
+                CompactPreparedLaunch::State(CompactStatePreparedLaunch::Absorb {
+                    batch: batch.into(),
                     initializes_state,
                     tail_columns,
                     tail,
                     states: slab,
-                }
+                })
             }
             CompactDomainOperation::StateExpandInPlace {
                 from_log_size,
                 to_log_size,
                 absorbed_columns,
                 bands,
-            } => CompactPreparedLaunch::ExpandInPlace {
+            } => CompactPreparedLaunch::State(CompactStatePreparedLaunch::ExpandInPlace {
                 from_log: from_log_size,
                 to_log: to_log_size,
                 absorbed_columns,
                 bands,
                 states: slab,
                 scratch_pair,
-            },
+            }),
             CompactDomainOperation::FinalizeInPlace {
                 log_size,
                 absorbed_columns,
@@ -630,13 +683,13 @@ fn bind_compact_launches(
                     &requirements.leaves.plan,
                     retained_outputs,
                 )?;
-                CompactPreparedLaunch::FinalizeInPlace {
+                CompactPreparedLaunch::State(CompactStatePreparedLaunch::FinalizeInPlace {
                     log_size,
                     absorbed_columns,
                     tail_columns,
                     tail,
                     states_and_hashes: slab,
-                }
+                })
             }
         };
         launches.push(launch);
@@ -663,7 +716,7 @@ fn exact_batch(
     Ok(batch)
 }
 
-fn bind_tail_descriptor(
+pub(super) fn bind_tail_descriptor(
     tail: Option<CompactDomainTail>,
     target_log_size: u32,
     absorbed_columns: u32,
