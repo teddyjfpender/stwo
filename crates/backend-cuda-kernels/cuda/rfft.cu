@@ -1371,6 +1371,90 @@ static unsigned n2b_hash16_final_stages(unsigned log_n) {
     return 0;
 }
 
+static cudaError_t ntt_n2b_before_final_interval_from_stage_two_on(
+    m31 **values,
+    unsigned log_n,
+    unsigned num_poly,
+    m31 *twiddles,
+    unsigned twiddle_words,
+    unsigned eval_domain_size,
+    cudaStream_t stream
+) {
+    auto nofinal = [&](unsigned stages, unsigned start_stage) -> cudaError_t {
+        switch (stages) {
+            case 5:
+                return ntt_n2b_nofinal_5_stage_batch_on(
+                    values, values, log_n, num_poly, start_stage, twiddles,
+                    twiddle_words, eval_domain_size, stream);
+            case 6:
+                return ntt_n2b_nofinal_6_stage_batch_on(
+                    values, values, log_n, num_poly, start_stage, twiddles,
+                    twiddle_words, eval_domain_size, stream);
+            case 7:
+                return ntt_n2b_nofinal_7_stage_batch_on(
+                    values, values, log_n, num_poly, start_stage, twiddles,
+                    twiddle_words, eval_domain_size, stream);
+            case 8:
+                return ntt_n2b_nofinal_8_stage_batch_on(
+                    values, values, log_n, num_poly, start_stage, twiddles,
+                    twiddle_words, eval_domain_size, stream);
+            default:
+                return cudaErrorInvalidConfiguration;
+        }
+    };
+
+    if (log_n <= 19) {
+        const auto &config = LAUNCH_N2B_CONFIG_13_19[log_n - 13];
+        return nofinal(config[0] - 1, 2);
+    }
+    if (log_n <= 27) {
+        const auto &config = LAUNCH_N2B_CONFIG_20_27[log_n - 20];
+        cudaError_t status = nofinal(config[0] - 1, 2);
+        return status == cudaSuccess
+            ? nofinal(config[1], 1 + config[0]) : status;
+    }
+    const auto &config = LAUNCH_N2B_CONFIG_28_30[log_n - 28];
+    cudaError_t status = nofinal(config[0] - 1, 2);
+    if (status == cudaSuccess) {
+        status = nofinal(config[1], 1 + config[0]);
+    }
+    return status == cudaSuccess
+        ? nofinal(config[2], 1 + config[0] + config[1]) : status;
+}
+
+static cudaError_t ntt_n2b_final_interval_before_circle_dispatch_on(
+    m31 **values,
+    unsigned log_n,
+    unsigned num_poly,
+    m31 *twiddles,
+    unsigned twiddle_words,
+    unsigned eval_domain_size,
+    cudaStream_t stream
+) {
+    const unsigned stages = n2b_hash16_final_stages(log_n);
+    const unsigned start_stage = log_n + 1 - stages;
+    switch (stages) {
+        case 7:
+            return ntt_n2b_final_7_stage_batch_on<false>(
+                values, values, log_n, num_poly, start_stage, twiddles,
+                twiddle_words, eval_domain_size, stream);
+        case 8:
+            return ntt_n2b_final_8_stage_batch_on<false>(
+                values, values, log_n, num_poly, start_stage, twiddles,
+                twiddle_words, eval_domain_size, stream);
+        case 10:
+            return ntt_n2b_final_10_stage_batch_on<false>(
+                values, values, log_n, num_poly, start_stage, twiddles,
+                twiddle_words, eval_domain_size, stream);
+        case 11:
+            return ntt_n2b_final_11_stage_batch_on<false>(
+                values, values, log_n, num_poly, start_stage, twiddles,
+                twiddle_words, eval_domain_size, stream);
+        default:
+            return cudaErrorInvalidConfiguration;
+    }
+}
+
 static cudaError_t ntt_n2b_hash16_dispatch_on(
     m31 **values,
     unsigned log_n,
@@ -1566,6 +1650,60 @@ extern "C" int stwo_ntt_n2b_columns_from_stage_two_before_circle_on(
         if (err != cudaSuccess) {
             return err;
         }
+    }
+    return cudaSuccess;
+}
+
+extern "C" int stwo_ntt_n2b_columns_from_stage_two_before_final_interval_on(
+    uint32_t **device_values,
+    unsigned log_n,
+    unsigned num_poly,
+    uint32_t *g_twiddles,
+    unsigned twiddles_size,
+    unsigned eval_domain_size,
+    void *stream
+) {
+    if (device_values == nullptr || g_twiddles == nullptr || stream == nullptr ||
+        log_n < 13 || log_n > 30 || num_poly == 0 ||
+        eval_domain_size != (1u << (log_n - 1)) ||
+        eval_domain_size > twiddles_size) {
+        return cudaErrorInvalidValue;
+    }
+    cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    for (unsigned base = 0; base < num_poly; base += MAX_NTT_BATCH_COLUMNS) {
+        const unsigned chunk = min(num_poly - base, MAX_NTT_BATCH_COLUMNS);
+        cudaError_t err = ntt_n2b_before_final_interval_from_stage_two_on(
+            reinterpret_cast<m31 **>(device_values + base), log_n, chunk,
+            reinterpret_cast<m31 *>(g_twiddles), twiddles_size,
+            eval_domain_size, cuda_stream);
+        if (err != cudaSuccess) return err;
+    }
+    return cudaSuccess;
+}
+
+extern "C" int stwo_ntt_n2b_columns_final_interval_before_circle_on(
+    uint32_t **device_values,
+    unsigned log_n,
+    unsigned num_poly,
+    uint32_t *g_twiddles,
+    unsigned twiddles_size,
+    unsigned eval_domain_size,
+    void *stream
+) {
+    if (device_values == nullptr || g_twiddles == nullptr || stream == nullptr ||
+        log_n < 13 || log_n > 30 || num_poly == 0 ||
+        eval_domain_size != (1u << (log_n - 1)) ||
+        eval_domain_size > twiddles_size) {
+        return cudaErrorInvalidValue;
+    }
+    cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    for (unsigned base = 0; base < num_poly; base += MAX_NTT_BATCH_COLUMNS) {
+        const unsigned chunk = min(num_poly - base, MAX_NTT_BATCH_COLUMNS);
+        cudaError_t err = ntt_n2b_final_interval_before_circle_dispatch_on(
+            reinterpret_cast<m31 **>(device_values + base), log_n, chunk,
+            reinterpret_cast<m31 *>(g_twiddles), twiddles_size,
+            eval_domain_size, cuda_stream);
+        if (err != cudaSuccess) return err;
     }
     return cudaSuccess;
 }

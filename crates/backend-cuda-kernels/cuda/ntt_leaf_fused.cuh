@@ -1,6 +1,7 @@
 #ifndef NTT_LEAF_FUSED_H
 #define NTT_LEAF_FUSED_H
 
+#include "blake2s.cuh"
 #include "fields.cuh"
 #include "utils.cuh"
 
@@ -28,6 +29,29 @@ extern "C" int stwo_ntt_leaf_fused_on(
     unsigned eval_domain_size,
     uint32_t cols_done,
     uint32_t is_final,
+    Blake2sHash *states,
+    void *stream);
+
+// Candidate-only fixed-width terminal interval. `device_values` is a device
+// pointer table containing `16 * tiles` columns in canonical commitment order.
+// Every column already contains the exact image immediately before its final
+// configured N2B interval. One launch completes that interval and the circle
+// butterfly, preserves the canonical evaluations in place, and advances the
+// compact h[8]-only leaf states without a later evaluation reread.
+//
+// The lane remains dormant until CUDA byte parity, resource, and SASS gates
+// qualify it; callers must retain the materialized fallback.
+extern "C" int stwo_ntt_direct_compact_final16_configure(unsigned log_n);
+
+extern "C" int stwo_ntt_direct_compact_final16_on(
+    uint32_t **device_values,
+    unsigned log_n,
+    uint32_t tiles,
+    uint32_t *twiddles,
+    unsigned twiddle_words,
+    unsigned eval_domain_size,
+    uint32_t cols_done,
+    const CompactBlake2sTailDescriptor *initial_tail,
     Blake2sHash *states,
     void *stream);
 

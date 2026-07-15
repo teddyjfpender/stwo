@@ -79,6 +79,30 @@ int stwo_ntt_n2b_columns_from_stage_two_before_circle_on(
     void *stream
 );
 
+// Fixed-width compact-final candidate split. The prefix stops before the
+// qualified final N2B interval; the second entry completes that interval but
+// leaves only the circle butterfly for a generic remainder sink.
+extern "C"
+int stwo_ntt_n2b_columns_from_stage_two_before_final_interval_on(
+    uint32_t **device_values,
+    unsigned log_n,
+    unsigned num_poly,
+    uint32_t *g_twiddles,
+    unsigned twiddles_size,
+    unsigned eval_domain_size,
+    void *stream
+);
+extern "C"
+int stwo_ntt_n2b_columns_final_interval_before_circle_on(
+    uint32_t **device_values,
+    unsigned log_n,
+    unsigned num_poly,
+    uint32_t *g_twiddles,
+    unsigned twiddles_size,
+    unsigned eval_domain_size,
+    void *stream
+);
+
 // Allocation-free explicit-stream LDE. Both pointer tables live on the device.
 // `coefficient_sizes[i]` is the exact source length and may be smaller than
 // `eval_domain_size` when blowup > 1. Each destination has

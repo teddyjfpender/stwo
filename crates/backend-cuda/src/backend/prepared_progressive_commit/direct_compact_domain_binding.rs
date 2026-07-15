@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::direct_compact_terminal_fused::PreparedDirectCompactTerminalExecution;
 use super::direct_retained_b2n::PreparedBatch as DirectPreparedBatch;
 use super::domain_compact_binding::{
     bind_tail_descriptor, validate_compact_slab, CompactOutputBatch, CompactStatePreparedLaunch,
@@ -19,6 +20,7 @@ pub enum DirectCompactDomainBindingError {
         workspace: ArenaSlotId,
     },
     SizeOverflow,
+    Terminal(DirectCompactTerminalError),
 }
 
 impl core::fmt::Display for DirectCompactDomainBindingError {
@@ -47,6 +49,12 @@ impl From<CompactDomainProgramError> for DirectCompactDomainBindingError {
     }
 }
 
+impl From<DirectCompactTerminalError> for DirectCompactDomainBindingError {
+    fn from(value: DirectCompactTerminalError) -> Self {
+        Self::Terminal(value)
+    }
+}
+
 impl From<super::super::prepared_commit::PreparedCommitError> for DirectCompactDomainBindingError {
     fn from(value: super::super::prepared_commit::PreparedCommitError) -> Self {
         Self::Compact(value.into())
@@ -68,15 +76,16 @@ impl From<super::super::exec_context::CudaRuntimeError> for DirectCompactDomainB
 /// Direct retained LDE, compact h8 state, and the existing Merkle suffix. The
 /// stored compact launch vector has no coefficient-backed LDE variant.
 pub struct PreparedDirectCompactDomainCommitGraph<'a> {
-    direct: PreparedDirectRetainedB2nGraph<'a>,
-    leaves: PreparedDirectCompactDomainLeaves<'a>,
+    pub(super) direct: PreparedDirectRetainedB2nGraph<'a>,
+    pub(super) leaves: PreparedDirectCompactDomainLeaves<'a>,
     merkle: PreparedMerkleFromLeaves<'a>,
     retained_evaluations: Vec<Option<ArenaSlice>>,
+    pub(super) terminal: Option<PreparedDirectCompactTerminalExecution>,
 }
 
-struct PreparedDirectCompactDomainLeaves<'a> {
-    arena: &'a DeviceArena,
-    launches: Vec<CompactStatePreparedLaunch>,
+pub(super) struct PreparedDirectCompactDomainLeaves<'a> {
+    pub(super) arena: &'a DeviceArena,
+    pub(super) launches: Vec<CompactStatePreparedLaunch>,
     leaf_hashes: ArenaSlice,
     cache_key: u64,
 }
@@ -195,14 +204,19 @@ impl CompactDomainProgram {
             },
             merkle,
             retained_evaluations,
+            terminal: None,
         })
     }
 }
 
 impl PreparedDirectCompactDomainCommitGraph<'_> {
     pub fn launch(&self) -> Result<(), DirectCompactDomainBindingError> {
-        self.direct.launch()?;
-        self.leaves.launch()?;
+        if let Some(terminal) = &self.terminal {
+            terminal.launch(&self.direct, self.leaves.arena)?;
+        } else {
+            self.direct.launch()?;
+            self.leaves.launch()?;
+        }
         self.merkle
             .launch()
             .map_err(CompactDomainBindingError::from)?;
@@ -259,6 +273,12 @@ impl PreparedDirectCompactDomainCommitGraph<'_> {
 
     pub fn retained_evaluations(&self) -> &[Option<ArenaSlice>] {
         &self.retained_evaluations
+    }
+
+    /// Exact per-shape traffic/launch receipt for the opt-in terminal path.
+    /// `None` identifies the explicit materialized fallback graph.
+    pub fn terminal_receipt(&self) -> Option<&DirectCompactTerminalReceipt> {
+        self.terminal.as_ref().map(|terminal| terminal.receipt())
     }
 
     pub fn exact_lower_prefix_aliases(&self) -> usize {

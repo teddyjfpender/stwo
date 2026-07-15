@@ -316,8 +316,7 @@ mod progressive_blake2s_state_tests {
             *mut core::ffi::c_void,
         ) -> i32;
         let _: AbsorbFn = super::stwo_blake2s_compact_absorb_quad_on;
-        let _: TerminalPairFn =
-            super::stwo_blake2s_compact_absorb_n2b_terminal_pair_on;
+        let _: TerminalPairFn = super::stwo_blake2s_compact_absorb_n2b_terminal_pair_on;
         let _: ExpandFn = super::stwo_blake2s_compact_expand_in_place_on;
         let _: FinalizeFn = super::stwo_blake2s_compact_finalize_quad_in_place_on;
 
@@ -1576,6 +1575,30 @@ extern "C" {
         stream: *mut core::ffi::c_void,
     ) -> i32;
 
+    /// Continue from stage two through every complete N2B interval before the
+    /// configured terminal interval consumed by the fixed16 compact sink.
+    pub fn stwo_ntt_n2b_columns_from_stage_two_before_final_interval_on(
+        device_values: *const *mut u32,
+        log_n: u32,
+        num_poly: u32,
+        g_twiddles: *mut u32,
+        twiddles_size: u32,
+        eval_domain_size: u32,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
+    /// Complete only the configured final interval while leaving the circle
+    /// butterfly for the paired compact remainder sink.
+    pub fn stwo_ntt_n2b_columns_final_interval_before_circle_on(
+        device_values: *const *mut u32,
+        log_n: u32,
+        num_poly: u32,
+        g_twiddles: *mut u32,
+        twiddles_size: u32,
+        eval_domain_size: u32,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
     /// Allocation-free LDE. Pointer and exact coefficient-size tables are
     /// device-resident; staging and N2B use `stream`.
     pub fn stwo_lde_n2b_columns_on(
@@ -2812,6 +2835,26 @@ extern "C" {
         states: *mut ProgressiveBlake2sState,
         stream: *mut c_void,
     ) -> i32;
+
+    /// Setup-time shared-memory admission for the candidate fixed16 compact
+    /// terminal interval. Hardware qualification is required before selection.
+    pub fn stwo_ntt_direct_compact_final16_configure(log_n: u32) -> i32;
+
+    /// Complete `16 * tiles` prefinal columns in place and advance compact
+    /// leaf states without a separate full-evaluation absorb pass.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stwo_ntt_direct_compact_final16_on(
+        device_values: *const *mut u32,
+        log_n: u32,
+        tiles: u32,
+        g_twiddles: *mut u32,
+        twiddles_size: u32,
+        eval_domain_size: u32,
+        cols_done: u32,
+        initial_tail: *const CompactBlake2sTailDescriptor,
+        states: *mut Blake2sHash,
+        stream: *mut c_void,
+    ) -> i32;
 }
 
 #[cfg(test)]
@@ -2836,8 +2879,9 @@ mod direct_retained_b2n_contract_tests {
     fn direct_retained_b2n_abi_is_linked() {
         let _: DirectRetainedB2nFn = stwo_ntt_b2n_columns_to_retained_on;
         let _: StageTwoN2bFn = stwo_ntt_n2b_columns_from_stage_two_on;
-        let _: StageTwoN2bFn =
-            stwo_ntt_n2b_columns_from_stage_two_before_circle_on;
+        let _: StageTwoN2bFn = stwo_ntt_n2b_columns_from_stage_two_before_circle_on;
+        let _: StageTwoN2bFn = stwo_ntt_n2b_columns_from_stage_two_before_final_interval_on;
+        let _: StageTwoN2bFn = stwo_ntt_n2b_columns_final_interval_before_circle_on;
     }
 
     fn optimized_partition(log_n: u32) -> Vec<u32> {
@@ -2977,6 +3021,8 @@ mod direct_retained_b2n_contract_tests {
             "eval_domain_size != (1u << (log_n - 1))",
             "stwo_ntt_n2b_columns_from_stage_two_on",
             "stwo_ntt_n2b_columns_from_stage_two_before_circle_on",
+            "stwo_ntt_n2b_columns_from_stage_two_before_final_interval_on",
+            "stwo_ntt_n2b_columns_final_interval_before_circle_on",
             "eval_domain_size, 2, cuda_stream",
             "false, false",
         ] {

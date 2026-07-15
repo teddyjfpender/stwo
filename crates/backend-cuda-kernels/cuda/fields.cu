@@ -1,10 +1,22 @@
 #include "fields.cuh"
+#include "m31_fast32.cuh"
+
+#ifndef STWO_M31_FAST32_GLOBAL
+#define STWO_M31_FAST32_GLOBAL 0
+#endif
+
+static_assert(STWO_M31_FAST32_GLOBAL == 0 || STWO_M31_FAST32_GLOBAL == 1,
+              "STWO_M31_FAST32_GLOBAL must be 0 or 1");
 
 __host__ __device__ m31 mul(m31 a, m31 b) {
+#if defined(__CUDA_ARCH__) && STWO_M31_FAST32_GLOBAL
+    return stwo_m31_mul_fast32(a, b);
+#else
     uint64_t v = ((uint64_t) a * (uint64_t) b);
     uint64_t w = v + (v >> 31);
     uint64_t u = v + (w >> 31);
     return u & P;
+#endif
 }
 
 __host__ __device__ m31 add(m31 a, m31 b) {

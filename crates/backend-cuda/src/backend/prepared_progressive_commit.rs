@@ -28,6 +28,7 @@ use super::progressive_ntt_leaf_fusion::{
 };
 
 mod direct_compact_domain_binding;
+mod direct_compact_terminal_fused;
 mod direct_retained_b2n;
 mod domain_compact;
 mod domain_compact_binding;
@@ -42,6 +43,11 @@ mod shape_wide;
 pub use direct_compact_domain_binding::{
     direct_compact_domain_arena_slot_requirements, DirectCompactDomainBindingError,
     PreparedDirectCompactDomainCommitGraph,
+};
+pub use direct_compact_terminal_fused::{
+    DirectCompactTerminalBatchMode, DirectCompactTerminalBatchReceipt, DirectCompactTerminalError,
+    DirectCompactTerminalFallbackReason, DirectCompactTerminalReceipt,
+    DirectCompactTerminalSupport,
 };
 pub use direct_retained_b2n::{
     DirectRetainedB2nBatchPlan, DirectRetainedB2nColumn, DirectRetainedB2nError,

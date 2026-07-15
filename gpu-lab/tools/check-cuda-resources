@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+"""Compare actual ptxas kernel resources and emit a fail-closed receipt."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import re
+from pathlib import Path
+
+FUNCTION = re.compile(r"Function properties for\s+['\"]?(.+?)['\"]?\s*$")
+STACK = re.compile(
+    r"(\d+) bytes stack frame,\s*(\d+) bytes spill stores,\s*(\d+) bytes spill loads"
+)
+REGISTERS = re.compile(r"Used\s+(\d+) registers")
+SHARED = re.compile(r"(\d+) bytes smem")
+
+
+def parse(text: str) -> dict[str, dict[str, int]]:
+    resources: dict[str, dict[str, int]] = {}
+    current: str | None = None
+    for line in text.splitlines():
+        function = FUNCTION.search(line)
+        if function:
+            current = function.group(1)
+            resources.setdefault(current, {})
+            continue
+        if current is None:
+            continue
+        stack = STACK.search(line)
+        if stack:
+            resources[current].update(
+                stack_bytes=int(stack.group(1)),
+                spill_store_bytes=int(stack.group(2)),
+                spill_load_bytes=int(stack.group(3)),
+            )
+        registers = REGISTERS.search(line)
+        if registers:
+            resources[current]["registers"] = int(registers.group(1))
+            shared = SHARED.search(line)
+            resources[current]["static_shared_bytes"] = int(
+                shared.group(1) if shared else 0
+            )
+    return resources
+
+
+def select(resources: dict[str, dict[str, int]], pattern: str) -> dict[str, int]:
+    regex = re.compile(pattern)
+    matches = [value for name, value in resources.items() if regex.search(name)]
+    if not matches or any("registers" not in value for value in matches):
+        raise ValueError(f"no complete ptxas resource entry matches {pattern!r}")
+    keys = (
+        "registers",
+        "stack_bytes",
+        "spill_store_bytes",
+        "spill_load_bytes",
+        "static_shared_bytes",
+    )
+    return {key: max(value.get(key, 0) for value in matches) for key in keys}
+
+
+def self_test() -> int:
+    fixture = """ptxas info : Function properties for kernel
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info : Used 64 registers, 2048 bytes smem
+"""
+    assert select(parse(fixture), "^kernel$") == {
+        "registers": 64,
+        "stack_bytes": 0,
+        "spill_store_bytes": 0,
+        "spill_load_bytes": 0,
+        "static_shared_bytes": 2048,
+    }
+    print('{"contract":"cuda-resource-delta-v1","self_test":"PASS"}')
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("baseline", nargs="?", type=Path)
+    parser.add_argument("candidate", nargs="?", type=Path)
+    parser.add_argument("--kernel", required=False)
+    parser.add_argument("--max-registers", type=int, default=255)
+    parser.add_argument("--max-register-increase", type=int, default=0)
+    parser.add_argument("--max-static-shared-increase", type=int, default=4096)
+    parser.add_argument("--self-test", action="store_true")
+    args = parser.parse_args()
+    if args.self_test:
+        return self_test()
+    if not args.kernel or not args.baseline or not args.candidate:
+        parser.error("baseline, candidate, and --kernel are required")
+    if not args.baseline.is_file() or not args.candidate.is_file():
+        parser.error("baseline and candidate must be actual ptxas logs")
+    try:
+        baseline = select(parse(args.baseline.read_text()), args.kernel)
+        candidate = select(parse(args.candidate.read_text()), args.kernel)
+    except (OSError, ValueError, re.error) as error:
+        parser.error(str(error))
+    passed = (
+        candidate["registers"] <= args.max_registers
+        and candidate["registers"]
+        <= baseline["registers"] + args.max_register_increase
+        and candidate["stack_bytes"] == 0
+        and candidate["spill_store_bytes"] == 0
+        and candidate["spill_load_bytes"] == 0
+        and candidate["static_shared_bytes"]
+        <= baseline["static_shared_bytes"] + args.max_static_shared_increase
+    )
+    receipt = {
+        "contract": "cuda-resource-delta-v1",
+        "kernel_regex": args.kernel,
+        "baseline_sha256": hashlib.sha256(args.baseline.read_bytes()).hexdigest(),
+        "candidate_sha256": hashlib.sha256(args.candidate.read_bytes()).hexdigest(),
+        "baseline": baseline,
+        "candidate": candidate,
+        "limits": {
+            "max_registers": args.max_registers,
+            "max_register_increase": args.max_register_increase,
+            "max_static_shared_increase": args.max_static_shared_increase,
+            "stack_and_spill_bytes": 0,
+        },
+        "timing_credit": False,
+        "result": "PASS" if passed else "FAIL",
+    }
+    print(json.dumps(receipt, sort_keys=True, separators=(",", ":")))
+    return 0 if passed else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

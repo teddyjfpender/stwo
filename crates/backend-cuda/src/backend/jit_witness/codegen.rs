@@ -18,7 +18,7 @@ use schedule::{emit_scheduled_outputs, OutputSchedule};
 /// Bumped whenever the emitted source for a fixed program changes, mixed into the
 /// cache key so new source can never collide with PTX an older build persisted for the
 /// same bytecode (same rule as the constraint lane's `CODEGEN_VERSION`).
-pub const WITNESS_CODEGEN_VERSION: u64 = 11;
+pub const WITNESS_CODEGEN_VERSION: u64 = 12;
 
 /// Cache key: program semantic hash mixed (FNV-1a) with [`WITNESS_CODEGEN_VERSION`].
 pub fn witness_jit_cache_key(semantic_hash: u64) -> u64 {
@@ -436,6 +436,13 @@ typedef unsigned long long u64;
 
 #define STWO_M31_P 2147483647u
 
+#ifndef STWO_M31_FAST32_GLOBAL
+#define STWO_M31_FAST32_GLOBAL 0
+#endif
+#if STWO_M31_FAST32_GLOBAL != 0 && STWO_M31_FAST32_GLOBAL != 1
+#error \"STWO_M31_FAST32_GLOBAL must be 0 or 1\"
+#endif
+
 __device__ __forceinline__ unsigned stwo_m31_add(unsigned lhs, unsigned rhs) {
     unsigned sum = lhs + rhs;
     return sum >= STWO_M31_P ? sum - STWO_M31_P : sum;
@@ -451,9 +458,18 @@ __device__ __forceinline__ unsigned stwo_m31_neg(unsigned value) {
 }
 
 __device__ __forceinline__ unsigned stwo_m31_mul(unsigned lhs, unsigned rhs) {
+#if STWO_M31_FAST32_GLOBAL
+    unsigned lo = lhs * rhs;
+    unsigned hi = __umulhi(lhs, rhs);
+    unsigned quotient = (hi << 1) | (lo >> 31);
+    unsigned reduced = (lo & STWO_M31_P) + quotient;
+    reduced = (reduced & STWO_M31_P) + (reduced >> 31);
+    return reduced == STWO_M31_P ? 0u : reduced;
+#else
     u64 product = (u64)lhs * (u64)rhs;
     u64 reduced = (((((product >> 31) + product + 1u) >> 31) + product) & (u64)STWO_M31_P);
     return (unsigned)reduced;
+#endif
 }
 
 ",
@@ -464,6 +480,24 @@ __device__ __forceinline__ unsigned stwo_m31_mul(unsigned lhs, unsigned rhs) {
 mod tests {
     use super::super::recording::WitnessRecorder;
     use super::*;
+
+    #[test]
+    fn generated_m31_fast32_candidate_is_default_off_and_preserves_fallback() {
+        let mut source = String::new();
+        emit_preamble(&mut source);
+        for required in [
+            "#define STWO_M31_FAST32_GLOBAL 0",
+            "#if STWO_M31_FAST32_GLOBAL",
+            "unsigned hi = __umulhi(lhs, rhs);",
+            "u64 product = (u64)lhs * (u64)rhs;",
+            "#error \"STWO_M31_FAST32_GLOBAL must be 0 or 1\"",
+        ] {
+            assert!(
+                source.contains(required),
+                "missing preamble gate: {required}"
+            );
+        }
+    }
 
     #[test]
     fn cache_key_depends_on_codegen_version() {

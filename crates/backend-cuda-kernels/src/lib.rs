@@ -13,6 +13,7 @@
 //! `stwo-backend-metal`.
 
 pub mod aot_pack;
+pub mod m31_fast32_contract;
 pub mod raw;
 #[cfg(not(stwo_cuda_link))]
 mod stubs;
@@ -146,22 +147,54 @@ mod tests {
         assert_ne!(raw::stwo_ntt_leaf_fused_on as usize, 0);
         assert_ne!(raw::stwo_ntt_progressive_leaf_fused_configure as usize, 0);
         assert_ne!(raw::stwo_ntt_progressive_leaf_fused_on as usize, 0);
+        assert_ne!(raw::stwo_ntt_direct_compact_final16_configure as usize, 0);
+        assert_ne!(raw::stwo_ntt_direct_compact_final16_on as usize, 0);
     }
 
     #[test]
     fn progressive_ntt_leaf_sink_preserves_lazy_block_and_retained_write_contract() {
         let source = include_str!("../cuda/ntt_leaf_fused.cu");
-        assert!(source.contains("if constexpr (PROGRESSIVE)"));
+        assert!(source.contains("SINK == FusedLeafSink::Progressive"));
         assert!(source.contains("4u * cols_done, 0u"));
         assert!(source.contains("state->pending[word] = message[word]"));
         assert_eq!(
-            source
-                .matches("writes_completed_evaluation<PROGRESSIVE>")
-                .count(),
+            source.matches("writes_completed_evaluation<SINK>").count(),
             2
         );
         assert!(source.contains("(retained_write_mask & ~0xffffu) != 0"));
         assert!(source.contains("uint32_t retained_write_mask"));
+    }
+
+    #[test]
+    fn direct_compact_final16_fast32_candidate_is_fail_closed_and_source_narrow() {
+        let source = include_str!("../cuda/ntt_leaf_fused.cu");
+        let arithmetic = include_str!("../cuda/m31_fast32.cuh");
+        let fields = include_str!("../cuda/fields.cu");
+        let compact = include_str!("../cuda/ntt_compact_leaf.cuh");
+        for required in [
+            "FusedLeafSink::DirectCompact",
+            "stwo_ntt_direct_compact_final16_on",
+            "tiles > kMaxFixed16Tiles",
+            "stwo_compact_tail_descriptor_valid",
+            "stwo_m31_mul_fast32",
+        ] {
+            assert!(
+                source.contains(required),
+                "missing fixed16 contract: {required}"
+            );
+        }
+        assert!(arithmetic.contains("__umulhi(a, b)"));
+        assert!(arithmetic.contains("(hi << 1) | (lo >> 31)"));
+        assert!(!arithmetic.contains("uint64_t"));
+        assert!(!arithmetic.contains("unsigned long long"));
+        assert!(fields.contains("#define STWO_M31_FAST32_GLOBAL 0"));
+        assert!(fields.contains("#if defined(__CUDA_ARCH__) && STWO_M31_FAST32_GLOBAL"));
+        assert!(fields.contains("return stwo_m31_mul_fast32(a, b);"));
+        assert!(fields.contains("uint64_t v = ((uint64_t) a * (uint64_t) b);"));
+        assert!(compact.contains("stwo_compact_consume_final16_quad"));
+        assert!(compact.contains("stwo_blake2s_compress_leaf_block_quad_device"));
+        assert!(source.contains("compact_scratch + quad * 16"));
+        assert!(!source.contains("consume_fused_leaf_message<FusedLeafSink::DirectCompact>"));
     }
 
     #[test]
@@ -215,10 +248,7 @@ mod tests {
 
     #[test]
     fn progressive_in_place_symbols_are_linked_in_cuda_and_stub_builds() {
-        assert_ne!(
-            raw::stwo_blake2s_progressive_expand_in_place_on as usize,
-            0
-        );
+        assert_ne!(raw::stwo_blake2s_progressive_expand_in_place_on as usize, 0);
         assert_ne!(
             raw::stwo_blake2s_progressive_finalize_in_place_on as usize,
             0

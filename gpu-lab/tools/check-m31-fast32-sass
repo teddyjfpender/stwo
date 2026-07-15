@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+"""Fail closed if fast32 source lines lower to wide/carry SASS."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+SOURCE_MARKER = re.compile(r'File\s+"([^"]+)",\s*line\s+\d+')
+INSTRUCTION = re.compile(r"/\*[0-9a-fA-F]+\*/")
+FORBIDDEN = re.compile(
+    r"\b(?:IMAD\.WIDE|IADD3\.X|UIADD3\.X|IADD\.X|IMAD\.X|SHF\.[LR]\.[A-Z0-9.]*64)\b"
+)
+
+
+def inspect(disassembly: str) -> tuple[int, list[str]]:
+    target = False
+    instructions = 0
+    violations: list[str] = []
+    for line in disassembly.splitlines():
+        marker = SOURCE_MARKER.search(line)
+        if marker:
+            target = Path(marker.group(1)).name == "m31_fast32.cuh"
+            continue
+        if target and INSTRUCTION.search(line):
+            instructions += 1
+            if FORBIDDEN.search(line):
+                violations.append(line.strip())
+    return instructions, violations
+
+
+def self_test() -> int:
+    narrow = '''//## File "/repo/m31_fast32.cuh", line 12
+/*0010*/ IMAD.HI.U32 R4, R2, R3, RZ;
+//## File "/repo/ntt_leaf_fused.cu", line 210
+/*0020*/ IMAD.WIDE.U32 R6, R2, 0x4, R4;
+'''
+    wide = '''//## File "/repo/m31_fast32.cuh", line 12
+/*0010*/ IMAD.WIDE.U32 R4, R2, R3, RZ;
+'''
+    assert inspect(narrow) == (1, [])
+    assert inspect(wide)[1]
+    print('{"contract":"m31-fast32-sass-v1","self_test":"PASS"}')
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("cubin", nargs="?", type=Path)
+    parser.add_argument("--nvdisasm", default=os.environ.get("NVDISASM", "nvdisasm"))
+    parser.add_argument("--self-test", action="store_true")
+    args = parser.parse_args()
+    if args.self_test:
+        return self_test()
+    if args.cubin is None or not args.cubin.is_file():
+        parser.error("an existing candidate cubin is required")
+    result = subprocess.run(
+        [args.nvdisasm, "-g", str(args.cubin)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        print(result.stderr, file=sys.stderr, end="")
+        return result.returncode
+    instructions, violations = inspect(result.stdout)
+    receipt = {
+        "contract": "m31-fast32-sass-v1",
+        "cubin_sha256": hashlib.sha256(args.cubin.read_bytes()).hexdigest(),
+        "source": "m31_fast32.cuh",
+        "attributed_instructions": instructions,
+        "forbidden_instructions": violations,
+        "result": "PASS" if instructions and not violations else "FAIL",
+    }
+    print(json.dumps(receipt, sort_keys=True, separators=(",", ":")))
+    return 0 if receipt["result"] == "PASS" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

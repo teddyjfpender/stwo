@@ -171,33 +171,6 @@ void stream_leaf_update_quad(
     states[leaf].s[quad_lane + 4] = h_high;
 }
 
-__host__ __device__ constexpr uint32_t progressive_pending_words(
-    uint32_t absorbed_columns) {
-    return absorbed_columns == 0 ? 0 : (absorbed_columns - 1) % 16 + 1;
-}
-
-bool compact_tail_descriptor_valid(
-    uint32_t size,
-    uint32_t absorbed_columns,
-    const CompactBlake2sTailDescriptor &tail) {
-    uint32_t target_log_size = 0;
-    for (uint32_t rows = size; rows > 1; rows >>= 1) ++target_log_size;
-    const uint32_t pending_words = progressive_pending_words(absorbed_columns);
-    for (uint32_t word = 0; word < 16; ++word) {
-        const uint64_t address = tail.column_addresses[word];
-        const uint32_t log_ratio = tail.log_ratios[word];
-        if (word < pending_words) {
-            if (address == 0 || (address & 3u) != 0 ||
-                log_ratio > target_log_size) {
-                return false;
-            }
-        } else if (address != 0 || log_ratio != 0) {
-            return false;
-        }
-    }
-    return true;
-}
-
 // One quad owns one native-domain row. The chaining value and lazy pending
 // block remain distributed across its four lanes for the complete canonical
 // batch; HBM sees one state read and one state write, irrespective of width.
@@ -234,7 +207,7 @@ void progressive_leaf_absorb_quad(
     }
     __syncwarp(mask);
 
-    uint32_t pending_words = progressive_pending_words(absorbed_columns_before);
+    uint32_t pending_words = stwo_compact_pending_words(absorbed_columns_before);
     uint32_t compressed_bytes = 4u * (absorbed_columns_before - pending_words);
     uint32_t consumed = 0;
     while (consumed < number_of_columns) {
@@ -294,7 +267,7 @@ void compact_leaf_absorb_quad(
     uint32_t h_high = initializes_state != 0
         ? kIv[quad_lane + 4]
         : states[row].s[quad_lane + 4];
-    uint32_t pending_words = progressive_pending_words(absorbed_columns_before);
+    uint32_t pending_words = stwo_compact_pending_words(absorbed_columns_before);
     for (uint32_t word = quad_lane; word < pending_words;
          word += kQuadWidth) {
         const uint32_t *column = reinterpret_cast<const uint32_t *>(
@@ -369,7 +342,7 @@ void compact_leaf_absorb_n2b_terminal_pair(
     uint32_t h_high = initializes_state != 0
         ? kIv[quad_lane + 4]
         : states[row].s[quad_lane + 4];
-    uint32_t pending_words = progressive_pending_words(absorbed_columns_before);
+    uint32_t pending_words = stwo_compact_pending_words(absorbed_columns_before);
     for (uint32_t word = quad_lane; word < pending_words;
          word += kQuadWidth) {
         const uint32_t *column = reinterpret_cast<const uint32_t *>(
@@ -437,7 +410,7 @@ void compact_leaf_finalize_quad_in_place(
     const uint32_t mask = 0xFu << (lane_in_warp & ~3u);
     const uint32_t local_row = threadIdx.x / kQuadWidth;
     __shared__ uint32_t messages[kLeavesPerBlock][16];
-    const uint32_t pending_words = progressive_pending_words(absorbed_columns);
+    const uint32_t pending_words = stwo_compact_pending_words(absorbed_columns);
     for (uint32_t word = quad_lane; word < 16; word += kQuadWidth) {
         if (word < pending_words) {
             const uint32_t *column = reinterpret_cast<const uint32_t *>(
@@ -459,6 +432,29 @@ void compact_leaf_finalize_quad_in_place(
 }
 
 }  // namespace
+
+__device__ void stwo_blake2s_init_leaf_state_quad_device(Blake2sHash *state) {
+    const uint32_t quad_lane = threadIdx.x & 3u;
+    state->s[quad_lane] = kIv[quad_lane]
+        ^ (quad_lane == 0 ? 0x01010020u : 0u);
+    state->s[quad_lane + 4] = kIv[quad_lane + 4];
+}
+
+__device__ void stwo_blake2s_compress_leaf_block_quad_device(
+    Blake2sHash *state,
+    const uint32_t message[16],
+    uint32_t total_bytes,
+    uint32_t lastblock) {
+    const uint32_t quad_lane = threadIdx.x & 3u;
+    const uint32_t lane_in_warp = threadIdx.x & 31u;
+    const uint32_t mask = 0xFu << (lane_in_warp & ~3u);
+    uint32_t h_low = state->s[quad_lane];
+    uint32_t h_high = state->s[quad_lane + 4];
+    compress_quad(mask, quad_lane, h_low, h_high, message,
+                  total_bytes, lastblock);
+    state->s[quad_lane] = h_low;
+    state->s[quad_lane + 4] = h_high;
+}
 
 extern "C" int stwo_blake2s_leaf_update_quad_on(
     uint32_t size,
@@ -529,7 +525,7 @@ extern "C" int stwo_blake2s_compact_absorb_quad_on(
         return cudaErrorInvalidValue;
     }
     const CompactBlake2sTailDescriptor descriptor = *tail;
-    if (!compact_tail_descriptor_valid(
+    if (!stwo_compact_tail_descriptor_valid(
             size, absorbed_columns_before, descriptor)) {
         return cudaErrorInvalidValue;
     }
@@ -564,7 +560,7 @@ extern "C" int stwo_blake2s_compact_absorb_n2b_terminal_pair_on(
         return cudaErrorInvalidValue;
     }
     const CompactBlake2sTailDescriptor descriptor = *tail;
-    if (!compact_tail_descriptor_valid(
+    if (!stwo_compact_tail_descriptor_valid(
             size, absorbed_columns_before, descriptor)) {
         return cudaErrorInvalidValue;
     }
@@ -591,7 +587,7 @@ extern "C" int stwo_blake2s_compact_finalize_quad_in_place_on(
         return cudaErrorInvalidValue;
     }
     const CompactBlake2sTailDescriptor descriptor = *tail;
-    if (!compact_tail_descriptor_valid(size, absorbed_columns, descriptor)) {
+    if (!stwo_compact_tail_descriptor_valid(size, absorbed_columns, descriptor)) {
         return cudaErrorInvalidValue;
     }
     const uint32_t blocks = 1 + (size - 1) / kLeavesPerBlock;

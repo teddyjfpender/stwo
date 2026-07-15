@@ -400,6 +400,7 @@ fn value_aliases_allow_only_the_same_owner_lower_prefix() {
             retained_output: ArenaSlice::dangling_at_for_test(5, 500, 32),
         },
     ];
+    let admitted = columns.clone();
     let token = columns[0].source_evaluations.context_token();
     let logical = bind_logical_columns(&direct, &columns, token).unwrap();
     let inverse_twiddles = ArenaSlice::dangling_at_for_test(9, 700, 64);
@@ -427,6 +428,17 @@ fn value_aliases_allow_only_the_same_owner_lower_prefix() {
 
     columns[0].source_evaluations = ArenaSlice::dangling_at_for_test(6, 100, 8);
     let logical = bind_logical_columns(&direct, &columns, token).unwrap();
+    assert!(matches!(
+        validate_value_aliases(&logical, inverse_twiddles, forward_twiddles),
+        Err(DirectRetainedB2nError::InvalidAlias { .. })
+    ));
+
+    // Terminal pair ownership writes four-column tranches in place. Distinct
+    // canonical outputs must therefore be disjoint even when their Arena IDs
+    // differ and only their physical address ranges overlap.
+    let mut terminal_alias = admitted;
+    terminal_alias[1].retained_output = ArenaSlice::dangling_at_for_test(12, 108, 16);
+    let logical = bind_logical_columns(&direct, &terminal_alias, token).unwrap();
     assert!(matches!(
         validate_value_aliases(&logical, inverse_twiddles, forward_twiddles),
         Err(DirectRetainedB2nError::InvalidAlias { .. })

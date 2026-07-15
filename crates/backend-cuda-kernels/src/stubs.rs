@@ -2083,6 +2083,32 @@ pub unsafe extern "C" fn stwo_ntt_n2b_columns_from_stage_two_before_circle_on(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_ntt_n2b_columns_from_stage_two_before_final_interval_on(
+    _device_values: *const *mut u32,
+    _log_n: u32,
+    _num_poly: u32,
+    _g_twiddles: *mut u32,
+    _twiddles_size: u32,
+    _eval_domain_size: u32,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_ntt_n2b_columns_from_stage_two_before_final_interval_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_ntt_n2b_columns_final_interval_before_circle_on(
+    _device_values: *const *mut u32,
+    _log_n: u32,
+    _num_poly: u32,
+    _g_twiddles: *mut u32,
+    _twiddles_size: u32,
+    _eval_domain_size: u32,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_ntt_n2b_columns_final_interval_before_circle_on")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stwo_lde_n2b_columns_on(
     _coefficient_values: *const *const u32,
     _coefficient_sizes: *const u32,
@@ -3304,4 +3330,25 @@ pub unsafe extern "C" fn stwo_ntt_progressive_leaf_fused_on(
     _stream: *mut c_void,
 ) -> i32 {
     no_cuda_symbol("stwo_ntt_progressive_leaf_fused_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_ntt_direct_compact_final16_configure(_log_n: u32) -> i32 {
+    no_cuda_symbol("stwo_ntt_direct_compact_final16_configure")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_ntt_direct_compact_final16_on(
+    _device_values: *const *mut u32,
+    _log_n: u32,
+    _tiles: u32,
+    _g_twiddles: *mut u32,
+    _twiddles_size: u32,
+    _eval_domain_size: u32,
+    _cols_done: u32,
+    _initial_tail: *const CompactBlake2sTailDescriptor,
+    _states: *mut Blake2sHash,
+    _stream: *mut c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_ntt_direct_compact_final16_on")
 }

@@ -27,8 +27,9 @@ use super::program::{
 /// releasing base values instead of retaining the whole base section; 6 = demand-
 /// driven versioned base-cone emission plus folding each ready canonical constraint-
 /// root prefix into `acc` at its final definition, eliminating artificial base/root
-/// lifetimes without changing the ext or coefficient order.
-pub const CODEGEN_VERSION: u64 = 6;
+/// lifetimes without changing the ext or coefficient order; 7 = default-off
+/// `STWO_M31_FAST32_GLOBAL` candidate with the byte-identical 64-bit fallback.
+pub const CODEGEN_VERSION: u64 = 7;
 
 /// Cache key for compiled kernels: the program's content semantic hash mixed (FNV-1a)
 /// with [`CODEGEN_VERSION`]. This is the key for both the in-process function cache
@@ -501,6 +502,13 @@ typedef unsigned long long u64;
 
 #define STWO_M31_P 2147483647u
 
+#ifndef STWO_M31_FAST32_GLOBAL
+#define STWO_M31_FAST32_GLOBAL 0
+#endif
+#if STWO_M31_FAST32_GLOBAL != 0 && STWO_M31_FAST32_GLOBAL != 1
+#error \"STWO_M31_FAST32_GLOBAL must be 0 or 1\"
+#endif
+
 __device__ __forceinline__ unsigned stwo_m31_add(unsigned lhs, unsigned rhs) {
     unsigned sum = lhs + rhs;
     return sum >= STWO_M31_P ? sum - STWO_M31_P : sum;
@@ -516,9 +524,18 @@ __device__ __forceinline__ unsigned stwo_m31_neg(unsigned value) {
 }
 
 __device__ __forceinline__ unsigned stwo_m31_mul(unsigned lhs, unsigned rhs) {
+#if STWO_M31_FAST32_GLOBAL
+    unsigned lo = lhs * rhs;
+    unsigned hi = __umulhi(lhs, rhs);
+    unsigned quotient = (hi << 1) | (lo >> 31);
+    unsigned reduced = (lo & STWO_M31_P) + quotient;
+    reduced = (reduced & STWO_M31_P) + (reduced >> 31);
+    return reduced == STWO_M31_P ? 0u : reduced;
+#else
     u64 product = (u64)lhs * (u64)rhs;
     u64 reduced = (((((product >> 31) + product + 1u) >> 31) + product) & (u64)STWO_M31_P);
     return (unsigned)reduced;
+#endif
 }
 
 __device__ __forceinline__ unsigned stwo_m31_square(unsigned value) {

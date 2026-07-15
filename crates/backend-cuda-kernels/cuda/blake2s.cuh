@@ -30,6 +30,33 @@ struct alignas(8) CompactBlake2sTailDescriptor {
     uint32_t log_ratios[16];
 };
 
+__host__ __device__ constexpr uint32_t stwo_compact_pending_words(
+    uint32_t absorbed_columns) {
+    return absorbed_columns == 0 ? 0 : (absorbed_columns - 1) % 16 + 1;
+}
+
+inline bool stwo_compact_tail_descriptor_valid(
+    uint32_t size,
+    uint32_t absorbed_columns,
+    const CompactBlake2sTailDescriptor &tail) {
+    uint32_t target_log_size = 0;
+    for (uint32_t rows = size; rows > 1; rows >>= 1) ++target_log_size;
+    const uint32_t pending_words = stwo_compact_pending_words(absorbed_columns);
+    for (uint32_t word = 0; word < 16; ++word) {
+        const uint64_t address = tail.column_addresses[word];
+        const uint32_t log_ratio = tail.log_ratios[word];
+        if (word < pending_words) {
+            if (address == 0 || (address & 3u) != 0 ||
+                log_ratio > target_log_size) {
+                return false;
+            }
+        } else if (address != 0 || log_ratio != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static_assert(sizeof(CompactBlake2sTailDescriptor) == 192,
               "compact Blake2s tail descriptor must be 192 bytes");
 static_assert(alignof(CompactBlake2sTailDescriptor) == 8,
@@ -58,6 +85,15 @@ __device__ void stwo_blake2s_hash2_device(
 // Cross-translation-unit sink for the fused N2B→leaf kernel. `message` is one
 // exact 16-word block; `state` already contains the running h[8].
 __device__ void stwo_blake2s_compress_leaf_block_device(
+    Blake2sHash *state,
+    const uint32_t message[16],
+    uint32_t total_bytes,
+    uint32_t lastblock);
+
+// Cooperative low-register counterparts. Exactly one aligned four-lane warp
+// subgroup calls each function for one state/message.
+__device__ void stwo_blake2s_init_leaf_state_quad_device(Blake2sHash *state);
+__device__ void stwo_blake2s_compress_leaf_block_quad_device(
     Blake2sHash *state,
     const uint32_t message[16],
     uint32_t total_bytes,

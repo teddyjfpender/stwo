@@ -515,73 +515,6 @@ impl<'a> PreparedDirectRetainedB2nGraph<'a> {
                 .count(),
         })
     }
-
-    pub fn launch(&self) -> Result<(), DirectRetainedB2nError> {
-        let stream = self.arena.context().stream_raw().as_ptr();
-        for batch in &self.batches {
-            let eval_domain_size = 1u32
-                .checked_shl(batch.source_log_size - 1)
-                .ok_or(DirectRetainedB2nError::SizeOverflow)?;
-            let code = unsafe {
-                stwo_backend_cuda_kernels::raw::stwo_ntt_b2n_columns_to_retained_on(
-                    batch.input_pointers.as_u32_ptr().cast(),
-                    batch.output_pointers.as_u32_ptr().cast(),
-                    batch.source_log_size,
-                    batch.columns,
-                    self.inverse_twiddles.as_u32_ptr(),
-                    self.inverse_twiddle_words,
-                    eval_domain_size,
-                    stream,
-                )
-            };
-            check_cuda("direct_retained_b2n", code)?;
-
-            let eval_domain_size = 1u32
-                .checked_shl(batch.retained_log_size - 1)
-                .ok_or(DirectRetainedB2nError::SizeOverflow)?;
-            let code = unsafe {
-                stwo_backend_cuda_kernels::raw::stwo_ntt_n2b_columns_from_stage_two_on(
-                    batch.output_pointers.as_u32_ptr().cast(),
-                    batch.retained_log_size,
-                    batch.columns,
-                    self.forward_twiddles.as_u32_ptr(),
-                    self.forward_twiddle_words,
-                    eval_domain_size,
-                    stream,
-                )
-            };
-            check_cuda("direct_retained_n2b_stage_two", code)?;
-        }
-        Ok(())
-    }
-
-    pub fn launch_sequence(
-        &self,
-    ) -> impl ExactSizeIterator<Item = DirectRetainedB2nLaunchKind> + '_ {
-        self.batches.iter().copied().map(|batch| {
-            batch.launch_kind(
-                self.role,
-                self.inverse_twiddle_words,
-                self.forward_twiddle_words,
-            )
-        })
-    }
-
-    pub fn commit_cache_key(&self) -> u64 {
-        self.commit_cache_key
-    }
-
-    pub fn retained_evaluations(&self) -> &[ArenaSlice] {
-        &self.retained_evaluations
-    }
-
-    pub(super) fn prepared_batches(&self) -> &[PreparedBatch] {
-        &self.batches
-    }
-
-    pub fn exact_lower_prefix_aliases(&self) -> usize {
-        self.exact_lower_prefix_aliases
-    }
 }
 
 fn admit_twiddles(
@@ -759,6 +692,9 @@ fn words(log_size: u32) -> Result<usize, DirectRetainedB2nError> {
         .checked_shl(log_size)
         .ok_or(DirectRetainedB2nError::SizeOverflow)
 }
+
+#[path = "direct_retained_b2n/launch.rs"]
+mod launch;
 
 #[cfg(test)]
 #[path = "direct_retained_b2n_tests.rs"]

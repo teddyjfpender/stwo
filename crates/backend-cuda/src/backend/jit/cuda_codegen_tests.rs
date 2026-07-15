@@ -7,6 +7,28 @@ use crate::backend::jit::program::{
 };
 
 #[test]
+fn generated_m31_fast32_candidate_is_default_off_and_preserves_fallback() {
+    let mut source = String::new();
+    emit_preamble(&mut source);
+    for required in [
+        "#define STWO_M31_FAST32_GLOBAL 0",
+        "#if STWO_M31_FAST32_GLOBAL",
+        "unsigned hi = __umulhi(lhs, rhs);",
+        "u64 product = (u64)lhs * (u64)rhs;",
+        "#error \"STWO_M31_FAST32_GLOBAL must be 0 or 1\"",
+    ] {
+        assert!(
+            source.contains(required),
+            "missing preamble gate: {required}"
+        );
+    }
+    assert!(
+        source.find("#if STWO_M31_FAST32_GLOBAL").unwrap()
+            < source.find("u64 product = (u64)lhs * (u64)rhs;").unwrap()
+    );
+}
+
+#[test]
 fn shifted_trace_codegen_threads_the_true_trace_log() {
     let header = MetalEvaluationProgramHeaderV1::new(0, 0x1234, 0, 1, 0, 0, 1, 1, 1);
     let program = OwnedMetalEvaluationProgramV1::from_parts(
