@@ -2320,6 +2320,17 @@ extern "C" {
         handle: *mut core::ffi::c_void,
         out_stream: *mut *mut core::ffi::c_void,
     ) -> i32;
+    pub fn stwo_exec_context_timing_begin(
+        handle: *mut core::ffi::c_void,
+        out_interval_capacity: *mut u32,
+    ) -> i32;
+    pub fn stwo_exec_context_timing_mark(handle: *mut core::ffi::c_void) -> i32;
+    pub fn stwo_exec_context_timing_elapsed(
+        handle: *mut core::ffi::c_void,
+        out_elapsed_ms: *mut f32,
+        capacity: u32,
+        out_count: *mut u32,
+    ) -> i32;
     pub fn stwo_exec_context_lane_count(handle: *mut core::ffi::c_void, out_count: *mut u32)
         -> i32;
     pub fn stwo_exec_context_lane_stream(

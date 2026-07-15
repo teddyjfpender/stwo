@@ -28,12 +28,15 @@
 
 namespace {
 constexpr uint32_t STWO_EXEC_LANE_COUNT = 8;
+constexpr uint32_t STWO_EXEC_TIMING_EVENT_COUNT = 32;
 
 struct StwoExecContext {
     cudaStream_t stream;
     cudaStream_t lanes[STWO_EXEC_LANE_COUNT];
     cudaEvent_t lane_forks[STWO_EXEC_LANE_COUNT];
     cudaEvent_t lane_joins[STWO_EXEC_LANE_COUNT];
+    cudaEvent_t timing_events[STWO_EXEC_TIMING_EVENT_COUNT];
+    uint32_t timing_marker_count;
     cudaMemPool_t pool;
 };
 
@@ -203,6 +206,10 @@ extern "C" int stwo_exec_context_create(void **out_handle) {
         ctx->lane_forks[lane] = nullptr;
         ctx->lane_joins[lane] = nullptr;
     }
+    for (uint32_t marker = 0; marker < STWO_EXEC_TIMING_EVENT_COUNT; ++marker) {
+        ctx->timing_events[marker] = nullptr;
+    }
+    ctx->timing_marker_count = 0;
     ctx->pool = nullptr;
 
     cudaError_t err = cudaStreamCreateWithFlags(&ctx->stream, cudaStreamNonBlocking);
@@ -303,6 +310,11 @@ extern "C" int stwo_exec_context_destroy(void *handle) {
     if (ctx->stream != nullptr) {
         err = first_error(err, cudaStreamSynchronize(ctx->stream));
     }
+    for (uint32_t marker = 0; marker < STWO_EXEC_TIMING_EVENT_COUNT; ++marker) {
+        if (ctx->timing_events[marker] != nullptr) {
+            err = first_error(err, cudaEventDestroy(ctx->timing_events[marker]));
+        }
+    }
     for (uint32_t lane = 0; lane < STWO_EXEC_LANE_COUNT; ++lane) {
         if (ctx->lane_joins[lane] != nullptr) {
             err = first_error(err, cudaEventDestroy(ctx->lane_joins[lane]));
@@ -390,6 +402,91 @@ extern "C" int stwo_exec_context_stream(void *handle, void **out_stream) {
     }
     *out_stream = reinterpret_cast<void *>(context_from(handle)->stream);
     return *out_stream == nullptr ? cudaErrorInvalidResourceHandle : cudaSuccess;
+}
+
+// Diagnostic-only device timeline. Events are created on first use, before the
+// first recorded marker, and then reused across warm proofs. Recording a marker
+// is asynchronous; elapsed time is queried only after the proof's existing
+// stream fence, so instrumentation adds no synchronization to the hot path.
+extern "C" int stwo_exec_context_timing_begin(
+    void *handle, uint32_t *out_interval_capacity
+) {
+    if (handle == nullptr || out_interval_capacity == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    *out_interval_capacity = 0;
+    StwoExecContext *ctx = context_from(handle);
+    if (ctx->timing_events[0] == nullptr) {
+        for (uint32_t marker = 0; marker < STWO_EXEC_TIMING_EVENT_COUNT; ++marker) {
+            cudaError_t err = cudaEventCreate(&ctx->timing_events[marker]);
+            if (err != cudaSuccess) {
+                for (uint32_t cleanup = 0; cleanup <= marker; ++cleanup) {
+                    if (ctx->timing_events[cleanup] != nullptr) {
+                        cudaEventDestroy(ctx->timing_events[cleanup]);
+                        ctx->timing_events[cleanup] = nullptr;
+                    }
+                }
+                ctx->timing_marker_count = 0;
+                return err;
+            }
+        }
+    }
+    ctx->timing_marker_count = 0;
+    cudaError_t err = cudaEventRecord(ctx->timing_events[0], ctx->stream);
+    if (err != cudaSuccess) {
+        return err;
+    }
+    ctx->timing_marker_count = 1;
+    *out_interval_capacity = STWO_EXEC_TIMING_EVENT_COUNT - 1;
+    return cudaSuccess;
+}
+
+extern "C" int stwo_exec_context_timing_mark(void *handle) {
+    if (handle == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    StwoExecContext *ctx = context_from(handle);
+    if (ctx->timing_marker_count == 0 ||
+        ctx->timing_marker_count >= STWO_EXEC_TIMING_EVENT_COUNT) {
+        return cudaErrorInvalidValue;
+    }
+    cudaError_t err = cudaEventRecord(
+        ctx->timing_events[ctx->timing_marker_count], ctx->stream);
+    if (err == cudaSuccess) {
+        ++ctx->timing_marker_count;
+    }
+    return err;
+}
+
+extern "C" int stwo_exec_context_timing_elapsed(
+    void *handle,
+    float *out_elapsed_ms,
+    uint32_t capacity,
+    uint32_t *out_count
+) {
+    if (handle == nullptr || out_elapsed_ms == nullptr || out_count == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    *out_count = 0;
+    StwoExecContext *ctx = context_from(handle);
+    if (ctx->timing_marker_count < 2) {
+        return cudaErrorInvalidValue;
+    }
+    const uint32_t count = ctx->timing_marker_count - 1;
+    if (capacity < count) {
+        return cudaErrorInvalidValue;
+    }
+    for (uint32_t interval = 0; interval < count; ++interval) {
+        cudaError_t err = cudaEventElapsedTime(
+            &out_elapsed_ms[interval],
+            ctx->timing_events[interval],
+            ctx->timing_events[interval + 1]);
+        if (err != cudaSuccess) {
+            return err;
+        }
+    }
+    *out_count = count;
+    return cudaSuccess;
 }
 
 // Capture-safe component lanes owned by the proof context. Streams and events

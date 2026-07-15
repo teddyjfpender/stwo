@@ -60,15 +60,32 @@ pub enum CudaRuntimeError {
     /// This binary was built without the CUDA kernel archive.
     Unavailable,
     /// CUDA returned a non-zero status code.
-    Cuda { operation: &'static str, code: i32 },
+    Cuda {
+        operation: &'static str,
+        code: i32,
+    },
     /// CUDA reported success without returning the required opaque pointer.
-    NullPointer { operation: &'static str },
+    NullPointer {
+        operation: &'static str,
+    },
     /// A requested allocation size overflowed `usize` bytes.
     SizeOverflow,
     /// A graph or arena-backed plan was launched on a different context.
     ContextMismatch,
     /// A component scheduler selected a lane not owned by this context.
-    InvalidLane { lane: usize, lane_count: usize },
+    InvalidLane {
+        lane: usize,
+        lane_count: usize,
+    },
+    TimingNotStarted,
+    TimingIntervalCapacity {
+        requested: usize,
+        available: usize,
+    },
+    TimingIntervalCount {
+        expected: usize,
+        actual: usize,
+    },
 }
 
 impl core::fmt::Display for CudaRuntimeError {
@@ -87,6 +104,20 @@ impl core::fmt::Display for CudaRuntimeError {
                 write!(
                     f,
                     "CUDA lane {lane} is outside the {lane_count} owned lanes"
+                )
+            }
+            Self::TimingNotStarted => f.write_str("CUDA diagnostic timing was not started"),
+            Self::TimingIntervalCapacity {
+                requested,
+                available,
+            } => write!(
+                f,
+                "CUDA diagnostic timing requested {requested} intervals, capacity is {available}"
+            ),
+            Self::TimingIntervalCount { expected, actual } => {
+                write!(
+                    f,
+                    "CUDA timing interval count mismatch: expected {expected}, got {actual}"
                 )
             }
         }
@@ -140,6 +171,7 @@ pub struct CudaExecContext {
     lanes: Vec<NonNull<c_void>>,
     telemetry: Cell<CudaExecTelemetry>,
     last_graph_submit: Cell<Option<std::time::Instant>>,
+    timing_interval_capacity: Cell<Option<usize>>,
     _not_sync: PhantomData<Cell<()>>,
 }
 
@@ -271,6 +303,7 @@ impl CudaExecContext {
             lanes,
             telemetry: Cell::new(CudaExecTelemetry::default()),
             last_graph_submit: Cell::new(None),
+            timing_interval_capacity: Cell::new(None),
             _not_sync: PhantomData,
         })
     }
@@ -293,6 +326,69 @@ impl CudaExecContext {
     /// Opaque CUDA stream pointer for stream-explicit kernel launch wrappers.
     pub fn stream_raw(&self) -> NonNull<c_void> {
         self.stream
+    }
+
+    /// Begin a diagnostic-only device timeline on the proof's main stream.
+    /// Timed events are allocated lazily by the native context and reused; the
+    /// returned capacity is the maximum number of intervals that may be marked.
+    pub fn begin_timing(&self) -> Result<usize, CudaRuntimeError> {
+        let mut capacity = 0u32;
+        let code = unsafe {
+            stwo_backend_cuda_kernels::raw::stwo_exec_context_timing_begin(
+                self.handle.as_ptr(),
+                &mut capacity,
+            )
+        };
+        check_cuda("exec_context_timing_begin", code)?;
+        let capacity = capacity as usize;
+        self.timing_interval_capacity.set(Some(capacity));
+        Ok(capacity)
+    }
+
+    /// Record the end of one asynchronously enqueued device interval.
+    pub fn mark_timing(&self) -> Result<(), CudaRuntimeError> {
+        let code = unsafe {
+            stwo_backend_cuda_kernels::raw::stwo_exec_context_timing_mark(self.handle.as_ptr())
+        };
+        check_cuda("exec_context_timing_mark", code)
+    }
+
+    /// Read adjacent event durations after the caller has drained the stream at
+    /// its existing protocol fence. This method never synchronizes.
+    pub fn elapsed_timing_ms(
+        &self,
+        expected_intervals: usize,
+    ) -> Result<Vec<f32>, CudaRuntimeError> {
+        let available = self
+            .timing_interval_capacity
+            .get()
+            .ok_or(CudaRuntimeError::TimingNotStarted)?;
+        if expected_intervals > available {
+            return Err(CudaRuntimeError::TimingIntervalCapacity {
+                requested: expected_intervals,
+                available,
+            });
+        }
+        let capacity = expected_intervals as u32;
+        let mut elapsed = vec![0.0f32; expected_intervals];
+        let mut actual = 0u32;
+        let code = unsafe {
+            stwo_backend_cuda_kernels::raw::stwo_exec_context_timing_elapsed(
+                self.handle.as_ptr(),
+                elapsed.as_mut_ptr(),
+                capacity,
+                &mut actual,
+            )
+        };
+        check_cuda("exec_context_timing_elapsed", code)?;
+        let actual = actual as usize;
+        if actual != expected_intervals {
+            return Err(CudaRuntimeError::TimingIntervalCount {
+                expected: expected_intervals,
+                actual,
+            });
+        }
+        Ok(elapsed)
     }
 
     pub fn launch_context(&self) -> CudaLaunchContext {
@@ -1311,6 +1407,27 @@ mod tests {
 
     /// Native graph gate: one captured D2D node replays against the same arena
     /// addresses while the source slot changes between launches.
+    #[cfg(stwo_cuda_link)]
+    #[test]
+    fn diagnostic_timing_events_are_reused_without_an_internal_fence() {
+        let context = CudaExecContext::new().unwrap();
+        let capacity = context.begin_timing().unwrap();
+        assert_eq!(capacity, 31);
+        for _ in 0..capacity {
+            context.mark_timing().unwrap();
+        }
+        assert!(context.mark_timing().is_err());
+        context.sync().unwrap();
+        let first = context.elapsed_timing_ms(capacity).unwrap();
+        assert_eq!(first.len(), capacity);
+        assert!(first.iter().all(|value| value.is_finite() && *value >= 0.0));
+
+        assert_eq!(context.begin_timing().unwrap(), capacity);
+        context.mark_timing().unwrap();
+        context.sync().unwrap();
+        assert_eq!(context.elapsed_timing_ms(1).unwrap().len(), 1);
+    }
+
     #[cfg(stwo_cuda_link)]
     #[test]
     fn graph_capture_replays_over_stable_arena_slots() {

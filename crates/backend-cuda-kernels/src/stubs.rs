@@ -2663,6 +2663,29 @@ pub unsafe extern "C" fn stwo_exec_context_stream(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_exec_context_timing_begin(
+    _handle: *mut core::ffi::c_void,
+    _out_interval_capacity: *mut u32,
+) -> i32 {
+    no_cuda_symbol("stwo_exec_context_timing_begin")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_exec_context_timing_mark(_handle: *mut core::ffi::c_void) -> i32 {
+    no_cuda_symbol("stwo_exec_context_timing_mark")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_exec_context_timing_elapsed(
+    _handle: *mut core::ffi::c_void,
+    _out_elapsed_ms: *mut f32,
+    _capacity: u32,
+    _out_count: *mut u32,
+) -> i32 {
+    no_cuda_symbol("stwo_exec_context_timing_elapsed")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stwo_exec_context_lane_count(
     _handle: *mut core::ffi::c_void,
     _out_count: *mut u32,
