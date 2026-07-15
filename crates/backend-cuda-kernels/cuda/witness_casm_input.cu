@@ -42,7 +42,9 @@ extern "C" int stwo_witness_casm_input_scatter_on(
     uint32_t *iota_dev,
     void *stream_ptr
 ) {
-    if (n_real == 0 || n_real > consumer_rows || rows_dev == nullptr ||
+    if (n_real == 0 || consumer_rows < 16 ||
+        (consumer_rows & (consumer_rows - 1)) != 0 ||
+        n_real > consumer_rows || rows_dev == nullptr ||
         pc_dev == nullptr || ap_dev == nullptr || fp_dev == nullptr ||
         enabler_dev == nullptr) {
         fprintf(stderr, "stwo_witness_casm_input_scatter_on: invalid geometry\n");

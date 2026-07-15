@@ -59,6 +59,21 @@ fn row_major_casm_ingress_matches_host_padding_and_reuses_staging() {
     )
     .unwrap();
     let stage = PreparedWitnessCasmInputStage::prepare(&arena, &requirements, &slots).unwrap();
+    let columns = stage.consumer_input_columns();
+    let invalid_geometry = unsafe {
+        stwo_backend_cuda_kernels::raw::stwo_witness_casm_input_scatter_on(
+            stage.staging().as_u32_ptr().cast_const(),
+            3,
+            15,
+            columns[0].as_u32_ptr(),
+            columns[1].as_u32_ptr(),
+            columns[2].as_u32_ptr(),
+            columns[3].as_u32_ptr(),
+            columns[4].as_u32_ptr(),
+            arena.context().stream_raw().as_ptr(),
+        )
+    };
+    assert_ne!(invalid_geometry, 0);
 
     for seed in [0, 1_000] {
         let rows = [
