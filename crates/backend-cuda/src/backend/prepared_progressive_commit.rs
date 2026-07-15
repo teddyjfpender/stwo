@@ -28,6 +28,14 @@ use super::progressive_ntt_leaf_fusion::{
 };
 
 mod in_place;
+mod program;
+mod program_oracle;
+
+pub use program::{
+    CommitProgram, CommitProgramError, CommitProgramIdentity, CommitProgramLayer,
+    CommitProgramOperation, CommitProgramStep, CommitProgramTraffic,
+};
+pub use program_oracle::{CommitProgramFixture, CommitProgramOracle, CommitProgramOracleLayer};
 
 const WORD_BYTES: usize = core::mem::size_of::<u32>();
 const POINTER_WORDS: usize = core::mem::size_of::<*mut u32>().div_ceil(WORD_BYTES);
