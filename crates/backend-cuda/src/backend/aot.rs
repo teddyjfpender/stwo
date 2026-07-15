@@ -102,6 +102,142 @@ pub struct EmittedKernel {
 pub struct EmittedConstraintKernel {
     pub kernel: EmittedKernel,
     pub rc_base: u32,
+    /// Opaque lowered program reused only when `kernel_emit` assembles an
+    /// exact same-domain composition wave. Production plans keep the ordinary
+    /// kernel identity and never interpret this representation.
+    pub wave_fragment: ConstraintWaveFragment,
+}
+
+/// One resource-governed constraint part retained for offline wave emission.
+/// Its bytecode fields stay private so callers cannot construct a source/key
+/// pair which did not come from the canonical constraint lowerer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConstraintWaveFragment {
+    program: super::jit::OwnedMetalEvaluationProgramV1,
+}
+
+impl ConstraintWaveFragment {
+    pub fn semantic_hash(&self) -> u64 {
+        self.program.header().semantic_hash
+    }
+}
+
+/// Stable identity of one exact evaluation-domain composition wave.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompositionWaveKernelIdentity {
+    pub evaluation_log_size: u32,
+    pub part_count: usize,
+    pub kernel_name: String,
+    pub semantic_hash: u64,
+    pub cache_key: u64,
+}
+
+/// Source-independent identity of one canonical part inside a wave. The
+/// coefficient span is proof-global and makes a reordered or cross-domain
+/// descriptor set a different AOT key even when two AIR parts share bytecode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompositionWaveKernelPartIdentity {
+    pub semantic_hash: u64,
+    pub coefficient_start: u32,
+    pub coefficient_end: u32,
+}
+
+/// Version of the wave ABI/source emitter. Independent from the ordinary
+/// per-part emitter because both kernel families coexist in the AOT pack.
+pub const COMPOSITION_WAVE_CODEGEN_VERSION: u64 = 1;
+
+fn composition_wave_semantic_hashes_match(
+    identities: &[CompositionWaveKernelPartIdentity],
+    fragment_semantic_hashes: &[u64],
+) -> bool {
+    identities.len() == fragment_semantic_hashes.len()
+        && identities
+            .iter()
+            .zip(fragment_semantic_hashes)
+            .all(|(identity, &fragment_hash)| identity.semantic_hash == fragment_hash)
+}
+
+/// Derive the runtime identity without retaining CUDA source or bytecode.
+pub fn composition_wave_kernel_identity(
+    evaluation_log_size: u32,
+    parts: &[CompositionWaveKernelPartIdentity],
+) -> Option<CompositionWaveKernelIdentity> {
+    if !(2..=30).contains(&evaluation_log_size)
+        || parts.is_empty()
+        || parts
+            .iter()
+            .any(|part| part.semantic_hash == 0 || part.coefficient_start >= part.coefficient_end)
+        || parts
+            .windows(2)
+            .any(|pair| pair[0].coefficient_end > pair[1].coefficient_start)
+    {
+        return None;
+    }
+    let mut semantic_hash = 0xcbf29ce484222325u64;
+    let mut feed = |bytes: &[u8]| {
+        for &byte in bytes {
+            semantic_hash ^= u64::from(byte);
+            semantic_hash = semantic_hash.wrapping_mul(0x100000001b3);
+        }
+    };
+    feed(b"stwo-cuda-composition-wave-v1\0");
+    feed(&evaluation_log_size.to_le_bytes());
+    feed(&(parts.len() as u64).to_le_bytes());
+    for part in parts {
+        feed(&part.semantic_hash.to_le_bytes());
+        feed(&part.coefficient_start.to_le_bytes());
+        feed(&part.coefficient_end.to_le_bytes());
+    }
+    let mut cache_key = 0xcbf29ce484222325u64;
+    for byte in semantic_hash
+        .to_le_bytes()
+        .into_iter()
+        .chain(super::jit::cuda_codegen::CODEGEN_VERSION.to_le_bytes())
+        .chain(COMPOSITION_WAVE_CODEGEN_VERSION.to_le_bytes())
+    {
+        cache_key ^= u64::from(byte);
+        cache_key = cache_key.wrapping_mul(0x100000001b3);
+    }
+    Some(CompositionWaveKernelIdentity {
+        evaluation_log_size,
+        part_count: parts.len(),
+        kernel_name: format!("stwo_composition_wave_{semantic_hash:016x}"),
+        semantic_hash,
+        cache_key,
+    })
+}
+
+/// Emit one self-contained AOT source for a canonical same-domain wave.
+pub fn composition_wave_kernel_source(
+    evaluation_log_size: u32,
+    parts: &[(CompositionWaveKernelPartIdentity, ConstraintWaveFragment)],
+) -> Option<EmittedKernel> {
+    let part_identities = parts
+        .iter()
+        .map(|(identity, _)| *identity)
+        .collect::<Vec<_>>();
+    let fragment_semantic_hashes = parts
+        .iter()
+        .map(|(_, fragment)| fragment.semantic_hash())
+        .collect::<Vec<_>>();
+    if !composition_wave_semantic_hashes_match(&part_identities, &fragment_semantic_hashes) {
+        return None;
+    }
+    let identity = composition_wave_kernel_identity(evaluation_log_size, &part_identities)?;
+    let programs = parts
+        .iter()
+        .map(|(_, fragment)| &fragment.program)
+        .collect::<Vec<_>>();
+    let source = super::jit::cuda_codegen::compile_v1_composition_wave_to_cuda_source(
+        &programs,
+        &identity.kernel_name,
+    )?;
+    Some(EmittedKernel {
+        kernel_name: identity.kernel_name,
+        cache_key: identity.cache_key,
+        semantic_hash: identity.semantic_hash,
+        source,
+    })
 }
 
 /// Structural constraint program plus the evaluator constants hoisted into its
@@ -213,7 +349,7 @@ pub fn constraint_program_with_live_cap<F: FrameworkEval>(
         )
         .ok()?;
     let kernels = parts
-        .iter()
+        .into_iter()
         .map(|part| {
             let semantic_hash = part.program.header().semantic_hash;
             let source = cuda_codegen::compile_v1_to_cuda_source(&part.program)?;
@@ -225,6 +361,9 @@ pub fn constraint_program_with_live_cap<F: FrameworkEval>(
                     source,
                 },
                 rc_base: part.rc_base,
+                wave_fragment: ConstraintWaveFragment {
+                    program: part.program,
+                },
             })
         })
         .collect::<Option<Vec<_>>>()?;
@@ -423,6 +562,104 @@ mod tests {
                 "closure step {close_before_step}"
             );
         }
+    }
+
+    #[test]
+    fn composition_wave_identity_is_deterministic_and_seals_every_axis() {
+        let parts = [
+            CompositionWaveKernelPartIdentity {
+                semantic_hash: 11,
+                coefficient_start: 3,
+                coefficient_end: 5,
+            },
+            CompositionWaveKernelPartIdentity {
+                semantic_hash: 13,
+                coefficient_start: 9,
+                coefficient_end: 12,
+            },
+        ];
+        let identity = composition_wave_kernel_identity(19, &parts).unwrap();
+        assert_eq!(identity.evaluation_log_size, 19);
+        assert_eq!(identity.part_count, 2);
+        assert_eq!(
+            identity,
+            composition_wave_kernel_identity(19, &parts).unwrap()
+        );
+
+        let mut different_semantic_hash = parts;
+        different_semantic_hash[1].semantic_hash += 1;
+        let different_semantic_hash =
+            composition_wave_kernel_identity(19, &different_semantic_hash).unwrap();
+        assert_ne!(identity.cache_key, different_semantic_hash.cache_key);
+        assert_ne!(identity.kernel_name, different_semantic_hash.kernel_name);
+
+        let mut different_span = parts;
+        different_span[1].coefficient_start += 1;
+        let different_span = composition_wave_kernel_identity(19, &different_span).unwrap();
+        assert_ne!(identity.cache_key, different_span.cache_key);
+        assert_ne!(identity.kernel_name, different_span.kernel_name);
+
+        let different_log = composition_wave_kernel_identity(20, &parts).unwrap();
+        assert_ne!(identity.cache_key, different_log.cache_key);
+        assert_ne!(identity.kernel_name, different_log.kernel_name);
+    }
+
+    #[test]
+    fn composition_wave_identity_rejects_empty_zero_reversed_and_overlap() {
+        let parts = [
+            CompositionWaveKernelPartIdentity {
+                semantic_hash: 11,
+                coefficient_start: 3,
+                coefficient_end: 5,
+            },
+            CompositionWaveKernelPartIdentity {
+                semantic_hash: 13,
+                coefficient_start: 9,
+                coefficient_end: 12,
+            },
+        ];
+        assert!(composition_wave_kernel_identity(19, &[]).is_none());
+
+        let mut zero_hash = parts;
+        zero_hash[0].semantic_hash = 0;
+        assert!(composition_wave_kernel_identity(19, &zero_hash).is_none());
+
+        let mut reordered = parts;
+        reordered.swap(0, 1);
+        assert!(composition_wave_kernel_identity(19, &reordered).is_none());
+
+        let mut overlapping = parts;
+        overlapping[1].coefficient_start = 4;
+        assert!(composition_wave_kernel_identity(19, &overlapping).is_none());
+
+        let mut reversed = parts;
+        reversed[1].coefficient_end = reversed[1].coefficient_start - 1;
+        assert!(composition_wave_kernel_identity(19, &reversed).is_none());
+    }
+
+    #[test]
+    fn composition_wave_source_rejects_fragment_semantic_mismatch() {
+        let identities = [
+            CompositionWaveKernelPartIdentity {
+                semantic_hash: 11,
+                coefficient_start: 3,
+                coefficient_end: 5,
+            },
+            CompositionWaveKernelPartIdentity {
+                semantic_hash: 13,
+                coefficient_start: 9,
+                coefficient_end: 12,
+            },
+        ];
+        assert!(composition_wave_semantic_hashes_match(
+            &identities,
+            &[11, 13]
+        ));
+        assert!(!composition_wave_semantic_hashes_match(
+            &identities,
+            &[11, 17]
+        ));
+        assert!(!composition_wave_semantic_hashes_match(&identities, &[11]));
     }
 
     #[test]

@@ -27,6 +27,50 @@ fn shifted_trace_codegen_threads_the_true_trace_log() {
 }
 
 #[test]
+fn composition_wave_keeps_parts_ordered_and_writes_each_accumulator_row_once() {
+    let program = |semantic_hash, trace_column| {
+        OwnedMetalEvaluationProgramV1::from_parts(
+            MetalEvaluationProgramHeaderV1::new(0, semantic_hash, 0, 1, 0, 0, 1, 1, 1),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![MetalEvaluationProgramBaseInstV1::trace_col(
+                0,
+                0,
+                trace_column,
+                0,
+            )],
+            vec![MetalEvaluationProgramExtInstV1::secure_col(0, 0, 0, 0, 0)],
+            vec![0],
+        )
+    };
+    let first = program(0x1111, 3);
+    let second = program(0x2222, 7);
+    let source = compile_v1_composition_wave_to_cuda_source(
+        &[&first, &second],
+        "stwo_composition_wave_test",
+    )
+    .unwrap();
+    let global = source.find("extern \"C\" __global__").unwrap();
+    let first_call = source[global..]
+        .find("wave_acc = stwo_qm31_add(wave_acc, stwo_composition_wave_part_0(")
+        .unwrap();
+    let second_call = source[global..]
+        .find("wave_acc = stwo_qm31_add(wave_acc, stwo_composition_wave_part_1(")
+        .unwrap();
+    assert!(first_call < second_call);
+    assert_eq!(source.matches("__device__ __noinline__").count(), 2);
+    assert!(source.contains("static_assert(sizeof(StwoCudaCompositionWavePart) == 48"));
+    assert!(source.contains("parts[0u], random_coeff_powers"));
+    assert!(source.contains("parts[1u], random_coeff_powers"));
+    assert!(source.contains("unsigned rc_base = part.rc_base;"));
+    assert!(source.contains("return stwo_qm31_mul_base(acc, part.denom_inv[denom_idx]);"));
+    assert!(source.contains("coord_0[row_index] = wave_acc.a;"));
+    assert!(!source.contains("coord_0[row_index] = stwo_m31_add"));
+    assert!(!source.contains("part_count"));
+}
+
+#[test]
 fn ext_stream_is_emitted_in_order_at_its_base_dependency_frontier() {
     let header = MetalEvaluationProgramHeaderV1::new(0, 0x5678, 0, 1, 0, 1, 1, 3, 5);
     let base = vec![

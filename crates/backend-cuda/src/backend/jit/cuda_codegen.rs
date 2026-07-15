@@ -96,6 +96,101 @@ pub fn compile_v1_to_cuda_source(program: &OwnedMetalEvaluationProgramV1) -> Opt
     Some(src)
 }
 
+/// Compile several already-governed constraint parts into one launch which owns
+/// one evaluation-domain accumulator. Each part remains a separate device
+/// function so the component split's register/resource boundary survives
+/// ptxas, while the global kernel keeps the accumulator in registers and writes
+/// each coordinate exactly once.
+pub(crate) fn compile_v1_composition_wave_to_cuda_source(
+    programs: &[&OwnedMetalEvaluationProgramV1],
+    kernel_name: &str,
+) -> Option<String> {
+    if programs.is_empty() || kernel_name.is_empty() {
+        return None;
+    }
+    let mut src = String::with_capacity(
+        programs
+            .iter()
+            .map(|program| {
+                (program.base_insts().len() + program.ext_insts().len()).saturating_mul(80)
+            })
+            .sum::<usize>()
+            .saturating_add(16_384),
+    );
+    emit_preamble(&mut src);
+    src.push_str(
+        "struct StwoCudaCompositionWavePart {\n\
+         \x20   const unsigned *const *trace_cols;\n\
+         \x20   const unsigned *interaction_offsets;\n\
+         \x20   const unsigned *base_params;\n\
+         \x20   const unsigned *ext_params;\n\
+         \x20   const unsigned *denom_inv;\n\
+         \x20   unsigned log_n_rows;\n\
+         \x20   unsigned rc_base;\n\
+         };\n\
+         static_assert(sizeof(StwoCudaCompositionWavePart) == 48, \"wave part ABI\");\n\n",
+    );
+    for (ordinal, program) in programs.iter().enumerate() {
+        emit_composition_wave_fragment(program, ordinal, &mut src)?;
+    }
+    src.push_str(&format!(
+        "extern \"C\" __global__ void __launch_bounds__(128) {kernel_name}(\n\
+         \x20   const StwoCudaCompositionWavePart *parts,\n\
+         \x20   const unsigned *random_coeff_powers,\n\
+         \x20   unsigned *coord_0,\n\
+         \x20   unsigned *coord_1,\n\
+         \x20   unsigned *coord_2,\n\
+         \x20   unsigned *coord_3,\n\
+         \x20   unsigned row_count\n\
+         ) {{\n\
+         \x20   unsigned row_index = blockIdx.x * blockDim.x + threadIdx.x;\n\
+         \x20   if (row_index >= row_count) {{ return; }}\n\
+         \x20   StwoCudaQm31 wave_acc = StwoCudaQm31{{0u, 0u, 0u, 0u}};\n",
+    ));
+    for ordinal in 0..programs.len() {
+        src.push_str(&format!(
+            "    wave_acc = stwo_qm31_add(wave_acc, stwo_composition_wave_part_{ordinal}(\n\
+             \x20       parts[{ordinal}u], random_coeff_powers, row_count, row_index));\n"
+        ));
+    }
+    src.push_str(
+        "    coord_0[row_index] = wave_acc.a;\n\
+         \x20   coord_1[row_index] = wave_acc.b;\n\
+         \x20   coord_2[row_index] = wave_acc.c;\n\
+         \x20   coord_3[row_index] = wave_acc.d;\n\
+         }\n",
+    );
+    Some(src)
+}
+
+fn emit_composition_wave_fragment(
+    program: &OwnedMetalEvaluationProgramV1,
+    ordinal: usize,
+    src: &mut String,
+) -> Option<()> {
+    src.push_str(&format!(
+        "__device__ __noinline__ StwoCudaQm31 stwo_composition_wave_part_{ordinal}(\n\
+         \x20   const StwoCudaCompositionWavePart &part,\n\
+         \x20   const unsigned *random_coeff_powers,\n\
+         \x20   unsigned row_count,\n\
+         \x20   unsigned row_index\n\
+         ) {{\n\
+         \x20   const unsigned *const *trace_cols = part.trace_cols;\n\
+         \x20   const unsigned *interaction_offsets = part.interaction_offsets;\n\
+         \x20   const unsigned *base_params = part.base_params;\n\
+         \x20   const unsigned *ext_params = part.ext_params;\n\
+         \x20   unsigned log_n_rows = part.log_n_rows;\n\
+         \x20   unsigned rc_base = part.rc_base;\n"
+    ));
+    emit_instruction_body(program, src)?;
+    src.push_str(
+        "    unsigned denom_idx = row_index >> log_n_rows;\n\
+         \x20   return stwo_qm31_mul_base(acc, part.denom_inv[denom_idx]);\n\
+         }\n\n",
+    );
+    Some(())
+}
+
 fn emit_instruction_body(program: &OwnedMetalEvaluationProgramV1, src: &mut String) -> Option<()> {
     let mut ext_declared = vec![false; program.header().max_ext_regs as usize];
     let base_schedule = BaseDefinitionSchedule::build(program)?;
