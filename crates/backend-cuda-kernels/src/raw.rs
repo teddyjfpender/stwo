@@ -57,6 +57,21 @@ pub struct ProgressiveBlake2sState {
 const _: () = assert!(core::mem::size_of::<ProgressiveBlake2sState>() == 96);
 const _: () = assert!(core::mem::offset_of!(ProgressiveBlake2sState, pending) == 32);
 
+/// Host-owned recipe for reconstructing the lazy final Blake2s block from
+/// retained device columns. Keep in sync with `CompactBlake2sTailDescriptor`
+/// in `cuda/blake2s.cuh`.
+#[repr(C, align(8))]
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub struct CompactBlake2sTailDescriptor {
+    pub column_addresses: [u64; 16],
+    pub log_ratios: [u32; 16],
+}
+
+const _: () = assert!(core::mem::size_of::<CompactBlake2sTailDescriptor>() == 192);
+const _: () = assert!(core::mem::align_of::<CompactBlake2sTailDescriptor>() == 8);
+const _: () = assert!(core::mem::offset_of!(CompactBlake2sTailDescriptor, column_addresses) == 0);
+const _: () = assert!(core::mem::offset_of!(CompactBlake2sTailDescriptor, log_ratios) == 128);
+
 /// Largest canonical word prefix whose byte counter fits the low 32-bit
 /// counter implemented by the four-lane compressor.
 pub const BLAKE2S_PROGRESSIVE_QUAD_MAX_COUNTER_COLUMNS: u32 = 0x3fff_ffff;
@@ -76,10 +91,63 @@ pub const fn blake2s_progressive_absorb_quad_counts_valid(
             <= BLAKE2S_PROGRESSIVE_QUAD_MAX_COUNTER_COLUMNS - number_of_columns
 }
 
+/// Number of words retained lazily after a canonical prefix. A complete
+/// 16-word block stays lazy until more input arrives or the hash is finalized.
+pub const fn blake2s_compact_tail_words(absorbed_columns: u32) -> u32 {
+    if absorbed_columns == 0 {
+        0
+    } else {
+        (absorbed_columns - 1) % 16 + 1
+    }
+}
+
+/// Address-free compact absorb admission. Initialization is exact: only an
+/// empty prefix initializes, and an empty prefix must initialize.
+pub const fn blake2s_compact_absorb_counts_valid(
+    number_of_columns: u32,
+    absorbed_columns_before: u32,
+    initializes_state: bool,
+) -> bool {
+    number_of_columns != 0
+        && initializes_state == (absorbed_columns_before == 0)
+        && number_of_columns <= BLAKE2S_PROGRESSIVE_QUAD_MAX_COUNTER_COLUMNS
+        && absorbed_columns_before
+            <= BLAKE2S_PROGRESSIVE_QUAD_MAX_COUNTER_COLUMNS - number_of_columns
+}
+
+/// Fail-closed descriptor admission mirrored by the native wrapper. Unused
+/// entries must be canonical zeroes so captured launch parameters are stable.
+pub const fn blake2s_compact_tail_descriptor_valid(
+    descriptor: &CompactBlake2sTailDescriptor,
+    target_log_size: u32,
+    absorbed_columns: u32,
+) -> bool {
+    if target_log_size >= 31 || absorbed_columns > BLAKE2S_PROGRESSIVE_QUAD_MAX_COUNTER_COLUMNS {
+        return false;
+    }
+    let pending_words = blake2s_compact_tail_words(absorbed_columns) as usize;
+    let mut word = 0;
+    while word < 16 {
+        let address = descriptor.column_addresses[word];
+        let log_ratio = descriptor.log_ratios[word];
+        if word < pending_words {
+            if address == 0 || address & 3 != 0 || log_ratio > target_log_size {
+                return false;
+            }
+        } else if address != 0 || log_ratio != 0 {
+            return false;
+        }
+        word += 1;
+    }
+    true
+}
+
 #[cfg(test)]
 mod progressive_blake2s_state_tests {
     use super::{
-        blake2s_progressive_absorb_quad_counts_valid, ProgressiveBlake2sState,
+        blake2s_compact_absorb_counts_valid, blake2s_compact_tail_descriptor_valid,
+        blake2s_compact_tail_words, blake2s_progressive_absorb_quad_counts_valid, Blake2sHash,
+        CompactBlake2sTailDescriptor, ProgressiveBlake2sState,
         BLAKE2S_PROGRESSIVE_QUAD_MAX_COUNTER_COLUMNS,
     };
 
@@ -142,6 +210,108 @@ mod progressive_blake2s_state_tests {
         assert!(native.contains("constexpr uint32_t kMaxQuadRows = 1u << 30;"));
         assert!(native.contains("size > kMaxQuadRows"));
         assert!(native.contains("number_of_columns > kMaxCounterColumns"));
+    }
+
+    #[test]
+    fn compact_descriptor_layout_and_lazy_boundaries_are_exact() {
+        assert_eq!(core::mem::size_of::<CompactBlake2sTailDescriptor>(), 192);
+        assert_eq!(core::mem::align_of::<CompactBlake2sTailDescriptor>(), 8);
+        assert_eq!(
+            core::mem::offset_of!(CompactBlake2sTailDescriptor, column_addresses),
+            0
+        );
+        assert_eq!(
+            core::mem::offset_of!(CompactBlake2sTailDescriptor, log_ratios),
+            128
+        );
+        assert_eq!(blake2s_compact_tail_words(0), 0);
+        assert_eq!(blake2s_compact_tail_words(1), 1);
+        assert_eq!(blake2s_compact_tail_words(15), 15);
+        assert_eq!(blake2s_compact_tail_words(16), 16);
+        assert_eq!(blake2s_compact_tail_words(17), 1);
+        assert_eq!(blake2s_compact_tail_words(32), 16);
+
+        let header = include_str!("../cuda/blake2s.cuh");
+        assert!(header.contains("sizeof(CompactBlake2sTailDescriptor) == 192"));
+        assert!(header.contains("alignof(CompactBlake2sTailDescriptor) == 8"));
+        assert!(header.contains("offsetof(CompactBlake2sTailDescriptor, log_ratios) == 128"));
+    }
+
+    #[test]
+    fn compact_admission_is_canonical_and_fail_closed() {
+        let max = BLAKE2S_PROGRESSIVE_QUAD_MAX_COUNTER_COLUMNS;
+        assert!(blake2s_compact_absorb_counts_valid(1, 0, true));
+        assert!(blake2s_compact_absorb_counts_valid(1, max - 1, false));
+        assert!(!blake2s_compact_absorb_counts_valid(1, 0, false));
+        assert!(!blake2s_compact_absorb_counts_valid(1, 1, true));
+        assert!(!blake2s_compact_absorb_counts_valid(0, 0, true));
+        assert!(!blake2s_compact_absorb_counts_valid(1, max, false));
+
+        let empty = CompactBlake2sTailDescriptor::default();
+        assert!(blake2s_compact_tail_descriptor_valid(&empty, 5, 0));
+
+        let mut full = CompactBlake2sTailDescriptor::default();
+        for word in 0..16 {
+            full.column_addresses[word] = 4 * (word as u64 + 1);
+            full.log_ratios[word] = word as u32 % 6;
+        }
+        assert!(blake2s_compact_tail_descriptor_valid(&full, 5, 16));
+
+        let mut noncanonical = full;
+        noncanonical.column_addresses[15] = 0;
+        assert!(!blake2s_compact_tail_descriptor_valid(&noncanonical, 5, 16));
+        let mut noncanonical = empty;
+        noncanonical.log_ratios[1] = 1;
+        assert!(!blake2s_compact_tail_descriptor_valid(&noncanonical, 5, 0));
+        let mut misaligned = empty;
+        misaligned.column_addresses[0] = 5;
+        assert!(!blake2s_compact_tail_descriptor_valid(&misaligned, 5, 1));
+        let mut excessive_lift = empty;
+        excessive_lift.column_addresses[0] = 4;
+        excessive_lift.log_ratios[0] = 6;
+        assert!(!blake2s_compact_tail_descriptor_valid(
+            &excessive_lift,
+            5,
+            1
+        ));
+        assert!(!blake2s_compact_tail_descriptor_valid(&empty, 31, 0));
+    }
+
+    #[test]
+    fn compact_ffi_uses_the_pinned_descriptor_by_pointer_and_hash_state() {
+        type AbsorbFn = unsafe extern "C" fn(
+            u32,
+            u32,
+            u32,
+            *const *mut u32,
+            u32,
+            *const CompactBlake2sTailDescriptor,
+            *mut Blake2sHash,
+            *mut core::ffi::c_void,
+        ) -> i32;
+        type ExpandFn = unsafe extern "C" fn(
+            u32,
+            u32,
+            *mut Blake2sHash,
+            *mut Blake2sHash,
+            *mut core::ffi::c_void,
+        ) -> i32;
+        type FinalizeFn = unsafe extern "C" fn(
+            u32,
+            u32,
+            *const CompactBlake2sTailDescriptor,
+            *mut Blake2sHash,
+            *mut core::ffi::c_void,
+        ) -> i32;
+        let _: AbsorbFn = super::stwo_blake2s_compact_absorb_quad_on;
+        let _: ExpandFn = super::stwo_blake2s_compact_expand_in_place_on;
+        let _: FinalizeFn = super::stwo_blake2s_compact_finalize_quad_in_place_on;
+
+        let native = include_str!("../cuda/blake2s_quad.cu");
+        assert!(native.contains("const CompactBlake2sTailDescriptor descriptor = *tail;"));
+        assert!(native.contains("CompactBlake2sTailDescriptor tail,"));
+        let expansion = include_str!("../cuda/progressive_commit_in_place.cu");
+        assert!(expansion.contains("2 * sizeof(Blake2sHash)"));
     }
 }
 
@@ -658,6 +828,18 @@ extern "C" {
         states: *mut ProgressiveBlake2sState,
         stream: *mut core::ffi::c_void,
     ) -> i32;
+    /// Compact four-lane absorb. The wrapper copies `tail` into the captured
+    /// kernel parameters; only the addressed device columns must outlive it.
+    pub fn stwo_blake2s_compact_absorb_quad_on(
+        size: u32,
+        number_of_columns: u32,
+        absorbed_columns_before: u32,
+        columns: *const *mut u32,
+        initializes_state: u32,
+        tail: *const CompactBlake2sTailDescriptor,
+        states: *mut Blake2sHash,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
     pub fn stwo_blake2s_progressive_expand_on(
         from_log_size: u32,
         to_log_size: u32,
@@ -672,6 +854,13 @@ extern "C" {
         scratch_pair: *mut ProgressiveBlake2sState,
         stream: *mut core::ffi::c_void,
     ) -> i32;
+    pub fn stwo_blake2s_compact_expand_in_place_on(
+        from_log_size: u32,
+        to_log_size: u32,
+        states: *mut Blake2sHash,
+        scratch_pair: *mut Blake2sHash,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
     pub fn stwo_blake2s_progressive_finalize_on(
         size: u32,
         absorbed_columns: u32,
@@ -684,6 +873,13 @@ extern "C" {
         absorbed_columns: u32,
         states_and_hashes: *mut ProgressiveBlake2sState,
         scratch_pair: *mut ProgressiveBlake2sState,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+    pub fn stwo_blake2s_compact_finalize_quad_in_place_on(
+        size: u32,
+        absorbed_columns: u32,
+        tail: *const CompactBlake2sTailDescriptor,
+        states_and_hashes: *mut Blake2sHash,
         stream: *mut core::ffi::c_void,
     ) -> i32;
     pub fn stwo_blake2s_leaf_update_on(

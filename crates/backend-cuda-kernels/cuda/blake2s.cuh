@@ -21,6 +21,23 @@ static_assert(sizeof(ProgressiveBlake2sState) == 96,
               "progressive Blake2s state ABI must be 96 bytes");
 static_assert(offsetof(ProgressiveBlake2sState, pending) == 32,
               "invalid pending offset");
+
+// Host-owned descriptor for reconstructing the compact h[8]-only state's
+// lazy final block. CUDA launch capture copies this descriptor into kernel
+// parameters; the addressed retained evaluation columns remain arena-owned.
+struct alignas(8) CompactBlake2sTailDescriptor {
+    uint64_t column_addresses[16];
+    uint32_t log_ratios[16];
+};
+
+static_assert(sizeof(CompactBlake2sTailDescriptor) == 192,
+              "compact Blake2s tail descriptor must be 192 bytes");
+static_assert(alignof(CompactBlake2sTailDescriptor) == 8,
+              "compact Blake2s tail descriptor must be 8-byte aligned");
+static_assert(offsetof(CompactBlake2sTailDescriptor, column_addresses) == 0,
+              "invalid compact tail column offset");
+static_assert(offsetof(CompactBlake2sTailDescriptor, log_ratios) == 128,
+              "invalid compact tail log-ratio offset");
 #if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__)
 static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__,
               "progressive pending words require little-endian CUDA targets");
@@ -130,6 +147,19 @@ int stwo_blake2s_progressive_absorb_quad_on(
     uint32_t initializes_state,
     ProgressiveBlake2sState *states,
     void *stream);
+// Compact retained-domain successor. Only h[8] persists in `states`; the lazy
+// 1..=16-word prefix is reconstructed from `tail` at every later boundary.
+// The host wrapper copies `tail` by value into the captured kernel parameters.
+extern "C"
+int stwo_blake2s_compact_absorb_quad_on(
+    uint32_t size,
+    uint32_t number_of_columns,
+    uint32_t absorbed_columns_before,
+    uint32_t **columns,
+    uint32_t initializes_state,
+    const CompactBlake2sTailDescriptor *tail,
+    Blake2sHash *states,
+    void *stream);
 extern "C"
 int stwo_blake2s_progressive_expand_on(
     uint32_t from_log_size,
@@ -138,11 +168,25 @@ int stwo_blake2s_progressive_expand_on(
     ProgressiveBlake2sState *states_out,
     void *stream);
 extern "C"
+int stwo_blake2s_compact_expand_in_place_on(
+    uint32_t from_log_size,
+    uint32_t to_log_size,
+    Blake2sHash *states,
+    Blake2sHash *scratch_pair,
+    void *stream);
+extern "C"
 int stwo_blake2s_progressive_finalize_on(
     uint32_t size,
     uint32_t absorbed_columns,
     const ProgressiveBlake2sState *states,
     Blake2sHash *result,
+    void *stream);
+extern "C"
+int stwo_blake2s_compact_finalize_quad_in_place_on(
+    uint32_t size,
+    uint32_t absorbed_columns,
+    const CompactBlake2sTailDescriptor *tail,
+    Blake2sHash *states_and_hashes,
     void *stream);
 extern "C"
 int stwo_blake2s_leaf_update_on(uint32_t size, uint32_t group_n_cols, uint32_t **columns, const uint32_t *column_log_sizes, uint32_t lifting_log_size, uint32_t cols_done, Blake2sHash *state, void *stream);

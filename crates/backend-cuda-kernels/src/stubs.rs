@@ -6,7 +6,8 @@
 use core::ffi::c_void;
 
 use crate::raw::{
-    Blake2sHash, CirclePointBaseField, CudaSecureField, LayerIndexPair, ProgressiveBlake2sState,
+    Blake2sHash, CirclePointBaseField, CompactBlake2sTailDescriptor, CudaSecureField,
+    LayerIndexPair, ProgressiveBlake2sState,
 };
 
 const CUDA_ERROR_NOT_SUPPORTED: i32 = 801;
@@ -1287,6 +1288,20 @@ pub unsafe extern "C" fn stwo_blake2s_progressive_absorb_quad_on(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_blake2s_compact_absorb_quad_on(
+    _size: u32,
+    _number_of_columns: u32,
+    _absorbed_columns_before: u32,
+    _columns: *const *mut u32,
+    _initializes_state: u32,
+    _tail: *const CompactBlake2sTailDescriptor,
+    _states: *mut Blake2sHash,
+    _stream: *mut c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_blake2s_compact_absorb_quad_on")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stwo_blake2s_progressive_expand_on(
     _from_log_size: u32,
     _to_log_size: u32,
@@ -1309,6 +1324,17 @@ pub unsafe extern "C" fn stwo_blake2s_progressive_expand_in_place_on(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_blake2s_compact_expand_in_place_on(
+    _from_log_size: u32,
+    _to_log_size: u32,
+    _states: *mut Blake2sHash,
+    _scratch_pair: *mut Blake2sHash,
+    _stream: *mut c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_blake2s_compact_expand_in_place_on")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stwo_blake2s_progressive_finalize_on(
     _size: u32,
     _absorbed_columns: u32,
@@ -1328,6 +1354,17 @@ pub unsafe extern "C" fn stwo_blake2s_progressive_finalize_in_place_on(
     _stream: *mut c_void,
 ) -> i32 {
     no_cuda_symbol("stwo_blake2s_progressive_finalize_in_place_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_blake2s_compact_finalize_quad_in_place_on(
+    _size: u32,
+    _absorbed_columns: u32,
+    _tail: *const CompactBlake2sTailDescriptor,
+    _states_and_hashes: *mut Blake2sHash,
+    _stream: *mut c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_blake2s_compact_finalize_quad_in_place_on")
 }
 
 #[unsafe(no_mangle)]
