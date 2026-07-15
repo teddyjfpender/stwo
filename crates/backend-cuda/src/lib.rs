@@ -199,6 +199,11 @@ pub use backend::quotient_numerator_single_write::{
     QuotientNumeratorSingleWritePlan, QuotientNumeratorSingleWriteReport,
     QUOTIENT_NUMERATOR_SINGLE_WRITE_TERM_WORDS,
 };
+pub use backend::quotient_numerator_staged_single_write::{
+    quotient_numerator_staged_single_write_plan, QuotientNumeratorStagedLde,
+    QuotientNumeratorStagedSingleWriteError, QuotientNumeratorStagedSingleWritePlan,
+    QuotientNumeratorStagedSingleWriteReport, QuotientNumeratorStagedSource,
+};
 pub use backend::relation_graph::{
     relation_batch_fused_eligible, relation_graph_requirements, PreparedRelationGraph,
     PreparedRelationOutput, RelationArenaSlotRequirement, RelationBatchProgram, RelationChallenges,

@@ -49,6 +49,7 @@ pub mod progressive_ntt_leaf_fusion;
 pub mod proof_assembly;
 mod quotient;
 pub mod quotient_numerator_single_write;
+pub mod quotient_numerator_staged_single_write;
 pub mod relation_graph;
 mod secure_column;
 
