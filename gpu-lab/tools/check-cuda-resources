@@ -60,10 +60,17 @@ def select(resources: dict[str, dict[str, int]], pattern: str) -> dict[str, int]
     return {key: max(value.get(key, 0) for value in matches) for key in keys}
 
 
+def launch_fits(registers: int, threads: int, registers_per_sm: int) -> bool:
+    return registers * threads <= registers_per_sm
+
+
 def self_test() -> int:
     fixture = """ptxas info : Function properties for kernel
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info : Used 64 registers, 2048 bytes smem
+ptxas info : Function properties for oversized_kernel
+    64 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info : Used 207 registers, 32896 bytes smem
 """
     assert select(parse(fixture), "^kernel$") == {
         "registers": 64,
@@ -72,6 +79,8 @@ ptxas info : Used 64 registers, 2048 bytes smem
         "spill_load_bytes": 0,
         "static_shared_bytes": 2048,
     }
+    assert not launch_fits(207, 512, 65536)
+    assert launch_fits(98, 512, 65536)
     print('{"contract":"cuda-resource-delta-v1","self_test":"PASS"}')
     return 0
 
@@ -84,10 +93,43 @@ def main() -> int:
     parser.add_argument("--max-registers", type=int, default=255)
     parser.add_argument("--max-register-increase", type=int, default=0)
     parser.add_argument("--max-static-shared-increase", type=int, default=4096)
+    parser.add_argument("--launch-threads", type=int)
+    parser.add_argument("--registers-per-sm", type=int)
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
     if args.self_test:
         return self_test()
+    if args.launch_threads is not None:
+        if not args.kernel or not args.baseline or args.candidate:
+            parser.error(
+                "one ptxas log and --kernel are required with --launch-threads"
+            )
+        if args.registers_per_sm is None:
+            parser.error("--registers-per-sm is required with --launch-threads")
+        if args.launch_threads <= 0 or args.registers_per_sm <= 0:
+            parser.error("launch and SM register counts must be positive")
+        try:
+            resource = select(parse(args.baseline.read_text()), args.kernel)
+        except (OSError, ValueError, re.error) as error:
+            parser.error(str(error))
+        registers_at_launch = resource["registers"] * args.launch_threads
+        passed = launch_fits(
+            resource["registers"], args.launch_threads, args.registers_per_sm
+        )
+        receipt = {
+            "contract": "cuda-launch-register-budget-v1",
+            "kernel_regex": args.kernel,
+            "ptxas_sha256": hashlib.sha256(args.baseline.read_bytes()).hexdigest(),
+            "resource": resource,
+            "launch_threads": args.launch_threads,
+            "registers_at_launch": registers_at_launch,
+            "registers_per_sm": args.registers_per_sm,
+            "necessary_condition_only": True,
+            "hardware_max_threads_required": True,
+            "result": "PASS" if passed else "FAIL",
+        }
+        print(json.dumps(receipt, sort_keys=True, separators=(",", ":")))
+        return 0 if passed else 1
     if not args.kernel or not args.baseline or not args.candidate:
         parser.error("baseline, candidate, and --kernel are required")
     if not args.baseline.is_file() or not args.candidate.is_file():

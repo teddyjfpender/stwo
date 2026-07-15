@@ -19,8 +19,9 @@
 #                                                 # AND link every native test
 #                                                 # binary (catches stub-masked
 #                                                 # FFI/symbol drift; no GPU)
-#   scripts/cuda_compile_check.sh --resources F.. # -Xptxas -v register/spill
-#                                                 # table; FAILS on any spill
+#   scripts/cuda_compile_check.sh --resources F.. # -Xptxas -v resource table;
+#                                                 # FAILS on spills and known
+#                                                 # SM90 launch-contract drift
 #
 # Environment:
 #   CUDA_IMAGE  container image (default nvidia/cuda:11.8.0-devel-ubuntu22.04,
@@ -166,6 +167,31 @@ if [[ "$MODE" == "resources" ]]; then
   if echo "$out" | grep -E '[1-9][0-9]* bytes spill (stores|loads)' >/dev/null; then
     echo '[cuda_compile_check] resources FAIL: spills detected'
     exit 1
+  fi
+  if [[ "$ARCH" == "sm_90" ]] && printf '%s\n' "${FILES[@]}" \
+      | grep -Fxq "${KERNELS_DIR}/cuda/ifft.cu"; then
+    # The exact composition/B2N launchers use (32, 2^LOG_VALUES_PER_THREAD).
+    # Keep this static seam paired with the ptxas receipt: if launch geometry
+    # changes, update both rather than silently checking a stale thread count.
+    source_pattern='dim3 block{warp, 1u << LOG_VALUES_PER_THREAD, 1};'
+    if [[ "$(grep -Fc "$source_pattern" "${KERNELS_DIR}/cuda/ifft.cu")" -ne 2 ]]; then
+      echo '[cuda_compile_check] resources FAIL: ifft launch geometry drifted'
+      exit 1
+    fi
+    receipt=$(mktemp)
+    trap 'rm -f "$receipt"' EXIT
+    printf '%s\n' "$out" > "$receipt"
+    gpu-lab/tools/check-cuda-resources "$receipt" \
+      --kernel '_Z22b2n_noinit_block_batchILj4ELb1EE' \
+      --launch-threads 512 --registers-per-sm 65536
+    gpu-lab/tools/check-cuda-resources "$receipt" \
+      --kernel '_Z32composition_split_boundary_batchILj3ELb1EE' \
+      --launch-threads 256 --registers-per-sm 65536
+    gpu-lab/tools/check-cuda-resources "$receipt" \
+      --kernel '_Z32composition_split_boundary_batchILj4ELb1EE' \
+      --launch-threads 512 --registers-per-sm 65536
+    rm -f "$receipt"
+    trap - EXIT
   fi
   echo '[cuda_compile_check] resources PASS (zero spills)'
   exit 0
