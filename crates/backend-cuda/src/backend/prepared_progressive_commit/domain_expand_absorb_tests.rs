@@ -190,6 +190,80 @@ fn fused_oracle_matches_canonical_progressive_bytes_and_mutations() {
 }
 
 #[test]
+fn ping_pong_parity_ends_at_merkle_base_without_hidden_copy() {
+    let cases = [
+        (vec![5; 17], 6, 0usize),
+        ([vec![5; 17], vec![6; 16]].concat(), 7, 1),
+        ([vec![5; 17], vec![6; 16], vec![7; 1]].concat(), 8, 2),
+    ];
+
+    for (case, (logs, lifting_log_size, expected_transitions)) in cases.into_iter().enumerate() {
+        let (base, domain, compact, fused) = programs(&logs, lifting_log_size);
+        assert_eq!(fused.receipt().transitions.len(), expected_transitions);
+        assert_eq!(fused.receipt().fused_leaf_traffic.device_copies, 0);
+        assert!(fused
+            .receipt()
+            .transitions
+            .iter()
+            .all(|transition| transition.fused_traffic.device_copies == 0));
+
+        let initial = fused
+            .steps()
+            .iter()
+            .find_map(|step| match step.operation {
+                FusedCompactDomainOperation::AbsorbDomainBatch {
+                    initializes_state: true,
+                    state,
+                    ..
+                } => Some(state),
+                _ => None,
+            })
+            .unwrap();
+        let final_state = fused
+            .steps()
+            .iter()
+            .find_map(|step| match step.operation {
+                FusedCompactDomainOperation::FinalizeInPlace { state, .. } => Some(state),
+                _ => None,
+            })
+            .unwrap();
+        let state_capacity =
+            fused.receipt().qualified_slab_capacity_words - PROGRESSIVE_IN_PLACE_SCRATCH_WORDS;
+        let expected_initial_offset = if expected_transitions % 2 == 1 {
+            state_capacity - initial.len_words
+        } else {
+            0
+        };
+        assert_eq!(initial.offset_words, expected_initial_offset);
+        assert_eq!(final_state.offset_words, 0);
+        assert_eq!(
+            final_state.len_words,
+            compact_state_words(lifting_log_size).unwrap()
+        );
+
+        let fixture = base.fixture(0x51ab_0000 + case as u64).unwrap();
+        let expected = fused_leaf_oracle(
+            &fused,
+            &base.requirements().leaves.plan,
+            &fixture.evaluations,
+        );
+        assert_eq!(expected, fixture.oracle.leaf_hashes);
+        let mut mutated = fixture.evaluations.clone();
+        let last_column = mutated.last_mut().unwrap();
+        *last_column.last_mut().unwrap() ^= 0x00c0_ffee;
+        let changed = fused_leaf_oracle(&fused, &base.requirements().leaves.plan, &mutated);
+        assert_ne!(changed, expected);
+        assert_eq!(
+            changed,
+            fused
+                .oracle(&base, &domain, &compact, &mutated)
+                .unwrap()
+                .leaf_hashes
+        );
+    }
+}
+
+#[test]
 fn final_expansion_without_absorb_fails_closed() {
     let base = base_program(&[3; 17], 6);
     let domain = DomainCooperativeProgram::compile_mode_a(&base).unwrap();

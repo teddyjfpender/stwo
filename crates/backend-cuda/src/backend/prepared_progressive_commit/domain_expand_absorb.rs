@@ -22,7 +22,7 @@ const WORD_BYTES: u64 = core::mem::size_of::<u32>() as u64;
 const HASH_WORDS: usize = core::mem::size_of::<Blake2sHash>() / core::mem::size_of::<u32>();
 const HASH_BYTES: u64 = core::mem::size_of::<Blake2sHash>() as u64;
 const COMPACT_EXPANSION_SCRATCH_HASHES: u64 = 2;
-const CACHE_TAG: &[u8] = b"stwo-compact-expand-absorb-ping-pong-v1";
+const CACHE_TAG: &[u8] = b"stwo-compact-expand-absorb-ping-pong-v2";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FusedCompactDomainOperation {
@@ -278,6 +278,19 @@ fn compile_steps(
         offset_words: state_capacity_words,
         len_words: PROGRESSIVE_IN_PLACE_SCRATCH_WORDS,
     };
+    let transition_count = compact_steps
+        .iter()
+        .filter(|step| {
+            matches!(
+                step.operation,
+                CompactDomainOperation::StateExpandInPlace { .. }
+            )
+        })
+        .count();
+    // Final compact hashes are the Merkle leaf layer at slab offset zero. Start
+    // on the opposite side for an odd number of transitions so alternating
+    // disjoint destinations end at zero without an unaccounted copy.
+    let initial_state_is_high = transition_count % 2 == 1;
 
     let mut batches = Vec::new();
     let mut expected_first_column = 0u32;
@@ -370,10 +383,23 @@ fn compile_steps(
                     leaf_compressions,
                 )?;
                 let state = match current_state {
-                    None if initializes_state => DomainCooperativeSlabSlice {
-                        offset_words: 0,
-                        len_words: compact_state_words(log_size)?,
-                    },
+                    None if initializes_state => {
+                        let len_words = compact_state_words(log_size)?;
+                        DomainCooperativeSlabSlice {
+                            offset_words: if initial_state_is_high {
+                                state_capacity_words.checked_sub(len_words).ok_or(
+                                    FusedCompactDomainProgramError::SlabCapacity {
+                                        step: index,
+                                        required_words: len_words,
+                                        available_words: state_capacity_words,
+                                    },
+                                )?
+                            } else {
+                                0
+                            },
+                            len_words,
+                        }
+                    }
                     Some(state) if !initializes_state && current_log == Some(log_size) => state,
                     _ => return Err(FusedCompactDomainProgramError::InvalidState),
                 };
@@ -577,6 +603,9 @@ fn compile_steps(
                 }
                 saw_finalize = true;
                 let state = current_state.ok_or(FusedCompactDomainProgramError::InvalidState)?;
+                if state.offset_words != 0 || state.len_words != compact_state_words(log_size)? {
+                    return Err(FusedCompactDomainProgramError::InvalidState);
+                }
                 validate_finalize_traffic(step.traffic, state, reconstructed_tail)?;
                 current_traffic = add_traffic(current_traffic, step.traffic)?;
                 fused_traffic = add_traffic(fused_traffic, step.traffic)?;
