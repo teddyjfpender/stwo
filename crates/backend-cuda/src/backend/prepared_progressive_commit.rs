@@ -27,6 +27,8 @@ use super::progressive_ntt_leaf_fusion::{
     ProgressiveNttLeafFusionTelemetry,
 };
 
+mod in_place;
+
 const WORD_BYTES: usize = core::mem::size_of::<u32>();
 const POINTER_WORDS: usize = core::mem::size_of::<*mut u32>().div_ceil(WORD_BYTES);
 const HASH_WORDS: usize = core::mem::size_of::<Blake2sHash>() / WORD_BYTES;
@@ -101,6 +103,10 @@ pub enum ProgressiveLeafLaunchKind {
         from_log_size: u32,
         to_log_size: u32,
     },
+    ExpandInPlace {
+        from_log_size: u32,
+        to_log_size: u32,
+    },
     Lde {
         log_size: u32,
         columns: u32,
@@ -120,6 +126,18 @@ pub enum ProgressiveLeafLaunchKind {
         log_size: u32,
         absorbed_columns: u32,
     },
+    FinalizeInPlace {
+        log_size: u32,
+        absorbed_columns: u32,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+#[repr(u8)]
+pub enum ProgressiveCommitStorageMode {
+    #[default]
+    Separate = 0,
+    InPlaceSlab = 1,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -513,6 +531,12 @@ enum Launch {
         input: ArenaSlice,
         output: ArenaSlice,
     },
+    ExpandInPlace {
+        from_log: u32,
+        to_log: u32,
+        states: ArenaSlice,
+        scratch_pair: ArenaSlice,
+    },
     Lde(PreparedBatch),
     Absorb {
         log_size: u32,
@@ -530,6 +554,12 @@ enum Launch {
         states: ArenaSlice,
         output: ArenaSlice,
     },
+    FinalizeInPlace {
+        log_size: u32,
+        absorbed_columns: u32,
+        states_and_hashes: ArenaSlice,
+        scratch_pair: ArenaSlice,
+    },
 }
 
 pub struct PreparedProgressiveLeaves<'a> {
@@ -539,6 +569,8 @@ pub struct PreparedProgressiveLeaves<'a> {
     twiddles: ArenaSlice,
     twiddle_words: u32,
     cache_key: u64,
+    storage: ProgressiveCommitStorageMode,
+    in_place_scratch: Option<ArenaSlice>,
     ntt_leaf_fusion: ProgressiveNttLeafFusionTelemetry,
 }
 
@@ -603,8 +635,64 @@ impl<'a> PreparedProgressiveLeaves<'a> {
         mode: ProgressiveCommitMode,
         ntt_leaf_fusion: ProgressiveNttLeafFusionMode,
     ) -> Result<Self, PreparedProgressiveCommitError> {
+        Self::prepare_impl(
+            arena,
+            requirements,
+            slots,
+            coefficients,
+            retained_outputs,
+            twiddles,
+            mode,
+            ntt_leaf_fusion,
+            ProgressiveCommitStorageMode::Separate,
+        )
+    }
+
+    /// Dormant single-slab twin. Callers must seal this storage mode into the
+    /// protocol identity before constructing the aliased slot tuple.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_in_place_slab_with_mode_and_ntt_fusion(
+        arena: &'a DeviceArena,
+        requirements: &ProgressiveLeafWorkspaceRequirements,
+        slots: &ProgressiveLeafWorkspaceSlots,
+        coefficients: &[CommitCoefficientColumn],
+        retained_outputs: &[Option<ArenaSlice>],
+        twiddles: ArenaSlice,
+        mode: ProgressiveCommitMode,
+        ntt_leaf_fusion: ProgressiveNttLeafFusionMode,
+    ) -> Result<Self, PreparedProgressiveCommitError> {
+        Self::prepare_impl(
+            arena,
+            requirements,
+            slots,
+            coefficients,
+            retained_outputs,
+            twiddles,
+            mode,
+            ntt_leaf_fusion,
+            ProgressiveCommitStorageMode::InPlaceSlab,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_impl(
+        arena: &'a DeviceArena,
+        requirements: &ProgressiveLeafWorkspaceRequirements,
+        slots: &ProgressiveLeafWorkspaceSlots,
+        coefficients: &[CommitCoefficientColumn],
+        retained_outputs: &[Option<ArenaSlice>],
+        twiddles: ArenaSlice,
+        mode: ProgressiveCommitMode,
+        ntt_leaf_fusion: ProgressiveNttLeafFusionMode,
+        storage: ProgressiveCommitStorageMode,
+    ) -> Result<Self, PreparedProgressiveCommitError> {
         progressive_prepare_mode_admission_for_mode(mode, requirements)?;
-        let workspace = requirements.arena_slot_requirements(slots)?;
+        let workspace = match storage {
+            ProgressiveCommitStorageMode::Separate => requirements.arena_slot_requirements(slots),
+            ProgressiveCommitStorageMode::InPlaceSlab => {
+                requirements.arena_slot_requirements_in_place(slots)
+            }
+        }?;
         let workspace_ids: BTreeSet<_> = workspace.iter().map(|entry| entry.id).collect();
         if coefficients.len() != requirements.plan.columns.len()
             || retained_outputs.len() != requirements.plan.columns.len()
@@ -629,23 +717,48 @@ impl<'a> PreparedProgressiveLeaves<'a> {
         }
         let twiddle_words = u32::try_from(twiddles.len_words())
             .map_err(|_| PreparedProgressiveCommitError::SizeOverflow)?;
-        let ping = bind_slot(
-            arena,
-            slots.state_ping,
-            requirements.state_ping_words,
-            STATE_WORDS,
-        )?;
-        let pong = match (slots.state_pong, requirements.state_pong_words) {
-            (Some(id), Some(words)) => Some(bind_slot(arena, id, words, STATE_WORDS)?),
-            (None, None) => None,
-            _ => return Err(PreparedProgressiveCommitError::InvalidSlotShape),
+        let (ping, pong, leaf_hashes, in_place_scratch) = match storage {
+            ProgressiveCommitStorageMode::Separate => {
+                let ping = bind_slot(
+                    arena,
+                    slots.state_ping,
+                    requirements.state_ping_words,
+                    STATE_WORDS,
+                )?;
+                let pong = match (slots.state_pong, requirements.state_pong_words) {
+                    (Some(id), Some(words)) => Some(bind_slot(arena, id, words, STATE_WORDS)?),
+                    (None, None) => None,
+                    _ => return Err(PreparedProgressiveCommitError::InvalidSlotShape),
+                };
+                let leaf_hashes = bind_slot(
+                    arena,
+                    slots.leaf_hashes,
+                    requirements.leaf_hash_words,
+                    HASH_WORDS,
+                )?;
+                (ping, pong, leaf_hashes, None)
+            }
+            ProgressiveCommitStorageMode::InPlaceSlab => {
+                let slab_words = requirements.in_place_slab_words()?;
+                let slab = bind_slot(arena, slots.state_ping, slab_words, STATE_WORDS)?;
+                let scratch_offset = slab_words
+                    .checked_sub(
+                        super::progressive_commit_in_place::PROGRESSIVE_IN_PLACE_SCRATCH_WORDS,
+                    )
+                    .ok_or(PreparedProgressiveCommitError::SizeOverflow)?;
+                let scratch_pair = slab.checked_subslice(
+                    scratch_offset,
+                    super::progressive_commit_in_place::PROGRESSIVE_IN_PLACE_SCRATCH_WORDS,
+                )?;
+                let leaf_hashes = slab.checked_subslice(0, requirements.leaf_hash_words)?;
+                (
+                    slab,
+                    requirements.state_pong_words.map(|_| slab),
+                    leaf_hashes,
+                    Some(scratch_pair),
+                )
+            }
         };
-        let leaf_hashes = bind_slot(
-            arena,
-            slots.leaf_hashes,
-            requirements.leaf_hash_words,
-            HASH_WORDS,
-        )?;
         let scratch = match (slots.lde_scratch, requirements.lde_scratch_words) {
             (Some(id), Some(words)) => Some(bind_slot(arena, id, words, 1)?),
             (None, None) => None,
@@ -809,15 +922,29 @@ impl<'a> PreparedProgressiveLeaves<'a> {
         });
         for (batch, segments) in prepared_batches {
             if batch.log_size > current_log {
-                let output = next.ok_or(PreparedProgressiveCommitError::InvalidSlotShape)?;
-                launches.push(Launch::Expand {
-                    from_log: current_log,
-                    to_log: batch.log_size,
-                    input: current,
-                    output,
-                });
-                next = Some(current);
-                current = output;
+                match storage {
+                    ProgressiveCommitStorageMode::Separate => {
+                        let output =
+                            next.ok_or(PreparedProgressiveCommitError::InvalidSlotShape)?;
+                        launches.push(Launch::Expand {
+                            from_log: current_log,
+                            to_log: batch.log_size,
+                            input: current,
+                            output,
+                        });
+                        next = Some(current);
+                        current = output;
+                    }
+                    ProgressiveCommitStorageMode::InPlaceSlab => {
+                        launches.push(Launch::ExpandInPlace {
+                            from_log: current_log,
+                            to_log: batch.log_size,
+                            states: current,
+                            scratch_pair: in_place_scratch
+                                .ok_or(PreparedProgressiveCommitError::InvalidSlotShape)?,
+                        });
+                    }
+                }
                 current_log = batch.log_size;
             }
             for segment in segments {
@@ -845,21 +972,43 @@ impl<'a> PreparedProgressiveLeaves<'a> {
             }
         }
         if current_log < requirements.plan.geometry.lifting_log_size {
-            let output = next.ok_or(PreparedProgressiveCommitError::InvalidSlotShape)?;
-            launches.push(Launch::Expand {
-                from_log: current_log,
-                to_log: requirements.plan.geometry.lifting_log_size,
-                input: current,
-                output,
-            });
-            current = output;
+            match storage {
+                ProgressiveCommitStorageMode::Separate => {
+                    let output = next.ok_or(PreparedProgressiveCommitError::InvalidSlotShape)?;
+                    launches.push(Launch::Expand {
+                        from_log: current_log,
+                        to_log: requirements.plan.geometry.lifting_log_size,
+                        input: current,
+                        output,
+                    });
+                    current = output;
+                }
+                ProgressiveCommitStorageMode::InPlaceSlab => {
+                    launches.push(Launch::ExpandInPlace {
+                        from_log: current_log,
+                        to_log: requirements.plan.geometry.lifting_log_size,
+                        states: current,
+                        scratch_pair: in_place_scratch
+                            .ok_or(PreparedProgressiveCommitError::InvalidSlotShape)?,
+                    });
+                }
+            }
         }
-        launches.push(Launch::Finalize {
-            log_size: requirements.plan.geometry.lifting_log_size,
-            absorbed_columns,
-            states: current,
-            output: leaf_hashes,
-        });
+        match storage {
+            ProgressiveCommitStorageMode::Separate => launches.push(Launch::Finalize {
+                log_size: requirements.plan.geometry.lifting_log_size,
+                absorbed_columns,
+                states: current,
+                output: leaf_hashes,
+            }),
+            ProgressiveCommitStorageMode::InPlaceSlab => launches.push(Launch::FinalizeInPlace {
+                log_size: requirements.plan.geometry.lifting_log_size,
+                absorbed_columns,
+                states_and_hashes: current,
+                scratch_pair: in_place_scratch
+                    .ok_or(PreparedProgressiveCommitError::InvalidSlotShape)?,
+            }),
+        }
 
         // Dynamic shared-memory admission is setup-only and occurs before any
         // capture. Unsupported devices reject the selected topology here.
@@ -885,7 +1034,16 @@ impl<'a> PreparedProgressiveLeaves<'a> {
             leaf_hashes,
             twiddles,
             twiddle_words,
-            cache_key: requirements.plan.cache_key,
+            cache_key: match storage {
+                ProgressiveCommitStorageMode::Separate => requirements.plan.cache_key,
+                ProgressiveCommitStorageMode::InPlaceSlab => {
+                    super::progressive_commit_in_place::progressive_in_place_cache_key(
+                        requirements.plan.cache_key,
+                    )
+                }
+            },
+            storage,
+            in_place_scratch,
             ntt_leaf_fusion: fusion_telemetry,
         })
     }
@@ -915,6 +1073,21 @@ impl<'a> PreparedProgressiveLeaves<'a> {
                             to_log,
                             input.as_u32_ptr().cast(),
                             output.as_u32_ptr().cast(),
+                            stream,
+                        ),
+                    ),
+                    Launch::ExpandInPlace {
+                        from_log,
+                        to_log,
+                        states,
+                        scratch_pair,
+                    } => (
+                        "progressive_leaf_expand_in_place",
+                        stwo_backend_cuda_kernels::raw::stwo_blake2s_progressive_expand_in_place_on(
+                            from_log,
+                            to_log,
+                            states.as_u32_ptr().cast(),
+                            scratch_pair.as_u32_ptr().cast(),
                             stream,
                         ),
                     ),
@@ -982,6 +1155,21 @@ impl<'a> PreparedProgressiveLeaves<'a> {
                             stream,
                         ),
                     ),
+                    Launch::FinalizeInPlace {
+                        log_size,
+                        absorbed_columns,
+                        states_and_hashes,
+                        scratch_pair,
+                    } => (
+                        "progressive_leaf_finalize_in_place",
+                        stwo_backend_cuda_kernels::raw::stwo_blake2s_progressive_finalize_in_place_on(
+                            1u32 << log_size,
+                            absorbed_columns,
+                            states_and_hashes.as_u32_ptr().cast(),
+                            scratch_pair.as_u32_ptr().cast(),
+                            stream,
+                        ),
+                    ),
                 }
             };
             check_cuda(operation, code)?;
@@ -995,6 +1183,12 @@ impl<'a> PreparedProgressiveLeaves<'a> {
             Launch::Expand {
                 from_log, to_log, ..
             } => ProgressiveLeafLaunchKind::Expand {
+                from_log_size: from_log,
+                to_log_size: to_log,
+            },
+            Launch::ExpandInPlace {
+                from_log, to_log, ..
+            } => ProgressiveLeafLaunchKind::ExpandInPlace {
                 from_log_size: from_log,
                 to_log_size: to_log,
             },
@@ -1027,6 +1221,14 @@ impl<'a> PreparedProgressiveLeaves<'a> {
                 log_size,
                 absorbed_columns,
             },
+            Launch::FinalizeInPlace {
+                log_size,
+                absorbed_columns,
+                ..
+            } => ProgressiveLeafLaunchKind::FinalizeInPlace {
+                log_size,
+                absorbed_columns,
+            },
         })
     }
     pub fn leaf_hashes(&self) -> ArenaSlice {
@@ -1034,6 +1236,12 @@ impl<'a> PreparedProgressiveLeaves<'a> {
     }
     pub fn cache_key(&self) -> u64 {
         self.cache_key
+    }
+    pub fn storage_mode(&self) -> ProgressiveCommitStorageMode {
+        self.storage
+    }
+    pub fn in_place_scratch_pair(&self) -> Option<ArenaSlice> {
+        self.in_place_scratch
     }
     pub fn ntt_leaf_fusion_telemetry(&self) -> ProgressiveNttLeafFusionTelemetry {
         self.ntt_leaf_fusion
@@ -1197,6 +1405,74 @@ impl<'a> PreparedProgressiveCommitGraph<'a> {
             &requirements.merkle,
             &slots.merkle,
             interior_fused,
+        )?;
+        if leaves.leaf_hashes().id() != merkle.leaves().id()
+            || leaves.leaf_hashes().as_u32_ptr() != merkle.leaves().as_u32_ptr()
+        {
+            return Err(PreparedProgressiveCommitError::GeometryMismatch);
+        }
+        Ok(Self {
+            leaves,
+            merkle,
+            retained_evaluations: retained_outputs.to_vec(),
+        })
+    }
+
+    /// Dormant complete one-slab constructor. Interior fusion is deliberately
+    /// rejected: this storage topology uses the qualified disjoint-band
+    /// interior lane and must be part of immutable runtime identity.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_in_place_slab_with_modes_and_ntt_fusion(
+        arena: &'a DeviceArena,
+        config: CommitWorkspaceConfig,
+        requirements: &ProgressiveCommitWorkspaceRequirements,
+        slots: &ProgressiveCommitWorkspaceSlots,
+        coefficients: &[CommitCoefficientColumn],
+        retained_outputs: &[Option<ArenaSlice>],
+        twiddles: ArenaSlice,
+        progressive_mode: ProgressiveCommitMode,
+        interior_fused: bool,
+        ntt_leaf_fusion: ProgressiveNttLeafFusionMode,
+    ) -> Result<Self, PreparedProgressiveCommitError> {
+        if interior_fused {
+            return Err(PreparedProgressiveCommitError::InvalidSlotShape);
+        }
+        progressive_prepare_mode_admission_for_mode(progressive_mode, &requirements.leaves)?;
+        let workspace = requirements.arena_slot_requirements_in_place(slots)?;
+        let workspace_ids = workspace
+            .iter()
+            .map(|entry| entry.id)
+            .collect::<BTreeSet<_>>();
+        let mut external = BTreeSet::new();
+        for source in coefficients
+            .iter()
+            .map(|column| column.coefficients)
+            .chain(retained_outputs.iter().flatten().copied())
+            .chain(core::iter::once(twiddles))
+        {
+            if workspace_ids.contains(&source.id()) || !external.insert(source.id()) {
+                return Err(PreparedProgressiveCommitError::AliasedSlot(source.id()));
+            }
+        }
+        let leaves = PreparedProgressiveLeaves::prepare_in_place_slab_with_mode_and_ntt_fusion(
+            arena,
+            &requirements.leaves,
+            &slots.leaves,
+            coefficients,
+            retained_outputs,
+            twiddles,
+            progressive_mode,
+            ntt_leaf_fusion,
+        )?;
+        let scratch_pair = leaves
+            .in_place_scratch_pair()
+            .ok_or(PreparedProgressiveCommitError::InvalidSlotShape)?;
+        let merkle = PreparedMerkleFromLeaves::prepare_in_place_slab(
+            arena,
+            config,
+            &requirements.merkle,
+            &slots.merkle,
+            scratch_pair,
         )?;
         if leaves.leaf_hashes().id() != merkle.leaves().id()
             || leaves.leaf_hashes().as_u32_ptr() != merkle.leaves().as_u32_ptr()

@@ -7,7 +7,9 @@
 
 use std::ops::Range;
 
-use stwo::core::vcs::blake2_hash::{Blake2sHash, Blake2sHasherGeneric};
+use stwo::core::vcs::blake2_hash::Blake2sHash;
+#[cfg(test)]
+use stwo::core::vcs::blake2_hash::Blake2sHasherGeneric;
 
 use super::progressive_commit::PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES;
 
@@ -17,6 +19,7 @@ pub const PROGRESSIVE_IN_PLACE_SCRATCH_BYTES: usize =
     SAVED_EXPANSION_STATES * PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES;
 pub const PROGRESSIVE_IN_PLACE_SCRATCH_WORDS: usize =
     PROGRESSIVE_IN_PLACE_SCRATCH_BYTES / core::mem::size_of::<u32>();
+const IN_PLACE_CACHE_TAG: &[u8] = b"progressive-commit-in-place-slab-v1";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InPlaceBand {
@@ -47,6 +50,15 @@ pub fn progressive_in_place_slab_words(lifting_log_size: u32) -> Result<usize, I
         .checked_mul(PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES / core::mem::size_of::<u32>())
         .and_then(|words| words.checked_add(PROGRESSIVE_IN_PLACE_SCRATCH_WORDS))
         .ok_or(InPlacePlanError::SizeOverflow)
+}
+
+pub fn progressive_in_place_cache_key(base: u64) -> u64 {
+    IN_PLACE_CACHE_TAG
+        .iter()
+        .chain(base.to_le_bytes().iter())
+        .fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        })
 }
 
 /// High-to-low source-pair bands for one state-domain expansion.
@@ -148,6 +160,7 @@ pub fn merkle_band_plan(
     })
 }
 
+#[cfg(test)]
 pub fn ranges_overlap(left: &Range<usize>, right: &Range<usize>) -> bool {
     left.start < right.end && right.start < left.end
 }
@@ -314,6 +327,19 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(in_place_root(leaves.clone()), merkle_root(leaves));
         }
+    }
+
+    #[test]
+    fn in_place_storage_has_a_distinct_stable_cache_identity() {
+        assert_ne!(progressive_in_place_cache_key(7), 7);
+        assert_eq!(
+            progressive_in_place_cache_key(7),
+            progressive_in_place_cache_key(7)
+        );
+        assert_ne!(
+            progressive_in_place_cache_key(7),
+            progressive_in_place_cache_key(8)
+        );
     }
 
     fn expand_tokens(mut states: Vec<usize>, from_log: u32, to_log: u32) -> Vec<usize> {

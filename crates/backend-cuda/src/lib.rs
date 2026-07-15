@@ -119,8 +119,9 @@ pub use backend::prepared_progressive_commit::{
     progressive_prepare_mode_admission_for_mode, ModeAwareCommitWorkspaceRequirements,
     ModeAwareCommitWorkspaceSlots, PreparedProgressiveCommitError, PreparedProgressiveCommitGraph,
     PreparedProgressiveLeaves, ProgressiveBatchRequirements, ProgressiveBatchSlots,
-    ProgressiveCommitWorkspaceRequirements, ProgressiveCommitWorkspaceSlots,
-    ProgressiveLeafLaunchKind, ProgressiveLeafWorkspaceRequirements, ProgressiveLeafWorkspaceSlots,
+    ProgressiveCommitStorageMode, ProgressiveCommitWorkspaceRequirements,
+    ProgressiveCommitWorkspaceSlots, ProgressiveLeafLaunchKind,
+    ProgressiveLeafWorkspaceRequirements, ProgressiveLeafWorkspaceSlots,
 };
 pub use backend::prepared_quotient::{
     quotient_workspace_requirements, PreparedQuotientError, PreparedQuotientGraph,
@@ -177,9 +178,9 @@ pub use backend::progressive_commit::{
     PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES,
 };
 pub use backend::progressive_commit_in_place::{
-    expansion_band_plan, finalize_band_plan, merkle_band_plan, progressive_in_place_slab_words,
-    InPlaceBand, InPlaceBandPlan, InPlacePlanError, PROGRESSIVE_IN_PLACE_SCRATCH_BYTES,
-    PROGRESSIVE_IN_PLACE_SCRATCH_WORDS,
+    expansion_band_plan, finalize_band_plan, merkle_band_plan, progressive_in_place_cache_key,
+    progressive_in_place_slab_words, InPlaceBand, InPlaceBandPlan, InPlacePlanError,
+    PROGRESSIVE_IN_PLACE_SCRATCH_BYTES, PROGRESSIVE_IN_PLACE_SCRATCH_WORDS,
 };
 pub use backend::progressive_ntt_leaf_fusion::{
     progressive_ntt_leaf_fusion_telemetry, ProgressiveNttLeafFusionMode,
