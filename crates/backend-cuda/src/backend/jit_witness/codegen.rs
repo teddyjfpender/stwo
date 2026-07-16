@@ -5,7 +5,7 @@
 //! helpers match the byte-equal-proven constraint lane; integer ops are native CUDA
 //! `unsigned`. The ABI contains only explicit C pointer/scalar parameters.
 
-use super::isa::{DeduceKind, WitnessOp, WitnessProgram};
+use super::isa::{DeduceKind, DeduceModuleState, WitnessOp, WitnessProgram};
 
 #[path = "codegen_phase_plan.rs"]
 pub mod phase_plan;
@@ -83,12 +83,10 @@ fn compile_witness_to_cuda_source_inner(
         )
     };
     if kinds_used.iter().any(uses_fp256) {
-        if kinds_used.iter().any(|kind| {
-            matches!(
-                kind,
-                DeduceKind::PartialEcMulW18 | DeduceKind::PedersenPointsTableW18
-            )
-        }) {
+        if kinds_used
+            .iter()
+            .any(|kind| kind.module_state() == DeduceModuleState::PedersenTableColumnsAndRowsV1)
+        {
             src.push_str("#define STWO_WIT_NEEDS_PEDERSEN 1\n");
         }
         emit_fp256_deduce_support(&mut src);
@@ -571,6 +569,25 @@ mod tests {
         let next_result_definition = source.find("unsigned r7 = douts0[1];").unwrap();
         assert!(argument_snapshot < argument_store && argument_store < call);
         assert!(call < result_store && result_store < next_result_definition);
+    }
+
+    #[test]
+    fn every_deduce_source_matches_its_module_state() {
+        for raw in 0..=11 {
+            let kind = DeduceKind::from_raw(raw).unwrap();
+            let mut recorder = WitnessRecorder::new("module_state_probe");
+            let inputs = (0..kind.shape().0)
+                .map(|index| recorder.input(index as u32))
+                .collect::<Vec<_>>();
+            let outputs = recorder.deduce(kind, &inputs);
+            recorder.col_write(0, outputs[0]);
+            let source = compile_witness_to_cuda_source(&recorder.finish()).unwrap();
+            assert_eq!(
+                source.contains("#define STWO_WIT_NEEDS_PEDERSEN 1\n"),
+                kind.module_state() == DeduceModuleState::PedersenTableColumnsAndRowsV1,
+                "{kind:?} source/module-state drift"
+            );
+        }
     }
 
     #[test]

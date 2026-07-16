@@ -151,6 +151,16 @@ pub enum DeduceKind {
     Poseidon3PartialRoundsChain = 11,
 }
 
+/// Runtime state a computed deduce reads outside its explicit arguments.
+///
+/// This classification is exhaustive by design: adding a deduce kind must
+/// choose a state contract before codegen or a compiled proof can admit it.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum DeduceModuleState {
+    SelfContained,
+    PedersenTableColumnsAndRowsV1,
+}
+
 impl DeduceKind {
     pub const fn from_raw(value: u32) -> Option<Self> {
         Some(match value {
@@ -181,6 +191,24 @@ impl DeduceKind {
             Self::Cube252 => (10, 10),
             Self::PoseidonFullRoundChain => (32, 32),
             Self::Poseidon3PartialRoundsChain => (42, 42),
+        }
+    }
+
+    pub const fn module_state(self) -> DeduceModuleState {
+        match self {
+            Self::PartialEcMulW18 | Self::PedersenPointsTableW18 => {
+                DeduceModuleState::PedersenTableColumnsAndRowsV1
+            }
+            Self::BlakeG
+            | Self::BlakeRoundSigma
+            | Self::FeltAdd
+            | Self::FeltSub
+            | Self::FeltMul
+            | Self::FeltDiv
+            | Self::PoseidonRoundKeys
+            | Self::Cube252
+            | Self::PoseidonFullRoundChain
+            | Self::Poseidon3PartialRoundsChain => DeduceModuleState::SelfContained,
         }
     }
 }
@@ -385,6 +413,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn every_deduce_kind_has_exact_module_state() {
+        for raw in 0..=11 {
+            let kind = DeduceKind::from_raw(raw).unwrap();
+            assert_eq!(
+                kind.module_state(),
+                if matches!(
+                    kind,
+                    DeduceKind::PartialEcMulW18 | DeduceKind::PedersenPointsTableW18
+                ) {
+                    DeduceModuleState::PedersenTableColumnsAndRowsV1
+                } else {
+                    DeduceModuleState::SelfContained
+                }
+            );
+        }
+        assert_eq!(DeduceKind::from_raw(12), None);
+    }
+
+    #[test]
     fn abi_layout_is_stable() {
         validate_isa_layout().unwrap();
     }
@@ -392,8 +439,7 @@ mod tests {
     #[test]
     fn opcode_roundtrip_is_total() {
         // Every discriminant round-trips, and the first unused value is rejected.
-        // (23 = SubWord; 24/25 = the ISA-V2 inverse/eq extension.)
-        for raw in 0u8..=25 {
+        for raw in 0u8..=27 {
             let op = WitnessOp::from_raw(raw).expect("known opcode");
             assert_eq!(op as u8, raw);
         }

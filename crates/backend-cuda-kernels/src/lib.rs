@@ -39,6 +39,11 @@ pub const fn static_cuda_source_identity() -> [u8; 32] {
     STATIC_CUDA_SOURCE_IDENTITY
 }
 
+/// Canonical identity used by the embedded AOT pack for one exact CUDA source.
+pub fn aot_source_identity(source: &[u8]) -> [u8; 32] {
+    aot_identity::source_identity(source)
+}
+
 /// Expected archive-payload/build identity embedded in this Rust build.
 /// This is not an attestation of the SASS loaded by a CUDA driver.
 pub const fn expected_static_cuda_module_build_identity() -> [u8; 32] {

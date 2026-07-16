@@ -18,6 +18,11 @@ pub use stwo_backend_cuda_kernels::aot_pack::{
     AotKernelAuthority, AotKernelSchemaScope,
 };
 
+/// Canonical identity the AOT pack binds to an emitted CUDA translation unit.
+pub fn emitted_source_identity(source: &str) -> [u8; 32] {
+    stwo_backend_cuda_kernels::aot_source_identity(source.as_bytes())
+}
+
 /// Collision-resistant identity of the exact AOT cubins and generation
 /// policies embedded in this binary. All-zero means absent or policy-invalid
 /// and is never source authority. Compiled proofs that require source/symbol
