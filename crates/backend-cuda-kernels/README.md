@@ -7,9 +7,11 @@ starting point for a future `stwo-backend-cuda` crate.
 **The crate is compile-gated**: without `nvcc` it builds as a stub, so there is no CUDA
 toolkit requirement for building or testing stwo. With `nvcc` available (on `PATH` or via
 `STWO_CUDA_NVCC`), `cargo build -p stwo-backend-cuda-kernels` compiles every kernel under
-`cuda/` into a static archive (`-rdc=true -dlto`, `-arch` from `STWO_CUDA_ARCH`, default
-`native`) — run that on an NVIDIA box as the first validation gate for the staged
-sources. No FFI bindings are exposed yet; they belong with the `stwo-backend-cuda` trait
+`cuda/` into a static archive with separable compilation. Target SMs come from the
+comma-separated numeric `STWO_CUDA_ARCH`, or are detected from the first local GPU;
+headless compiler hosts must set the variable explicitly. Run that on an NVIDIA box as
+the first validation gate for the staged sources. No FFI bindings are exposed yet; they
+belong with the `stwo-backend-cuda` trait
 implementations (see "How to turn this into a backend" below).
 
 ## What was taken

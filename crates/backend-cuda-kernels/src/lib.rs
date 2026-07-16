@@ -22,6 +22,10 @@ pub mod raw;
 mod stubs;
 
 include!(concat!(env!("OUT_DIR"), "/static_cuda_source_identity.rs"));
+include!(concat!(
+    env!("OUT_DIR"),
+    "/static_cuda_module_build_identity.rs"
+));
 
 /// True when the CUDA kernels were compiled and linked into this build.
 pub const CUDA_KERNELS_BUILT: bool = cfg!(stwo_cuda_link);
@@ -35,6 +39,56 @@ pub const fn static_cuda_source_identity() -> [u8; 32] {
     STATIC_CUDA_SOURCE_IDENTITY
 }
 
+/// Expected archive-payload/build identity embedded in this Rust build.
+/// This is not an attestation of the SASS loaded by a CUDA driver.
+pub const fn expected_static_cuda_module_build_identity() -> [u8; 32] {
+    STATIC_CUDA_MODULE_BUILD_IDENTITY
+}
+
+/// Sorted numeric SM targets compiled into the ordinary static CUDA archive.
+pub const fn static_cuda_module_target_sms() -> &'static [u32] {
+    STATIC_CUDA_MODULE_TARGET_SMS
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StaticCudaModuleBuildIdentityError {
+    Unavailable(i32),
+    ReceiptMismatch {
+        expected: [u8; 32],
+        actual: [u8; 32],
+    },
+}
+
+impl std::fmt::Display for StaticCudaModuleBuildIdentityError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable(code) => {
+                write!(formatter, "static CUDA build identity unavailable ({code})")
+            }
+            Self::ReceiptMismatch { .. } => {
+                formatter.write_str("linked static CUDA build identity receipt mismatch")
+            }
+        }
+    }
+}
+
+impl std::error::Error for StaticCudaModuleBuildIdentityError {}
+
+/// Reads the host-only archive receipt and requires an exact match with the
+/// Rust constant generated from the same payload manifest.
+pub fn static_cuda_module_build_identity() -> Result<[u8; 32], StaticCudaModuleBuildIdentityError> {
+    let mut actual = [0; 32];
+    let code = unsafe { raw::stwo_static_cuda_module_build_identity(actual.as_mut_ptr()) };
+    if code != 0 {
+        return Err(StaticCudaModuleBuildIdentityError::Unavailable(code));
+    }
+    let expected = expected_static_cuda_module_build_identity();
+    if actual != expected {
+        return Err(StaticCudaModuleBuildIdentityError::ReceiptMismatch { expected, actual });
+    }
+    Ok(actual)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -43,10 +97,30 @@ mod tests {
     fn build_mode_is_consistent() {
         assert_eq!(BUILD_MODE == "cuda", CUDA_KERNELS_BUILT);
         assert_ne!(static_cuda_source_identity(), [0; 32]);
+        if CUDA_KERNELS_BUILT {
+            assert_ne!(expected_static_cuda_module_build_identity(), [0; 32]);
+            assert!(!static_cuda_module_target_sms().is_empty());
+            assert_eq!(
+                static_cuda_module_build_identity().unwrap(),
+                expected_static_cuda_module_build_identity()
+            );
+        } else {
+            assert_eq!(expected_static_cuda_module_build_identity(), [0; 32]);
+            assert!(static_cuda_module_target_sms().is_empty());
+            assert_eq!(
+                static_cuda_module_build_identity(),
+                Err(StaticCudaModuleBuildIdentityError::Unavailable(801))
+            );
+            let mut receipt = [0xff; 32];
+            let code = unsafe { raw::stwo_static_cuda_module_build_identity(receipt.as_mut_ptr()) };
+            assert_eq!(code, 801);
+            assert_eq!(receipt, [0; 32]);
+        }
     }
 
     #[test]
     fn recent_checked_abi_symbols_are_linked_in_cuda_and_stub_builds() {
+        assert_ne!(raw::stwo_static_cuda_module_build_identity as usize, 0);
         assert_ne!(raw::cuda_default_pool_alloc_checked as usize, 0);
         assert_ne!(raw::cuda_default_pool_copy_h2d_checked as usize, 0);
         assert_ne!(raw::cuda_default_pool_free_checked as usize, 0);

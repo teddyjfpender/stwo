@@ -21,6 +21,14 @@ fn no_cuda_symbol(symbol: &str) -> ! {
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_static_cuda_module_build_identity(out: *mut u8) -> i32 {
+    if !out.is_null() {
+        core::ptr::write_bytes(out, 0, 32);
+    }
+    CUDA_ERROR_NOT_SUPPORTED
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn copy_uint32_t_vec_from_device_to_host(
     device_ptr: *const u32,
     host_ptr: *const u32,

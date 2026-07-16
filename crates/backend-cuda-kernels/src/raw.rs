@@ -467,6 +467,10 @@ mod composition_wave_abi_tests {
 
 #[cfg_attr(stwo_cuda_link, link(name = "stwo_cuda_kernels", kind = "static"))]
 extern "C" {
+    /// Returns the collision-resistant build identity carried by the linked
+    /// ordinary static CUDA archive. This does not attest loaded SASS.
+    pub fn stwo_static_cuda_module_build_identity(out: *mut u8) -> i32;
+
     /// Returns a CUDA error code (0 = success). Sets the default mem pool's release
     /// threshold to never-release so warm proves reuse allocations.
     pub fn cuda_mem_pool_init() -> i32;

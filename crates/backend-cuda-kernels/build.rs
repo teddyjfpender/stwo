@@ -8,14 +8,14 @@
 //!
 //! Tunables:
 //! - `STWO_CUDA_NVCC`: path to the nvcc binary (default: `nvcc` from `PATH`)
-//! - `STWO_CUDA_ARCH`: value for `-arch` (default: `native`)
+//! - `STWO_CUDA_ARCH`: comma-separated numeric SMs; detected from the first local GPU, and required
+//!   explicitly on a headless compiler host
 //! - `STWO_CUDA_NVCC_FLAGS`: extra whitespace-separated flags appended to every call
 //! - `STWO_CUDA_BUILD_JOBS`: maximum concurrent nvcc processes (default: host parallelism)
 //! - `STWO_CUDA_HOST_COMPILER`: explicit nvcc host compiler (default: `c++` from `PATH`)
 //!
-//! The kernels are compiled with `-rdc=true` (they cross-reference `fields.cu` across
-//! translation units) and `-dlto`, so device link-time optimization can inline field ops
-//! at the final device link — see "Known issues" in the README.
+//! The kernels use separable compilation because translation units cross-reference
+//! `fields.cu`; see "Known issues" in the README for the remaining inlining cost.
 
 use std::env;
 use std::path::PathBuf;
@@ -38,6 +38,14 @@ fn cuda_build_workers(job_count: usize) -> usize {
 #[path = "build_cache.rs"]
 mod build_cache;
 use build_cache::*;
+
+#[path = "static_module_identity.rs"]
+mod static_module_identity;
+use static_module_identity::{
+    is_ordinary_cuda_authority_file, normalized_target_sms, receipt_carrier_source,
+    static_module_build_identity, ExactFile, ExecutableIdentity, StaticModuleIdentityInput,
+    TuObject,
+};
 
 #[path = "src/aot_identity.rs"]
 mod aot_identity;
@@ -103,6 +111,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=PATH");
     println!("cargo:rerun-if-changed=build_cache.rs");
     println!("cargo:rerun-if-changed=build_fingerprint_tests.rs");
+    println!("cargo:rerun-if-changed=static_module_identity.rs");
+    println!("cargo:rerun-if-changed=static_module_identity_tests.rs");
     println!("cargo:rerun-if-changed=src/aot_identity.rs");
     println!("cargo:rerun-if-changed=src/aot_source_manifest.rs");
 
@@ -125,6 +135,7 @@ fn main() {
     let aot_constraint_max_instrs = generated_aot_constraint_max_instrs();
     let aot_constraint_max_live_u32_lanes = generated_aot_constraint_max_live_u32_lanes();
     if !nvcc_available {
+        write_static_cuda_module_build_identity(&out_dir, [0; 32], &[]);
         write_aot_pack(
             &out_dir,
             &[],
@@ -138,6 +149,8 @@ fn main() {
         .and_then(|path| std::fs::canonicalize(path).ok())
         .unwrap_or_else(|| PathBuf::from(&nvcc_requested));
     let nvcc = nvcc_path.to_string_lossy().into_owned();
+    let nvcc_executable_bytes =
+        std::fs::read(&nvcc_path).expect("read exact nvcc executable identity");
     let nvcc_identity =
         command_version(&nvcc, true).expect("re-probe resolved nvcc version successfully");
     let nvcc_command_identity = command_identity(&nvcc, Some(&nvcc_path));
@@ -147,6 +160,8 @@ fn main() {
     emit_command_reruns(Some(&host_path));
     let host_executable = std::fs::canonicalize(&host_path).unwrap_or_else(|_| host_path.clone());
     let host_executable = host_executable.to_string_lossy().into_owned();
+    let host_executable_bytes =
+        std::fs::read(&host_executable).expect("read exact nvcc host compiler executable identity");
     let host_version_identity = command_version(&host_executable, false)
         .expect("query resolved nvcc host compiler version");
     let host_command_identity = command_identity(
@@ -165,12 +180,13 @@ fn main() {
     };
     // STWO_CUDA_ARCH accepts a comma list (e.g. "sm_86,sm_90") to build a fat binary
     // that runs on multiple GPU generations — one release artifact for 3090 and H100.
-    let archs: Vec<String> = env::var("STWO_CUDA_ARCH")
-        .unwrap_or_else(|_| detect_arch())
-        .split(',')
-        .map(|a| a.trim().to_string())
-        .filter(|a| !a.is_empty())
-        .collect();
+    let target_sms =
+        normalized_target_sms(&env::var("STWO_CUDA_ARCH").unwrap_or_else(|_| detect_arch()))
+            .unwrap_or_else(|error| panic!("{error}"));
+    let archs = target_sms
+        .iter()
+        .map(|sm| format!("sm_{sm}"))
+        .collect::<Vec<_>>();
     let gencode_flags: Vec<String> = archs
         .iter()
         .flat_map(|arch| {
@@ -185,6 +201,7 @@ fn main() {
         .map(|flags| flags.split_whitespace().map(str::to_string).collect())
         .unwrap_or_default();
     validate_extra_flags(&extra_flags).unwrap_or_else(|error| panic!("{error}"));
+    let source_closure = snapshot_ordinary_cuda_sources();
 
     // Separable compilation (-rdc=true) requires an explicit device-link step: the
     // final Rust link knows nothing about CUDA, so the device-link object must be in
@@ -226,6 +243,7 @@ fn main() {
         let _ = std::fs::create_dir_all(dir);
     }
     let mut objects: Vec<PathBuf> = Vec::with_capacity(sources.len() + 1);
+    let mut object_argvs: Vec<Vec<String>> = Vec::with_capacity(sources.len());
     let mut obj_jobs: Vec<(PathBuf, PathBuf)> = Vec::new();
     let mut staged_objects: Vec<(PathBuf, PathBuf, Option<PathBuf>)> = Vec::new();
     let mut source_identities: Vec<(PathBuf, PathBuf, u128)> = Vec::with_capacity(sources.len());
@@ -267,6 +285,15 @@ fn main() {
             staged_objects.push((staging, object.clone(), publish_cache));
         }
         objects.push(object);
+        // Seal the exact compiler-policy argv against the final content-addressed
+        // object name. A temporary publication suffix is intentionally normalized
+        // away: cache hits execute no nvcc command, while the exact object bytes
+        // below remain authoritative in either path.
+        let mut argv = object_compile_flags.clone();
+        argv.push(source_arg.to_string_lossy().into_owned());
+        argv.push("-o".to_string());
+        argv.push(objects.last().unwrap().to_string_lossy().into_owned());
+        object_argvs.push(argv);
         source_identities.push((source.clone(), source_arg, key));
     }
     if !obj_jobs.is_empty() {
@@ -331,26 +358,106 @@ fn main() {
         }
     }
     let dlink = out_dir.join("stwo_cuda_kernels_dlink.o");
-    run_nvcc(
-        nvcc_command(&nvcc)
-            .arg("-dlink")
-            .arg("-Xcompiler")
-            .arg("-fPIC")
-            .arg(compiler_identity.host_flag)
-            .args(&gencode_flags)
-            .args(&objects)
-            .arg("-o")
-            .arg(&dlink),
+    let dlink_staging = out_dir.join("stwo_cuda_kernels_dlink.staged.o");
+    let _ = std::fs::remove_file(&dlink_staging);
+    let mut dlink_argv = vec![
+        "-dlink".to_string(),
+        "-Xcompiler".to_string(),
+        "-fPIC".to_string(),
+        compiler_identity.host_flag.to_string(),
+    ];
+    dlink_argv.extend(gencode_flags.iter().cloned());
+    dlink_argv.extend(extra_flags.iter().cloned());
+    dlink_argv.extend(
+        objects
+            .iter()
+            .map(|object| object.to_string_lossy().into_owned()),
     );
-    objects.push(dlink);
+    dlink_argv.push("-o".to_string());
+    dlink_argv.push(dlink_staging.to_string_lossy().into_owned());
+    run_nvcc(nvcc_command(&nvcc).args(&dlink_argv));
+
+    let object_payloads = objects
+        .iter()
+        .map(|object| std::fs::read(object).expect("read exact CUDA TU object payload"))
+        .collect::<Vec<_>>();
+    let dlink_payload =
+        std::fs::read(&dlink_staging).expect("read exact CUDA device-link object payload");
+    let source_entries = source_closure
+        .iter()
+        .map(|(_, path, bytes)| ExactFile { path, bytes })
+        .collect::<Vec<_>>();
+    assert_eq!(sources.len(), object_argvs.len());
+    assert_eq!(sources.len(), object_payloads.len());
+    let object_source_paths = sources
+        .iter()
+        .map(|source| {
+            normalized_source_path(source)
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect::<Vec<_>>();
+    let object_entries = object_source_paths
+        .iter()
+        .zip(object_argvs.iter())
+        .zip(object_payloads.iter())
+        .map(|((source_path, argv), bytes)| TuObject {
+            source_path,
+            argv,
+            bytes,
+        })
+        .collect::<Vec<_>>();
+    let identity = static_module_build_identity(&StaticModuleIdentityInput {
+        target_sms: &target_sms,
+        nvcc: ExecutableIdentity {
+            path: &nvcc,
+            bytes: &nvcc_executable_bytes,
+            version_output: &nvcc_identity,
+        },
+        host_compiler: ExecutableIdentity {
+            path: &host_executable,
+            bytes: &host_executable_bytes,
+            version_output: &host_version_identity,
+        },
+        sources: &source_entries,
+        objects: &object_entries,
+        dlink_argv: &dlink_argv,
+        dlink_bytes: &dlink_payload,
+    })
+    .unwrap_or_else(|error| panic!("invalid static CUDA build identity: {error}"));
+    write_static_cuda_module_build_identity(&out_dir, identity, &target_sms);
+
+    let carrier_source = receipt_carrier_source(identity);
+    let carrier_source_path = out_dir.join("static_cuda_module_build_identity.cc");
+    std::fs::write(&carrier_source_path, &carrier_source)
+        .expect("write static CUDA build-identity receipt source");
+    let carrier = out_dir.join("static_cuda_module_build_identity.o");
+    let carrier_staging = out_dir.join("static_cuda_module_build_identity.staged.o");
+    let _ = std::fs::remove_file(&carrier_staging);
+    let output = Command::new(&host_executable)
+        .args(["-std=c++17", "-O2", "-fPIC", "-c"])
+        .arg(&carrier_source_path)
+        .arg("-o")
+        .arg(&carrier_staging)
+        .output()
+        .expect("compile static CUDA build-identity receipt carrier");
+    assert!(
+        output.status.success(),
+        "receipt carrier compilation failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let archive = out_dir.join("libstwo_cuda_kernels.a");
-    let _ = std::fs::remove_file(&archive);
+    let archive_staging = staging_path(&archive);
+    let _ = std::fs::remove_file(&archive_staging);
     let ar = env::var("AR").unwrap_or_else(|_| "ar".to_string());
     let output = Command::new(&ar)
         .arg("crs")
-        .arg(&archive)
+        .arg(&archive_staging)
         .args(&objects)
+        .arg(&dlink_staging)
+        // The receipt is deliberately last and excluded from `identity`.
+        .arg(&carrier_staging)
         .output()
         .expect("ar should be available to archive the kernel objects");
     assert!(
@@ -358,6 +465,35 @@ fn main() {
         "ar failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    publish_validated_artifacts(
+        &[
+            (dlink_staging.clone(), dlink.clone()),
+            (carrier_staging, carrier),
+            (archive_staging, archive),
+        ],
+        || {
+            validate_static_module_inputs(
+                &source_closure,
+                &objects,
+                &object_payloads,
+                &dlink_staging,
+                &dlink_payload,
+                &nvcc_path,
+                &nvcc_executable_bytes,
+                std::path::Path::new(&host_executable),
+                &host_executable_bytes,
+            )?;
+            validate_exact_bytes(&carrier_source_path, &carrier_source)?;
+            if !compiler_identity_is_current(compiler_identity) {
+                return Err(
+                    "nvcc or its host compiler changed while linking CUDA archive; retry the build"
+                        .to_string(),
+                );
+            }
+            Ok(())
+        },
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
 
     let aot_snapshot = build_aot_pack(
         &nvcc,
@@ -420,6 +556,20 @@ fn main() {
         aot_constraint_max_live_u32_lanes,
         "generated AOT live-lane cap changed during build"
     );
+    validate_static_module_inputs(
+        &source_closure,
+        &objects,
+        &object_payloads,
+        &dlink,
+        &dlink_payload,
+        &nvcc_path,
+        &nvcc_executable_bytes,
+        std::path::Path::new(&host_executable),
+        &host_executable_bytes,
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    validate_exact_bytes(&carrier_source_path, &carrier_source)
+        .unwrap_or_else(|error| panic!("{error}"));
     assert!(
         compiler_identity_is_current(compiler_identity),
         "nvcc or its host compiler changed before build completion; retry the build"
@@ -440,10 +590,102 @@ fn main() {
     println!("cargo:rustc-link-lib=stdc++");
 }
 
+fn write_static_cuda_module_build_identity(
+    out_dir: &std::path::Path,
+    identity: [u8; 32],
+    target_sms: &[u32],
+) {
+    let sms = target_sms
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let contents = format!(
+        "pub(crate) const STATIC_CUDA_MODULE_BUILD_IDENTITY: [u8; 32] = {};\n\
+         pub(crate) static STATIC_CUDA_MODULE_TARGET_SMS: &[u32] = &[{sms}];\n",
+        rust_digest(&identity)
+    );
+    let destination = out_dir.join("static_cuda_module_build_identity.rs");
+    let staging = staging_path(&destination);
+    std::fs::write(&staging, contents).expect("write static CUDA build identity constants");
+    std::fs::rename(staging, destination).expect("publish static CUDA build identity constants");
+}
+
+fn ordinary_cuda_authority_files() -> Vec<PathBuf> {
+    let cuda = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap()).join("cuda");
+    let mut files = Vec::new();
+    collect_ordinary_cuda_authority_files(&cuda, &mut files);
+    files.sort();
+    files.dedup();
+    files
+}
+
+fn collect_ordinary_cuda_authority_files(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(dir).expect("read ordinary CUDA authority directory") {
+        let path = entry.expect("read ordinary CUDA authority entry").path();
+        if path.is_dir() {
+            if path.file_name().is_some_and(|name| name == "generated") {
+                continue;
+            }
+            collect_ordinary_cuda_authority_files(&path, out);
+        } else if is_ordinary_cuda_authority_file(&path) {
+            out.push(path);
+        }
+    }
+}
+
+fn snapshot_ordinary_cuda_sources() -> Vec<(PathBuf, String, Vec<u8>)> {
+    let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    ordinary_cuda_authority_files()
+        .into_iter()
+        .map(|path| {
+            let relative = path
+                .strip_prefix(&manifest)
+                .expect("ordinary CUDA source belongs to this crate")
+                .to_string_lossy()
+                .replace('\\', "/");
+            let bytes = std::fs::read(&path).expect("read exact ordinary CUDA source closure");
+            (path, relative, bytes)
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_static_module_inputs(
+    sources: &[(PathBuf, String, Vec<u8>)],
+    objects: &[PathBuf],
+    object_payloads: &[Vec<u8>],
+    dlink: &std::path::Path,
+    dlink_payload: &[u8],
+    nvcc: &std::path::Path,
+    nvcc_bytes: &[u8],
+    host_compiler: &std::path::Path,
+    host_compiler_bytes: &[u8],
+) -> Result<(), String> {
+    let current_sources = ordinary_cuda_authority_files();
+    let expected_sources = sources
+        .iter()
+        .map(|(path, ..)| path.clone())
+        .collect::<Vec<_>>();
+    if current_sources != expected_sources {
+        return Err("ordinary CUDA source closure changed during build; retry".to_string());
+    }
+    for (path, _, bytes) in sources {
+        validate_exact_bytes(path, bytes)?;
+    }
+    if objects.len() != object_payloads.len() {
+        return Err("CUDA object snapshot cardinality changed".to_string());
+    }
+    for (path, bytes) in objects.iter().zip(object_payloads) {
+        validate_exact_bytes(path, bytes)?;
+    }
+    validate_exact_bytes(dlink, dlink_payload)?;
+    validate_exact_bytes(nvcc, nvcc_bytes)?;
+    validate_exact_bytes(host_compiler, host_compiler_bytes)
+}
+
 /// The compute capability of the local GPU as an `-arch` value (e.g. `sm_86`), queried
-/// via `nvidia-smi`. Falls back to `native` — but note `-arch=native` segfaults nvcc
-/// 11.8's detection path (validated on RunPod), which is why the explicit query is the
-/// default and `STWO_CUDA_ARCH` exists as an override.
+/// via `nvidia-smi`. A headless compiler host must set `STWO_CUDA_ARCH` explicitly.
 fn detect_arch() -> String {
     Command::new("nvidia-smi")
         .args(["--query-gpu=compute_cap", "--format=csv,noheader"])
@@ -455,7 +697,9 @@ fn detect_arch() -> String {
             let cap = cap.lines().next()?.trim().replace('.', "");
             (!cap.is_empty()).then(|| format!("sm_{cap}"))
         })
-        .unwrap_or_else(|| "native".to_string())
+        .unwrap_or_else(|| {
+            panic!("could not detect a numeric GPU SM; set STWO_CUDA_ARCH explicitly")
+        })
 }
 
 /// The toolkit's library directory (for `-lcudart`), from `CUDA_HOME`/`CUDA_PATH` or
@@ -486,11 +730,7 @@ fn kernel_sources() -> Vec<PathBuf> {
 fn write_static_cuda_source_identity(out_dir: &std::path::Path) {
     const DOMAIN: &[u8] = b"stwo-cuda-static-source-set-v1\0";
     let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
-    let cuda = manifest.join("cuda");
-    let mut files = kernel_sources();
-    collect_extension(&cuda, "cuh", &mut files);
-    files.sort();
-    files.dedup();
+    let files = ordinary_cuda_authority_files();
 
     let mut hasher = blake3::Hasher::new();
     hasher.update(DOMAIN);
@@ -522,20 +762,6 @@ fn encoded_len(value: usize) -> [u8; 8] {
     u64::try_from(value)
         .expect("static CUDA source identity length fits u64")
         .to_le_bytes()
-}
-
-fn collect_extension(dir: &std::path::Path, extension: &str, out: &mut Vec<PathBuf>) {
-    for entry in std::fs::read_dir(dir).expect("cuda/ directory must exist") {
-        let path = entry.expect("readable cuda/ directory entry").path();
-        if path.is_dir() {
-            if path.file_name().is_some_and(|name| name == "generated") {
-                continue;
-            }
-            collect_extension(&path, extension, out);
-        } else if path.extension().is_some_and(|actual| actual == extension) {
-            out.push(path);
-        }
-    }
 }
 
 fn collect_cu(dir: &std::path::Path, out: &mut Vec<PathBuf>) {

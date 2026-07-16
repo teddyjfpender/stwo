@@ -73,6 +73,55 @@ fn compiler_fingerprint_covers_exact_invocation_and_policy() {
             .any(|(name, value)| name == variable && value.is_none()));
     }
     assert!(validate_extra_flags(&strings(&["-lineinfo", "-ccbin=/other/c++"])).is_err());
+    for selector in [
+        "-arch",
+        "-arch=sm_89",
+        "--arch=sm_89",
+        "--gpu-architecture",
+        "--gpu-architecture=sm_89",
+        "--gpu-name=sm_89",
+        "-code",
+        "-code=sm_89",
+        "--gpu-code",
+        "--gpu-code=sm_89",
+        "-gencode",
+        "-gencode=arch=compute_89,code=sm_89",
+        "--generate-code",
+        "--generate-code=arch=compute_89,code=sm_89",
+        "-optf",
+        "-optf=/tmp/nvcc.flags",
+        "--options-file",
+        "--options-file=/tmp/nvcc.flags",
+        "-prune",
+        "--prune",
+        "-Xnvprune=-arch=sm_89",
+        "--nvprune-options=-optf=/tmp/nvprune.flags",
+    ] {
+        assert!(
+            validate_extra_flags(&strings(&["-lineinfo", selector])).is_err(),
+            "unsafe nvcc selector escaped admission: {selector}"
+        );
+    }
+    for forwarded in [
+        &["-Xptxas=-arch=sm_89"][..],
+        &["--ptxas-options=--gpu-name=sm_89"][..],
+        &["-Xptxas=-v,-optf=/tmp/ptxas.flags"][..],
+        &["--ptxas-options=--options-file=/tmp/ptxas.flags"][..],
+        &["-Xptxas", "-v,-arch=sm_89"][..],
+        &["-Xnvlink=-arch=sm_89"][..],
+        &["--nvlink-options=--arch=sm_89"][..],
+        &["-Xnvlink=--Xptxas=-arch=sm_89"][..],
+        &["--nvlink-options=-Xptxas=--gpu-name=sm_89"][..],
+        &["-Xnvlink=-v,-optf=/tmp/nvlink.flags"][..],
+        &["--nvlink-options", "--options-file=/tmp/nvlink.flags"][..],
+    ] {
+        assert!(
+            validate_extra_flags(&strings(forwarded)).is_err(),
+            "forwarded selector escaped admission: {forwarded:?}"
+        );
+    }
+    assert!(validate_extra_flags(&strings(&["-lineinfo", "-Xptxas=-v"])).is_ok());
+    assert!(validate_extra_flags(&strings(&["-Xptxas=-v,-O3"])).is_ok());
 }
 
 #[test]

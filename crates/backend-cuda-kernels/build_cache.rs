@@ -172,13 +172,89 @@ pub(crate) fn normalized_source_path(source: &Path) -> PathBuf {
 }
 
 pub(crate) fn validate_extra_flags(flags: &[String]) -> Result<(), &'static str> {
-    if flags.iter().any(|flag| {
+    fn selects(value: &str, selectors: &[&str]) -> bool {
+        selectors.iter().any(|selector| {
+            value == *selector
+                || value
+                    .strip_prefix(*selector)
+                    .is_some_and(|suffix| suffix.starts_with('='))
+        })
+    }
+
+    fn forwarded_selects(flags: &[String], forwarders: &[&str], selectors: &[&str]) -> bool {
+        flags.iter().enumerate().any(|(index, flag)| {
+            forwarders.iter().any(|forwarder| {
+                let payload = if flag == *forwarder {
+                    flags.get(index + 1).map(String::as_str)
+                } else {
+                    flag.strip_prefix(*forwarder)
+                        .and_then(|suffix| suffix.strip_prefix('='))
+                };
+                payload.is_some_and(|payload| {
+                    payload
+                        .split(',')
+                        .any(|option| selects(option.trim(), selectors))
+                })
+            })
+        })
+    }
+
+    let overrides_host_compiler = flags.iter().any(|flag| {
         flag == "-ccbin"
             || flag.starts_with("-ccbin=")
             || flag == "--compiler-bindir"
             || flag.starts_with("--compiler-bindir=")
-    }) {
+    });
+    if overrides_host_compiler {
         return Err("use STWO_CUDA_HOST_COMPILER instead of overriding nvcc -ccbin");
+    }
+    let overrides_target_sms = flags.iter().any(|flag| {
+        selects(
+            flag,
+            &[
+                "-arch",
+                "--arch",
+                "--gpu-architecture",
+                "--gpu-name",
+                "-code",
+                "--gpu-code",
+                "-gencode",
+                "--generate-code",
+            ],
+        )
+    });
+    if overrides_target_sms {
+        return Err("use STWO_CUDA_ARCH instead of overriding nvcc architecture/code flags");
+    }
+    let imports_unsealed_flags = flags
+        .iter()
+        .any(|flag| selects(flag, &["-optf", "--options-file"]));
+    if imports_unsealed_flags {
+        return Err("STWO_CUDA_NVCC_FLAGS may not import an nvcc options file");
+    }
+    if forwarded_selects(
+        flags,
+        &["-Xptxas", "--ptxas-options"],
+        &["-arch", "--gpu-name", "-optf", "--options-file"],
+    ) {
+        return Err(
+            "forwarded CUDA tool flags may not override target SMs or import options files",
+        );
+    }
+    if flags.iter().any(|flag| {
+        selects(
+            flag,
+            &[
+                "-Xnvlink",
+                "--nvlink-options",
+                "-prune",
+                "--prune",
+                "-Xnvprune",
+                "--nvprune-options",
+            ],
+        )
+    }) {
+        return Err("STWO_CUDA_NVCC_FLAGS may not configure nvlink or nvprune");
     }
     Ok(())
 }
