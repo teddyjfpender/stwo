@@ -48,7 +48,9 @@ use aot_identity::{
 
 #[path = "src/aot_source_manifest.rs"]
 mod aot_source_manifest;
-use aot_source_manifest::{parse_source_manifest, validate_exported_kernel_symbol};
+use aot_source_manifest::{
+    parse_source_manifest, validate_exported_kernel_symbol, validate_structured_kernel_signature,
+};
 
 struct AotBuildEntry {
     cache_key: u64,
@@ -583,9 +585,12 @@ fn build_aot_pack(
         let source_arg = normalized_source_path(source);
         let stem = source.file_stem().unwrap().to_string_lossy().to_string();
         let source_bytes = std::fs::read(source).expect("read generated AOT source identity");
-        validate_exported_kernel_symbol(&source_bytes, &metadata.kernel_symbol).unwrap_or_else(
-            |error| panic!("invalid generated source {}: {error}", source.display()),
-        );
+        if let Some(schema) = metadata.abi_schema {
+            validate_structured_kernel_signature(&source_bytes, &metadata.kernel_symbol, schema)
+        } else {
+            validate_exported_kernel_symbol(&source_bytes, &metadata.kernel_symbol)
+        }
+        .unwrap_or_else(|error| panic!("invalid generated source {}: {error}", source.display()));
         let exact_source_identity = source_identity(&source_bytes);
         assert_ne!(
             exact_source_identity,
@@ -801,6 +806,9 @@ fn write_aot_pack(
         let abi_schema = match entry.abi_schema {
             Some(AotKernelAbiSchema::RecordedWitnessV1) => {
                 "Some(AotKernelAbiSchema::RecordedWitnessV1)"
+            }
+            Some(AotKernelAbiSchema::OrdinaryConstraintV1) => {
+                "Some(AotKernelAbiSchema::OrdinaryConstraintV1)"
             }
             None => "None",
         };

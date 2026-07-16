@@ -419,8 +419,8 @@ pub fn constraint_program_with_live_cap<F: FrameworkEval>(
                     cache_key: cuda_codegen::jit_cache_key(semantic_hash),
                     semantic_hash,
                     source,
-                    abi_schema: None,
-                    program_identity: None,
+                    abi_schema: Some(AotKernelAbiSchema::OrdinaryConstraintV1),
+                    program_identity: Some(part.program.semantic_identity()),
                 },
                 rc_base: part.rc_base,
                 wave_fragment: ConstraintWaveFragment {
@@ -553,6 +553,8 @@ pub fn witness_phase_program_bindings(
 
 #[cfg(test)]
 mod tests {
+    use stwo_constraint_framework::EvalAtRow;
+
     use super::super::jit_witness::codegen::phase_plan::WitnessPhasePlan;
     use super::super::jit_witness::recording::WitnessRecorder;
     use super::*;
@@ -758,6 +760,67 @@ mod tests {
             schema.arguments()[7].access,
             AotKernelAbiAccess::LaunchRowCount
         );
+    }
+
+    struct OrdinaryConstraintEval;
+
+    impl FrameworkEval for OrdinaryConstraintEval {
+        fn log_size(&self) -> u32 {
+            4
+        }
+
+        fn max_constraint_log_degree_bound(&self) -> u32 {
+            5
+        }
+
+        fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
+            let value = eval.next_trace_mask();
+            eval.add_constraint(value);
+            eval
+        }
+    }
+
+    #[test]
+    fn ordinary_constraint_emitter_owns_typed_program_and_launch_abi() {
+        let program = constraint_program(
+            &OrdinaryConstraintEval,
+            1,
+            SecureField::from_u32_unchecked(0, 0, 0, 0),
+            4,
+            usize::MAX,
+        )
+        .unwrap();
+        assert_eq!(program.kernels.len(), 1);
+        let part = &program.kernels[0];
+        let emitted = &part.kernel;
+        assert_eq!(
+            emitted.program_identity,
+            Some(part.wave_fragment.program.semantic_identity())
+        );
+        let schema = emitted.abi_schema.unwrap();
+        assert_eq!(schema, AotKernelAbiSchema::OrdinaryConstraintV1);
+        assert_eq!(schema.arguments().len(), 13);
+        assert_eq!(schema.arguments()[0].name, "trace_cols");
+        assert_eq!(schema.arguments()[6].access, AotKernelAbiAccess::ReadWrite);
+        assert_eq!(
+            schema.arguments()[10].access,
+            AotKernelAbiAccess::LaunchRowCount
+        );
+        assert_eq!(
+            schema.arguments()[11].access,
+            AotKernelAbiAccess::TraceLogSize
+        );
+        assert_eq!(
+            schema.arguments()[12].access,
+            AotKernelAbiAccess::RandomCoefficientBase
+        );
+        assert!(emitted.source.contains(
+            "const unsigned *const *trace_cols,\n    const unsigned *interaction_offsets,\n    \
+             const unsigned *base_params,\n    const unsigned *ext_params,\n    const unsigned \
+             *random_coeff_powers,\n    const unsigned *denom_inv,\n    unsigned *coord_0,\n    \
+             unsigned *coord_1,\n    unsigned *coord_2,\n    unsigned *coord_3,\n    unsigned \
+             row_count,\n    unsigned log_n_rows,\n    unsigned rc_base"
+        ));
     }
 
     #[test]

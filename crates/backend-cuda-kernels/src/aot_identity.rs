@@ -39,6 +39,8 @@ pub enum AotKernelAbiAccess {
     Write = 2,
     ReadWrite = 3,
     LaunchRowCount = 4,
+    TraceLogSize = 5,
+    RandomCoefficientBase = 6,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -46,37 +48,43 @@ pub struct AotKernelAbiArgument {
     pub ordinal: u8,
     pub name: &'static str,
     pub kind: AotKernelAbiKind,
-    /// Coarse pointee access only. This does not authorize extents or aliases.
+    /// Coarse pointee access or scalar launch role. This does not authorize
+    /// extents, aliases, or concrete scalar values.
     pub access: AotKernelAbiAccess,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AotKernelAbiSchema {
     RecordedWitnessV1,
+    OrdinaryConstraintV1,
 }
 
 impl AotKernelAbiSchema {
     pub const fn manifest_tag(self) -> &'static str {
         match self {
             Self::RecordedWitnessV1 => "recorded_witness_v1",
+            Self::OrdinaryConstraintV1 => "ordinary_constraint_v1",
         }
     }
 
     pub const fn family(self) -> &'static str {
         match self {
             Self::RecordedWitnessV1 => "recorded_witness",
+            Self::OrdinaryConstraintV1 => "ordinary_constraint",
         }
     }
 
     pub const fn version(self) -> u32 {
         match self {
             Self::RecordedWitnessV1 => 1,
+            Self::OrdinaryConstraintV1 => 1,
         }
     }
 
     pub const fn arguments(self) -> &'static [AotKernelAbiArgument] {
         match self {
             Self::RecordedWitnessV1 => &RECORDED_WITNESS_V1_ARGUMENTS,
+            Self::OrdinaryConstraintV1 => &ORDINARY_CONSTRAINT_V1_ARGUMENTS,
         }
     }
 
@@ -133,6 +141,87 @@ const RECORDED_WITNESS_V1_ARGUMENTS: [AotKernelAbiArgument; 8] = [
         "row_count",
         AotKernelAbiKind::U32,
         AotKernelAbiAccess::LaunchRowCount,
+    ),
+];
+
+const ORDINARY_CONSTRAINT_V1_ARGUMENTS: [AotKernelAbiArgument; 13] = [
+    abi_argument(
+        0,
+        "trace_cols",
+        AotKernelAbiKind::DevicePointerTableU32,
+        AotKernelAbiAccess::Read,
+    ),
+    abi_argument(
+        1,
+        "interaction_offsets",
+        AotKernelAbiKind::DevicePointerU32,
+        AotKernelAbiAccess::Read,
+    ),
+    abi_argument(
+        2,
+        "base_params",
+        AotKernelAbiKind::DevicePointerU32,
+        AotKernelAbiAccess::Read,
+    ),
+    abi_argument(
+        3,
+        "ext_params",
+        AotKernelAbiKind::DevicePointerU32,
+        AotKernelAbiAccess::Read,
+    ),
+    abi_argument(
+        4,
+        "random_coeff_powers",
+        AotKernelAbiKind::DevicePointerU32,
+        AotKernelAbiAccess::Read,
+    ),
+    abi_argument(
+        5,
+        "denom_inv",
+        AotKernelAbiKind::DevicePointerU32,
+        AotKernelAbiAccess::Read,
+    ),
+    abi_argument(
+        6,
+        "coord_0",
+        AotKernelAbiKind::DevicePointerU32,
+        AotKernelAbiAccess::ReadWrite,
+    ),
+    abi_argument(
+        7,
+        "coord_1",
+        AotKernelAbiKind::DevicePointerU32,
+        AotKernelAbiAccess::ReadWrite,
+    ),
+    abi_argument(
+        8,
+        "coord_2",
+        AotKernelAbiKind::DevicePointerU32,
+        AotKernelAbiAccess::ReadWrite,
+    ),
+    abi_argument(
+        9,
+        "coord_3",
+        AotKernelAbiKind::DevicePointerU32,
+        AotKernelAbiAccess::ReadWrite,
+    ),
+    abi_argument(
+        10,
+        "row_count",
+        AotKernelAbiKind::U32,
+        AotKernelAbiAccess::LaunchRowCount,
+    ),
+    abi_argument(
+        11,
+        "log_n_rows",
+        AotKernelAbiKind::U32,
+        AotKernelAbiAccess::TraceLogSize,
+    ),
+    abi_argument(
+        12,
+        "rc_base",
+        AotKernelAbiKind::U32,
+        AotKernelAbiAccess::RandomCoefficientBase,
     ),
 ];
 
@@ -374,22 +463,56 @@ mod tests {
     }
 
     #[test]
-    fn recorded_witness_schema_is_ordinal_complete_and_typed() {
-        let schema = AotKernelAbiSchema::RecordedWitnessV1;
-        assert_eq!(schema.family(), "recorded_witness");
-        assert_eq!(schema.version(), 1);
-        assert_eq!(schema.arguments().len(), 8);
-        for (ordinal, argument) in schema.arguments().iter().enumerate() {
-            assert_eq!(usize::from(argument.ordinal), ordinal);
+    fn structured_schemas_are_ordinal_complete_and_typed() {
+        for schema in [
+            AotKernelAbiSchema::RecordedWitnessV1,
+            AotKernelAbiSchema::OrdinaryConstraintV1,
+        ] {
+            assert_eq!(schema.version(), 1);
+            for (ordinal, argument) in schema.arguments().iter().enumerate() {
+                assert_eq!(usize::from(argument.ordinal), ordinal);
+            }
+            assert_ne!(abi_schema_identity(schema), ZERO_IDENTITY);
         }
-        assert_eq!(schema.arguments()[0].name, "input_cols");
-        assert_eq!(schema.arguments()[4].access, AotKernelAbiAccess::ReadWrite);
-        assert_eq!(schema.arguments()[7].kind, AotKernelAbiKind::U32);
+
+        let witness = AotKernelAbiSchema::RecordedWitnessV1;
+        assert_eq!(witness.family(), "recorded_witness");
+        assert_eq!(witness.arguments().len(), 8);
+        assert_eq!(witness.arguments()[0].name, "input_cols");
+        assert_eq!(witness.arguments()[4].access, AotKernelAbiAccess::ReadWrite);
+        assert_eq!(witness.arguments()[7].kind, AotKernelAbiKind::U32);
         assert_eq!(
-            schema.arguments()[7].access,
+            witness.arguments()[7].access,
             AotKernelAbiAccess::LaunchRowCount
         );
-        assert_ne!(abi_schema_identity(schema), ZERO_IDENTITY);
+
+        let constraint = AotKernelAbiSchema::OrdinaryConstraintV1;
+        assert_eq!(constraint.family(), "ordinary_constraint");
+        assert_eq!(constraint.arguments().len(), 13);
+        assert_eq!(constraint.arguments()[0].name, "trace_cols");
+        assert_eq!(
+            constraint.arguments()[0].kind,
+            AotKernelAbiKind::DevicePointerTableU32
+        );
+        assert!(constraint.arguments()[6..10]
+            .iter()
+            .all(|argument| argument.access == AotKernelAbiAccess::ReadWrite));
+        assert_eq!(
+            constraint.arguments()[10].access,
+            AotKernelAbiAccess::LaunchRowCount
+        );
+        assert_eq!(
+            constraint.arguments()[11].access,
+            AotKernelAbiAccess::TraceLogSize
+        );
+        assert_eq!(
+            constraint.arguments()[12].access,
+            AotKernelAbiAccess::RandomCoefficientBase
+        );
+        assert_ne!(
+            abi_schema_identity(witness),
+            abi_schema_identity(constraint)
+        );
     }
 
     #[test]

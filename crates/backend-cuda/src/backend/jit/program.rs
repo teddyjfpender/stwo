@@ -364,6 +364,42 @@ impl OwnedMetalEvaluationProgramV1 {
         &self.constraint_roots
     }
 
+    /// Collision-resistant identity of the exact typed inputs consumed by the
+    /// ordinary CUDA source emitter. Invocation context (parameter extents,
+    /// domain size and section serialization) is deliberately supplied through
+    /// the structured launch ABI and may differ for one deduplicated source.
+    pub fn semantic_identity(&self) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"stwo-cuda-constraint-program-semantic-identity-v1\0");
+        let header = self.header;
+        hasher.update(&header.semantic_hash.to_le_bytes());
+        for value in [header.max_base_regs, header.max_ext_regs] {
+            hasher.update(&value.to_le_bytes());
+        }
+        hash_len(&mut hasher, self.base_insts.len());
+        for inst in &self.base_insts {
+            hasher.update(&[inst.op, inst.interaction]);
+            hasher.update(&inst.dst.to_le_bytes());
+            hasher.update(&inst.a.to_le_bytes());
+            hasher.update(&inst.b.to_le_bytes());
+            hasher.update(&inst.imm.to_le_bytes());
+        }
+        hash_len(&mut hasher, self.ext_insts.len());
+        for inst in &self.ext_insts {
+            hasher.update(&[inst.op, inst.reserved0]);
+            hasher.update(&inst.dst.to_le_bytes());
+            hasher.update(&inst.a.to_le_bytes());
+            hasher.update(&inst.b.to_le_bytes());
+            hasher.update(&inst.c.to_le_bytes());
+            hasher.update(&inst.d.to_le_bytes());
+        }
+        hash_len(&mut hasher, self.constraint_roots.len());
+        for root in &self.constraint_roots {
+            hasher.update(&root.to_le_bytes());
+        }
+        *hasher.finalize().as_bytes()
+    }
+
     pub fn payload_len_bytes(&self) -> u64 {
         self.sections
             .iter()
@@ -371,6 +407,14 @@ impl OwnedMetalEvaluationProgramV1 {
             .max()
             .unwrap_or(0)
     }
+}
+
+fn hash_len(hasher: &mut blake3::Hasher, len: usize) {
+    hasher.update(
+        &u64::try_from(len)
+            .expect("constraint program length fits u64")
+            .to_le_bytes(),
+    );
 }
 
 #[derive(Debug)]
@@ -1665,6 +1709,39 @@ mod tests {
 
     fn finalize(state: RecordingState) -> OwnedMetalEvaluationProgramV1 {
         finalize_recording_state(state, 2, 0, 1, 6)
+    }
+
+    #[test]
+    fn constraint_program_identity_covers_exact_codegen_inputs_only() {
+        let program = finalize(synthetic_state(2, 2));
+        let identity = program.semantic_identity();
+        assert_ne!(identity, [0; 32]);
+
+        let mut changed = program.clone();
+        changed.header.semantic_hash ^= 1;
+        assert_ne!(identity, changed.semantic_identity());
+        let mut changed = program.clone();
+        changed.header.max_base_regs += 1;
+        assert_ne!(identity, changed.semantic_identity());
+        let mut changed = program.clone();
+        changed.base_insts[0].imm += 1;
+        assert_ne!(identity, changed.semantic_identity());
+        let mut changed = program.clone();
+        changed.ext_insts[0].a += 1;
+        assert_ne!(identity, changed.semantic_identity());
+        let mut changed = program.clone();
+        changed.constraint_roots[0] += 1;
+        assert_ne!(identity, changed.semantic_identity());
+
+        let mut invocation_context = program.clone();
+        invocation_context.header.n_interactions += 1;
+        invocation_context.header.n_base_params += 1;
+        invocation_context.header.n_ext_params += 1;
+        invocation_context.header.reserved[0] += 1;
+        invocation_context.sections[0].count += 1;
+        invocation_context.base_consts.push(1);
+        invocation_context.ext_consts.push([1, 2, 3, 4]);
+        assert_eq!(identity, invocation_context.semantic_identity());
     }
 
     fn test_ext_params() -> Vec<SecureField> {
