@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+
+if [ -z "${SSH_ORIGINAL_COMMAND:-}" ]; then
+    echo 'root interactive SSH is disabled; use labctl automation or log in as dev' >&2
+    exit 1
+fi
+
+exec /bin/bash -c "$SSH_ORIGINAL_COMMAND"

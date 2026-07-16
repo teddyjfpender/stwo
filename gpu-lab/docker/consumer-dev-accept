@@ -20,6 +20,205 @@ installed_version() {
     dpkg-query -W -f='${Version}' "$1" 2>/dev/null || die "missing package $1"
 }
 
+path_identity() {
+    stat -c '%u:%g:%a' "$1" 2>/dev/null || die "missing path $1"
+}
+
+validate_authorized_keys() {
+    local path=$1 label=$2 line count=0
+    while IFS= read -r line; do
+        if [[ -z "$line" ]] \
+            || ! printf '%s\n' "$line" | ssh-keygen -l -f - >/dev/null 2>&1; then
+            die "$label contains a blank or invalid OpenSSH entry"
+        fi
+        ((count += 1))
+    done < "$path"
+    ((count > 0)) || die "$label is empty"
+}
+
+check_sshd_policy() {
+    local config=/etc/ssh/sshd_config.d/20-stwo-consumer-dev.conf effective
+    grep -Fxq 'AllowUsers root dev' "$config" || die 'sshd AllowUsers policy differs'
+    grep -Fxq 'PermitRootLogin forced-commands-only' "$config" \
+        || die 'root SSH is not forced-command-only'
+    grep -Fxq 'PasswordAuthentication no' "$config" \
+        || die 'SSH password authentication is enabled'
+    grep -Fxq 'KbdInteractiveAuthentication no' "$config" \
+        || die 'SSH keyboard-interactive authentication is enabled'
+    grep -Fxq \
+        'PermitUserEnvironment LD_LIBRARY_PATH,LIBRARY_PATH,RUNPOD_POD_ID,RUNPOD_VOLUME_ID,RUNPOD_DC_ID,RUNPOD_GPU_COUNT' \
+        "$config" || die 'SSH user-environment allowlist differs'
+    grep -Eq '^SetEnv .*CARGO_HOME=/workspace/\.cache/cargo( |$)' "$config" \
+        || die 'SSH Cargo home differs'
+    grep -Eq '^SetEnv .*CARGO_TARGET_DIR=/workspace/dev/target( |$)' "$config" \
+        || die 'SSH Cargo target differs'
+    grep -Eq '^SetEnv .*STWO_GPU_DEV_IMAGE_VERSION=2026-07-16\.2$' "$config" \
+        || die 'SSH image identity differs'
+
+    if [[ $(id -u) -eq 0 ]] && compgen -G '/etc/ssh/ssh_host_*_key' >/dev/null; then
+        effective=$(sshd -T -C user=root,host=localhost,addr=127.0.0.1)
+        grep -Fxq 'permitrootlogin forced-commands-only' <<< "$effective" \
+            || die 'effective root SSH policy differs'
+        grep -Fxq 'passwordauthentication no' <<< "$effective" \
+            || die 'effective SSH password policy differs'
+        grep -Fxq 'kbdinteractiveauthentication no' <<< "$effective" \
+            || die 'effective SSH keyboard-interactive policy differs'
+        grep -Fxq 'allowusers root' <<< "$effective" \
+            || die 'effective SSH policy does not admit root automation'
+        grep -Fxq 'allowusers dev' <<< "$effective" \
+            || die 'effective SSH policy does not admit dev'
+    fi
+}
+
+check_layout() {
+    local path marker=/workspace/gpu-lab/DEV_LAYOUT_V1
+    expect_exact dev-passwd 'dev:x:1000:1000::/home/dev:/bin/bash' \
+        "$(getent passwd dev)"
+    expect_exact dev-group 'dev:x:1000:' "$(getent group dev)"
+    expect_exact dev-groups 1000 "$(id -G dev)"
+    expect_exact dev-home 1000:1000:750 "$(path_identity /home/dev)"
+    expect_exact workspace-root 0:0:755 "$(path_identity /workspace)"
+    expect_exact controller-root 0:0:755 "$(path_identity /workspace/gpu-lab)"
+    for path in \
+        /workspace/.cache \
+        /workspace/.cache/cargo \
+        /workspace/.cache/ccache \
+        /workspace/.cache/cuda \
+        /workspace/.cache/sccache \
+        /workspace/dev \
+        /workspace/dev/target; do
+        [[ -d "$path" && ! -L "$path" ]] || die "$path must be a real directory"
+        expect_exact "$path identity" 1000:1000:750 "$(path_identity "$path")"
+    done
+    expect_exact root-command 0:0:555 \
+        "$(path_identity /usr/local/bin/stwo-gpu-dev-root-command)"
+    expect_exact sshd-policy 0:0:644 \
+        "$(path_identity /etc/ssh/sshd_config.d/20-stwo-consumer-dev.conf)"
+    if [[ -e "$marker" || -L "$marker" ]]; then
+        [[ -f "$marker" && ! -L "$marker" ]] || die "$marker must be a regular file"
+        expect_exact dev-layout-marker 0:0:444 "$(path_identity "$marker")"
+        expect_exact dev-layout-identity \
+            'stwo-consumer-dev-layout-v1 uid=1000 gid=1000' "$(cat "$marker")"
+    elif [[ -n "${PUBLIC_KEY:-}" || -n "${SSH_CONNECTION:-}" ]]; then
+        die 'runtime dev-layout marker is missing'
+    fi
+    check_sshd_policy
+}
+
+check_environment() {
+    expect_exact PATH \
+        /opt/cmake/bin:/opt/rust/cargo/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+        "${PATH:-}"
+    expect_exact CUDA_HOME /usr/local/cuda "${CUDA_HOME:-}"
+    expect_exact RUSTUP_HOME /opt/rust/rustup "${RUSTUP_HOME:-}"
+    expect_exact CARGO_HOME /workspace/.cache/cargo "${CARGO_HOME:-}"
+    expect_exact CARGO_TARGET_DIR /workspace/dev/target "${CARGO_TARGET_DIR:-}"
+    expect_exact CCACHE_DIR /workspace/.cache/ccache "${CCACHE_DIR:-}"
+    expect_exact CUDA_CACHE_PATH /workspace/.cache/cuda "${CUDA_CACHE_PATH:-}"
+    expect_exact SCCACHE_DIR /workspace/.cache/sccache "${SCCACHE_DIR:-}"
+    if [[ -n "${SSH_CONNECTION:-}" ]]; then
+        expect_exact LD_LIBRARY_PATH \
+            /usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/lib64 \
+            "${LD_LIBRARY_PATH:-}"
+        expect_exact LIBRARY_PATH /usr/local/cuda/lib64/stubs "${LIBRARY_PATH:-}"
+    fi
+}
+
+check_ssh_identity() {
+    local actual_user=$1 home owner normalized_keys root_keys line name value
+    local expected_keys=''
+    [[ -n "${PUBLIC_KEY:-}" || -n "${SSH_CONNECTION:-}" ]] || return 0
+    case "$actual_user" in
+        root) home=/root; owner=0:0 ;;
+        dev) home=/home/dev; owner=1000:1000 ;;
+        *) die "unsupported session user $actual_user" ;;
+    esac
+    [[ -d "$home/.ssh" && ! -L "$home/.ssh" ]] \
+        || die "$actual_user SSH directory must be a real directory"
+    expect_exact "$actual_user ssh-directory" "$owner:700" \
+        "$(path_identity "$home/.ssh")"
+    expect_exact "$actual_user authorized-keys" "$owner:600" \
+        "$(path_identity "$home/.ssh/authorized_keys")"
+    expect_exact "$actual_user ssh-environment" "$owner:600" \
+        "$(path_identity "$home/.ssh/environment")"
+
+    if [[ -n "${PUBLIC_KEY:-}" ]]; then
+        expected_keys=$(mktemp)
+        printf '%s' "$PUBLIC_KEY" > "$expected_keys"
+        [[ "$PUBLIC_KEY" == *$'\n' ]] || printf '\n' >> "$expected_keys"
+    fi
+    if [[ "$actual_user" == dev ]]; then
+        validate_authorized_keys "$home/.ssh/authorized_keys" 'dev authorized keys'
+        if [[ -n "$expected_keys" ]]; then
+            cmp -s "$expected_keys" "$home/.ssh/authorized_keys" \
+                || die 'dev authorized keys differ from PUBLIC_KEY'
+        fi
+    else
+        if [[ -n "$expected_keys" ]]; then
+            normalized_keys=$(mktemp)
+            sed 's|^restrict,command="/usr/local/bin/stwo-gpu-dev-root-command" ||' \
+                "$home/.ssh/authorized_keys" > "$normalized_keys"
+            cmp -s "$expected_keys" "$normalized_keys" \
+                || die 'root authorized keys are missing the forced-command restriction'
+            rm -f "$normalized_keys"
+        fi
+        validate_authorized_keys "$home/.ssh/authorized_keys" 'root authorized keys'
+        root_keys=$home/.ssh/authorized_keys
+        grep -Eqv '^restrict,command="/usr/local/bin/stwo-gpu-dev-root-command" .+$' \
+            "$root_keys" && die 'root authorized key is not restricted'
+        [[ -d /home/dev/.ssh && ! -L /home/dev/.ssh ]] \
+            || die 'dev SSH directory must be a real directory'
+        expect_exact 'dev ssh-directory' 1000:1000:700 \
+            "$(path_identity /home/dev/.ssh)"
+        expect_exact 'dev authorized-keys' 1000:1000:600 \
+            "$(path_identity /home/dev/.ssh/authorized_keys)"
+        expect_exact 'dev ssh-environment' 1000:1000:600 \
+            "$(path_identity /home/dev/.ssh/environment)"
+        validate_authorized_keys /home/dev/.ssh/authorized_keys 'dev authorized keys'
+        if [[ -n "$expected_keys" ]]; then
+            cmp -s "$expected_keys" /home/dev/.ssh/authorized_keys \
+                || die 'dev authorized keys differ from PUBLIC_KEY'
+        fi
+        cmp -s /root/.ssh/environment /home/dev/.ssh/environment \
+            || die 'root and dev SSH environments differ'
+    fi
+    while IFS= read -r line; do
+        name=${line%%=*}
+        value=${line#*=}
+        [[ "$line" == *=* && -n "$value" ]] || die 'invalid SSH environment entry'
+        case "$name" in
+            LD_LIBRARY_PATH|LIBRARY_PATH) ;;
+            RUNPOD_POD_ID|RUNPOD_VOLUME_ID|RUNPOD_DC_ID|RUNPOD_GPU_COUNT)
+                [[ "$value" =~ ^[A-Za-z0-9._:-]+$ ]] \
+                    || die "unsafe $name in SSH environment"
+                ;;
+            *) die "unexpected $name in SSH environment" ;;
+        esac
+    done < "$home/.ssh/environment"
+    [[ -z "$expected_keys" ]] || rm -f "$expected_keys"
+}
+
+check_session() {
+    local required=$1 actual
+    actual=$(id -un)
+    [[ "$actual" == root || "$actual" == dev ]] \
+        || die "session user must be root or dev, found $actual"
+    if [[ "$required" != any && "$actual" != "$required" ]]; then
+        die "session user must be $required, found $actual"
+    fi
+    if [[ "$actual" == dev ]]; then
+        expect_exact session-uid 1000 "$(id -u)"
+        expect_exact session-gid 1000 "$(id -g)"
+        expect_exact HOME /home/dev "${HOME:-}"
+        [[ -w /workspace/.cache && -w /workspace/dev ]] \
+            || die 'dev session cannot write its cache and development roots'
+    else
+        expect_exact session-uid 0 "$(id -u)"
+        expect_exact HOME /root "${HOME:-}"
+    fi
+    check_ssh_identity "$actual"
+}
+
 check_toolchain() {
     local toolchain=$1 expected_rustc=$2 components
     rustup toolchain list | grep -Eq "^${toolchain}(-x86_64-unknown-linux-gnu)?( |$)" \
@@ -36,7 +235,7 @@ check_toolchain() {
 check_tools() {
     local ncu_version nsys_version sanitizer_version
     expect_exact architecture x86_64 "$(uname -m)"
-    expect_exact image-version 2026-07-16.1 "${STWO_GPU_DEV_IMAGE_VERSION:-}"
+    expect_exact image-version 2026-07-16.2 "${STWO_GPU_DEV_IMAGE_VERSION:-}"
     expect_exact cuda-image 12.8.2 "${CUDA_VERSION:-}"
     expect_contains nvcc "release 12.8" "$(nvcc --version)"
     expect_exact cmake "cmake version 4.3.3" "$(cmake --version | sed -n '1p')"
@@ -104,11 +303,52 @@ CUDA
     "$tmp/smoke" "$expected_sm" || die "CUDA smoke failed"
 }
 
-usage() {
-    printf 'usage: %s [--gpu [--sm 86|89|120]]\n' "${0##*/}"
+health_probe() {
+    local command_line executable process sshd_running=false
+    expect_exact image-version 2026-07-16.2 "${STWO_GPU_DEV_IMAGE_VERSION:-}"
+    check_layout
+    check_environment
+    check_session root
+    for process in /proc/[0-9]*/cmdline; do
+        command_line=$(tr '\0' ' ' < "$process" 2>/dev/null || true)
+        executable=$(readlink -f "${process%/cmdline}/exe" 2>/dev/null || true)
+        if [[ "$executable" == /usr/sbin/sshd \
+            && "$command_line" == *'/usr/sbin/sshd -D -e'* ]]; then
+            sshd_running=true
+            break
+        fi
+    done
+    [[ "$sshd_running" == true ]] || die 'the expected sshd command is not running'
+    printf 'consumer-dev health: PASS\n'
 }
 
+usage() {
+    printf 'usage: %s [--health|--require-root|--require-dev] [--gpu [--sm 86|89|120]]\n' \
+        "${0##*/}"
+}
+
+if [[ ${1:-} == --health ]]; then
+    [[ $# -eq 1 ]] || die '--health accepts no other arguments'
+    health_probe
+    exit 0
+fi
+
+required_user=any
+case ${1:-} in
+    --require-root)
+        required_user=root
+        shift
+        ;;
+    --require-dev)
+        required_user=dev
+        shift
+        ;;
+esac
+
 check_tools
+check_layout
+check_environment
+check_session "$required_user"
 case ${1:-} in
     '') ;;
     --gpu)

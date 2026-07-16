@@ -2,40 +2,91 @@
 set -Eeuo pipefail
 
 umask 077
-install -d -m 0700 /root/.ssh
+
+root_ssh=/root/.ssh
+dev_ssh=/home/dev/.ssh
+key_payload=
+root_keys=
+dev_keys=
+session_environment=
+root_environment=
+dev_environment=
+layout_marker_tmp=
+session_dirs_safe=false
+
+clear_session_identity() {
+    [[ "$session_dirs_safe" == true ]] || return 0
+    rm -f \
+        "$root_ssh/authorized_keys" "$root_ssh/environment" \
+        "$dev_ssh/authorized_keys" "$dev_ssh/environment"
+}
+
+cleanup() {
+    local rc=$?
+    trap - EXIT
+    rm -f \
+        "${key_payload:-}" "${root_keys:-}" "${dev_keys:-}" \
+        "${session_environment:-}" \
+        "${root_environment:-}" "${dev_environment:-}" \
+        "${layout_marker_tmp:-}"
+    if ((rc != 0)); then
+        clear_session_identity
+    fi
+    exit "$rc"
+}
+trap cleanup EXIT
+
+for ssh_dir in "$root_ssh" "$dev_ssh"; do
+    if [[ -L "$ssh_dir" || ( -e "$ssh_dir" && ! -d "$ssh_dir" ) ]]; then
+        printf '%s must be a real directory\n' "$ssh_dir" >&2
+        exit 1
+    fi
+done
+install -d -m 0700 -o root -g root "$root_ssh"
+install -d -m 0700 -o dev -g dev "$dev_ssh"
+session_dirs_safe=true
+clear_session_identity
 
 if [[ -z "${PUBLIC_KEY:-}" || "$PUBLIC_KEY" == *$'\r'* ]]; then
-    rm -f /root/.ssh/authorized_keys
     printf 'PUBLIC_KEY must contain one or more SSH public keys\n' >&2
     exit 1
 fi
-authorized_keys=$(mktemp /root/.ssh/authorized_keys.XXXXXX)
-printf '%s' "$PUBLIC_KEY" > "$authorized_keys"
-[[ "$PUBLIC_KEY" == *$'\n' ]] || printf '\n' >> "$authorized_keys"
-chmod 0600 "$authorized_keys"
+key_payload=$(mktemp)
+printf '%s' "$PUBLIC_KEY" > "$key_payload"
+[[ "$PUBLIC_KEY" == *$'\n' ]] || printf '\n' >> "$key_payload"
+
+root_keys=$(mktemp "$root_ssh/authorized_keys.XXXXXX")
+dev_keys=$(mktemp "$dev_ssh/authorized_keys.XXXXXX")
 key_count=0
-invalid_public_key=false
 while IFS= read -r public_key; do
     if [[ -z "$public_key" ]] \
         || ! printf '%s\n' "$public_key" | ssh-keygen -l -f - >/dev/null 2>&1; then
-        invalid_public_key=true
-        break
+        printf 'PUBLIC_KEY contains a blank or invalid SSH public key\n' >&2
+        exit 1
     fi
+    printf -v restricted_key \
+        'restrict,command="/usr/local/bin/stwo-gpu-dev-root-command" %s' "$public_key"
+    printf '%s\n' "$restricted_key" | ssh-keygen -l -f - >/dev/null 2>&1 || {
+        printf 'PUBLIC_KEY cannot be safely restricted for root automation\n' >&2
+        exit 1
+    }
+    printf '%s\n' "$restricted_key" >> "$root_keys"
+    printf '%s\n' "$public_key" >> "$dev_keys"
     ((key_count += 1))
-done < "$authorized_keys"
-if [[ "$invalid_public_key" == true ]] || ((key_count == 0)); then
-    rm -f "$authorized_keys" /root/.ssh/authorized_keys
-    printf 'PUBLIC_KEY contains a blank or invalid SSH public key\n' >&2
+done < "$key_payload"
+((key_count > 0)) || {
+    printf 'PUBLIC_KEY must contain one or more SSH public keys\n' >&2
     exit 1
-fi
-mv -f "$authorized_keys" /root/.ssh/authorized_keys
+}
+chmod 0600 "$root_keys" "$dev_keys"
+chown root:root "$root_keys"
+chown dev:dev "$dev_keys"
+mv -f "$root_keys" "$root_ssh/authorized_keys"
+root_keys=
+mv -f "$dev_keys" "$dev_ssh/authorized_keys"
+dev_keys=
 
-install -d -m 0700 \
-    /workspace/.cache/ccache \
-    /workspace/.cache/cuda \
-    /workspace/.cache/sccache
-
-session_environment=$(mktemp /root/.ssh/environment.XXXXXX)
+session_environment=$(mktemp)
 cat > "$session_environment" <<'ENVIRONMENT'
 LD_LIBRARY_PATH=/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/lib64
 LIBRARY_PATH=/usr/local/cuda/lib64/stubs
@@ -50,11 +101,70 @@ for name in RUNPOD_POD_ID RUNPOD_VOLUME_ID RUNPOD_DC_ID RUNPOD_GPU_COUNT; do
         printf '%s=%s\n' "$name" "$value" >> "$session_environment"
     fi
 done
-chmod 0600 "$session_environment"
-mv -f "$session_environment" /root/.ssh/environment
+
+root_environment=$(mktemp "$root_ssh/environment.XXXXXX")
+dev_environment=$(mktemp "$dev_ssh/environment.XXXXXX")
+cp "$session_environment" "$root_environment"
+cp "$session_environment" "$dev_environment"
+chmod 0600 "$root_environment" "$dev_environment"
+chown root:root "$root_environment"
+chown dev:dev "$dev_environment"
+mv -f "$root_environment" "$root_ssh/environment"
+root_environment=
+mv -f "$dev_environment" "$dev_ssh/environment"
+dev_environment=
+
+for path in /workspace /workspace/gpu-lab; do
+    if [[ -L "$path" || ( -e "$path" && ! -d "$path" ) ]]; then
+        printf '%s must be a real directory\n' "$path" >&2
+        exit 1
+    fi
+done
+install -d -m 0755 -o root -g root /workspace /workspace/gpu-lab
+dev_paths=(
+    /workspace/.cache
+    /workspace/.cache/cargo
+    /workspace/.cache/ccache
+    /workspace/.cache/cuda
+    /workspace/.cache/sccache
+    /workspace/dev
+    /workspace/dev/target
+)
+for path in "${dev_paths[@]}"; do
+    if [[ -L "$path" || ( -e "$path" && ! -d "$path" ) ]]; then
+        printf '%s must be a real directory\n' "$path" >&2
+        exit 1
+    fi
+    mkdir -p "$path"
+done
+layout_marker=/workspace/gpu-lab/DEV_LAYOUT_V1
+layout_identity='stwo-consumer-dev-layout-v1 uid=1000 gid=1000'
+if [[ -e "$layout_marker" || -L "$layout_marker" ]]; then
+    [[ -f "$layout_marker" && ! -L "$layout_marker" ]] \
+        || { printf '%s must be a regular file\n' "$layout_marker" >&2; exit 1; }
+    [[ $(stat -c '%u:%g:%a' "$layout_marker") == 0:0:444 ]] \
+        || { printf '%s has unsafe ownership or mode\n' "$layout_marker" >&2; exit 1; }
+    [[ $(cat "$layout_marker") == "$layout_identity" ]] \
+        || { printf '%s has an unexpected identity\n' "$layout_marker" >&2; exit 1; }
+else
+    chown -R --no-dereference dev:dev /workspace/.cache /workspace/dev
+    layout_marker_tmp=$(mktemp /workspace/gpu-lab/.DEV_LAYOUT_V1.XXXXXX)
+    printf '%s\n' "$layout_identity" > "$layout_marker_tmp"
+    chmod 0444 "$layout_marker_tmp"
+    chown root:root "$layout_marker_tmp"
+    sync -f "$layout_marker_tmp"
+    ln "$layout_marker_tmp" "$layout_marker"
+    rm -f "$layout_marker_tmp"
+    layout_marker_tmp=
+    sync -f /workspace/gpu-lab
+fi
+chown --no-dereference dev:dev "${dev_paths[@]}"
+chmod 0750 "${dev_paths[@]}"
 
 mkdir -p /run/sshd
 ssh-keygen -A
 umask 022
 
+trap - EXIT
+rm -f "$key_payload" "$session_environment"
 exec /opt/nvidia/nvidia_entrypoint.sh "$@"

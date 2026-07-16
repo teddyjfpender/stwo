@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+repo_root=$(git rev-parse --show-toplevel)
+entrypoint=$repo_root/gpu-lab/docker/consumer-dev-entrypoint
+image=ubuntu@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90
+
+docker run --rm -v "$entrypoint:/entrypoint:ro" "$image" bash -s <<'TEST'
+set -Eeuo pipefail
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -y -qq openssh-client >/dev/null
+
+old_group=$(getent group 1000 | cut -d: -f1 || true)
+if [[ -n "$old_group" ]]; then
+    groupmod -n dev "$old_group"
+else
+    groupadd --gid 1000 dev
+fi
+old_user=$(getent passwd 1000 | cut -d: -f1 || true)
+if [[ -n "$old_user" ]]; then
+    userdel -r "$old_user" 2>/dev/null || userdel "$old_user"
+fi
+useradd --uid 1000 --gid 1000 --create-home --shell /bin/bash dev
+mkdir -p /opt/nvidia /etc/ssh
+
+cat > /opt/nvidia/nvidia_entrypoint.sh <<'SH'
+#!/bin/sh
+set -eu
+marker=/workspace/gpu-lab/DEV_LAYOUT_V1
+if [ -z "${SECOND_START:-}" ]; then
+    test "$(stat -c '%u:%g:%a' "$marker")" = 0:0:444
+    test "$(stat -c '%u:%g:%a' /workspace/.cache)" = 1000:1000:750
+    test "$(stat -c '%u:%g:%a' /root/.ssh/authorized_keys)" = 0:0:600
+    test "$(stat -c '%u:%g:%a' /home/dev/.ssh/authorized_keys)" = 1000:1000:600
+    touch /workspace/.cache/root-sentinel
+    chown root:root /workspace/.cache/root-sentinel
+    export SECOND_START=1
+    exec bash /entrypoint /bin/true
+fi
+test "$(stat -c '%u:%g' /workspace/.cache/root-sentinel)" = 0:0
+test "$(cat "$marker")" = 'stwo-consumer-dev-layout-v1 uid=1000 gid=1000'
+SH
+chmod 0555 /opt/nvidia/nvidia_entrypoint.sh
+
+ssh-keygen -q -t ed25519 -N '' -f /tmp/labkey
+public_key=$(cat /tmp/labkey.pub)
+PUBLIC_KEY="$public_key" bash /entrypoint /bin/true
+
+rm -rf /home/dev/.ssh
+printf protected > /usr/local/bin/authorized_keys
+target_before=$(stat -c '%u:%g:%a:%i' /usr/local/bin)
+before=$(sha256sum /usr/local/bin/authorized_keys)
+ln -s /usr/local/bin /home/dev/.ssh
+if PUBLIC_KEY="$public_key" bash /entrypoint /bin/true \
+    > /tmp/attack.out 2> /tmp/attack.err; then
+    printf 'hostile dev SSH symlink was accepted\n' >&2
+    exit 1
+fi
+test -L /home/dev/.ssh
+test -f /usr/local/bin/authorized_keys
+test "$(stat -c '%u:%g:%a:%i' /usr/local/bin)" = "$target_before"
+test "$(sha256sum /usr/local/bin/authorized_keys)" = "$before"
+grep -Fq '/home/dev/.ssh must be a real directory' /tmp/attack.err
+TEST
+
+printf 'consumer-dev entrypoint regression: PASS\n'

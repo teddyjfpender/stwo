@@ -3,4 +3,5 @@
 !gpu-lab/docker/
 !gpu-lab/docker/consumer-dev-accept
 !gpu-lab/docker/consumer-dev-entrypoint
+!gpu-lab/docker/consumer-dev-root-command
 !gpu-lab/docker/consumer-dev-sshd.conf
