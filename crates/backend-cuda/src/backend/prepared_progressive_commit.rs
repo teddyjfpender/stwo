@@ -31,6 +31,8 @@ mod composition_split;
 mod direct_compact_domain_binding;
 mod direct_compact_terminal_fused;
 mod direct_retained_b2n;
+mod direct_terminal_expand_absorb;
+mod direct_terminal_expand_absorb_binding;
 mod domain_compact;
 mod domain_compact_binding;
 mod domain_cooperative;
@@ -64,6 +66,14 @@ pub use direct_retained_b2n::{
     DirectRetainedB2nBatchPlan, DirectRetainedB2nColumn, DirectRetainedB2nError,
     DirectRetainedB2nLaunchKind, DirectRetainedB2nOracle, DirectRetainedB2nProgram,
     PreparedDirectRetainedB2nGraph,
+};
+pub use direct_terminal_expand_absorb::{
+    DirectTerminalExpandAbsorbError, DirectTerminalExpandAbsorbOperation,
+    DirectTerminalExpandAbsorbProgram, DirectTerminalExpandAbsorbReceipt,
+    DirectTerminalExpandAbsorbTransition,
+};
+pub use direct_terminal_expand_absorb_binding::{
+    direct_terminal_expand_absorb_arena_slot_requirements, PreparedDirectTerminalExpandAbsorbGraph,
 };
 pub use domain_compact::{
     CompactDomainComparison, CompactDomainOperation, CompactDomainProgram,

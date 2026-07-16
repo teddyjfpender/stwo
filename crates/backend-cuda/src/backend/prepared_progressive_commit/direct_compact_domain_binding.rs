@@ -20,6 +20,11 @@ pub enum DirectCompactDomainBindingError {
     },
     SizeOverflow,
     Terminal(DirectCompactTerminalError),
+    ExpandAbsorb(DirectTerminalExpandAbsorbError),
+    UnsupportedArchitecture {
+        sm_major: u32,
+        sm_minor: u32,
+    },
 }
 
 impl core::fmt::Display for DirectCompactDomainBindingError {
@@ -42,6 +47,12 @@ impl From<CompactDomainBindingError> for DirectCompactDomainBindingError {
     }
 }
 
+impl From<PreparedProgressiveCommitError> for DirectCompactDomainBindingError {
+    fn from(value: PreparedProgressiveCommitError) -> Self {
+        Self::Compact(value.into())
+    }
+}
+
 impl From<CompactDomainProgramError> for DirectCompactDomainBindingError {
     fn from(value: CompactDomainProgramError) -> Self {
         Self::Compact(value.into())
@@ -51,6 +62,12 @@ impl From<CompactDomainProgramError> for DirectCompactDomainBindingError {
 impl From<DirectCompactTerminalError> for DirectCompactDomainBindingError {
     fn from(value: DirectCompactTerminalError) -> Self {
         Self::Terminal(value)
+    }
+}
+
+impl From<DirectTerminalExpandAbsorbError> for DirectCompactDomainBindingError {
+    fn from(value: DirectTerminalExpandAbsorbError) -> Self {
+        Self::ExpandAbsorb(value)
     }
 }
 
@@ -77,16 +94,17 @@ impl From<super::super::exec_context::CudaRuntimeError> for DirectCompactDomainB
 pub struct PreparedDirectCompactDomainCommitGraph<'a> {
     pub(super) direct: PreparedDirectRetainedB2nGraph<'a>,
     pub(super) leaves: PreparedDirectCompactDomainLeaves<'a>,
-    merkle: PreparedMerkleFromLeaves<'a>,
-    retained_evaluations: Vec<Option<ArenaSlice>>,
+    pub(super) merkle: PreparedMerkleFromLeaves<'a>,
+    pub(super) retained_evaluations: Vec<Option<ArenaSlice>>,
     pub(super) terminal: Option<PreparedDirectCompactTerminalExecution>,
+    pub(super) expand_absorb_receipt: Option<DirectTerminalExpandAbsorbReceipt>,
 }
 
 pub(super) struct PreparedDirectCompactDomainLeaves<'a> {
     pub(super) arena: &'a DeviceArena,
     pub(super) launches: Vec<CompactStatePreparedLaunch>,
-    leaf_hashes: ArenaSlice,
-    cache_key: u64,
+    pub(super) leaf_hashes: ArenaSlice,
+    pub(super) cache_key: u64,
 }
 
 impl PreparedDirectCompactDomainLeaves<'_> {
@@ -204,6 +222,7 @@ impl CompactDomainProgram {
             merkle,
             retained_evaluations,
             terminal: None,
+            expand_absorb_receipt: None,
         })
     }
 }
@@ -280,6 +299,10 @@ impl PreparedDirectCompactDomainCommitGraph<'_> {
         self.terminal.as_ref().map(|terminal| terminal.receipt())
     }
 
+    pub fn expand_absorb_receipt(&self) -> Option<&DirectTerminalExpandAbsorbReceipt> {
+        self.expand_absorb_receipt.as_ref()
+    }
+
     pub fn exact_lower_prefix_aliases(&self) -> usize {
         self.direct.exact_lower_prefix_aliases()
     }
@@ -300,7 +323,7 @@ impl PreparedDirectCompactDomainCommitGraph<'_> {
     }
 }
 
-fn validate_external_workspace_ownership(
+pub(super) fn validate_external_workspace_ownership(
     arena: &DeviceArena,
     workspace: &[CommitArenaSlotRequirement],
     columns: &[DirectRetainedB2nColumn],

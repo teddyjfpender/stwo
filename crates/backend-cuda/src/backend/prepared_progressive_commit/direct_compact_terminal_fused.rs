@@ -1,5 +1,4 @@
 //! Exact fixed16 terminal N2B plus compact-h8 execution.
-//!
 //! Profitable log>=13 fixed-width prefixes stop before the final configured
 //! N2B interval; one candidate sink completes it, writes canonical retained
 //! evaluations, and advances compact state. A profitable non-16 remainder
@@ -14,6 +13,7 @@ use super::domain_compact_binding::{bind_tail_descriptor, CompactStatePreparedLa
 use super::*;
 
 mod accounting;
+mod expand_absorb_binding;
 pub use accounting::*;
 use accounting::{
     admit_batch, batch_mode, batch_receipt, checked_sum, checked_sum_i32, checked_sum_u32, fallback,
@@ -311,8 +311,18 @@ enum PreparedDirectCompactTerminalStep {
         batch: DirectPreparedBatch,
         absorb: CompactStatePreparedLaunch,
     },
+    MaterializedExpandAbsorb {
+        batch: DirectPreparedBatch,
+        from_log_size: u32,
+        to_log_size: u32,
+        absorbed_columns_before: u32,
+        tail: CompactBlake2sTailDescriptor,
+        source_state: ArenaSlice,
+        destination_state: ArenaSlice,
+    },
     Fixed16Hybrid {
         batch: DirectPreparedBatch,
+        expansion: Option<CompactStatePreparedLaunch>,
         fixed_columns: u32,
         tiles: u32,
         remainder_columns: u32,
@@ -421,6 +431,7 @@ impl PreparedDirectCompactTerminalExecution {
                             };
                             steps.push(PreparedDirectCompactTerminalStep::Fixed16Hybrid {
                                 batch,
+                                expansion: None,
                                 fixed_columns,
                                 tiles,
                                 remainder_columns: generic_remainder_columns,
@@ -447,7 +458,7 @@ impl PreparedDirectCompactTerminalExecution {
         })
     }
 
-    fn configure(&self) -> Result<(), DirectCompactTerminalError> {
+    pub(super) fn configure(&self) -> Result<(), DirectCompactTerminalError> {
         let mut configured = std::collections::BTreeSet::new();
         for step in &self.steps {
             let PreparedDirectCompactTerminalStep::Fixed16Hybrid { batch, .. } = *step else {
@@ -479,8 +490,35 @@ impl PreparedDirectCompactTerminalExecution {
                     direct.launch_batch_materialized(batch.batch_index)?;
                     absorb.launch(arena)?;
                 }
+                PreparedDirectCompactTerminalStep::MaterializedExpandAbsorb {
+                    batch,
+                    from_log_size,
+                    to_log_size,
+                    absorbed_columns_before,
+                    tail,
+                    source_state,
+                    destination_state,
+                } => {
+                    direct.launch_batch_materialized(batch.batch_index)?;
+                    let code = unsafe {
+                        stwo_backend_cuda_kernels::raw::stwo_blake2s_compact_expand_absorb_quad_on(
+                            from_log_size,
+                            to_log_size,
+                            batch.columns,
+                            absorbed_columns_before,
+                            batch.output_pointers.as_u32_ptr().cast(),
+                            &tail,
+                            source_state.as_u32_ptr().cast(),
+                            destination_state.as_u32_ptr().cast(),
+                            stream,
+                        )
+                    };
+                    check_cuda("direct_compact_expand_absorb", code)
+                        .map_err(CompactDomainBindingError::from)?;
+                }
                 PreparedDirectCompactTerminalStep::Fixed16Hybrid {
                     batch,
+                    expansion,
                     fixed_columns,
                     tiles,
                     remainder_columns,
@@ -488,6 +526,9 @@ impl PreparedDirectCompactTerminalExecution {
                     remainder_tail,
                     states,
                 } => {
+                    if let Some(expansion) = expansion {
+                        expansion.launch(arena)?;
+                    }
                     direct.launch_batch_before_final_interval(batch.batch_index)?;
                     let size = 1u32
                         .checked_shl(batch.retained_log_size)
