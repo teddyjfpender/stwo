@@ -13,10 +13,13 @@
 //! identity, while per-key strict lookup proves complete source/shape coverage;
 //! a matching policy tag alone never admits a partial or stale pack.
 
+pub use stwo_backend_cuda_kernels::aot_pack::{AotKernelAuthority, AotKernelSchemaScope};
+
 /// Collision-resistant identity of the exact AOT cubins and generation
 /// policies embedded in this binary. All-zero means absent or policy-invalid
-/// and is never authority. This does not supply the source/effect contract
-/// still absent from the generated AOT manifest.
+/// and is never source authority. Compiled proofs that require source/symbol
+/// provenance must retain each [`loaded_kernel_authority`] identity; argument
+/// and effect authority is not available.
 pub fn loaded_manifest_identity() -> [u8; 32] {
     let identity = stwo_backend_cuda_kernels::aot_pack::aot_pack_identity();
     if identity == [0; 32]
@@ -34,6 +37,21 @@ pub fn loaded_cubin_identity(cache_key: u64, sm_major: u32, sm_minor: u32) -> [u
         return [0; 32];
     }
     stwo_backend_cuda_kernels::aot_pack::aot_cubin_identity(cache_key, sm_major, sm_minor)
+}
+
+/// Exact source/symbol/semantic/binary authority for one loaded kernel.
+/// `None` means absent or rejected with the containing pack. The schema scope
+/// is intentionally exported-symbol-only until kernel emission provides a
+/// structured argument and read/write contract.
+pub fn loaded_kernel_authority(
+    cache_key: u64,
+    sm_major: u32,
+    sm_minor: u32,
+) -> Option<AotKernelAuthority> {
+    if loaded_manifest_identity() == [0; 32] {
+        return None;
+    }
+    stwo_backend_cuda_kernels::aot_pack::aot_kernel_authority(cache_key, sm_major, sm_minor)
 }
 
 /// Non-authoritative u64 compatibility/telemetry projection of
@@ -537,6 +555,7 @@ mod tests {
             assert_ne!(loaded_manifest_hash(), 0);
         }
         assert_eq!(loaded_cubin_identity(0, u32::MAX, u32::MAX), [0; 32]);
+        assert_eq!(loaded_kernel_authority(0, u32::MAX, u32::MAX), None);
     }
 
     #[derive(Default)]

@@ -41,7 +41,30 @@ use build_cache::*;
 
 #[path = "src/aot_identity.rs"]
 mod aot_identity;
-use aot_identity::{cubin_identity, pack_identity, CubinIdentityInput};
+use aot_identity::{
+    cubin_identity, kernel_authority_identity, pack_identity, source_identity,
+    AotKernelSchemaScope, CubinIdentityInput, KernelAuthorityIdentityInput,
+};
+
+#[path = "src/aot_source_manifest.rs"]
+mod aot_source_manifest;
+use aot_source_manifest::{parse_source_manifest, validate_exported_kernel_symbol};
+
+struct AotBuildEntry {
+    cache_key: u64,
+    sm: u32,
+    cubin: PathBuf,
+    kernel_symbol: String,
+    semantic_hash: u64,
+    source_identity: [u8; 32],
+}
+
+struct AotBuildSnapshot {
+    sources: Vec<(PathBuf, PathBuf, u128)>,
+    exact_sources: Vec<(PathBuf, [u8; 32])>,
+    manifest: (PathBuf, PathBuf, u128),
+    manifest_bytes: Vec<u8>,
+}
 
 fn object_fixed_flags(include_dirs: &[String]) -> Vec<String> {
     // The fp256/poseidon252 stack calls constexpr host accessors from device
@@ -77,6 +100,7 @@ fn main() {
     println!("cargo:rerun-if-changed=build_cache.rs");
     println!("cargo:rerun-if-changed=build_fingerprint_tests.rs");
     println!("cargo:rerun-if-changed=src/aot_identity.rs");
+    println!("cargo:rerun-if-changed=src/aot_source_manifest.rs");
 
     let sources = kernel_sources();
     for source in &sources {
@@ -330,7 +354,7 @@ fn main() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let aot_source_identities = build_aot_pack(
+    let aot_snapshot = build_aot_pack(
         &nvcc,
         compiler_identity,
         &archs,
@@ -345,7 +369,8 @@ fn main() {
         sources,
         "CUDA source set changed while nvcc was running; retry the build"
     );
-    let expected_aot_sources: Vec<PathBuf> = aot_source_identities
+    let expected_aot_sources: Vec<PathBuf> = aot_snapshot
+        .sources
         .iter()
         .map(|(source, ..)| source.clone())
         .collect();
@@ -372,7 +397,13 @@ fn main() {
         &source_identities,
     )
     .unwrap_or_else(|error| panic!("{error}"));
-    validate_source_identities(0, None, &aot_source_identities)
+    validate_source_identities(0, None, &aot_snapshot.sources)
+        .unwrap_or_else(|error| panic!("{error}"));
+    validate_exact_aot_sources(&aot_snapshot.exact_sources)
+        .unwrap_or_else(|error| panic!("{error}"));
+    validate_source_identities(0, None, std::slice::from_ref(&aot_snapshot.manifest))
+        .unwrap_or_else(|error| panic!("{error}"));
+    validate_exact_bytes(&aot_snapshot.manifest.0, &aot_snapshot.manifest_bytes)
         .unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(
         generated_aot_constraint_max_instrs(),
@@ -513,25 +544,66 @@ fn build_aot_pack(
     out_dir: &std::path::Path,
     constraint_max_instrs: usize,
     constraint_max_live_u32_lanes: usize,
-) -> Vec<(PathBuf, PathBuf, u128)> {
+) -> AotBuildSnapshot {
     let sources = aot_sources_for_build();
+    let manifest_path = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap())
+        .join("cuda")
+        .join("generated")
+        .join("aot_manifest.json");
+    let manifest_arg = normalized_source_path(&manifest_path);
+    let manifest_bytes = std::fs::read(&manifest_path).expect("read generated AOT manifest");
+    let manifest = parse_source_manifest(&manifest_bytes)
+        .unwrap_or_else(|error| panic!("invalid generated AOT manifest: {error}"));
+    let manifest_identity = artifact_fingerprint(0, &manifest_arg, &manifest_bytes, None);
+    let manifest_sources = manifest
+        .iter()
+        .map(|entry| manifest_path.parent().unwrap().join(&entry.file))
+        .collect::<Vec<_>>();
+    if !cfg!(feature = "test-only-empty-aot-pack") {
+        assert_eq!(
+            sources, manifest_sources,
+            "generated AOT source set does not match aot_manifest.json"
+        );
+    }
 
     let cubin_dir = out_dir.join("aot_cubins");
     std::fs::create_dir_all(&cubin_dir).expect("create aot cubin cache dir");
+    let source_snapshot_dir = out_dir.join("aot_sources");
+    std::fs::create_dir_all(&source_snapshot_dir).expect("create AOT source snapshot dir");
     // Collect jobs, then compile stale ones on a bounded worker pool — cubins
     // are independent TUs and SASS -O3 on the big fp256 kernels takes minutes
     // each; serial nvcc dominated the first pod build.
-    let mut entries: Vec<(u64, u32, PathBuf)> = Vec::new();
+    let mut entries = Vec::new();
     let mut jobs: Vec<(PathBuf, PathBuf, PathBuf, Vec<String>)> = Vec::new();
     let mut source_identities: Vec<(PathBuf, PathBuf, u128)> = Vec::with_capacity(sources.len());
-    for source in &sources {
+    let mut exact_source_identities = Vec::with_capacity(sources.len());
+    for (source, metadata) in sources.iter().zip(&manifest) {
         let source_arg = normalized_source_path(source);
         let stem = source.file_stem().unwrap().to_string_lossy().to_string();
-        let key = u64::from_str_radix(stem.rsplit('_').next().unwrap(), 16)
-            .expect("generated kernel file names end in _<cache_key:016x>");
         let source_bytes = std::fs::read(source).expect("read generated AOT source identity");
-        let source_identity = artifact_fingerprint(0, &source_arg, &source_bytes, None);
-        source_identities.push((source.clone(), source_arg.clone(), source_identity));
+        validate_exported_kernel_symbol(&source_bytes, &metadata.kernel_symbol).unwrap_or_else(
+            |error| panic!("invalid generated source {}: {error}", source.display()),
+        );
+        let exact_source_identity = source_identity(&source_bytes);
+        assert_ne!(
+            exact_source_identity,
+            aot_identity::ZERO_IDENTITY,
+            "generated AOT source must be nonempty"
+        );
+        exact_source_identities.push((source.clone(), exact_source_identity));
+        // Compile the exact authorized bytes, not a checkout path that could
+        // drift between hashing and a worker invoking nvcc.
+        let source_snapshot =
+            source_snapshot_dir.join(format!("{stem}_{}.cu", hex_digest(&exact_source_identity)));
+        if source_snapshot.is_file() {
+            validate_exact_bytes(&source_snapshot, &source_bytes)
+                .unwrap_or_else(|error| panic!("{error}"));
+        } else {
+            std::fs::write(&source_snapshot, &source_bytes)
+                .expect("write exact generated AOT source snapshot");
+        }
+        let build_source_identity = artifact_fingerprint(0, &source_arg, &source_bytes, None);
+        source_identities.push((source.clone(), source_arg.clone(), build_source_identity));
         for arch in archs {
             let num: u32 = arch
                 .trim_start_matches("sm_")
@@ -558,9 +630,21 @@ fn build_aot_pack(
             if !cubin.is_file() {
                 let staging = staging_path(&cubin);
                 let _ = std::fs::remove_file(&staging);
-                jobs.push((source_arg.clone(), staging, cubin.clone(), compile_flags));
+                jobs.push((
+                    source_snapshot.clone(),
+                    staging,
+                    cubin.clone(),
+                    compile_flags,
+                ));
             }
-            entries.push((key, num, cubin));
+            entries.push(AotBuildEntry {
+                cache_key: metadata.cache_key,
+                sm: num,
+                cubin,
+                kernel_symbol: metadata.kernel_symbol.clone(),
+                semantic_hash: metadata.semantic_hash,
+                source_identity: exact_source_identity,
+            });
         }
     }
     if !jobs.is_empty() {
@@ -599,6 +683,17 @@ fn build_aot_pack(
         .collect();
     publish_validated_artifacts(&aot_publications, || {
         validate_source_identities(0, None, &source_identities)?;
+        validate_exact_aot_sources(&exact_source_identities)?;
+        validate_source_identities(
+            0,
+            None,
+            std::slice::from_ref(&(
+                manifest_path.clone(),
+                manifest_arg.clone(),
+                manifest_identity,
+            )),
+        )?;
+        validate_exact_bytes(&manifest_path, &manifest_bytes)?;
         if !compiler_identity_is_current(compiler_identity) {
             return Err(
                 "nvcc or its host compiler changed while compiling AOT cubins; retry the build"
@@ -608,17 +703,18 @@ fn build_aot_pack(
         Ok(())
     })
     .unwrap_or_else(|error| panic!("{error}"));
-    let refs: Vec<(u64, u32, &std::path::Path)> = entries
-        .iter()
-        .map(|(k, a, p)| (*k, *a, p.as_path()))
-        .collect();
     write_aot_pack(
         out_dir,
-        &refs,
+        &entries,
         constraint_max_instrs,
         constraint_max_live_u32_lanes,
     );
-    source_identities
+    AotBuildSnapshot {
+        sources: source_identities,
+        exact_sources: exact_source_identities,
+        manifest: (manifest_path, manifest_arg, manifest_identity),
+        manifest_bytes,
+    }
 }
 
 /// Concatenate cubins into `aot_pack.bin` + emit `aot_index.rs` (sorted by
@@ -626,20 +722,25 @@ fn build_aot_pack(
 /// include_bytes! happy.
 fn write_aot_pack(
     out_dir: &std::path::Path,
-    entries: &[(u64, u32, &std::path::Path)],
+    entries: &[AotBuildEntry],
     constraint_max_instrs: usize,
     constraint_max_live_u32_lanes: usize,
 ) {
     let mut blobs = entries
         .iter()
-        .map(|(cache_key, sm, path)| (*cache_key, *sm, std::fs::read(path).expect("read cubin")))
+        .map(|entry| {
+            (
+                entry,
+                std::fs::read(&entry.cubin).expect("read generated AOT cubin"),
+            )
+        })
         .collect::<Vec<_>>();
-    blobs.sort_by_key(|(cache_key, sm, _)| (*cache_key, *sm));
+    blobs.sort_by_key(|(entry, _)| (entry.cache_key, entry.sm));
     let identity_inputs = blobs
         .iter()
-        .map(|(cache_key, sm, bytes)| CubinIdentityInput {
-            cache_key: *cache_key,
-            sm: *sm,
+        .map(|(entry, bytes)| CubinIdentityInput {
+            cache_key: entry.cache_key,
+            sm: entry.sm,
             bytes,
         })
         .collect::<Vec<_>>();
@@ -649,25 +750,49 @@ fn write_aot_pack(
         &identity_inputs,
     );
     let mut pack: Vec<u8> = Vec::new();
-    let mut index: Vec<(u64, u32, usize, usize, [u8; 32])> = Vec::new();
-    for input in identity_inputs {
+    let mut index = Vec::new();
+    for ((entry, _), input) in blobs.iter().zip(identity_inputs) {
+        let exact_cubin_identity = cubin_identity(input);
+        let authority_identity = kernel_authority_identity(KernelAuthorityIdentityInput {
+            source_identity: entry.source_identity,
+            kernel_symbol: &entry.kernel_symbol,
+            semantic_hash: entry.semantic_hash,
+            cache_key: entry.cache_key,
+            sm: entry.sm,
+            cubin_identity: exact_cubin_identity,
+            schema_scope: AotKernelSchemaScope::ExportedSymbolOnly,
+        });
+        assert_ne!(
+            authority_identity,
+            aot_identity::ZERO_IDENTITY,
+            "generated AOT kernel authority must be nonzero"
+        );
         index.push((
-            input.cache_key,
-            input.sm,
+            entry,
             pack.len(),
             input.bytes.len(),
-            cubin_identity(input),
+            exact_cubin_identity,
+            authority_identity,
         ));
         pack.extend_from_slice(input.bytes);
     }
     std::fs::write(out_dir.join("aot_pack.bin"), &pack).expect("write aot pack");
     let mut rs = String::from(
-        "// Generated by build.rs — exact identities for aot_pack.bin.\n         pub(crate) static AOT_INDEX: &[AotIndexEntry] = &[\n",
+        "// Generated by build.rs — exact identities for aot_pack.bin.\n         static AOT_INDEX: &[AotIndexEntry] = &[\n",
     );
-    for (key, sm, off, len, digest) in &index {
+    for (entry, off, len, cubin_digest, authority_digest) in &index {
         rs.push_str(&format!(
-            "    (0x{key:016x}, {sm}, {off}, {len}, {}),\n",
-            rust_digest(digest)
+            "    AotIndexEntry {{ offset: {off}, len: {len}, authority: AotKernelAuthority {{ \
+             source_identity: {}, kernel_symbol: {:?}, semantic_hash: 0x{:016x}, \
+             cache_key: 0x{:016x}, target_sm: {}, cubin_identity: {}, identity: {}, \
+             schema_scope: AotKernelSchemaScope::ExportedSymbolOnly }} }},\n",
+            rust_digest(&entry.source_identity),
+            entry.kernel_symbol,
+            entry.semantic_hash,
+            entry.cache_key,
+            entry.sm,
+            rust_digest(cubin_digest),
+            rust_digest(authority_digest),
         ));
     }
     rs.push_str("];\n");
@@ -692,6 +817,36 @@ fn rust_digest(digest: &[u8; 32]) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!("[{bytes}]")
+}
+
+fn hex_digest(digest: &[u8; 32]) -> String {
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn validate_exact_aot_sources(sources: &[(PathBuf, [u8; 32])]) -> Result<(), String> {
+    for (path, identity) in sources {
+        let bytes =
+            std::fs::read(path).map_err(|error| format!("re-read {}: {error}", path.display()))?;
+        if source_identity(&bytes) != *identity {
+            return Err(format!(
+                "{} changed while nvcc was running; retry the build",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_exact_bytes(path: &std::path::Path, expected: &[u8]) -> Result<(), String> {
+    let current =
+        std::fs::read(path).map_err(|error| format!("re-read {}: {error}", path.display()))?;
+    if current != expected {
+        return Err(format!(
+            "{} changed while nvcc was running; retry the build",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 fn generated_aot_constraint_max_instrs() -> usize {
