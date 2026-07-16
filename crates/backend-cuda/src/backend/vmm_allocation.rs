@@ -14,6 +14,10 @@ use super::exec_context::{
     check_cuda, CudaExecContext, CudaQuiescence, CudaRuntimeError, JoinedCudaLanes,
 };
 
+mod tiled;
+
+pub use tiled::{PinnedDmaWindow, PinnedDmaWindowState};
+
 const INITIAL_GENERATION: u32 = 0;
 const RESTORED_GENERATION: u32 = 1;
 
@@ -28,6 +32,9 @@ pub enum VmmAllocationState {
 pub enum VmmAllocationError {
     Cuda(CudaRuntimeError),
     InvalidSize(usize),
+    InvalidStagingSize(usize),
+    PinnedStagingAllocationFailed(usize),
+    InvalidPinnedStagingState(PinnedDmaWindowState),
     InvalidGeometry {
         bytes: usize,
         granularity: usize,
@@ -49,6 +56,15 @@ impl core::fmt::Display for VmmAllocationError {
         match self {
             Self::Cuda(error) => error.fmt(f),
             Self::InvalidSize(bytes) => write!(f, "invalid CUDA VMM allocation size {bytes}"),
+            Self::InvalidStagingSize(bytes) => {
+                write!(f, "invalid CUDA VMM staging-window size {bytes}")
+            }
+            Self::PinnedStagingAllocationFailed(bytes) => {
+                write!(f, "CUDA pinned staging allocation failed for {bytes} bytes")
+            }
+            Self::InvalidPinnedStagingState(state) => {
+                write!(f, "invalid CUDA pinned staging state {state:?}")
+            }
             Self::InvalidGeometry { bytes, granularity } => write!(
                 f,
                 "invalid CUDA VMM geometry: {bytes} bytes at {granularity}-byte granularity"
@@ -193,59 +209,6 @@ impl<'context> VmmAllocation<'context> {
         self.state
     }
 
-    /// Spill the complete allocation, join every lane, fence the main stream,
-    /// then unmap and release physical backing.
-    ///
-    /// # Safety
-    ///
-    /// `host_destination` must name writable pinned host memory of exactly
-    /// `bytes`. The caller must hold exclusive scheduling authority over the
-    /// owner context: no copied launch handle may enqueue concurrent work. No
-    /// producer may retain access beyond the validated lane joins.
-    pub unsafe fn spill_to_host(
-        &mut self,
-        host_destination: NonNull<c_void>,
-        bytes: usize,
-    ) -> Result<(), VmmAllocationError> {
-        require_exact_bytes(self.bytes, bytes)?;
-        let mut operations = CudaVmmOps::new(self.handle, self.owner_context);
-        unsafe {
-            spill_transition(
-                &mut self.state,
-                &mut operations,
-                host_destination,
-                self.stable_address,
-                bytes,
-            )
-        }
-    }
-
-    /// Remap generation 1 at the same virtual address, enqueue a complete H2D
-    /// restore, then fork the restored main-stream state into every owned lane.
-    ///
-    /// # Safety
-    ///
-    /// `host_source` must name readable pinned host memory of exactly `bytes`
-    /// and remain live until later owner-stream synchronization. The caller must
-    /// hold exclusive scheduling authority over the owner context; lane
-    /// consumers must be enqueued only after this checked fork sequence returns.
-    pub unsafe fn restore_from_host(
-        &mut self,
-        host_source: NonNull<c_void>,
-        bytes: usize,
-    ) -> Result<(), VmmAllocationError> {
-        require_exact_bytes(self.bytes, bytes)?;
-        let mut operations = CudaVmmOps::new(self.handle, self.owner_context);
-        unsafe {
-            restore_transition(
-                &mut self.state,
-                &mut operations,
-                self.stable_address,
-                host_source,
-                bytes,
-            )
-        }
-    }
 }
 
 impl Drop for VmmAllocation<'_> {
@@ -282,6 +245,7 @@ trait VmmOps {
     ) -> Result<(), VmmAllocationError>;
 
     fn sync_main(&mut self) -> Result<(), VmmAllocationError>;
+    fn sync_transfer(&mut self) -> Result<(), VmmAllocationError>;
     fn unmap_release(&mut self) -> Result<(), VmmAllocationError>;
     fn remap_generation1(&mut self) -> Result<(), VmmAllocationError>;
     fn lane_count(&self) -> usize;
@@ -300,6 +264,7 @@ struct CudaVmmOps<'a> {
     context: &'a CudaExecContext,
     joined: Option<JoinedCudaLanes<'a>>,
     quiescence: Option<CudaQuiescence>,
+    transfer_pending: bool,
 }
 
 impl<'a> CudaVmmOps<'a> {
@@ -309,6 +274,7 @@ impl<'a> CudaVmmOps<'a> {
             context,
             joined: None,
             quiescence: None,
+            transfer_pending: false,
         }
     }
 }
@@ -328,12 +294,21 @@ impl VmmOps for CudaVmmOps<'_> {
         source: NonNull<c_void>,
         bytes: usize,
     ) -> Result<(), VmmAllocationError> {
-        let joined = self
-            .joined
-            .as_ref()
-            .ok_or(VmmAllocationError::SequenceViolation("copy_d2h"))?;
-        unsafe {
-            joined.memcpy_d2h_async(destination.as_ptr(), source.as_ptr(), bytes)?;
+        if self.transfer_pending {
+            return Err(VmmAllocationError::SequenceViolation("copy_d2h_pending"));
+        }
+        self.transfer_pending = true;
+        if let Some(joined) = &self.joined {
+            unsafe {
+                joined.memcpy_d2h_async(destination.as_ptr(), source.as_ptr(), bytes)?;
+            }
+        } else if self.quiescence.is_some() {
+            unsafe {
+                self.context
+                    .memcpy_d2h_async(destination.as_ptr(), source.as_ptr(), bytes)?;
+            }
+        } else {
+            return Err(VmmAllocationError::SequenceViolation("copy_d2h"));
         }
         Ok(())
     }
@@ -344,10 +319,25 @@ impl VmmOps for CudaVmmOps<'_> {
             .take()
             .ok_or(VmmAllocationError::SequenceViolation("sync_main"))?;
         self.quiescence = Some(joined.sync_main()?);
+        self.transfer_pending = false;
+        Ok(())
+    }
+
+    fn sync_transfer(&mut self) -> Result<(), VmmAllocationError> {
+        if !self.transfer_pending {
+            return Err(VmmAllocationError::SequenceViolation("sync_transfer"));
+        }
+        self.context.sync()?;
+        self.transfer_pending = false;
         Ok(())
     }
 
     fn unmap_release(&mut self) -> Result<(), VmmAllocationError> {
+        if self.transfer_pending {
+            return Err(VmmAllocationError::SequenceViolation(
+                "unmap_pending_transfer",
+            ));
+        }
         let quiescence = self
             .quiescence
             .take()
@@ -366,6 +356,11 @@ impl VmmOps for CudaVmmOps<'_> {
     }
 
     fn remap_generation1(&mut self) -> Result<(), VmmAllocationError> {
+        if self.transfer_pending {
+            return Err(VmmAllocationError::SequenceViolation(
+                "remap_pending_transfer",
+            ));
+        }
         let code = unsafe {
             stwo_backend_cuda_kernels::raw::stwo_vmm_allocation_remap_generation1(
                 self.allocation.as_ptr(),
@@ -391,6 +386,10 @@ impl VmmOps for CudaVmmOps<'_> {
         source: NonNull<c_void>,
         bytes: usize,
     ) -> Result<(), VmmAllocationError> {
+        if self.transfer_pending {
+            return Err(VmmAllocationError::SequenceViolation("copy_h2d_pending"));
+        }
+        self.transfer_pending = true;
         unsafe {
             self.context.memcpy_h2d_async(
                 destination.as_ptr(),
@@ -402,6 +401,7 @@ impl VmmOps for CudaVmmOps<'_> {
     }
 }
 
+#[cfg(test)]
 unsafe fn spill_transition(
     state: &mut VmmAllocationState,
     operations: &mut impl VmmOps,
@@ -439,6 +439,7 @@ unsafe fn spill_transition(
     Ok(())
 }
 
+#[cfg(test)]
 unsafe fn restore_transition(
     state: &mut VmmAllocationState,
     operations: &mut impl VmmOps,
@@ -481,6 +482,7 @@ mod tests {
         JoinAll,
         D2h,
         Sync,
+        TransferSync,
         Unmap,
         Remap,
         H2d,
@@ -520,6 +522,10 @@ mod tests {
 
         fn sync_main(&mut self) -> Result<(), VmmAllocationError> {
             self.invoke(Call::Sync)
+        }
+
+        fn sync_transfer(&mut self) -> Result<(), VmmAllocationError> {
+            self.invoke(Call::TransferSync)
         }
 
         fn unmap_release(&mut self) -> Result<(), VmmAllocationError> {
