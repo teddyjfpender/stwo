@@ -46,6 +46,7 @@ fn table_with_geometry(
         content_digest,
         source_n_rows: source_rows,
         n_rows: padded_rows,
+        registration_generation: PEDERSEN_TABLE_REGISTRATION_GENERATION,
     }
 }
 
@@ -206,6 +207,10 @@ fn registered_geometry_is_ordered_and_fails_closed() {
 
     assert_eq!(table.content_digest(), DIGEST_A);
     assert_eq!(table.source_n_rows(), 1 << 23);
+    assert_eq!(
+        table.registration_generation(),
+        PEDERSEN_TABLE_REGISTRATION_GENERATION
+    );
     assert!(table.has_exact_rows(1 << 23));
     assert!(!table.has_exact_rows(1 << 22));
     assert_eq!(table.column(0).unwrap().index(), 0);
@@ -243,6 +248,16 @@ fn registered_geometry_is_ordered_and_fails_closed() {
         wrong_rows.validate_exact_geometry(1 << 23),
         Err(RegisteredPedersenTableError::RowCount { .. })
     ));
+
+    let mut stale_generation = table;
+    stale_generation.registration_generation = 0;
+    assert_eq!(
+        stale_generation.validate_exact_geometry(1 << 23),
+        Err(RegisteredPedersenTableError::RegistrationGeneration {
+            expected: PEDERSEN_TABLE_REGISTRATION_GENERATION,
+            actual: 0,
+        })
+    );
 
     let mut wrong_index = table;
     wrong_index.columns[17].index = 18;

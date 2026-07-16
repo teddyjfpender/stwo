@@ -49,6 +49,16 @@ enum PedersenTableOwnershipMode : uint32_t {
     PEDERSEN_TABLE_MODE_OWNED_GENERATED_COLUMNS = 2,
 };
 
+constexpr bool pedersen_table_mode_can_publish_witness_globals(
+    PedersenTableOwnershipMode mode
+) {
+    return mode == PEDERSEN_TABLE_MODE_BORROWED_COLUMNS;
+}
+static_assert(pedersen_table_mode_can_publish_witness_globals(
+    PEDERSEN_TABLE_MODE_BORROWED_COLUMNS));
+static_assert(!pedersen_table_mode_can_publish_witness_globals(
+    PEDERSEN_TABLE_MODE_OWNED_GENERATED_COLUMNS));
+
 struct PedersenTableRuntimeState {
     PedersenTableOwnershipMode mode;
     m31* active_columns[INIT_PEDERSEN_TABLE_N_COLUMNS];
@@ -780,6 +790,17 @@ extern "C" void initialize_pedersen_table() {
 
 extern "C" bool is_pedersen_table_initialized() {
     return pedersen_table_runtime_is_initialized();
+}
+
+// Generated-owned columns are quarantined by the host-table differential and
+// may not initialize generated witness modules. Only the checked borrowed
+// registration is admissible at that boundary. This lock-free host snapshot is
+// valid only under the formal path's one-shot registration-before-publication
+// and process-lifetime retention contract; a replaceable table needs synchronized
+// generation-qualified state.
+extern "C" bool is_borrowed_pedersen_table_registered() {
+    return pedersen_table_runtime_is_initialized() &&
+        pedersen_table_mode_can_publish_witness_globals(s_pedersen_table_runtime.mode);
 }
 
 // Get the device pointers and row count for the pedersen table columns.

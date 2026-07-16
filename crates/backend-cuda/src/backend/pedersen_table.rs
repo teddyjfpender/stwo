@@ -27,6 +27,12 @@ use digest::{finish_pedersen_digest, hash_pedersen_column, pedersen_content_hash
 /// Column count of the pedersen points table (28 x-limbs + 28 y-limbs).
 pub const PEDERSEN_TABLE_N_COLUMNS: usize = 56;
 
+/// The borrowed table is installed once and retained for the process lifetime.
+/// Generation zero means absent; the sole successful `OnceLock` publication is
+/// generation one. A future replaceable table must increment this value instead
+/// of reusing the process-local module receipts introduced for generation one.
+pub const PEDERSEN_TABLE_REGISTRATION_GENERATION: u64 = 1;
+
 /// BLAKE3 identity of the exact padded bytes uploaded for all 56 columns.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PedersenTableContentDigest([u8; 32]);
@@ -76,6 +82,7 @@ pub struct RegisteredPedersenTable {
     content_digest: PedersenTableContentDigest,
     source_n_rows: usize,
     n_rows: usize,
+    registration_generation: u64,
 }
 
 /// A registered table failed the exact geometry required by a borrower.
@@ -104,6 +111,10 @@ pub enum RegisteredPedersenTableError {
     },
     NullColumnPointer {
         column: usize,
+    },
+    RegistrationGeneration {
+        expected: u64,
+        actual: u64,
     },
 }
 
@@ -282,6 +293,10 @@ impl RegisteredPedersenTable {
         self.n_rows
     }
 
+    pub const fn registration_generation(self) -> u64 {
+        self.registration_generation
+    }
+
     pub const fn columns(self) -> [RegisteredPedersenColumn; PEDERSEN_TABLE_N_COLUMNS] {
         self.columns
     }
@@ -301,6 +316,12 @@ impl RegisteredPedersenTable {
         self,
         expected_rows: usize,
     ) -> Result<(), RegisteredPedersenTableError> {
+        if self.registration_generation != PEDERSEN_TABLE_REGISTRATION_GENERATION {
+            return Err(RegisteredPedersenTableError::RegistrationGeneration {
+                expected: PEDERSEN_TABLE_REGISTRATION_GENERATION,
+                actual: self.registration_generation,
+            });
+        }
         if self.n_rows != expected_rows {
             return Err(RegisteredPedersenTableError::RowCount {
                 expected: expected_rows,
@@ -680,6 +701,7 @@ fn build_borrowed_pedersen_table(
         content_digest,
         source_n_rows: source_rows,
         n_rows: padded_rows,
+        registration_generation: PEDERSEN_TABLE_REGISTRATION_GENERATION,
     };
     if let Err(error) =
         table.validate_exact_registration_geometry(content_digest, source_rows, padded_rows)

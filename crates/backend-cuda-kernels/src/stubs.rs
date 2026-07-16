@@ -2670,6 +2670,18 @@ pub unsafe extern "C" fn stwo_cuda_jit_get_aot_stats(out: *mut crate::raw::CudaJ
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_cuda_jit_get_pedersen_module_publication(
+    _kernel_name: *const core::ffi::c_char,
+    _cache_key: u64,
+    out: *mut crate::raw::CudaPedersenModulePublication,
+) -> bool {
+    if let Some(out) = unsafe { out.as_mut() } {
+        *out = crate::raw::CudaPedersenModulePublication::default();
+    }
+    false
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stwo_cuda_jit_reset_aot_stats() {}
 
 #[unsafe(no_mangle)]

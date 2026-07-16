@@ -33,14 +33,17 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 #include <sys/stat.h>
 #include <cstdlib>
@@ -51,9 +54,8 @@
 // unsigned* ABI here is identical. MUST be declared at global scope: inside the
 // anonymous namespace below, `extern "C"` declarations still get internal
 // linkage and never resolve to the real symbols (measured: rust-lld undefined
-// `(anonymous namespace)::is_pedersen_table_initialized()`).
-extern "C" bool is_pedersen_table_initialized();
-extern "C" void initialize_pedersen_table();
+// `(anonymous namespace)::is_borrowed_pedersen_table_registered()`).
+extern "C" bool is_borrowed_pedersen_table_registered();
 extern "C" void get_pedersen_table_column_ptrs(unsigned **output_ptrs, uint32_t *out_n_rows);
 
 // The embedded AOT pack lookup (src/aot_pack.rs, populated by build.rs from
@@ -67,9 +69,55 @@ namespace {
 
 enum class KernelOrigin : uint8_t { Aot = 0, Runtime = 1 };
 
+constexpr uint32_t kPedersenPublicationAbiVersion = 1;
+constexpr uint32_t kPedersenGlobalsAbsent = 0;
+constexpr uint32_t kPedersenGlobalsPresent = 1;
+constexpr uint32_t kPedersenPublicationAot = 1u << 0;
+constexpr uint32_t kPedersenPublicationReadbackVerified = 1u << 1;
+constexpr uint32_t kPedersenPublicationEventComplete = 1u << 2;
+constexpr uint32_t kPedersenPublicationRequiredFlags =
+    kPedersenPublicationAot | kPedersenPublicationReadbackVerified |
+    kPedersenPublicationEventComplete;
+
+// Process-local receipt for one loaded module's two Pedersen device globals.
+// Content/source/cubin identities deliberately do not live here: Rust composes
+// this live-address receipt with the registered table and embedded AOT authority.
+struct StwoCudaPedersenModulePublication {
+    uint32_t abi_version;
+    uint32_t flags;
+    uint32_t device_ordinal;
+    uint32_t sm_major;
+    uint32_t sm_minor;
+    uint32_t pointer_count;
+    uint32_t columns_symbol_bytes;
+    uint32_t rows_symbol_bytes;
+    uint32_t n_rows;
+    uint32_t globals_state;
+    uint64_t cache_key;
+    uint64_t module_token;
+    uint64_t context_token;
+    uint64_t columns_symbol_token;
+    uint64_t rows_symbol_token;
+    uint64_t completion_event_token;
+    uint64_t column_pointers[56];
+};
+static_assert(sizeof(void *) == 8, "Pedersen module globals require 64-bit pointers");
+static_assert(sizeof(StwoCudaPedersenModulePublication) == 536,
+              "Pedersen publication ABI size");
+static_assert(alignof(StwoCudaPedersenModulePublication) == 8,
+              "Pedersen publication ABI alignment");
+static_assert(offsetof(StwoCudaPedersenModulePublication, cache_key) == 40,
+              "Pedersen publication cache-key offset");
+static_assert(offsetof(StwoCudaPedersenModulePublication, column_pointers) == 88,
+              "Pedersen publication pointer offset");
+
 struct CachedFunction {
+    CUmodule module;
     CUfunction function;
     KernelOrigin origin;
+    std::string kernel_name;
+    StwoCudaPedersenModulePublication pedersen_publication;
+    CUevent pedersen_publication_event;
 };
 
 struct StwoCudaJitAotStats {
@@ -170,15 +218,42 @@ void close_strict_aot_admission() {
     });
 }
 
+struct JitCacheKey {
+    uint64_t cache_key;
+    CUcontext context;
+
+    bool operator==(const JitCacheKey &other) const {
+        return cache_key == other.cache_key && context == other.context;
+    }
+};
+
+struct JitCacheKeyHash {
+    size_t operator()(const JitCacheKey &key) const {
+        size_t first = std::hash<uint64_t>{}(key.cache_key);
+        size_t second = std::hash<uintptr_t>{}(reinterpret_cast<uintptr_t>(key.context));
+        return first ^ (second + 0x9e3779b9u + (first << 6) + (first >> 2));
+    }
+};
+
 struct JitCache {
     // Guards `functions` and `key_mutexes` only — held briefly for map lookups/inserts,
     // NEVER across a compile, so distinct-key compiles run concurrently.
     std::mutex mutex;
-    // semantic_hash -> compiled function (module kept alive for process lifetime).
-    std::unordered_map<uint64_t, CachedFunction> functions;
-    // semantic_hash -> per-key compile lock: concurrent requests for the SAME key
-    // serialize (compile once, dedup) while different keys proceed in parallel.
-    std::unordered_map<uint64_t, std::shared_ptr<std::mutex>> key_mutexes;
+    // (semantic hash, CUDA context) -> compiled function and its owning module.
+    // One process may drive several GPUs; a CUfunction is never portable across
+    // contexts even when its semantic key is identical.
+    std::unordered_map<JitCacheKey, CachedFunction, JitCacheKeyHash> functions;
+    // Same composite key for compile serialization: different contexts may load
+    // the same cubin concurrently without ever aliasing their module globals.
+    std::unordered_map<JitCacheKey, std::shared_ptr<std::mutex>, JitCacheKeyHash>
+        key_mutexes;
+    // Strict admission may replace a runtime-origin entry with the exact AOT
+    // module. Prior launches are host-enqueue drained, but their asynchronous GPU
+    // work is not globally synchronized. Retain replaced modules/events for the
+    // CUDA-context lifetime rather than risking use-after-unload. This is the
+    // current process cache's deliberate ownership model, not yet the replacement
+    // backend's destructor-qualified InstalledProgram/BoundModuleInstance owner.
+    std::vector<CachedFunction> retired;
 };
 
 JitCache &jit_cache() {
@@ -186,12 +261,59 @@ JitCache &jit_cache() {
     return cache;
 }
 
+bool ensure_current_context(CUcontext *out) {
+    if (out == nullptr) return false;
+    *out = nullptr;
+    if (cuCtxGetCurrent(out) != CUDA_SUCCESS) return false;
+    if (*out != nullptr) return true;
+    if (cudaFree(0) != cudaSuccess) return false;
+    return cuCtxGetCurrent(out) == CUDA_SUCCESS && *out != nullptr;
+}
+
 // A runtime-origin entry is deliberately not a strict-mode cache hit. The caller
 // continues through the per-key compile path, resolves the embedded AOT entry, and
 // replaces this map slot. Missing AOT still fails closed in compile_kernel.
-bool try_use_cached_function(const CachedFunction &cached, CUfunction *out) {
+bool try_use_cached_function(const CachedFunction &cached, const char *kernel_name,
+                             CUcontext context, CUfunction *out) {
+    if (cached.kernel_name != kernel_name || cached.module == nullptr ||
+        cached.function == nullptr) {
+        return false;
+    }
     if (require_aot().load(std::memory_order_acquire) &&
         cached.origin != KernelOrigin::Aot) {
+        return false;
+    }
+    if (context == nullptr ||
+        cached.pedersen_publication.context_token !=
+            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(context)) ||
+        cached.pedersen_publication.module_token !=
+            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(cached.module))) {
+        return false;
+    }
+    if (cached.pedersen_publication.globals_state == kPedersenGlobalsPresent) {
+        const uint32_t required = kPedersenPublicationReadbackVerified |
+                                  kPedersenPublicationEventComplete |
+                                  (cached.origin == KernelOrigin::Aot
+                                       ? kPedersenPublicationAot
+                                       : 0);
+        if (cached.pedersen_publication.abi_version !=
+                kPedersenPublicationAbiVersion ||
+            cached.pedersen_publication.flags != required ||
+            cached.pedersen_publication.pointer_count != 56 ||
+            cached.pedersen_publication.columns_symbol_bytes != 448 ||
+            cached.pedersen_publication.rows_symbol_bytes != 4 ||
+            cached.pedersen_publication.n_rows == 0 ||
+            cached.pedersen_publication.columns_symbol_token == 0 ||
+            cached.pedersen_publication.rows_symbol_token == 0 ||
+            cached.pedersen_publication.columns_symbol_token % alignof(uint64_t) != 0 ||
+            cached.pedersen_publication.rows_symbol_token % alignof(uint32_t) != 0 ||
+            cached.pedersen_publication_event == nullptr ||
+            cached.pedersen_publication.completion_event_token !=
+                static_cast<uint64_t>(reinterpret_cast<uintptr_t>(
+                    cached.pedersen_publication_event))) {
+            return false;
+        }
+    } else if (cached.pedersen_publication.globals_state != kPedersenGlobalsAbsent) {
         return false;
     }
     (cached.origin == KernelOrigin::Aot ? aot_counters().aot_cache_hits
@@ -362,20 +484,88 @@ static bool nvrtc_accepts_dopt_off() {
 }
 
 // Witness-JIT modules that embed computed EC deduces (ISA-V3 kinds 2/3,
-// `stwo_wit_deduce.cuh`) declare per-module pedersen table globals — device
-// globals never cross CUmodule boundaries, so each loaded module needs its own
-// copy filled. Symbol absent = the kernel has no EC deduces (composition
-// kernels, non-EC witness kernels): nothing to do. Any failure fails the whole
-// load — the Rust caller then falls back to the host lane rather than
-// launching a kernel that would dereference null table pointers.
-static bool fill_witness_pedersen_globals(CUmodule module, const char *kernel_name) {
+// `stwo_wit_deduce.cuh`) declare per-module Pedersen table globals. Device
+// globals never cross CUmodule boundaries, so publication is proved separately
+// for every loaded module. A missing columns symbol is an explicit Absent state;
+// every other lookup/copy/readback/event failure rejects the load.
+static bool fill_witness_pedersen_globals(
+    CUmodule module,
+    const char *kernel_name,
+    uint64_t cache_key,
+    KernelOrigin origin,
+    StwoCudaPedersenModulePublication *out,
+    CUevent *out_event
+) {
+    if (module == nullptr || kernel_name == nullptr || out == nullptr ||
+        out_event == nullptr) {
+        return false;
+    }
+    *out = StwoCudaPedersenModulePublication{};
+    *out_event = nullptr;
+
+    CUcontext context = nullptr;
+    CUdevice device = 0;
+    int sm_major = 0;
+    int sm_minor = 0;
+    if (cuCtxGetCurrent(&context) != CUDA_SUCCESS || context == nullptr ||
+        cuCtxGetDevice(&device) != CUDA_SUCCESS || device < 0 ||
+        cuDeviceGetAttribute(&sm_major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+                             device) != CUDA_SUCCESS ||
+        cuDeviceGetAttribute(&sm_minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+                             device) != CUDA_SUCCESS ||
+        sm_major < 0 || sm_minor < 0) {
+        return false;
+    }
+
+    out->abi_version = kPedersenPublicationAbiVersion;
+    out->flags = origin == KernelOrigin::Aot ? kPedersenPublicationAot : 0;
+    out->device_ordinal = static_cast<uint32_t>(device);
+    out->sm_major = static_cast<uint32_t>(sm_major);
+    out->sm_minor = static_cast<uint32_t>(sm_minor);
+    out->cache_key = cache_key;
+    out->module_token = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(module));
+    out->context_token = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(context));
+    if (out->module_token == 0 || out->context_token == 0) return false;
+
     CUdeviceptr cols_sym;
     size_t cols_size = 0;
-    if (cuModuleGetGlobal(&cols_sym, &cols_size, module, "g_stwo_wit_pedersen_cols") !=
-        CUDA_SUCCESS) {
+    CUresult cols_result =
+        cuModuleGetGlobal(&cols_sym, &cols_size, module, "g_stwo_wit_pedersen_cols");
+    if (cols_result == CUDA_ERROR_NOT_FOUND) {
+        CUdeviceptr absent_rows_sym = 0;
+        size_t absent_rows_size = 0;
+        if (cuModuleGetGlobal(&absent_rows_sym, &absent_rows_size, module,
+                              "g_stwo_wit_pedersen_n_rows") != CUDA_ERROR_NOT_FOUND) {
+            return false;
+        }
+        // `out` was zero-initialized. Absent therefore has no symbol/pointer/event
+        // fields or completion flags, and the cold publication query (which
+        // requires exact Present+AOT+readback+event state) can never upgrade it.
+        out->globals_state = kPedersenGlobalsAbsent;
         return true;
     }
-    if (!is_pedersen_table_initialized()) {
+    if (cols_result != CUDA_SUCCESS) return false;
+
+    CUdeviceptr rows_sym;
+    size_t rows_size = 0;
+    if (cuModuleGetGlobal(&rows_sym, &rows_size, module,
+                          "g_stwo_wit_pedersen_n_rows") != CUDA_SUCCESS) {
+        return false;
+    }
+    constexpr size_t kPointerCount = 56;
+    constexpr size_t kColumnsBytes = kPointerCount * sizeof(uint64_t);
+    constexpr size_t kRowsBytes = sizeof(uint32_t);
+    if (cols_size != kColumnsBytes || rows_size != kRowsBytes ||
+        cols_sym % alignof(uint64_t) != 0 || rows_sym % alignof(uint32_t) != 0) {
+        fprintf(stderr,
+                "stwo JIT: pedersen globals malformed for %s "
+                "(cols_bytes=%zu rows_bytes=%zu cols_align=%llu rows_align=%llu)\n",
+                kernel_name, cols_size, rows_size,
+                (unsigned long long)(cols_sym % alignof(uint64_t)),
+                (unsigned long long)(rows_sym % alignof(uint32_t)));
+        return false;
+    }
+    if (!is_borrowed_pedersen_table_registered()) {
         // NO self-heal generation: the deduce-gate oracle falsified the
         // GPU-generated table (144/256 rows vs the host PEDERSEN_TABLE_18,
         // run 20260705T113615Z). The host-built table must be registered
@@ -393,26 +583,94 @@ static bool fill_witness_pedersen_globals(CUmodule module, const char *kernel_na
     get_pedersen_table_column_ptrs(ptrs, &n_rows);
     // The deduce functions mask row indices with n_rows-1; a non-power-of-two
     // count would silently alias rows, so reject it here instead.
-    if (cols_size < sizeof(ptrs) || n_rows == 0 || (n_rows & (n_rows - 1)) != 0) {
+    static_assert(sizeof(ptrs) == kColumnsBytes,
+                  "Pedersen columns symbol must be exactly 448 bytes");
+    if (n_rows == 0 || (n_rows & (n_rows - 1)) != 0) {
         fprintf(stderr,
-                "stwo JIT: pedersen table globals malformed for %s (sym_bytes=%zu n_rows=%u)\n",
-                kernel_name, cols_size, n_rows);
+                "stwo JIT: pedersen table geometry malformed for %s (n_rows=%u)\n",
+                kernel_name, n_rows);
         return false;
     }
-    CUdeviceptr rows_sym;
-    size_t rows_size = 0;
+    for (size_t i = 0; i < kPointerCount; ++i) {
+        CUdeviceptr pointer = static_cast<CUdeviceptr>(reinterpret_cast<uintptr_t>(ptrs[i]));
+        CUcontext pointer_context = nullptr;
+        if (pointer == 0 || pointer % alignof(uint32_t) != 0 ||
+            cuPointerGetAttribute(&pointer_context, CU_POINTER_ATTRIBUTE_CONTEXT, pointer) !=
+                CUDA_SUCCESS ||
+            pointer_context != context) {
+            fprintf(stderr,
+                    "stwo JIT: pedersen column %zu is not a current-context u32 pointer "
+                    "for %s\n",
+                    i, kernel_name);
+            return false;
+        }
+    }
+
+    unsigned *readback_ptrs[56] = {};
+    uint32_t readback_rows = 0;
     if (cuMemcpyHtoD(cols_sym, ptrs, sizeof(ptrs)) != CUDA_SUCCESS ||
-        cuModuleGetGlobal(&rows_sym, &rows_size, module, "g_stwo_wit_pedersen_n_rows") !=
-            CUDA_SUCCESS ||
-        rows_size < sizeof(n_rows) ||
-        cuMemcpyHtoD(rows_sym, &n_rows, sizeof(n_rows)) != CUDA_SUCCESS) {
+        cuMemcpyHtoD(rows_sym, &n_rows, sizeof(n_rows)) != CUDA_SUCCESS ||
+        cuMemcpyDtoH(readback_ptrs, cols_sym, sizeof(readback_ptrs)) != CUDA_SUCCESS ||
+        cuMemcpyDtoH(&readback_rows, rows_sym, sizeof(readback_rows)) != CUDA_SUCCESS ||
+        memcmp(readback_ptrs, ptrs, sizeof(ptrs)) != 0 || readback_rows != n_rows) {
         fprintf(stderr, "stwo JIT: failed filling pedersen table globals for %s\n",
                 kernel_name);
         return false;
     }
-    // Table generation launches ran on the legacy stream via the runtime API;
-    // make their completion visible to witness launches on any stream.
-    return cudaDeviceSynchronize() == cudaSuccess;
+
+    CUevent completion_event = nullptr;
+    if (cuEventCreate(&completion_event, CU_EVENT_DISABLE_TIMING) != CUDA_SUCCESS ||
+        completion_event == nullptr || cuEventRecord(completion_event, nullptr) != CUDA_SUCCESS ||
+        cuEventSynchronize(completion_event) != CUDA_SUCCESS) {
+        if (completion_event != nullptr) cuEventDestroy(completion_event);
+        fprintf(stderr, "stwo JIT: failed fencing pedersen publication for %s\n",
+                kernel_name);
+        return false;
+    }
+
+    out->flags |= kPedersenPublicationReadbackVerified |
+                  kPedersenPublicationEventComplete;
+    out->pointer_count = static_cast<uint32_t>(kPointerCount);
+    out->columns_symbol_bytes = static_cast<uint32_t>(cols_size);
+    out->rows_symbol_bytes = static_cast<uint32_t>(rows_size);
+    out->n_rows = n_rows;
+    out->globals_state = kPedersenGlobalsPresent;
+    out->columns_symbol_token = cols_sym;
+    out->rows_symbol_token = rows_sym;
+    out->completion_event_token =
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(completion_event));
+    for (size_t i = 0; i < kPointerCount; ++i) {
+        out->column_pointers[i] =
+            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(ptrs[i]));
+    }
+    *out_event = completion_event;
+    return true;
+}
+
+// Central loaded-module admission. Every origin takes this path so the cache
+// never contains a function without its owning module/context and explicit
+// Pedersen-global state.
+static bool bind_loaded_module(CUmodule module, const char *kernel_name,
+                               uint64_t cache_key, KernelOrigin origin,
+                               CachedFunction *out) {
+    if (module == nullptr || kernel_name == nullptr || out == nullptr) return false;
+    CUfunction function = nullptr;
+    if (cuModuleGetFunction(&function, module, kernel_name) != CUDA_SUCCESS ||
+        function == nullptr) {
+        fprintf(stderr, "stwo JIT: kernel %s not found in loaded module\n", kernel_name);
+        cuModuleUnload(module);
+        return false;
+    }
+    StwoCudaPedersenModulePublication publication{};
+    CUevent publication_event = nullptr;
+    if (!fill_witness_pedersen_globals(module, kernel_name, cache_key, origin,
+                                        &publication, &publication_event)) {
+        cuModuleUnload(module);
+        return false;
+    }
+    *out = CachedFunction{module, function, origin, std::string(kernel_name), publication,
+                          publication_event};
+    return true;
 }
 
 // CUBIN (SASS) fast path: emit/reuse a real-arch cubin and load it with
@@ -428,7 +686,7 @@ static bool try_cubin_path(const char *source, const char *kernel_name,
                            uint64_t semantic_hash, bool relax_opt,
                            const cudaDeviceProp &props,
                            std::chrono::steady_clock::time_point t_start,
-                           CUfunction *out) {
+                           CachedFunction *out) {
     std::vector<char> cubin;
     bool from_disk = false;
     std::string cache_file =
@@ -555,13 +813,8 @@ static bool try_cubin_path(const char *source, const char *kernel_name,
         }
         return false;
     }
-    if (cuModuleGetFunction(out, module, kernel_name) != CUDA_SUCCESS) {
-        if (jit_log_enabled()) {
-            fprintf(stderr, "stwo JIT: kernel %s not found in cubin module\n", kernel_name);
-        }
-        return false;
-    }
-    if (!fill_witness_pedersen_globals(module, kernel_name)) {
+    if (!bind_loaded_module(module, kernel_name, semantic_hash, KernelOrigin::Runtime,
+                            out)) {
         return false;
     }
     if (jit_log_enabled()) {
@@ -607,9 +860,8 @@ bool compile_kernel(const char *source, const char *kernel_name, uint64_t semant
         CUmodule module = nullptr;
         CUresult r = cuModuleLoadData(&module, blob);
         if (r == CUDA_SUCCESS) {
-            CUfunction function = nullptr;
-            if (cuModuleGetFunction(&function, module, kernel_name) == CUDA_SUCCESS &&
-                fill_witness_pedersen_globals(module, kernel_name)) {
+            if (bind_loaded_module(module, kernel_name, semantic_hash, KernelOrigin::Aot,
+                                   out)) {
                 if (jit_log_enabled()) {
                     fprintf(stderr,
                             "stwo JIT: AOT pack hit kernel=%s key=%016llx (embedded "
@@ -618,10 +870,8 @@ bool compile_kernel(const char *source, const char *kernel_name, uint64_t semant
                             props.minor);
                 }
                 aot_counters().aot_loads.fetch_add(1, std::memory_order_relaxed);
-                *out = CachedFunction{function, KernelOrigin::Aot};
                 return true;
             }
-            cuModuleUnload(module);
         }
         if (jit_log_enabled()) {
             fprintf(stderr,
@@ -654,12 +904,10 @@ bool compile_kernel(const char *source, const char *kernel_name, uint64_t semant
     // Cubin fast path (skips ptxas at load). On any failure, fall through to PTX.
     if (jit_cubin_cache_enabled() &&
         [&]() {
-            CUfunction function = nullptr;
             if (!try_cubin_path(source, kernel_name, semantic_hash, relax_opt, props,
-                                t_start, &function)) {
+                                t_start, out)) {
                 return false;
             }
-            *out = CachedFunction{function, KernelOrigin::Runtime};
             return true;
         }()) {
         aot_counters().runtime_loads.fetch_add(1, std::memory_order_relaxed);
@@ -777,12 +1025,8 @@ bool compile_kernel(const char *source, const char *kernel_name, uint64_t semant
                 kernel_name, err_str ? err_str : "?", ptx.size(), relax_opt ? 1 : 0);
         return false;
     }
-    CUfunction function = nullptr;
-    if (cuModuleGetFunction(&function, module, kernel_name) != CUDA_SUCCESS) {
-        fprintf(stderr, "stwo JIT: kernel %s not found in module\n", kernel_name);
-        return false;
-    }
-    if (!fill_witness_pedersen_globals(module, kernel_name)) {
+    if (!bind_loaded_module(module, kernel_name, semantic_hash, KernelOrigin::Runtime,
+                            out)) {
         return false;
     }
     if (jit_log_enabled()) {
@@ -797,7 +1041,6 @@ bool compile_kernel(const char *source, const char *kernel_name, uint64_t semant
                 from_disk ? "disk PTX cache" : "NVRTC compile");
     }
     aot_counters().runtime_loads.fetch_add(1, std::memory_order_relaxed);
-    *out = CachedFunction{function, KernelOrigin::Runtime};
     return true;
 }
 
@@ -812,14 +1055,20 @@ bool compile_kernel(const char *source, const char *kernel_name, uint64_t semant
 // resulting cache is identical).
 bool get_or_compile(const char *source, const char *kernel_name, uint64_t cache_key,
                     bool relax_opt, CUfunction *out) {
+    if (kernel_name == nullptr || out == nullptr) return false;
+    CUcontext context = nullptr;
+    if (!ensure_current_context(&context)) return false;
+    const JitCacheKey scoped_key{cache_key, context};
     JitCache &cache = jit_cache();
 
     // Fast path: already compiled by some prior request.
     {
         std::lock_guard<std::mutex> guard(cache.mutex);
-        auto it = cache.functions.find(cache_key);
-        if (it != cache.functions.end() && try_use_cached_function(it->second, out))
-            return true;
+        auto it = cache.functions.find(scoped_key);
+        if (it != cache.functions.end()) {
+            if (it->second.kernel_name != kernel_name) return false;
+            if (try_use_cached_function(it->second, kernel_name, context, out)) return true;
+        }
     }
 
     // Acquire (or create) this key's compile lock without holding the global lock
@@ -827,10 +1076,12 @@ bool get_or_compile(const char *source, const char *kernel_name, uint64_t cache_
     std::shared_ptr<std::mutex> key_lock;
     {
         std::lock_guard<std::mutex> guard(cache.mutex);
-        auto fit = cache.functions.find(cache_key);
-        if (fit != cache.functions.end() && try_use_cached_function(fit->second, out))
-            return true;
-        std::shared_ptr<std::mutex> &slot = cache.key_mutexes[cache_key];
+        auto fit = cache.functions.find(scoped_key);
+        if (fit != cache.functions.end()) {
+            if (fit->second.kernel_name != kernel_name) return false;
+            if (try_use_cached_function(fit->second, kernel_name, context, out)) return true;
+        }
+        std::shared_ptr<std::mutex> &slot = cache.key_mutexes[scoped_key];
         if (!slot) slot = std::make_shared<std::mutex>();
         key_lock = slot;
     }
@@ -840,23 +1091,130 @@ bool get_or_compile(const char *source, const char *kernel_name, uint64_t cache_
     // just finished compiling this exact key.
     {
         std::lock_guard<std::mutex> guard(cache.mutex);
-        auto it = cache.functions.find(cache_key);
-        if (it != cache.functions.end() && try_use_cached_function(it->second, out))
-            return true;
+        auto it = cache.functions.find(scoped_key);
+        if (it != cache.functions.end()) {
+            if (it->second.kernel_name != kernel_name) return false;
+            if (try_use_cached_function(it->second, kernel_name, context, out)) return true;
+        }
     }
 
     // This lifetime is the publication fence: strict admission cannot return while a
     // pre-admission compile can still load a module or insert it into the cache.
     JitOperationAdmission publication_admission;
-    CachedFunction compiled{nullptr, KernelOrigin::Runtime};
+    CachedFunction compiled{};
     if (!compile_kernel(source, kernel_name, cache_key, relax_opt, &compiled)) {
+        return false;
+    }
+    if (compiled.kernel_name != kernel_name ||
+        compiled.pedersen_publication.context_token !=
+            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(context))) {
+        if (compiled.pedersen_publication_event != nullptr) {
+            cuEventDestroy(compiled.pedersen_publication_event);
+        }
+        if (compiled.module != nullptr) cuModuleUnload(compiled.module);
         return false;
     }
     {
         std::lock_guard<std::mutex> guard(cache.mutex);
-        cache.functions.insert_or_assign(cache_key, compiled);
+        auto existing = cache.functions.find(scoped_key);
+        if (existing == cache.functions.end()) {
+            cache.functions.emplace(scoped_key, std::move(compiled));
+        } else {
+            cache.retired.push_back(std::move(existing->second));
+            existing->second = std::move(compiled);
+        }
     }
-    *out = compiled.function;
+    {
+        std::lock_guard<std::mutex> guard(cache.mutex);
+        *out = cache.functions.find(scoped_key)->second.function;
+    }
+    return true;
+}
+
+bool get_live_pedersen_publication(
+    const char *kernel_name,
+    uint64_t cache_key,
+    StwoCudaPedersenModulePublication *out
+) {
+    if (out == nullptr) return false;
+    *out = StwoCudaPedersenModulePublication{};
+    if (kernel_name == nullptr) return false;
+
+    CUcontext context = nullptr;
+    CUdevice device = 0;
+    int sm_major = 0;
+    int sm_minor = 0;
+    if (!ensure_current_context(&context) ||
+        cuCtxGetDevice(&device) != CUDA_SUCCESS || device < 0 ||
+        cuDeviceGetAttribute(&sm_major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+                             device) != CUDA_SUCCESS ||
+        cuDeviceGetAttribute(&sm_minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+                             device) != CUDA_SUCCESS ||
+        sm_major < 0 || sm_minor < 0) {
+        return false;
+    }
+
+    JitCache &cache = jit_cache();
+    // Deliberately retain the cache lock through symbol resolution and DtoH
+    // equality checks so this exact module cannot be replaced underneath the
+    // receipt. This is a one-shot cold admission query before graph creation,
+    // never part of the launch path.
+    std::lock_guard<std::mutex> guard(cache.mutex);
+    auto it = cache.functions.find(JitCacheKey{cache_key, context});
+    if (it == cache.functions.end()) return false;
+    const CachedFunction &cached = it->second;
+    const StwoCudaPedersenModulePublication &receipt = cached.pedersen_publication;
+    if (cached.origin != KernelOrigin::Aot || cached.kernel_name != kernel_name ||
+        cached.module == nullptr || cached.function == nullptr ||
+        cached.pedersen_publication_event == nullptr ||
+        receipt.abi_version != kPedersenPublicationAbiVersion ||
+        receipt.flags != kPedersenPublicationRequiredFlags ||
+        receipt.globals_state != kPedersenGlobalsPresent ||
+        receipt.device_ordinal != static_cast<uint32_t>(device) ||
+        receipt.sm_major != static_cast<uint32_t>(sm_major) ||
+        receipt.sm_minor != static_cast<uint32_t>(sm_minor) ||
+        receipt.pointer_count != 56 || receipt.columns_symbol_bytes != 448 ||
+        receipt.rows_symbol_bytes != 4 || receipt.n_rows == 0 ||
+        receipt.cache_key != cache_key || receipt.module_token == 0 ||
+        receipt.context_token == 0 || receipt.columns_symbol_token == 0 ||
+        receipt.rows_symbol_token == 0 || receipt.completion_event_token == 0 ||
+        receipt.module_token !=
+            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(cached.module)) ||
+        receipt.context_token !=
+            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(context)) ||
+        receipt.completion_event_token != static_cast<uint64_t>(reinterpret_cast<uintptr_t>(
+                                                 cached.pedersen_publication_event)) ||
+        receipt.columns_symbol_token % alignof(uint64_t) != 0 ||
+        receipt.rows_symbol_token % alignof(uint32_t) != 0 ||
+        cuEventQuery(cached.pedersen_publication_event) != CUDA_SUCCESS) {
+        return false;
+    }
+
+    CUdeviceptr columns_symbol = 0;
+    CUdeviceptr rows_symbol = 0;
+    size_t columns_bytes = 0;
+    size_t rows_bytes = 0;
+    if (cuModuleGetGlobal(&columns_symbol, &columns_bytes, cached.module,
+                          "g_stwo_wit_pedersen_cols") != CUDA_SUCCESS ||
+        cuModuleGetGlobal(&rows_symbol, &rows_bytes, cached.module,
+                          "g_stwo_wit_pedersen_n_rows") != CUDA_SUCCESS ||
+        columns_symbol != receipt.columns_symbol_token ||
+        rows_symbol != receipt.rows_symbol_token || columns_bytes != 448 ||
+        rows_bytes != 4) {
+        return false;
+    }
+
+    uint64_t readback_pointers[56] = {};
+    uint32_t readback_rows = 0;
+    if (cuMemcpyDtoH(readback_pointers, columns_symbol, sizeof(readback_pointers)) !=
+            CUDA_SUCCESS ||
+        cuMemcpyDtoH(&readback_rows, rows_symbol, sizeof(readback_rows)) != CUDA_SUCCESS ||
+        memcmp(readback_pointers, receipt.column_pointers,
+               sizeof(readback_pointers)) != 0 ||
+        readback_rows != receipt.n_rows) {
+        return false;
+    }
+    *out = receipt;
     return true;
 }
 
@@ -889,6 +1247,14 @@ extern "C" void stwo_cuda_jit_reset_aot_stats() {
     c.runtime_loads.store(0, std::memory_order_relaxed);
     c.runtime_cache_hits.store(0, std::memory_order_relaxed);
     c.strict_rejections.store(0, std::memory_order_relaxed);
+}
+
+extern "C" bool stwo_cuda_jit_get_pedersen_module_publication(
+    const char *kernel_name,
+    uint64_t cache_key,
+    StwoCudaPedersenModulePublication *out
+) {
+    return get_live_pedersen_publication(kernel_name, cache_key, out);
 }
 
 // Compile a kernel into the in-memory function cache (and the disk PTX cache) without
@@ -925,6 +1291,8 @@ extern "C" bool stwo_cuda_jit_precompile_batch(
     uint32_t count
 ) {
     if (count == 0) return true;
+    int requested_device = 0;
+    if (cudaGetDevice(&requested_device) != cudaSuccess) return false;
 
     uint32_t workers = jit_parallel_compile_workers(count);
     if (workers <= 1) {
@@ -941,6 +1309,12 @@ extern "C" bool stwo_cuda_jit_precompile_batch(
     std::atomic<uint32_t> next(0);
     std::atomic<bool> ok(true);
     auto worker = [&]() {
+        // CUDA device selection is thread-local. Bind every compile worker to
+        // the caller's device before it forms the context-scoped cache key.
+        if (cudaSetDevice(requested_device) != cudaSuccess) {
+            ok.store(false, std::memory_order_relaxed);
+            return;
+        }
         for (;;) {
             if (!ok.load(std::memory_order_relaxed)) return;
             uint32_t i = next.fetch_add(1, std::memory_order_relaxed);

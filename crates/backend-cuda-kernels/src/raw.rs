@@ -383,6 +383,127 @@ pub struct CudaJitAotStats {
     pub strict_rejections: u64,
 }
 
+pub const CUDA_PEDERSEN_PUBLICATION_ABI_VERSION: u32 = 1;
+pub const CUDA_PEDERSEN_GLOBALS_ABSENT: u32 = 0;
+pub const CUDA_PEDERSEN_GLOBALS_PRESENT: u32 = 1;
+pub const CUDA_PEDERSEN_PUBLICATION_AOT: u32 = 1 << 0;
+pub const CUDA_PEDERSEN_PUBLICATION_READBACK_VERIFIED: u32 = 1 << 1;
+pub const CUDA_PEDERSEN_PUBLICATION_EVENT_COMPLETE: u32 = 1 << 2;
+pub const CUDA_PEDERSEN_PUBLICATION_REQUIRED_FLAGS: u32 = CUDA_PEDERSEN_PUBLICATION_AOT
+    | CUDA_PEDERSEN_PUBLICATION_READBACK_VERIFIED
+    | CUDA_PEDERSEN_PUBLICATION_EVENT_COMPLETE;
+
+/// Live process-local receipt for one loaded AOT module's Pedersen globals.
+///
+/// Tokens and pointers are deliberately not semantic identities. The safe
+/// backend layer composes this with the registered table and AOT-pack authority.
+#[repr(C, align(8))]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct CudaPedersenModulePublication {
+    pub abi_version: u32,
+    pub flags: u32,
+    pub device_ordinal: u32,
+    pub sm_major: u32,
+    pub sm_minor: u32,
+    pub pointer_count: u32,
+    pub columns_symbol_bytes: u32,
+    pub rows_symbol_bytes: u32,
+    pub n_rows: u32,
+    pub globals_state: u32,
+    pub cache_key: u64,
+    pub module_token: u64,
+    pub context_token: u64,
+    pub columns_symbol_token: u64,
+    pub rows_symbol_token: u64,
+    pub completion_event_token: u64,
+    pub column_pointers: [u64; 56],
+}
+
+impl Default for CudaPedersenModulePublication {
+    fn default() -> Self {
+        Self {
+            abi_version: 0,
+            flags: 0,
+            device_ordinal: 0,
+            sm_major: 0,
+            sm_minor: 0,
+            pointer_count: 0,
+            columns_symbol_bytes: 0,
+            rows_symbol_bytes: 0,
+            n_rows: 0,
+            globals_state: 0,
+            cache_key: 0,
+            module_token: 0,
+            context_token: 0,
+            columns_symbol_token: 0,
+            rows_symbol_token: 0,
+            completion_event_token: 0,
+            column_pointers: [0; 56],
+        }
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<CudaPedersenModulePublication>() == 536);
+const _: () = assert!(core::mem::align_of::<CudaPedersenModulePublication>() == 8);
+const _: () = assert!(core::mem::offset_of!(CudaPedersenModulePublication, cache_key) == 40);
+const _: () = assert!(core::mem::offset_of!(CudaPedersenModulePublication, column_pointers) == 88);
+
+#[cfg(test)]
+mod pedersen_publication_abi_tests {
+    use super::CudaPedersenModulePublication;
+
+    #[test]
+    fn publication_layout_and_native_contract_are_exact() {
+        assert_eq!(core::mem::size_of::<CudaPedersenModulePublication>(), 536);
+        assert_eq!(core::mem::align_of::<CudaPedersenModulePublication>(), 8);
+        assert_eq!(
+            core::mem::offset_of!(CudaPedersenModulePublication, cache_key),
+            40
+        );
+        assert_eq!(
+            core::mem::offset_of!(CudaPedersenModulePublication, column_pointers),
+            88
+        );
+        type Query = unsafe extern "C" fn(
+            *const core::ffi::c_char,
+            u64,
+            *mut CudaPedersenModulePublication,
+        ) -> bool;
+        let _: Query = super::stwo_cuda_jit_get_pedersen_module_publication;
+
+        let native = include_str!("../cuda/runtime_jit.cu");
+        assert!(native.contains("cols_size != kColumnsBytes"));
+        assert!(native.contains("rows_size != kRowsBytes"));
+        assert!(native.contains("cuMemcpyDtoH(readback_ptrs"));
+        assert!(native.contains("memcmp(readback_ptrs, ptrs, sizeof(ptrs))"));
+        assert!(native.contains("cuEventSynchronize(completion_event)"));
+        assert!(native.contains("\"g_stwo_wit_pedersen_n_rows\") != CUDA_ERROR_NOT_FOUND"));
+        assert!(native.contains("JitCacheKey{cache_key, context}"));
+        assert!(native.contains("cached.origin != KernelOrigin::Aot"));
+        assert!(native.contains("if (!is_borrowed_pedersen_table_registered())"));
+        let table_runtime = include_str!("../cuda/pedersen_table_init.cu");
+        assert!(table_runtime.contains(
+            "!pedersen_table_mode_can_publish_witness_globals(\n    PEDERSEN_TABLE_MODE_OWNED_GENERATED_COLUMNS)"
+        ));
+
+        if !crate::CUDA_KERNELS_BUILT {
+            let kernel = std::ffi::CString::new("witness").unwrap();
+            let mut receipt = CudaPedersenModulePublication {
+                abi_version: 99,
+                ..CudaPedersenModulePublication::default()
+            };
+            assert!(!unsafe {
+                super::stwo_cuda_jit_get_pedersen_module_publication(
+                    kernel.as_ptr(),
+                    7,
+                    &mut receipt,
+                )
+            });
+            assert_eq!(receipt, CudaPedersenModulePublication::default());
+        }
+    }
+}
+
 /// Exact host/device ABI for one already-bound constraint part inside a
 /// same-domain composition wave. Keep in sync with
 /// `StwoCudaCompositionWavePart` emitted by `cuda_codegen.rs`.
@@ -658,6 +779,14 @@ extern "C" {
     /// error and NVRTC/disk-PTX paths are not entered.
     pub fn stwo_cuda_jit_set_require_aot(required: bool);
     pub fn stwo_cuda_jit_get_aot_stats(out: *mut CudaJitAotStats);
+    /// Query the exact live `(cache_key, current CUDA context, kernel_name)`
+    /// cache entry. Returns false for a miss, runtime-origin module, absent
+    /// globals, failed readback, or incomplete publication event.
+    pub fn stwo_cuda_jit_get_pedersen_module_publication(
+        kernel_name: *const core::ffi::c_char,
+        cache_key: u64,
+        out: *mut CudaPedersenModulePublication,
+    ) -> bool;
     /// Reset counters only. Cached functions and their AOT/runtime provenance
     /// remain intact, so subsequent cache-hit accounting stays truthful.
     pub fn stwo_cuda_jit_reset_aot_stats();
