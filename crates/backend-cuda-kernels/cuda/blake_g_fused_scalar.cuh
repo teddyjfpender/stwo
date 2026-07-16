@@ -22,7 +22,18 @@ template <uint32_t Word>
 DEVICE_FORCEINLINE void bg_lookup(BlakeGResidentOutputs outputs, uint32_t row,
                                   uint32_t column_length, uint32_t value) {
     static_assert(Word < 87u, "Blake-G lookup word is out of range");
-    outputs.lookup[(size_t)Word * column_length + row] = value;
+    if (outputs.lookup != nullptr) {
+        outputs.lookup[(size_t)Word * column_length + row] = value;
+    }
+}
+
+template <uint32_t Column>
+DEVICE_FORCEINLINE void bg_aux(BlakeGResidentOutputs outputs, uint32_t row,
+                               uint32_t column_length, uint32_t value) {
+    static_assert(Column < BG_N_AUX, "Blake-G auxiliary column is out of range");
+    if (outputs.aux != nullptr) {
+        outputs.aux[(size_t)Column * column_length + row] = value;
+    }
 }
 
 template <uint32_t Tuple, uint32_t Relation>
@@ -117,6 +128,10 @@ __global__ void blake_g_write_trace_fused_scalar_kernel(
     const uint32_t xor16_1 = ts0_lo_ms8 ^ in3_lo_ms8;
     const uint32_t xor16_2 = ts0_hi_ls8 ^ in3_hi_ls8;
     const uint32_t xor16_3 = ts0_hi_ms8 ^ in3_hi_ms8;
+    bg_aux<0>(outputs, row, column_length, ts0_lo_ls8);
+    bg_aux<1>(outputs, row, column_length, ts0_hi_ls8);
+    bg_aux<2>(outputs, row, column_length, in3_lo_ls8);
+    bg_aux<3>(outputs, row, column_length, in3_hi_ls8);
     bg_trace<14>(outputs, row, ts0_lo_ms8);
     bg_trace<15>(outputs, row, ts0_hi_ms8);
     bg_trace<16>(outputs, row, in3_lo_ms8);
@@ -160,6 +175,10 @@ __global__ void blake_g_write_trace_fused_scalar_kernel(
     const uint32_t xor12_1 = in1_lo_ms4 ^ ts22_lo_ms4;
     const uint32_t xor12_2 = in1_hi_ls12 ^ ts22_hi_ls12;
     const uint32_t xor12_3 = in1_hi_ms4 ^ ts22_hi_ms4;
+    bg_aux<4>(outputs, row, column_length, in1_lo_ls12);
+    bg_aux<5>(outputs, row, column_length, in1_hi_ls12);
+    bg_aux<6>(outputs, row, column_length, ts22_lo_ls12);
+    bg_aux<7>(outputs, row, column_length, ts22_hi_ls12);
     bg_trace<24>(outputs, row, in1_lo_ms4);
     bg_trace<25>(outputs, row, in1_hi_ms4);
     bg_trace<26>(outputs, row, ts22_lo_ms4);
@@ -203,6 +222,10 @@ __global__ void blake_g_write_trace_fused_scalar_kernel(
     const uint32_t xor8_1 = ts44_lo_ms8 ^ xr16_lo_ms8;
     const uint32_t xor8_2 = ts44_hi_ls8 ^ xr16_hi_ls8;
     const uint32_t xor8_3 = ts44_hi_ms8 ^ xr16_hi_ms8;
+    bg_aux<8>(outputs, row, column_length, ts44_lo_ls8);
+    bg_aux<9>(outputs, row, column_length, ts44_hi_ls8);
+    bg_aux<10>(outputs, row, column_length, xr16_lo_ls8);
+    bg_aux<11>(outputs, row, column_length, xr16_hi_ls8);
     bg_trace<34>(outputs, row, ts44_lo_ms8);
     bg_trace<35>(outputs, row, ts44_hi_ms8);
     bg_trace<36>(outputs, row, xr16_lo_ms8);
@@ -246,6 +269,10 @@ __global__ void blake_g_write_trace_fused_scalar_kernel(
     const uint32_t xor7_1 = xr12_lo_ms9 ^ ts66_lo_ms9;
     const uint32_t xor7_2 = xr12_hi_ls7 ^ ts66_hi_ls7;
     const uint32_t xor7_3 = xr12_hi_ms9 ^ ts66_hi_ms9;
+    bg_aux<12>(outputs, row, column_length, xr12_lo_ls7);
+    bg_aux<13>(outputs, row, column_length, xr12_hi_ls7);
+    bg_aux<14>(outputs, row, column_length, ts66_lo_ls7);
+    bg_aux<15>(outputs, row, column_length, ts66_hi_ls7);
     bg_trace<44>(outputs, row, xr12_lo_ms9);
     bg_trace<45>(outputs, row, xr12_hi_ms9);
     bg_trace<46>(outputs, row, ts66_lo_ms9);
@@ -268,6 +295,10 @@ __global__ void blake_g_write_trace_fused_scalar_kernel(
     bg_count_lut<3, 4, 9, 0>(feed, xr12_hi_ms9, ts66_hi_ms9);
     const uint32_t xr7_lo = xor7_1 + xor7_2 * 512u;
     const uint32_t xr7_hi = xor7_3 + xor7_0 * 512u;
+    bg_aux<16>(outputs, row, column_length, xr7_lo);
+    bg_aux<17>(outputs, row, column_length, xr7_hi);
+    bg_aux<18>(outputs, row, column_length, xr8_lo);
+    bg_aux<19>(outputs, row, column_length, xr8_hi);
 
     const uint32_t enabler = row < n_rows ? 1u : 0u;
     bg_trace<52>(outputs, row, enabler);

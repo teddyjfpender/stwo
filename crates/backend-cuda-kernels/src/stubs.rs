@@ -677,6 +677,36 @@ pub unsafe extern "C" fn blake_g_write_trace_into_on(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn blake_g_write_trace_projected_into_on(
+    inputs: *const u32,
+    producer_sub: *const u32,
+    producer_rows: u32,
+    producer_word_base: u32,
+    producer_instances: u32,
+    n_rows: u32,
+    column_length: u32,
+    trace_cols_host: *const *mut u32,
+    aux: *mut u32,
+    sub: *mut u32,
+    stream: *mut core::ffi::c_void,
+) -> i32 {
+    let _ = (
+        inputs,
+        producer_sub,
+        producer_rows,
+        producer_word_base,
+        producer_instances,
+        n_rows,
+        column_length,
+        trace_cols_host,
+        aux,
+        sub,
+        stream,
+    );
+    no_cuda_symbol("blake_g_write_trace_projected_into_on")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn blake_g_write_trace_fused_into_on(
     input_cols_host: *const *const u32,
     n_rows: u32,
@@ -698,6 +728,30 @@ pub unsafe extern "C" fn blake_g_write_trace_fused_into_on(
         stream,
     );
     no_cuda_symbol("blake_g_write_trace_fused_into_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn blake_g_write_trace_fused_projected_into_on(
+    input_cols_host: *const *const u32,
+    n_rows: u32,
+    column_length: u32,
+    trace_cols_host: *const *mut u32,
+    aux: *mut u32,
+    luts_host: *const *const u32,
+    counts_host: *const *mut u32,
+    stream: *mut core::ffi::c_void,
+) -> i32 {
+    let _ = (
+        input_cols_host,
+        n_rows,
+        column_length,
+        trace_cols_host,
+        aux,
+        luts_host,
+        counts_host,
+        stream,
+    );
+    no_cuda_symbol("blake_g_write_trace_fused_projected_into_on")
 }
 
 #[unsafe(no_mangle)]

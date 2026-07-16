@@ -42,6 +42,9 @@ constexpr int BG_N_SUB = 48;
 struct BlakeGResidentOutputs {
     uint32_t *trace[BG_N_TRACE];
     uint32_t *lookup;
+    // Replacement-only compact source: c[53..73], word-major. Exactly one of
+    // lookup/aux is non-null.
+    uint32_t *aux;
     uint32_t *sub;
 };
 
@@ -248,25 +251,34 @@ __global__ void blake_g_write_trace_kernel(
         resident.trace[j][row] = c[j];
     }
 
-    // Generated LookupData declaration order: sixteen xor tuples, the final
-    // blake_g tuple, then multiplicities (1, enabler).
-    for (int tuple = 0; tuple < 16; ++tuple) {
-        resident.lookup[(size_t)(4 * tuple) * column_length + row] = BG_TUPLE_RELATIONS[tuple];
-        for (int word = 0; word < 3; ++word) {
-            uint32_t value = c[BG_LOOKUP_TUPLE_COLS[3 * tuple + word]];
-            resident.lookup[(size_t)(4 * tuple + 1 + word) * column_length + row] = value;
-            if (resident.sub != nullptr) {
-                resident.sub[(size_t)(3 * tuple + word) * column_length + row] =
-                    c[BG_SUB_TUPLE_COLS[3 * tuple + word]];
+    if (resident.aux != nullptr) {
+        for (int column = 0; column < BG_N_AUX; ++column) {
+            resident.aux[(size_t)column * column_length + row] = c[BG_N_TRACE + column];
+        }
+    } else {
+        // Generated LookupData declaration order: sixteen xor tuples, the final
+        // blake_g tuple, then multiplicities (1, enabler).
+        for (int tuple = 0; tuple < 16; ++tuple) {
+            resident.lookup[(size_t)(4 * tuple) * column_length + row] = BG_TUPLE_RELATIONS[tuple];
+            for (int word = 0; word < 3; ++word) {
+                uint32_t value = c[BG_LOOKUP_TUPLE_COLS[3 * tuple + word]];
+                resident.lookup[(size_t)(4 * tuple + 1 + word) * column_length + row] = value;
             }
         }
+        resident.lookup[(size_t)64 * column_length + row] = 1139985212;
+        for (int word = 0; word < 20; ++word) {
+            resident.lookup[(size_t)(65 + word) * column_length + row] = c[BG_FINAL_COLS[word]];
+        }
+        resident.lookup[(size_t)85 * column_length + row] = 1;
+        resident.lookup[(size_t)86 * column_length + row] = c[52];
     }
-    resident.lookup[(size_t)64 * column_length + row] = 1139985212;
-    for (int word = 0; word < 20; ++word) {
-        resident.lookup[(size_t)(65 + word) * column_length + row] = c[BG_FINAL_COLS[word]];
+
+    if (resident.sub != nullptr) {
+        for (int word = 0; word < BG_N_SUB; ++word) {
+            resident.sub[(size_t)word * column_length + row] =
+                c[BG_SUB_TUPLE_COLS[word]];
+        }
     }
-    resident.lookup[(size_t)85 * column_length + row] = 1;
-    resident.lookup[(size_t)86 * column_length + row] = c[52];
 
     if (fused_feed.counts[0] == nullptr) {
         return;
@@ -475,7 +487,7 @@ extern "C" void blake_g_write_trace(
     ASSERT_CUDA_SUCCESS(cudaGetLastError());
 }
 
-extern "C" int blake_g_write_trace_into_on(
+static int blake_g_write_trace_into_on_impl(
     const uint32_t *inputs,
     const uint32_t *producer_sub,
     uint32_t producer_rows,
@@ -485,10 +497,12 @@ extern "C" int blake_g_write_trace_into_on(
     uint32_t column_length,
     uint32_t *const *trace_cols_host,
     uint32_t *lookup,
+    uint32_t *aux,
     uint32_t *sub,
     cudaStream_t stream
 ) {
-    if (column_length == 0 || trace_cols_host == nullptr || lookup == nullptr || sub == nullptr) {
+    if (column_length == 0 || trace_cols_host == nullptr ||
+        (lookup == nullptr) == (aux == nullptr) || sub == nullptr) {
         return static_cast<int>(cudaErrorInvalidValue);
     }
     if ((inputs == nullptr) == (producer_sub == nullptr)) {
@@ -509,6 +523,7 @@ extern "C" int blake_g_write_trace_into_on(
         resident.trace[column] = trace_cols_host[column];
     }
     resident.lookup = lookup;
+    resident.aux = aux;
     resident.sub = sub;
     uint32_t blocks = (column_length + BG_BLOCK - 1) / BG_BLOCK;
     blake_g_write_trace_kernel<<<blocks, BG_BLOCK, 0, stream>>>(
@@ -517,18 +532,44 @@ extern "C" int blake_g_write_trace_into_on(
     return static_cast<int>(cudaGetLastError());
 }
 
-extern "C" int blake_g_write_trace_fused_into_on(
+extern "C" int blake_g_write_trace_into_on(
+    const uint32_t *inputs, const uint32_t *producer_sub,
+    uint32_t producer_rows, uint32_t producer_word_base,
+    uint32_t producer_instances, uint32_t n_rows, uint32_t column_length,
+    uint32_t *const *trace_cols_host, uint32_t *lookup, uint32_t *sub,
+    cudaStream_t stream) {
+    return blake_g_write_trace_into_on_impl(
+        inputs, producer_sub, producer_rows, producer_word_base,
+        producer_instances, n_rows, column_length, trace_cols_host, lookup,
+        nullptr, sub, stream);
+}
+
+extern "C" int blake_g_write_trace_projected_into_on(
+    const uint32_t *inputs, const uint32_t *producer_sub,
+    uint32_t producer_rows, uint32_t producer_word_base,
+    uint32_t producer_instances, uint32_t n_rows, uint32_t column_length,
+    uint32_t *const *trace_cols_host, uint32_t *aux, uint32_t *sub,
+    cudaStream_t stream) {
+    return blake_g_write_trace_into_on_impl(
+        inputs, producer_sub, producer_rows, producer_word_base,
+        producer_instances, n_rows, column_length, trace_cols_host, nullptr,
+        aux, sub, stream);
+}
+
+static int blake_g_write_trace_fused_into_on_impl(
     const uint32_t *const *input_cols_host,
     uint32_t n_rows,
     uint32_t column_length,
     uint32_t *const *trace_cols_host,
     uint32_t *lookup,
+    uint32_t *aux,
     const uint32_t *const *luts_host,
     uint32_t *const *counts_host,
     cudaStream_t stream
 ) {
     if (column_length == 0 || n_rows > column_length || input_cols_host == nullptr ||
-        trace_cols_host == nullptr || lookup == nullptr || luts_host == nullptr ||
+        trace_cols_host == nullptr || (lookup == nullptr) == (aux == nullptr) ||
+        luts_host == nullptr ||
         counts_host == nullptr) {
         return static_cast<int>(cudaErrorInvalidValue);
     }
@@ -548,6 +589,7 @@ extern "C" int blake_g_write_trace_fused_into_on(
         resident.trace[column] = trace_cols_host[column];
     }
     resident.lookup = lookup;
+    resident.aux = aux;
     resident.sub = nullptr;
     for (int lut = 0; lut < 4; ++lut) {
         if (luts_host[lut] == nullptr) {
@@ -565,6 +607,26 @@ extern "C" int blake_g_write_trace_fused_into_on(
     blake_g_write_trace_fused_scalar_kernel<<<blocks, BG_BLOCK, 0, stream>>>(
         column_inputs, n_rows, column_length, resident, fused_feed);
     return static_cast<int>(cudaGetLastError());
+}
+
+extern "C" int blake_g_write_trace_fused_into_on(
+    const uint32_t *const *input_cols_host, uint32_t n_rows,
+    uint32_t column_length, uint32_t *const *trace_cols_host,
+    uint32_t *lookup, const uint32_t *const *luts_host,
+    uint32_t *const *counts_host, cudaStream_t stream) {
+    return blake_g_write_trace_fused_into_on_impl(
+        input_cols_host, n_rows, column_length, trace_cols_host, lookup,
+        nullptr, luts_host, counts_host, stream);
+}
+
+extern "C" int blake_g_write_trace_fused_projected_into_on(
+    const uint32_t *const *input_cols_host, uint32_t n_rows,
+    uint32_t column_length, uint32_t *const *trace_cols_host, uint32_t *aux,
+    const uint32_t *const *luts_host, uint32_t *const *counts_host,
+    cudaStream_t stream) {
+    return blake_g_write_trace_fused_into_on_impl(
+        input_cols_host, n_rows, column_length, trace_cols_host, nullptr, aux,
+        luts_host, counts_host, stream);
 }
 
 extern "C" void blake_g_xor_count(

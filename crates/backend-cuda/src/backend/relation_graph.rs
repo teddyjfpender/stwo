@@ -179,6 +179,9 @@ pub enum RelationTupleKind {
     MemorySmallLimbs = 4,
     MemorySmallValue = 5,
     BitwiseXor12 = 6,
+    /// One source-table pointer per tuple operand. Tuple word zero remains the
+    /// descriptor's sealed relation id, so no constants are materialized.
+    ProjectedColumns = 7,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -242,6 +245,9 @@ impl RelationColumnDescriptor {
 pub enum RelationSourceLayout {
     /// One contiguous word-major lookup buffer.
     LookupWords { words: u32 },
+    /// One column pointer per tuple operand; relation ids and standard
+    /// multiplicities stay in their existing descriptors.
+    ProjectedColumns { columns: u32 },
     /// `[id0, mult0, id1, mult1, ...]` column pointers.
     MemoryAddress { chunks: u32 },
     /// `[value limbs..., multiplicity]` column pointers.
@@ -256,6 +262,7 @@ impl RelationSourceLayout {
     pub fn pointer_count(self) -> Result<usize, RelationGraphError> {
         let count = match self {
             Self::LookupWords { .. } => 1,
+            Self::ProjectedColumns { columns } => columns,
             Self::MemoryAddress { chunks } => chunks
                 .checked_mul(2)
                 .ok_or(RelationGraphError::SizeOverflow)?,
@@ -806,6 +813,14 @@ fn validate_use(
                 .checked_add(relation_use.tuple_words)
                 .is_some_and(|end| end <= words)
         }
+        (
+            RelationSourceLayout::ProjectedColumns { columns },
+            RelationTupleKind::ProjectedColumns,
+        ) => relation_use
+            .tuple_words
+            .checked_sub(1)
+            .and_then(|operand_words| relation_use.tuple_arg.checked_add(operand_words))
+            .is_some_and(|end| end <= columns),
         (RelationSourceLayout::MemoryAddress { chunks }, RelationTupleKind::MemoryAddressChunk) => {
             relation_use.tuple_arg < chunks && relation_use.tuple_words == 3
         }
@@ -967,8 +982,9 @@ pub struct RelationChallenges<'a> {
 
 #[derive(Clone, Debug)]
 pub struct RelationInstanceSources {
-    /// Layout-defined source columns. LookupWords uses one contiguous word-major
-    /// buffer; every computed layout uses one pointer per source column.
+    /// Layout-defined source columns. `LookupWords` uses one contiguous
+    /// word-major buffer; computed and projected layouts use one pointer per
+    /// source column.
     pub columns: Vec<ArenaSlice>,
 }
 
@@ -2102,6 +2118,42 @@ mod tests {
                     multiplicity_kind: RelationMultiplicityKind::BitwiseXor12,
                     multiplicity_arg: 16,
                     ..big
+                },
+            ),
+            Err(RelationGraphError::SourceLayoutMismatch)
+        );
+
+        let projected = RelationUseDescriptor {
+            tuple_kind: RelationTupleKind::ProjectedColumns,
+            tuple_arg: 5,
+            tuple_words: 4,
+            relation_id: 1,
+            multiplicity_kind: RelationMultiplicityKind::One,
+            multiplicity_arg: 0,
+            negative: false,
+        };
+        assert!(validate_use(
+            RelationSourceLayout::ProjectedColumns { columns: 8 },
+            projected,
+        )
+        .is_ok());
+        assert_eq!(
+            validate_use(
+                RelationSourceLayout::ProjectedColumns { columns: 7 },
+                projected,
+            ),
+            Err(RelationGraphError::SourceLayoutMismatch)
+        );
+        assert_eq!(
+            validate_use(RelationSourceLayout::LookupWords { words: 8 }, projected),
+            Err(RelationGraphError::SourceLayoutMismatch)
+        );
+        assert_eq!(
+            validate_use(
+                RelationSourceLayout::ProjectedColumns { columns: 8 },
+                RelationUseDescriptor {
+                    tuple_words: 0,
+                    ..projected
                 },
             ),
             Err(RelationGraphError::SourceLayoutMismatch)

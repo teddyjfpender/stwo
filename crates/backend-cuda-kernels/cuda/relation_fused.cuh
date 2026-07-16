@@ -73,6 +73,9 @@ __device__ __forceinline__ m31 relation_tuple_word(
   if (kind == 0u) { // LookupWords.
     return sources[0][(arg + word) * n_rows + row];
   }
+  if (kind == 7u) { // ProjectedColumns; relation id is descriptor word 3.
+    return sources[arg + word - 1u][row];
+  }
   if (kind == 1u) { // MemoryAddressChunk.
     if (word == 1) {
       return row + 1u + arg * n_rows;

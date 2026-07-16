@@ -35,6 +35,13 @@ pub const BG_N_AUX: usize = 20;
 /// Total columns written by [`write_trace`] (0..53 trace, 53..73 aux).
 pub const BG_N_COLS: usize = BG_N_TRACE + BG_N_AUX;
 
+mod projected_relation;
+pub use projected_relation::{
+    blake_g_projected_relation_identity_is_exact, BlakeGRelationColumnSource, BG_N_LOOKUP_WORDS,
+    BG_N_PROJECTED_RELATION_COLUMNS, BG_PROJECTED_RELATION_COLUMNS, BG_PROJECTED_RELATION_MAP_HASH,
+    BG_PROJECTED_UNUSED_TRACE_COLUMNS,
+};
+
 /// Generates the 73 device-resident blake_g columns from the raw input words.
 ///
 /// `inputs` is `column_length * 6` raw u32 words, row-major (the 6 blake_g input
@@ -90,6 +97,41 @@ pub fn write_trace_into_on(
         trace,
         lookup,
         sub,
+        false,
+        context,
+    )
+}
+
+/// Replacement-only form of [`write_trace_into_on`]. `aux` contains exactly
+/// columns 53..73; relation ids and standard multiplicities remain in the
+/// descriptor, while committed operands are bound as projected columns.
+pub fn write_trace_projected_into_on(
+    inputs: &BaseFieldVec,
+    n_rows: usize,
+    column_length: usize,
+    trace: &[BaseFieldVec],
+    aux: &BaseFieldVec,
+    sub: &BaseFieldVec,
+    context: CudaLaunchContext,
+) -> Result<(), CudaRuntimeError> {
+    if inputs.size < column_length.saturating_mul(BG_N_DATA_INPUTS) {
+        return Err(CudaRuntimeError::Cuda {
+            operation: "blake_g_write_trace_projected_into_on_input_geometry",
+            code: -1,
+        });
+    }
+    write_trace_into_on_inner(
+        inputs.device_ptr,
+        core::ptr::null(),
+        0,
+        0,
+        0,
+        n_rows,
+        column_length,
+        trace,
+        aux,
+        sub,
+        true,
         context,
     )
 }
@@ -134,6 +176,51 @@ pub fn write_trace_from_sub_into_on(
         trace,
         lookup,
         sub,
+        false,
+        context,
+    )
+}
+
+/// Device-edge counterpart of [`write_trace_projected_into_on`].
+#[allow(clippy::too_many_arguments)]
+pub fn write_trace_from_sub_projected_into_on(
+    producer_sub: &BaseFieldVec,
+    producer_rows: usize,
+    producer_word_base: usize,
+    producer_instances: usize,
+    n_rows: usize,
+    column_length: usize,
+    trace: &[BaseFieldVec],
+    aux: &BaseFieldVec,
+    sub: &BaseFieldVec,
+    context: CudaLaunchContext,
+) -> Result<(), CudaRuntimeError> {
+    let required_words = producer_instances
+        .checked_mul(BG_N_DATA_INPUTS)
+        .and_then(|words| producer_word_base.checked_add(words))
+        .and_then(|words| words.checked_mul(producer_rows));
+    if required_words.is_none_or(|required| required > producer_sub.size)
+        || producer_rows
+            .checked_mul(producer_instances)
+            .is_none_or(|rows| rows != n_rows)
+    {
+        return Err(CudaRuntimeError::Cuda {
+            operation: "blake_g_write_trace_from_sub_projected_into_on_input_geometry",
+            code: -1,
+        });
+    }
+    write_trace_into_on_inner(
+        core::ptr::null(),
+        producer_sub.device_ptr,
+        producer_rows,
+        producer_word_base,
+        producer_instances,
+        n_rows,
+        column_length,
+        trace,
+        aux,
+        sub,
+        true,
         context,
     )
 }
@@ -148,16 +235,25 @@ fn write_trace_into_on_inner(
     n_rows: usize,
     column_length: usize,
     trace: &[BaseFieldVec],
-    lookup: &BaseFieldVec,
+    relation_words: &BaseFieldVec,
     sub: &BaseFieldVec,
+    projected: bool,
     context: CudaLaunchContext,
 ) -> Result<(), CudaRuntimeError> {
     if !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
         return Err(CudaRuntimeError::Unavailable);
     }
+    let relation_columns = if projected {
+        BG_N_AUX
+    } else {
+        BG_N_LOOKUP_WORDS
+    };
+    let required_relation_words = relation_columns
+        .checked_mul(column_length)
+        .ok_or(CudaRuntimeError::SizeOverflow)?;
     if trace.len() != BG_N_TRACE
         || trace.iter().any(|column| column.size != column_length)
-        || lookup.size < BG_N_LOOKUP_WORDS * column_length
+        || relation_words.size < required_relation_words
         || sub.size < BG_N_SUB_WORDS * column_length
         || n_rows > column_length
     {
@@ -171,7 +267,12 @@ fn write_trace_into_on_inner(
         .map(|column| column.device_ptr.cast_mut())
         .collect();
     let code = unsafe {
-        stwo_backend_cuda_kernels::raw::blake_g_write_trace_into_on(
+        let launch = if projected {
+            stwo_backend_cuda_kernels::raw::blake_g_write_trace_projected_into_on
+        } else {
+            stwo_backend_cuda_kernels::raw::blake_g_write_trace_into_on
+        };
+        launch(
             inputs,
             producer_sub,
             u32::try_from(producer_rows).map_err(|_| CudaRuntimeError::SizeOverflow)?,
@@ -180,7 +281,7 @@ fn write_trace_into_on_inner(
             u32::try_from(n_rows).map_err(|_| CudaRuntimeError::SizeOverflow)?,
             u32::try_from(column_length).map_err(|_| CudaRuntimeError::SizeOverflow)?,
             trace_ptrs.as_ptr(),
-            lookup.device_ptr.cast_mut(),
+            relation_words.device_ptr.cast_mut(),
             sub.device_ptr.cast_mut(),
             context.stream_raw().as_ptr(),
         )
@@ -189,13 +290,16 @@ fn write_trace_into_on_inner(
         Ok(())
     } else {
         Err(CudaRuntimeError::Cuda {
-            operation: "blake_g_write_trace_into_on",
+            operation: if projected {
+                "blake_g_write_trace_projected_into_on"
+            } else {
+                "blake_g_write_trace_into_on"
+            },
             code,
         })
     }
 }
 
-pub const BG_N_LOOKUP_WORDS: usize = 87;
 pub const BG_N_SUB_WORDS: usize = 48;
 
 /// Uploads a dense `(a << shift) | b -> row` LUT (row indices are `< P`, so the
