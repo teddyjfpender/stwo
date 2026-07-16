@@ -87,13 +87,13 @@ fn validate_phase_base_identity(
     launch_contract: WitnessLaunchContract,
     program_label: &str,
     parent_semantic_hash: u64,
-    loaded_manifest_hash: u64,
+    loaded_manifest_identity: [u8; 32],
 ) -> Result<(), PreparedWitnessError> {
     if launch_contract != WitnessLaunchContract::Recorded
         || identity.label != program_label
         || identity.semantic_hash != parent_semantic_hash
-        || identity.aot_manifest_hash == 0
-        || identity.aot_manifest_hash != loaded_manifest_hash
+        || identity.aot_manifest_identity == [0; 32]
+        || identity.aot_manifest_identity != loaded_manifest_identity
     {
         return Err(PreparedWitnessError::PhaseProgramMismatch);
     }
@@ -131,7 +131,7 @@ impl<'graph, 'arena> PreparedWitnessPhaseProgram<'graph, 'arena> {
             graph.launch_contract,
             &program.label,
             bindings.parent_semantic_hash,
-            aot::loaded_manifest_hash(),
+            aot::loaded_manifest_identity(),
         )?;
 
         let identities = bindings.phases.map(|phase| WitnessKernelIdentity {
@@ -139,6 +139,7 @@ impl<'graph, 'arena> PreparedWitnessPhaseProgram<'graph, 'arena> {
             kernel_name: phase.kernel_name,
             semantic_hash: bindings.parent_semantic_hash,
             cache_key: phase.cache_key,
+            aot_manifest_identity: graph.identity.aot_manifest_identity,
             aot_manifest_hash: graph.identity.aot_manifest_hash,
             mode: PreparedWitnessMode::RequireEmbeddedAot,
         });
@@ -277,6 +278,7 @@ mod tests {
             kernel_name: format!("phase_{phase}"),
             semantic_hash: 7,
             cache_key: 100 + u64::from(phase),
+            aot_manifest_identity: [9; 32],
             aot_manifest_hash: 9,
             mode: PreparedWitnessMode::RequireEmbeddedAot,
         }
@@ -353,8 +355,14 @@ mod tests {
     #[test]
     fn phase_overlay_requires_an_exact_strict_base_identity() {
         let mut base = identity(0);
-        validate_phase_base_identity(&base, WitnessLaunchContract::Recorded, "phase-test", 7, 9)
-            .unwrap();
+        validate_phase_base_identity(
+            &base,
+            WitnessLaunchContract::Recorded,
+            "phase-test",
+            7,
+            [9; 32],
+        )
+        .unwrap();
 
         base.mode = PreparedWitnessMode::PreResolved;
         assert_eq!(
@@ -363,7 +371,7 @@ mod tests {
                 WitnessLaunchContract::Recorded,
                 "phase-test",
                 7,
-                9,
+                [9; 32],
             )
             .unwrap_err(),
             PreparedWitnessError::PhaseRequiresStrictAot
@@ -375,7 +383,7 @@ mod tests {
                 WitnessLaunchContract::Recorded,
                 "phase-test",
                 8,
-                9,
+                [9; 32],
             )
             .unwrap_err(),
             PreparedWitnessError::PhaseProgramMismatch

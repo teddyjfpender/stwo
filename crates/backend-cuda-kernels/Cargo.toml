@@ -8,6 +8,12 @@ license = "Apache-2.0"
 [lib]
 path = "src/lib.rs"
 
+[dev-dependencies]
+blake3.workspace = true
+
+[build-dependencies]
+blake3.workspace = true
+
 [features]
 # Compile the ordinary CUDA archive but deliberately embed no generated AOT
 # cubins. This exists only for narrow native kernel differential tests; strict

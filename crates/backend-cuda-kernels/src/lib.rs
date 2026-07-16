@@ -12,6 +12,8 @@
 //! `stwo-backend-testkit` (proof byte-equality on both Blake2s channels), mirroring
 //! `stwo-backend-metal`.
 
+#[cfg(test)]
+mod aot_identity;
 pub mod aot_pack;
 pub mod m31_fast32_contract;
 pub mod raw;

@@ -49,6 +49,11 @@ pub struct WitnessKernelIdentity {
     pub kernel_name: String,
     pub semantic_hash: u64,
     pub cache_key: u64,
+    /// Collision-resistant identity for the exact embedded AOT pack. The
+    /// source/effect contract remains a separate authority frontier.
+    pub aot_manifest_identity: [u8; 32],
+    /// Non-authoritative compatibility/telemetry projection of
+    /// `aot_manifest_identity`.
     pub aot_manifest_hash: u64,
     pub mode: PreparedWitnessMode,
 }
@@ -61,18 +66,24 @@ struct WitnessKernelMaterial {
     source: Option<String>,
 }
 
+#[derive(Clone, Copy)]
+struct AotManifestBinding {
+    identity: [u8; 32],
+    telemetry_tag: u64,
+}
+
 fn witness_kernel_material(
     program: &WitnessProgram,
     mode: PreparedWitnessMode,
-    manifest_hash: u64,
+    manifest: AotManifestBinding,
 ) -> Result<WitnessKernelMaterial, PreparedWitnessError> {
-    witness_kernel_material_with(program, mode, manifest_hash, aot::witness_kernel_source)
+    witness_kernel_material_with(program, mode, manifest, aot::witness_kernel_source)
 }
 
 fn witness_kernel_material_with<F>(
     program: &WitnessProgram,
     mode: PreparedWitnessMode,
-    manifest_hash: u64,
+    manifest: AotManifestBinding,
     emit_source: F,
 ) -> Result<WitnessKernelMaterial, PreparedWitnessError>
 where
@@ -105,7 +116,8 @@ where
             kernel_name,
             semantic_hash,
             cache_key,
-            aot_manifest_hash: manifest_hash,
+            aot_manifest_identity: manifest.identity,
+            aot_manifest_hash: manifest.telemetry_tag,
             mode,
         },
         source,
@@ -113,7 +125,7 @@ where
 }
 
 fn enable_strict_aot(identity: &WitnessKernelIdentity) -> Result<(), PreparedWitnessError> {
-    if identity.aot_manifest_hash == 0 {
+    if identity.aot_manifest_identity == [0; 32] {
         return Err(PreparedWitnessError::EmptyAotManifest);
     }
     // Strictness is process-wide and monotonic. The source-free precompile below
@@ -914,8 +926,11 @@ impl<'a> PreparedWitnessGraph<'a> {
             .chain(prepared_table_data.into_iter().flatten());
         ensure_physically_disjoint(bound_ranges)?;
 
-        let manifest_hash = aot::loaded_manifest_hash();
-        let material = witness_kernel_material(program, mode, manifest_hash)?;
+        let manifest = AotManifestBinding {
+            identity: aot::loaded_manifest_identity(),
+            telemetry_tag: aot::loaded_manifest_hash(),
+        };
+        let material = witness_kernel_material(program, mode, manifest)?;
         let identity = material.identity;
         if mode == PreparedWitnessMode::RequireEmbeddedAot {
             enable_strict_aot(&identity)?;
@@ -1453,6 +1468,13 @@ mod tests {
     use super::super::jit_witness::recording::WitnessRecorder;
     use super::*;
 
+    fn test_manifest() -> AotManifestBinding {
+        AotManifestBinding {
+            identity: [0x12; 32],
+            telemetry_tag: 0x1234,
+        }
+    }
+
     #[test]
     fn bound_slots_truncate_pooled_surplus_to_the_logical_requirement() {
         // Pooled physical slots are sized to the LARGEST epoch-disjoint
@@ -1578,7 +1600,7 @@ mod tests {
         let strict = witness_kernel_material_with(
             &program,
             PreparedWitnessMode::RequireEmbeddedAot,
-            0x1234,
+            test_manifest(),
             |_| panic!("strict preparation invoked witness source codegen"),
         )
         .unwrap();
@@ -1598,7 +1620,7 @@ mod tests {
         let pre_resolved = witness_kernel_material_with(
             &program,
             PreparedWitnessMode::PreResolved,
-            0x1234,
+            test_manifest(),
             |program| {
                 emitted.set(true);
                 aot::witness_kernel_source(program)
@@ -1615,7 +1637,7 @@ mod tests {
         let identity = witness_kernel_material_with(
             &program(),
             PreparedWitnessMode::RequireEmbeddedAot,
-            0x1234,
+            test_manifest(),
             |_| panic!("strict preparation invoked witness source codegen"),
         )
         .unwrap()

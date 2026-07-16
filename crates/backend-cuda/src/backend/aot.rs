@@ -13,15 +13,37 @@
 //! identity, while per-key strict lookup proves complete source/shape coverage;
 //! a matching policy tag alone never admits a partial or stale pack.
 
-/// Stable identity of the AOT semantic-key/architecture set embedded in this
-/// binary. Zero means no AOT pack is present and is never a valid graph key.
-pub fn loaded_manifest_hash() -> u64 {
-    let hash = stwo_backend_cuda_kernels::aot_pack::aot_pack_manifest_hash();
-    if hash != 0 && loaded_constraint_max_live_u32_lanes() != constraint_split_max_live_u32_lanes()
+/// Collision-resistant identity of the exact AOT cubins and generation
+/// policies embedded in this binary. All-zero means absent or policy-invalid
+/// and is never authority. This does not supply the source/effect contract
+/// still absent from the generated AOT manifest.
+pub fn loaded_manifest_identity() -> [u8; 32] {
+    let identity = stwo_backend_cuda_kernels::aot_pack::aot_pack_identity();
+    if identity == [0; 32]
+        || loaded_constraint_max_live_u32_lanes() != constraint_split_max_live_u32_lanes()
     {
+        return [0; 32];
+    }
+    identity
+}
+
+/// Collision-resistant identity of one exact loaded `(cache_key, SM)` cubin.
+/// All-zero means absent, malformed, or rejected with the containing pack.
+pub fn loaded_cubin_identity(cache_key: u64, sm_major: u32, sm_minor: u32) -> [u8; 32] {
+    if loaded_manifest_identity() == [0; 32] {
+        return [0; 32];
+    }
+    stwo_backend_cuda_kernels::aot_pack::aot_cubin_identity(cache_key, sm_major, sm_minor)
+}
+
+/// Non-authoritative u64 compatibility/telemetry projection of
+/// [`loaded_manifest_identity`]. New graph and kernel authority must use the full
+/// 32-byte identity.
+pub fn loaded_manifest_hash() -> u64 {
+    if loaded_manifest_identity() == [0; 32] {
         return 0;
     }
-    hash
+    stwo_backend_cuda_kernels::aot_pack::aot_pack_manifest_hash()
 }
 
 /// Exact number of kernels embedded across every target architecture.
@@ -41,8 +63,8 @@ pub fn loaded_constraint_max_instrs() -> usize {
 }
 
 /// Exact compacted live-u32-lane cap used by the loaded AOT pack. Zero means no
-/// pack is present. [`loaded_manifest_hash`] rejects a stale pack whose value does
-/// not match the runtime lowerer's compiled policy.
+/// pack is present. [`loaded_manifest_identity`] rejects a stale pack whose value
+/// does not match the runtime lowerer's compiled policy.
 pub fn loaded_constraint_max_live_u32_lanes() -> usize {
     stwo_backend_cuda_kernels::aot_pack::aot_pack_constraint_max_live_u32_lanes()
 }
@@ -56,13 +78,14 @@ pub const fn constraint_split_max_live_u32_lanes() -> usize {
 /// fail closed in strict GPU-native mode, so a partial pack cannot masquerade as
 /// complete merely because it contains one kernel for the device.
 pub fn supports_arch(sm_major: u32, sm_minor: u32) -> bool {
-    stwo_backend_cuda_kernels::aot_pack::aot_pack_supports_arch(sm_major, sm_minor)
+    loaded_manifest_identity() != [0; 32]
+        && stwo_backend_cuda_kernels::aot_pack::aot_pack_supports_arch(sm_major, sm_minor)
 }
 
 /// Cheap read-only admission check for an exact embedded kernel. This searches
 /// the sealed binary's static AOT index and does not initialize CUDA.
 pub fn contains_loaded_kernel(cache_key: u64, sm_major: u32, sm_minor: u32) -> bool {
-    stwo_backend_cuda_kernels::aot_pack::aot_pack_contains(cache_key, sm_major, sm_minor)
+    loaded_cubin_identity(cache_key, sm_major, sm_minor) != [0; 32]
 }
 
 pub use stwo_backend_cuda_kernels::raw::CudaJitAotStats as RuntimeStats;
@@ -502,6 +525,19 @@ mod tests {
     use super::super::jit_witness::codegen::phase_plan::WitnessPhasePlan;
     use super::super::jit_witness::recording::WitnessRecorder;
     use super::*;
+
+    #[test]
+    fn full_manifest_identity_is_the_only_authority() {
+        let identity = loaded_manifest_identity();
+        if loaded_kernel_count() == 0 {
+            assert_eq!(identity, [0; 32]);
+            assert_eq!(loaded_manifest_hash(), 0);
+        } else {
+            assert_ne!(identity, [0; 32]);
+            assert_ne!(loaded_manifest_hash(), 0);
+        }
+        assert_eq!(loaded_cubin_identity(0, u32::MAX, u32::MAX), [0; 32]);
+    }
 
     #[derive(Default)]
     struct AdmissionModel {
