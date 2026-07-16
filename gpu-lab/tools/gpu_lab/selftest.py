@@ -38,6 +38,7 @@ from .pie_adapter_inventory_tests import pie_adapter_inventory_self_test
 from .pie_adapter_receipt_tests import pie_adapter_receipt_self_test
 from .result_tests import result_self_test
 from .results import _validate_correctness, _validate_timing
+from .score_tests import score_self_test
 from .semantics import make_tiny_fixture, validate_fixture
 
 
@@ -283,7 +284,8 @@ def self_test(root: Path) -> None:
                    "result.schema.json", "kernel-entry.schema.json", "build-recipe.schema.json",
                    "module-index.schema.json", "environment.schema.json",
                    "loop-result.schema.json", "baseline-envelope.schema.json",
-                   "baseline-comparison.schema.json", "pie-adapter-invocation.schema.json",
+                   "baseline-comparison.schema.json", "objective-score.schema.json",
+                   "pie-adapter-invocation.schema.json",
                    "pie-adapter-execution-record.schema.json",
                    "pie-adapter-source-inventory-v2.schema.json",
                    "pie-adapter-source-closure-v2.schema.json",
@@ -295,6 +297,7 @@ def self_test(root: Path) -> None:
     _fail_soft_result_test()
     loop_self_test()
     baseline_self_test()
+    score_self_test()
     result_self_test()
     source_count, largest_source, largest_lines = _source_shape_test(root)
     print(

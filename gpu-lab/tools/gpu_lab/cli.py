@@ -15,6 +15,7 @@ from .identity import build_module, write_toolchain_identity
 from .loop import capture_environment, write_loop_record
 from .oracle_seal import seal_oracle
 from .results import validate_result
+from .score import score
 from .selftest import self_test
 from .semantics import make_tiny_fixture, validate_fixture
 
@@ -113,6 +114,14 @@ def parser() -> argparse.ArgumentParser:
                       choices=("admissible", "non_admissible"))
     loop.add_argument("--output", required=True, type=Path)
 
+    objective = sub.add_parser("score")
+    add_result_arguments(objective)
+    objective.add_argument("--correctness-result", required=True, type=Path)
+    objective.add_argument("--comparison", required=True, type=Path)
+    objective.add_argument("--loop", required=True, type=Path)
+    objective.add_argument("--harness", required=True, type=Path)
+    objective.add_argument("--output", required=True, type=Path)
+
     sub.add_parser("self-test")
     return result
 
@@ -145,6 +154,9 @@ def main() -> int:
         elif args.command == "write-loop":
             write_loop_record(args)
             print(f"loop record written: {args.output}")
+        elif args.command == "score":
+            score(args)
+            print(f"objective score written: {args.output}")
         elif args.command == "self-test":
             self_test(LAB_ROOT)
         else:

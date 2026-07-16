@@ -167,6 +167,10 @@ registers/spills, latency distribution, or semantic throughput. Modelled deltas 
 modelled, hardware measurements must bind the complete identity tuple, and neither may be silently
 promoted into the other.
 
+The quick loop writes `objective-score.json` only after exact correctness, measurement identity,
+qualified p95, bounded latency/resource tradeoffs, and the ordinary-loop SLO pass. Compare its
+vector lexicographically; `unavailable` is not zero, and it intentionally contains no scalar.
+
 Every review should be able to answer:
 
 - What independent evidence would catch this being wrong?

@@ -1,0 +1,274 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://stwo.dev/gpu-lab/objective-score-v1.schema.json",
+  "title": "Stwo GPU lab same-identity objective vector",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "eligible", "gates", "inputs", "comparison_identity",
+    "baseline_identity", "candidate_identity", "promotion_policy", "objective_vector",
+    "scalar_score", "comparison_policy"
+  ],
+  "properties": {
+    "schema_version": {"const": "stwo.gpu-lab.objective-score.v1"},
+    "eligible": {"const": true},
+    "gates": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "correctness", "performance", "identity", "loop_record", "loop_slo",
+        "p95_qualification", "non_regression", "resource_budget"
+      ],
+      "properties": {
+        "correctness": {"const": "passed"},
+        "performance": {"const": "admissible"},
+        "identity": {"const": "comparable"},
+        "loop_record": {"const": "valid"},
+        "loop_slo": {"const": "passed"},
+        "p95_qualification": {"const": "passed"},
+        "non_regression": {"const": "passed"},
+        "resource_budget": {"const": "passed"}
+      }
+    },
+    "inputs": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "correctness_result_sha256", "benchmark_result_sha256",
+        "baseline_comparison_sha256", "loop_record_sha256"
+      ],
+      "properties": {
+        "correctness_result_sha256": {"$ref": "#/$defs/sha256"},
+        "benchmark_result_sha256": {"$ref": "#/$defs/sha256"},
+        "baseline_comparison_sha256": {"$ref": "#/$defs/sha256"},
+        "loop_record_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "comparison_identity": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "device_uuid", "target_sm", "driver_version", "fixture_sha256", "toolchain_sha256",
+        "abi_sha256", "shape_sha256", "stable_gpu_configuration",
+        "stable_gpu_configuration_sha256", "harness_sha256", "orchestrator_sha256",
+        "slo_checker_sha256"
+      ],
+      "properties": {
+        "device_uuid": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+        "target_sm": {"type": "integer", "minimum": 50, "maximum": 999},
+        "driver_version": {"type": "integer", "minimum": 1},
+        "fixture_sha256": {"$ref": "#/$defs/sha256"},
+        "toolchain_sha256": {"$ref": "#/$defs/sha256"},
+        "abi_sha256": {"$ref": "#/$defs/sha256"},
+        "shape_sha256": {"$ref": "#/$defs/sha256"},
+        "stable_gpu_configuration": {"$ref": "#/$defs/stable_configuration"},
+        "stable_gpu_configuration_sha256": {"$ref": "#/$defs/sha256"},
+        "harness_sha256": {"$ref": "#/$defs/sha256"},
+        "orchestrator_sha256": {"$ref": "#/$defs/sha256"},
+        "slo_checker_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "baseline_identity": {
+      "type": "object", "additionalProperties": false,
+      "required": ["envelope_sha256", "module_sha256"],
+      "properties": {
+        "envelope_sha256": {"$ref": "#/$defs/sha256"},
+        "module_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "candidate_identity": {
+      "type": "object", "additionalProperties": false,
+      "required": ["module_sha256", "build_recipe_hash"],
+      "properties": {
+        "module_sha256": {"$ref": "#/$defs/sha256"},
+        "build_recipe_hash": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "promotion_policy": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "timing_regression_limit_percent", "timing_credit_threshold_percent",
+        "max_registers_per_thread", "register_file_words_per_sm_floor",
+        "min_register_limited_blocks_per_sm", "max_local_bytes_per_thread",
+        "max_total_shared_bytes_per_block", "resource_increase_requires_graph_p50_credit",
+        "p95_min_iterations",
+        "p95_requires_stable_warmup", "p95_requires_non_exploratory", "loop_slo"
+      ],
+      "properties": {
+        "timing_regression_limit_percent": {"const": 2.0},
+        "timing_credit_threshold_percent": {"const": 2.0},
+        "max_registers_per_thread": {"const": 255},
+        "register_file_words_per_sm_floor": {"const": 65536},
+        "min_register_limited_blocks_per_sm": {"const": 1},
+        "max_local_bytes_per_thread": {"const": 16384},
+        "max_total_shared_bytes_per_block": {"const": 98304},
+        "resource_increase_requires_graph_p50_credit": {"const": true},
+        "p95_min_iterations": {"const": 30},
+        "p95_requires_stable_warmup": {"const": true},
+        "p95_requires_non_exploratory": {"const": true},
+        "loop_slo": {"const": "ordinary"}
+      }
+    },
+    "objective_vector": {
+      "type": "array", "minItems": 11, "maxItems": 11,
+      "prefixItems": [
+        {"$ref": "#/$defs/graph_p50"},
+        {"$ref": "#/$defs/graph_p95"},
+        {"$ref": "#/$defs/eager_p50"},
+        {"$ref": "#/$defs/eager_p95"},
+        {"$ref": "#/$defs/hbm_passes"},
+        {"$ref": "#/$defs/hbm_bytes"},
+        {"$ref": "#/$defs/launch_count"},
+        {"$ref": "#/$defs/registers"},
+        {"$ref": "#/$defs/local_bytes"},
+        {"$ref": "#/$defs/spill_bytes"},
+        {"$ref": "#/$defs/loop_slo"}
+      ],
+      "items": false
+    },
+    "scalar_score": {"type": "null"},
+    "comparison_policy": {
+      "const": "lexicographic only; require equal comparison_identity, baseline_identity, and objective availability; candidate_identity is evidence, not a comparability field"
+    }
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "environment_field": {
+      "oneOf": [
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["status", "value"],
+          "properties": {
+            "status": {"const": "available"},
+            "value": {"type": "string", "minLength": 1}
+          }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["status", "reason"],
+          "properties": {
+            "status": {"enum": ["not_supported", "unavailable"]},
+            "reason": {"type": "string", "minLength": 1}
+          }
+        }
+      ]
+    },
+    "stable_configuration": {
+      "type": "object", "additionalProperties": false,
+      "required": ["cuda_ecc_enabled", "nvidia_smi"],
+      "properties": {
+        "cuda_ecc_enabled": {"type": "boolean"},
+        "nvidia_smi": {
+          "type": "object", "additionalProperties": false,
+          "required": ["mig_mode", "ecc_mode", "persistence_mode", "power_limit_w"],
+          "properties": {
+            "mig_mode": {"$ref": "#/$defs/environment_field"},
+            "ecc_mode": {"$ref": "#/$defs/environment_field"},
+            "persistence_mode": {"$ref": "#/$defs/environment_field"},
+            "power_limit_w": {"$ref": "#/$defs/environment_field"}
+          }
+        }
+      }
+    },
+    "available": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "rank", "name", "status", "direction", "unit", "baseline", "candidate",
+        "raw_value", "value"
+      ],
+      "properties": {
+        "rank": {"type": "integer", "minimum": 1, "maximum": 11},
+        "name": {"type": "string"},
+        "status": {"const": "available"},
+        "direction": {"const": "maximize"},
+        "unit": {"enum": ["ratio", "count"]},
+        "baseline": {"type": "number"},
+        "candidate": {"type": "number"},
+        "raw_value": {"type": "number"},
+        "value": {"type": "number"}
+      }
+    },
+    "unavailable": {
+      "type": "object", "additionalProperties": false,
+      "required": ["rank", "name", "status", "direction", "reason"],
+      "properties": {
+        "rank": {"type": "integer", "minimum": 1, "maximum": 11},
+        "name": {"type": "string"},
+        "status": {"const": "unavailable"},
+        "direction": {"const": "maximize"},
+        "reason": {"const": "validated quick-loop artifacts do not emit this counter"}
+      }
+    },
+    "timing_objective": {"allOf": [
+      {"$ref": "#/$defs/available"},
+      {"properties": {
+        "unit": {"const": "ratio"},
+        "baseline": {"type": "number", "exclusiveMinimum": 0},
+        "candidate": {"type": "number", "exclusiveMinimum": 0},
+        "raw_value": {"type": "number", "exclusiveMinimum": 0},
+        "value": {"type": "number", "minimum": 1}
+      }}
+    ]},
+    "resource_objective": {"allOf": [
+      {"$ref": "#/$defs/available"},
+      {"properties": {
+        "unit": {"const": "count"},
+        "baseline": {"type": "number", "minimum": 0},
+        "candidate": {"type": "number", "minimum": 0},
+        "raw_value": {"type": "number"},
+        "value": {"type": "number"}
+      }}
+    ]},
+    "loop_objective": {"allOf": [
+      {"$ref": "#/$defs/available"},
+      {"properties": {
+        "unit": {"const": "ratio"},
+        "baseline": {"const": 1.0},
+        "candidate": {"type": "number", "minimum": 0, "maximum": 1},
+        "raw_value": {"type": "number", "minimum": 0, "maximum": 1},
+        "value": {"type": "number", "minimum": 0, "maximum": 1}
+      }}
+    ]},
+    "graph_p50": {"allOf": [
+      {"$ref": "#/$defs/timing_objective"},
+      {"properties": {"rank": {"const": 1}, "name": {"const": "graph_p50_speedup"}, "unit": {"const": "ratio"}}}
+    ]},
+    "graph_p95": {"allOf": [
+      {"$ref": "#/$defs/timing_objective"},
+      {"properties": {"rank": {"const": 2}, "name": {"const": "graph_p95_speedup"}, "unit": {"const": "ratio"}}}
+    ]},
+    "eager_p50": {"allOf": [
+      {"$ref": "#/$defs/timing_objective"},
+      {"properties": {"rank": {"const": 3}, "name": {"const": "eager_p50_speedup"}, "unit": {"const": "ratio"}}}
+    ]},
+    "eager_p95": {"allOf": [
+      {"$ref": "#/$defs/timing_objective"},
+      {"properties": {"rank": {"const": 4}, "name": {"const": "eager_p95_speedup"}, "unit": {"const": "ratio"}}}
+    ]},
+    "hbm_passes": {"allOf": [
+      {"$ref": "#/$defs/unavailable"},
+      {"properties": {"rank": {"const": 5}, "name": {"const": "hbm_passes_reduction"}}}
+    ]},
+    "hbm_bytes": {"allOf": [
+      {"$ref": "#/$defs/unavailable"},
+      {"properties": {"rank": {"const": 6}, "name": {"const": "hbm_bytes_reduction"}}}
+    ]},
+    "launch_count": {"allOf": [
+      {"$ref": "#/$defs/unavailable"},
+      {"properties": {"rank": {"const": 7}, "name": {"const": "launch_count_reduction"}}}
+    ]},
+    "registers": {"allOf": [
+      {"$ref": "#/$defs/resource_objective"},
+      {"properties": {"rank": {"const": 8}, "name": {"const": "registers_per_thread_reduction"}, "unit": {"const": "count"}}}
+    ]},
+    "local_bytes": {"allOf": [
+      {"$ref": "#/$defs/resource_objective"},
+      {"properties": {"rank": {"const": 9}, "name": {"const": "local_bytes_per_thread_reduction"}, "unit": {"const": "count"}}}
+    ]},
+    "spill_bytes": {"allOf": [
+      {"$ref": "#/$defs/unavailable"},
+      {"properties": {"rank": {"const": 10}, "name": {"const": "spill_bytes_reduction"}}}
+    ]},
+    "loop_slo": {"allOf": [
+      {"$ref": "#/$defs/loop_objective"},
+      {"properties": {"rank": {"const": 11}, "name": {"const": "ordinary_loop_slo_headroom"}, "unit": {"const": "ratio"}}}
+    ]}
+  }
+}

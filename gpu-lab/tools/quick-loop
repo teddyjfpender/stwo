@@ -45,6 +45,8 @@ replay="$run_dir/fixture.replay"
 plan="$run_dir/execution.plan"
 staging_seed="$run_dir/staging.seed.json"
 staging_record="$run_dir/staging.json"
+objective_score="$run_dir/objective-score.json"
+rm -f "$objective_score"
 stage_root=()
 if [[ -n "$local_root" ]]; then
   stage_root=(--local-root "$local_root")
@@ -162,6 +164,7 @@ python3 "$lab_root/tools/lab.py" compare-baseline \
   --output "$comparison" "${performance_flag[@]}"
 total_end_ns="$(python3 -c "$clock")"
 
+loop_record="$run_dir/loop.json"
 python3 "$lab_root/tools/lab.py" write-loop \
   --phase "configure_build=$build_start_ns:$build_done_ns" \
   --phase "prepare=$prepare_start_ns:$prepare_done_ns" \
@@ -181,10 +184,23 @@ python3 "$lab_root/tools/lab.py" write-loop \
   --orchestrator "$lab_root/tools/quick-loop" --slo-checker "$lab_root/tools/check-loop-slo" \
   --benchmark-exit-code "$benchmark_rc" --performance-status "$performance_status" \
   --staging-record "$staging_record" \
-  --output "$run_dir/loop.json"
+  --output "$loop_record"
+
+comparison_status="$(python3 - "$comparison" <<'PY'
+import json, pathlib, sys
+print(json.loads(pathlib.Path(sys.argv[1]).read_text())["status"])
+PY
+)"
+if [[ "$comparison_status" == "compared" ]]; then
+  python3 "$lab_root/tools/lab.py" score \
+    --result "$run_dir/benchmark.json" --correctness-result "$run_dir/correctness.json" \
+    --fixture "$fixture" --oracle-index "$oracle_index" --module-index "$module_index" \
+    --execution "$execution" --replay "$replay" --plan "$plan" --harness "$harness" \
+    --comparison "$comparison" --loop "$loop_record" --output "$objective_score"
+fi
 
 set +e
-"$lab_root/tools/check-loop-slo" "$run_dir/loop.json" ordinary
+"$lab_root/tools/check-loop-slo" "$loop_record" ordinary
 slo_rc=$?
 set -e
 if [[ "$benchmark_rc" -eq 2 ]]; then
