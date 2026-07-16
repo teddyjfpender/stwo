@@ -6,9 +6,9 @@
 #include <new>
 
 // Whole-allocation CUDA VMM storage for the replacement prover. A handle owns
-// one stable virtual address and at most one physical allocation at a time. The
-// only admitted lifecycle is mapped generation 0 -> unmapped -> mapped
-// generation 1. Stream quiescence remains a checked Rust-side prerequisite.
+// one stable virtual address and at most one physical allocation at a time.
+// Physical backing may be reclaimed and replaced across strictly consecutive
+// generations. Stream quiescence remains a checked Rust-side prerequisite.
 
 extern "C" int stwo_exec_context_device(void *handle, int *out_device);
 extern "C" int stwo_exec_context_stream(void *handle, void **out_stream);
@@ -27,6 +27,7 @@ struct StwoVmmAllocation {
     bool mapped;
     bool physical_live;
     bool primary_retained;
+    bool poisoned;
 };
 
 int status(CUresult result) {
@@ -36,6 +37,21 @@ int status(CUresult result) {
 int first_status(int current, int candidate) {
     return current == static_cast<int>(CUDA_SUCCESS) ? candidate : current;
 }
+
+int poison_and_return(StwoVmmAllocation *allocation, int result) {
+    if (allocation != nullptr) {
+        allocation->poisoned = true;
+    }
+    return result;
+}
+
+constexpr bool valid_generation_step(uint32_t current, uint32_t next) {
+    return current != UINT32_MAX && next == current + 1u;
+}
+
+static_assert(valid_generation_step(0u, 1u));
+static_assert(!valid_generation_step(0u, 2u));
+static_assert(!valid_generation_step(UINT32_MAX, 0u));
 
 CUmemAllocationProp allocation_properties(CUdevice device) {
     CUmemAllocationProp properties = {};
@@ -314,46 +330,58 @@ extern "C" int stwo_vmm_allocation_create(
 
 extern "C" int stwo_vmm_allocation_unmap_release(
     void *handle,
-    void *context_handle
+    void *context_handle,
+    uint32_t expected_generation
 ) {
     StwoVmmAllocation *allocation = static_cast<StwoVmmAllocation *>(handle);
     int result = require_owner_current(allocation, context_handle);
     if (result != static_cast<int>(CUDA_SUCCESS)) {
-        return result;
+        return poison_and_return(allocation, result);
     }
     result = require_not_capturing(context_handle);
     if (result != static_cast<int>(CUDA_SUCCESS)) {
-        return result;
+        return poison_and_return(allocation, result);
     }
-    if (!allocation->mapped || !allocation->physical_live ||
-        allocation->generation != 0) {
-        return static_cast<int>(CUDA_ERROR_INVALID_VALUE);
+    if (allocation->poisoned || !allocation->mapped ||
+        !allocation->physical_live ||
+        allocation->generation != expected_generation) {
+        return poison_and_return(
+            allocation, static_cast<int>(CUDA_ERROR_INVALID_VALUE));
     }
-    return unmap_and_release(allocation);
+    result = unmap_and_release(allocation);
+    return result == static_cast<int>(CUDA_SUCCESS)
+        ? result
+        : poison_and_return(allocation, result);
 }
 
-extern "C" int stwo_vmm_allocation_remap_generation1(
+extern "C" int stwo_vmm_allocation_remap_next(
     void *handle,
-    void *context_handle
+    void *context_handle,
+    uint32_t current_generation,
+    uint32_t next_generation
 ) {
     StwoVmmAllocation *allocation = static_cast<StwoVmmAllocation *>(handle);
     int result = require_owner_current(allocation, context_handle);
     if (result != static_cast<int>(CUDA_SUCCESS)) {
-        return result;
+        return poison_and_return(allocation, result);
     }
     result = require_not_capturing(context_handle);
     if (result != static_cast<int>(CUDA_SUCCESS)) {
-        return result;
+        return poison_and_return(allocation, result);
     }
-    if (allocation->mapped || allocation->physical_live ||
-        allocation->generation != 0) {
-        return static_cast<int>(CUDA_ERROR_INVALID_VALUE);
+    if (allocation->poisoned || allocation->mapped ||
+        allocation->physical_live ||
+        allocation->generation != current_generation ||
+        !valid_generation_step(current_generation, next_generation)) {
+        return poison_and_return(
+            allocation, static_cast<int>(CUDA_ERROR_INVALID_VALUE));
     }
     result = create_and_map_physical(allocation);
     if (result == static_cast<int>(CUDA_SUCCESS)) {
-        allocation->generation = 1;
+        allocation->generation = next_generation;
+        return result;
     }
-    return result;
+    return poison_and_return(allocation, result);
 }
 
 // Drop fallback only. Normal spill/reclaim has no global synchronization: it

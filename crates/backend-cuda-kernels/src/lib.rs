@@ -60,7 +60,7 @@ mod tests {
         assert_ne!(raw::stwo_exec_context_join_all_lanes as usize, 0);
         assert_ne!(raw::stwo_vmm_allocation_create as usize, 0);
         assert_ne!(raw::stwo_vmm_allocation_unmap_release as usize, 0);
-        assert_ne!(raw::stwo_vmm_allocation_remap_generation1 as usize, 0);
+        assert_ne!(raw::stwo_vmm_allocation_remap_next as usize, 0);
         assert_ne!(raw::stwo_vmm_allocation_destroy as usize, 0);
         assert_ne!(raw::stwo_ipc_exchange_context_uuid as usize, 0);
         assert_ne!(raw::stwo_ipc_exchange_owner_create as usize, 0);
@@ -96,14 +96,44 @@ mod tests {
             *mut usize,
             *mut usize,
         ) -> i32;
-        type Transition =
-            unsafe extern "C" fn(*mut core::ffi::c_void, *mut core::ffi::c_void) -> i32;
+        type Unmap =
+            unsafe extern "C" fn(*mut core::ffi::c_void, *mut core::ffi::c_void, u32) -> i32;
+        type Remap =
+            unsafe extern "C" fn(*mut core::ffi::c_void, *mut core::ffi::c_void, u32, u32) -> i32;
         type Destroy = unsafe extern "C" fn(*mut core::ffi::c_void) -> i32;
 
         let _: Create = raw::stwo_vmm_allocation_create;
-        let _: Transition = raw::stwo_vmm_allocation_unmap_release;
-        let _: Transition = raw::stwo_vmm_allocation_remap_generation1;
+        let _: Unmap = raw::stwo_vmm_allocation_unmap_release;
+        let _: Remap = raw::stwo_vmm_allocation_remap_next;
         let _: Destroy = raw::stwo_vmm_allocation_destroy;
+    }
+
+    #[test]
+    fn vmm_source_reserves_one_address_and_poison_checks_every_generation() {
+        let source = include_str!("../cuda/cuda_vmm_allocation.cu");
+        for required in [
+            "bool poisoned;",
+            "poison_and_return",
+            "uint32_t expected_generation",
+            "uint32_t current_generation",
+            "uint32_t next_generation",
+            "allocation->generation != expected_generation",
+            "allocation->generation != current_generation",
+            "constexpr bool valid_generation_step(uint32_t current, uint32_t next)",
+            "return current != UINT32_MAX && next == current + 1u;",
+            "static_assert(valid_generation_step(0u, 1u));",
+            "static_assert(!valid_generation_step(0u, 2u));",
+            "static_assert(!valid_generation_step(UINT32_MAX, 0u));",
+            "!valid_generation_step(current_generation, next_generation)",
+            "extern \"C\" int stwo_vmm_allocation_remap_next(",
+        ] {
+            assert!(
+                source.contains(required),
+                "missing VMM contract: {required}"
+            );
+        }
+        assert_eq!(source.matches("cuMemAddressReserve(").count(), 1);
+        assert!(!source.contains("stwo_vmm_allocation_remap_generation1"));
     }
 
     #[test]

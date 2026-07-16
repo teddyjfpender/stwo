@@ -2544,7 +2544,7 @@ extern "C" {
     ) -> i32;
 
     // Whole-allocation VMM storage. One handle owns a stable virtual address and
-    // permits exactly one reclaim/remap cycle (generation 0 -> unmapped -> 1).
+    // admits only consecutive reclaim/remap generations.
     pub fn stwo_vmm_allocation_create(
         context_handle: *mut core::ffi::c_void,
         requested_bytes: usize,
@@ -2556,10 +2556,13 @@ extern "C" {
     pub fn stwo_vmm_allocation_unmap_release(
         handle: *mut core::ffi::c_void,
         context_handle: *mut core::ffi::c_void,
+        expected_generation: u32,
     ) -> i32;
-    pub fn stwo_vmm_allocation_remap_generation1(
+    pub fn stwo_vmm_allocation_remap_next(
         handle: *mut core::ffi::c_void,
         context_handle: *mut core::ffi::c_void,
+        current_generation: u32,
+        next_generation: u32,
     ) -> i32;
     pub fn stwo_vmm_allocation_destroy(handle: *mut core::ffi::c_void) -> i32;
 

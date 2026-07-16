@@ -1,9 +1,9 @@
-//! Stable-address whole-allocation VMM storage for one bounded reclaim cycle.
+//! Stable-address whole-allocation VMM storage for bounded repeated reclaim.
 //!
-//! The only legal lifecycle is mapped generation 0, unmapped after a complete
-//! D2H spill, then physically remapped and restored before publishing mapped
-//! generation 1. Unmapping consumes proof that every auxiliary lane joined and
-//! the main stream completed; restore forks the new bytes into every lane.
+//! Each legal lifecycle step is mapped generation N, unmapped generation N
+//! after a complete D2H spill, then physically remapped and restored as mapped
+//! generation N+1. Unmapping consumes proof that every auxiliary lane joined
+//! and the main stream completed; restore forks the new bytes into every lane.
 
 use core::ffi::c_void;
 use core::marker::PhantomData;
@@ -14,17 +14,18 @@ use super::exec_context::{
     check_cuda, CudaExecContext, CudaQuiescence, CudaRuntimeError, JoinedCudaLanes,
 };
 
+#[cfg(all(test, stwo_cuda_link))]
+mod native_tests;
 mod tiled;
 
 pub use tiled::{PinnedDmaWindow, PinnedDmaWindowState};
 
 const INITIAL_GENERATION: u32 = 0;
-const RESTORED_GENERATION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VmmAllocationState {
     Mapped { generation: u32 },
-    Unmapped,
+    Unmapped { generation: u32 },
     Poisoned,
 }
 
@@ -48,6 +49,15 @@ pub enum VmmAllocationError {
         operation: &'static str,
         state: VmmAllocationState,
     },
+    GenerationMismatch {
+        expected: u32,
+        actual: u32,
+    },
+    InvalidGenerationStep {
+        current: u32,
+        next: u32,
+    },
+    GenerationOverflow(u32),
     SequenceViolation(&'static str),
 }
 
@@ -80,6 +90,17 @@ impl core::fmt::Display for VmmAllocationError {
                     "CUDA VMM operation {operation} is invalid in state {state:?}"
                 )
             }
+            Self::GenerationMismatch { expected, actual } => write!(
+                f,
+                "CUDA VMM generation mismatch: expected {expected}, actual {actual}"
+            ),
+            Self::InvalidGenerationStep { current, next } => write!(
+                f,
+                "CUDA VMM generation step must be consecutive, got {current} -> {next}"
+            ),
+            Self::GenerationOverflow(generation) => {
+                write!(f, "CUDA VMM generation {generation} cannot be advanced")
+            }
             Self::SequenceViolation(step) => {
                 write!(f, "CUDA VMM quiescence sequence violated at {step}")
             }
@@ -95,14 +116,16 @@ impl From<CudaRuntimeError> for VmmAllocationError {
     }
 }
 
-/// One stable virtual address with exactly one admitted physical reclaim cycle.
+/// One stable virtual address with strictly consecutive reclaim generations.
 ///
 /// This allocation is independent of [`super::exec_context::DeviceArena`]. A
 /// graph may retain `stable_address`, but replay is legal only while `state` is
 /// mapped. The exact owner context is borrowed for the allocation's lifetime,
 /// making context-before-allocation destruction impossible. A workspace can
 /// hold this value by borrowing an externally owned context or arena; it needs
-/// no self-reference. Both values remain confined to one owning host thread.
+/// no self-reference. Both values remain confined to one owning host thread. A
+/// graph or consumer launch is forbidden unless [`Self::state`] is
+/// [`VmmAllocationState::Mapped`] at the launch's exact expected generation.
 pub struct VmmAllocation<'context> {
     handle: NonNull<c_void>,
     stable_address: NonNull<c_void>,
@@ -193,6 +216,9 @@ impl<'context> VmmAllocation<'context> {
         })
     }
 
+    /// The reserved address is numerically stable across reclaim generations.
+    /// It may be dereferenced or captured by a graph only while [`Self::state`]
+    /// is [`VmmAllocationState::Mapped`] at the consumer's expected generation.
     pub fn stable_address(&self) -> NonNull<c_void> {
         self.stable_address
     }
@@ -208,7 +234,6 @@ impl<'context> VmmAllocation<'context> {
     pub fn state(&self) -> VmmAllocationState {
         self.state
     }
-
 }
 
 impl Drop for VmmAllocation<'_> {
@@ -234,6 +259,49 @@ fn require_exact_bytes(expected: usize, actual: usize) -> Result<(), VmmAllocati
     }
 }
 
+fn require_mapped_generation(
+    state: VmmAllocationState,
+    operation: &'static str,
+    expected_generation: u32,
+) -> Result<(), VmmAllocationError> {
+    match state {
+        VmmAllocationState::Mapped { generation } if generation == expected_generation => Ok(()),
+        VmmAllocationState::Mapped { generation } => Err(VmmAllocationError::GenerationMismatch {
+            expected: expected_generation,
+            actual: generation,
+        }),
+        state => Err(VmmAllocationError::InvalidState { operation, state }),
+    }
+}
+
+fn require_unmapped_generation_step(
+    state: VmmAllocationState,
+    operation: &'static str,
+    current_generation: u32,
+    next_generation: u32,
+) -> Result<(), VmmAllocationError> {
+    match state {
+        VmmAllocationState::Unmapped { generation } if generation == current_generation => {}
+        VmmAllocationState::Unmapped { generation } => {
+            return Err(VmmAllocationError::GenerationMismatch {
+                expected: current_generation,
+                actual: generation,
+            });
+        }
+        state => return Err(VmmAllocationError::InvalidState { operation, state }),
+    }
+    let expected_next = current_generation
+        .checked_add(1)
+        .ok_or(VmmAllocationError::GenerationOverflow(current_generation))?;
+    if next_generation != expected_next {
+        return Err(VmmAllocationError::InvalidGenerationStep {
+            current: current_generation,
+            next: next_generation,
+        });
+    }
+    Ok(())
+}
+
 trait VmmOps {
     fn join_all_lanes(&mut self) -> Result<(), VmmAllocationError>;
 
@@ -246,8 +314,12 @@ trait VmmOps {
 
     fn sync_main(&mut self) -> Result<(), VmmAllocationError>;
     fn sync_transfer(&mut self) -> Result<(), VmmAllocationError>;
-    fn unmap_release(&mut self) -> Result<(), VmmAllocationError>;
-    fn remap_generation1(&mut self) -> Result<(), VmmAllocationError>;
+    fn unmap_release(&mut self, expected_generation: u32) -> Result<(), VmmAllocationError>;
+    fn remap_next(
+        &mut self,
+        current_generation: u32,
+        next_generation: u32,
+    ) -> Result<(), VmmAllocationError>;
     fn lane_count(&self) -> usize;
     fn fork_lane(&mut self, lane: usize) -> Result<(), VmmAllocationError>;
 
@@ -332,7 +404,7 @@ impl VmmOps for CudaVmmOps<'_> {
         Ok(())
     }
 
-    fn unmap_release(&mut self) -> Result<(), VmmAllocationError> {
+    fn unmap_release(&mut self, expected_generation: u32) -> Result<(), VmmAllocationError> {
         if self.transfer_pending {
             return Err(VmmAllocationError::SequenceViolation(
                 "unmap_pending_transfer",
@@ -349,25 +421,32 @@ impl VmmOps for CudaVmmOps<'_> {
             stwo_backend_cuda_kernels::raw::stwo_vmm_allocation_unmap_release(
                 self.allocation.as_ptr(),
                 self.context.identity_token().as_ptr(),
+                expected_generation,
             )
         };
         check_cuda("vmm_allocation_unmap_release", code)?;
         Ok(())
     }
 
-    fn remap_generation1(&mut self) -> Result<(), VmmAllocationError> {
+    fn remap_next(
+        &mut self,
+        current_generation: u32,
+        next_generation: u32,
+    ) -> Result<(), VmmAllocationError> {
         if self.transfer_pending {
             return Err(VmmAllocationError::SequenceViolation(
                 "remap_pending_transfer",
             ));
         }
         let code = unsafe {
-            stwo_backend_cuda_kernels::raw::stwo_vmm_allocation_remap_generation1(
+            stwo_backend_cuda_kernels::raw::stwo_vmm_allocation_remap_next(
                 self.allocation.as_ptr(),
                 self.context.identity_token().as_ptr(),
+                current_generation,
+                next_generation,
             )
         };
-        check_cuda("vmm_allocation_remap_generation1", code)?;
+        check_cuda("vmm_allocation_remap_next", code)?;
         Ok(())
     }
 
@@ -405,19 +484,14 @@ impl VmmOps for CudaVmmOps<'_> {
 unsafe fn spill_transition(
     state: &mut VmmAllocationState,
     operations: &mut impl VmmOps,
+    expected_generation: u32,
     host_destination: NonNull<c_void>,
     device_source: NonNull<c_void>,
     bytes: usize,
 ) -> Result<(), VmmAllocationError> {
-    if *state
-        != (VmmAllocationState::Mapped {
-            generation: INITIAL_GENERATION,
-        })
-    {
-        return Err(VmmAllocationError::InvalidState {
-            operation: "spill",
-            state: *state,
-        });
+    if let Err(error) = require_mapped_generation(*state, "spill", expected_generation) {
+        *state = VmmAllocationState::Poisoned;
+        return Err(error);
     }
     if let Err(error) = operations.join_all_lanes() {
         *state = VmmAllocationState::Poisoned;
@@ -431,11 +505,13 @@ unsafe fn spill_transition(
         *state = VmmAllocationState::Poisoned;
         return Err(error);
     }
-    if let Err(error) = operations.unmap_release() {
+    if let Err(error) = operations.unmap_release(expected_generation) {
         *state = VmmAllocationState::Poisoned;
         return Err(error);
     }
-    *state = VmmAllocationState::Unmapped;
+    *state = VmmAllocationState::Unmapped {
+        generation: expected_generation,
+    };
     Ok(())
 }
 
@@ -443,17 +519,19 @@ unsafe fn spill_transition(
 unsafe fn restore_transition(
     state: &mut VmmAllocationState,
     operations: &mut impl VmmOps,
+    current_generation: u32,
+    next_generation: u32,
     device_destination: NonNull<c_void>,
     host_source: NonNull<c_void>,
     bytes: usize,
 ) -> Result<(), VmmAllocationError> {
-    if *state != VmmAllocationState::Unmapped {
-        return Err(VmmAllocationError::InvalidState {
-            operation: "restore",
-            state: *state,
-        });
+    if let Err(error) =
+        require_unmapped_generation_step(*state, "restore", current_generation, next_generation)
+    {
+        *state = VmmAllocationState::Poisoned;
+        return Err(error);
     }
-    if let Err(error) = operations.remap_generation1() {
+    if let Err(error) = operations.remap_next(current_generation, next_generation) {
         *state = VmmAllocationState::Poisoned;
         return Err(error);
     }
@@ -468,7 +546,7 @@ unsafe fn restore_transition(
         }
     }
     *state = VmmAllocationState::Mapped {
-        generation: RESTORED_GENERATION,
+        generation: next_generation,
     };
     Ok(())
 }
@@ -483,8 +561,8 @@ mod tests {
         D2h,
         Sync,
         TransferSync,
-        Unmap,
-        Remap,
+        Unmap(u32),
+        Remap(u32, u32),
         H2d,
         Fork(usize),
     }
@@ -528,12 +606,16 @@ mod tests {
             self.invoke(Call::TransferSync)
         }
 
-        fn unmap_release(&mut self) -> Result<(), VmmAllocationError> {
-            self.invoke(Call::Unmap)
+        fn unmap_release(&mut self, expected_generation: u32) -> Result<(), VmmAllocationError> {
+            self.invoke(Call::Unmap(expected_generation))
         }
 
-        fn remap_generation1(&mut self) -> Result<(), VmmAllocationError> {
-            self.invoke(Call::Remap)
+        fn remap_next(
+            &mut self,
+            current_generation: u32,
+            next_generation: u32,
+        ) -> Result<(), VmmAllocationError> {
+            self.invoke(Call::Remap(current_generation, next_generation))
         }
 
         fn lane_count(&self) -> usize {
@@ -563,22 +645,22 @@ mod tests {
         let mut state = VmmAllocationState::Mapped { generation: 0 };
         let mut spill = MockOps::default();
         unsafe {
-            spill_transition(&mut state, &mut spill, pointer(), pointer(), 64).unwrap();
+            spill_transition(&mut state, &mut spill, 0, pointer(), pointer(), 64).unwrap();
         }
         assert_eq!(
             spill.calls,
-            [Call::JoinAll, Call::D2h, Call::Sync, Call::Unmap]
+            [Call::JoinAll, Call::D2h, Call::Sync, Call::Unmap(0)]
         );
-        assert_eq!(state, VmmAllocationState::Unmapped);
+        assert_eq!(state, VmmAllocationState::Unmapped { generation: 0 });
 
         let mut restore = MockOps::default();
         unsafe {
-            restore_transition(&mut state, &mut restore, pointer(), pointer(), 64).unwrap();
+            restore_transition(&mut state, &mut restore, 0, 1, pointer(), pointer(), 64).unwrap();
         }
         assert_eq!(
             restore.calls,
             [
-                Call::Remap,
+                Call::Remap(0, 1),
                 Call::H2d,
                 Call::Fork(0),
                 Call::Fork(1),
@@ -588,11 +670,15 @@ mod tests {
         assert_eq!(state, VmmAllocationState::Mapped { generation: 1 });
 
         let mut rejected = MockOps::default();
-        assert!(
-            unsafe { spill_transition(&mut state, &mut rejected, pointer(), pointer(), 64) }
-                .is_err()
+        assert_eq!(
+            unsafe { spill_transition(&mut state, &mut rejected, 0, pointer(), pointer(), 64) },
+            Err(VmmAllocationError::GenerationMismatch {
+                expected: 0,
+                actual: 1,
+            })
         );
         assert!(rejected.calls.is_empty());
+        assert_eq!(state, VmmAllocationState::Poisoned);
     }
 
     #[test]
@@ -602,8 +688,8 @@ mod tests {
             (Call::D2h, vec![Call::JoinAll, Call::D2h]),
             (Call::Sync, vec![Call::JoinAll, Call::D2h, Call::Sync]),
             (
-                Call::Unmap,
-                vec![Call::JoinAll, Call::D2h, Call::Sync, Call::Unmap],
+                Call::Unmap(0),
+                vec![Call::JoinAll, Call::D2h, Call::Sync, Call::Unmap(0)],
             ),
         ];
         for (fail_at, expected) in cases {
@@ -613,7 +699,7 @@ mod tests {
                 ..MockOps::default()
             };
             assert!(unsafe {
-                spill_transition(&mut state, &mut operations, pointer(), pointer(), 64)
+                spill_transition(&mut state, &mut operations, 0, pointer(), pointer(), 64)
             }
             .is_err());
             assert_eq!(operations.calls, expected);
@@ -624,17 +710,20 @@ mod tests {
     #[test]
     fn every_restore_and_partial_fork_failure_poison_state_and_cannot_retry() {
         for (fail_at, expected) in [
-            (Call::Remap, vec![Call::Remap]),
-            (Call::H2d, vec![Call::Remap, Call::H2d]),
-            (Call::Fork(0), vec![Call::Remap, Call::H2d, Call::Fork(0)]),
+            (Call::Remap(0, 1), vec![Call::Remap(0, 1)]),
+            (Call::H2d, vec![Call::Remap(0, 1), Call::H2d]),
+            (
+                Call::Fork(0),
+                vec![Call::Remap(0, 1), Call::H2d, Call::Fork(0)],
+            ),
             (
                 Call::Fork(1),
-                vec![Call::Remap, Call::H2d, Call::Fork(0), Call::Fork(1)],
+                vec![Call::Remap(0, 1), Call::H2d, Call::Fork(0), Call::Fork(1)],
             ),
             (
                 Call::Fork(2),
                 vec![
-                    Call::Remap,
+                    Call::Remap(0, 1),
                     Call::H2d,
                     Call::Fork(0),
                     Call::Fork(1),
@@ -642,13 +731,13 @@ mod tests {
                 ],
             ),
         ] {
-            let mut state = VmmAllocationState::Unmapped;
+            let mut state = VmmAllocationState::Unmapped { generation: 0 };
             let mut operations = MockOps {
                 fail_at: Some(fail_at),
                 ..MockOps::default()
             };
             assert!(unsafe {
-                restore_transition(&mut state, &mut operations, pointer(), pointer(), 64)
+                restore_transition(&mut state, &mut operations, 0, 1, pointer(), pointer(), 64)
             }
             .is_err());
             assert_eq!(operations.calls, expected);
@@ -656,7 +745,7 @@ mod tests {
 
             let mut retry = MockOps::default();
             assert!(unsafe {
-                restore_transition(&mut state, &mut retry, pointer(), pointer(), 64)
+                restore_transition(&mut state, &mut retry, 0, 1, pointer(), pointer(), 64)
             }
             .is_err());
             assert!(retry.calls.is_empty());

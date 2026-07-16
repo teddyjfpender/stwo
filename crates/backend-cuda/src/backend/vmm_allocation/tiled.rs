@@ -133,6 +133,7 @@ impl VmmAllocation<'_> {
     pub unsafe fn spill_through_staging(
         &mut self,
         staging: &mut PinnedDmaWindow,
+        expected_generation: u32,
         destination: &mut [u8],
     ) -> Result<(), VmmAllocationError> {
         require_exact_bytes(self.bytes, destination.len())?;
@@ -142,6 +143,7 @@ impl VmmAllocation<'_> {
             spill_tiled_transition(
                 &mut self.state,
                 &mut operations,
+                expected_generation,
                 self.stable_address,
                 self.bytes,
                 destination,
@@ -149,8 +151,8 @@ impl VmmAllocation<'_> {
         }
     }
 
-    /// Remap generation 1 and restore all bytes from ordinary host storage
-    /// through an owned bounded pinned window.
+    /// Remap the exact next generation and restore all bytes from ordinary
+    /// host storage through an owned bounded pinned window.
     ///
     /// # Safety
     ///
@@ -159,6 +161,8 @@ impl VmmAllocation<'_> {
     pub unsafe fn restore_through_staging(
         &mut self,
         staging: &mut PinnedDmaWindow,
+        current_generation: u32,
+        next_generation: u32,
         source: &[u8],
     ) -> Result<(), VmmAllocationError> {
         require_exact_bytes(self.bytes, source.len())?;
@@ -168,6 +172,8 @@ impl VmmAllocation<'_> {
             restore_tiled_transition(
                 &mut self.state,
                 &mut operations,
+                current_generation,
+                next_generation,
                 self.stable_address,
                 self.bytes,
                 source,
@@ -256,12 +262,16 @@ impl VmmOps for CudaTiledVmmOps<'_, '_> {
         Err(VmmAllocationError::SequenceViolation("raw_tiled_sync"))
     }
 
-    fn unmap_release(&mut self) -> Result<(), VmmAllocationError> {
-        self.base.unmap_release()
+    fn unmap_release(&mut self, expected_generation: u32) -> Result<(), VmmAllocationError> {
+        self.base.unmap_release(expected_generation)
     }
 
-    fn remap_generation1(&mut self) -> Result<(), VmmAllocationError> {
-        self.base.remap_generation1()
+    fn remap_next(
+        &mut self,
+        current_generation: u32,
+        next_generation: u32,
+    ) -> Result<(), VmmAllocationError> {
+        self.base.remap_next(current_generation, next_generation)
     }
 
     fn lane_count(&self) -> usize {
@@ -367,21 +377,16 @@ impl TiledVmmOps for CudaTiledVmmOps<'_, '_> {
 unsafe fn spill_tiled_transition(
     state: &mut VmmAllocationState,
     operations: &mut impl TiledVmmOps,
+    expected_generation: u32,
     device_source: NonNull<c_void>,
     bytes: usize,
     destination: &mut [u8],
 ) -> Result<(), VmmAllocationError> {
     let staging_bytes = operations.staging_bytes();
     require_staging(staging_bytes)?;
-    if *state
-        != (VmmAllocationState::Mapped {
-            generation: INITIAL_GENERATION,
-        })
-    {
-        return Err(VmmAllocationError::InvalidState {
-            operation: "spill_tiled",
-            state: *state,
-        });
+    if let Err(error) = require_mapped_generation(*state, "spill_tiled", expected_generation) {
+        *state = VmmAllocationState::Poisoned;
+        return Err(error);
     }
     let result = (|| {
         operations.join_all_lanes()?;
@@ -393,11 +398,13 @@ unsafe fn spill_tiled_transition(
             operations.drain_staging_transfer()?;
             operations.retire_staging(offset, tile_bytes, destination)?;
         }
-        operations.unmap_release()
+        operations.unmap_release(expected_generation)
     })();
     match result {
         Ok(()) => {
-            *state = VmmAllocationState::Unmapped;
+            *state = VmmAllocationState::Unmapped {
+                generation: expected_generation,
+            };
             Ok(())
         }
         Err(error) => {
@@ -410,20 +417,25 @@ unsafe fn spill_tiled_transition(
 unsafe fn restore_tiled_transition(
     state: &mut VmmAllocationState,
     operations: &mut impl TiledVmmOps,
+    current_generation: u32,
+    next_generation: u32,
     device_destination: NonNull<c_void>,
     bytes: usize,
     source: &[u8],
 ) -> Result<(), VmmAllocationError> {
     let staging_bytes = operations.staging_bytes();
     require_staging(staging_bytes)?;
-    if *state != VmmAllocationState::Unmapped {
-        return Err(VmmAllocationError::InvalidState {
-            operation: "restore_tiled",
-            state: *state,
-        });
+    if let Err(error) = require_unmapped_generation_step(
+        *state,
+        "restore_tiled",
+        current_generation,
+        next_generation,
+    ) {
+        *state = VmmAllocationState::Poisoned;
+        return Err(error);
     }
     let result = (|| {
-        operations.remap_generation1()?;
+        operations.remap_next(current_generation, next_generation)?;
         for offset in (0..bytes).step_by(staging_bytes) {
             let tile_bytes = staging_bytes.min(bytes - offset);
             operations.prefetch_staging(offset, tile_bytes, source)?;
@@ -439,7 +451,7 @@ unsafe fn restore_tiled_transition(
     match result {
         Ok(()) => {
             *state = VmmAllocationState::Mapped {
-                generation: RESTORED_GENERATION,
+                generation: next_generation,
             };
             Ok(())
         }
@@ -465,8 +477,8 @@ mod tests {
         D2h,
         TransferSync,
         Retire(usize, usize),
-        Unmap,
-        Remap,
+        Unmap(u32),
+        Remap(u32, u32),
         Prefetch(usize, usize),
         H2d,
         Fork(usize),
@@ -526,12 +538,16 @@ mod tests {
             Err(VmmAllocationError::SequenceViolation("raw_mock_sync"))
         }
 
-        fn unmap_release(&mut self) -> Result<(), VmmAllocationError> {
-            self.invoke(Call::Unmap)
+        fn unmap_release(&mut self, expected_generation: u32) -> Result<(), VmmAllocationError> {
+            self.invoke(Call::Unmap(expected_generation))
         }
 
-        fn remap_generation1(&mut self) -> Result<(), VmmAllocationError> {
-            self.invoke(Call::Remap)
+        fn remap_next(
+            &mut self,
+            current_generation: u32,
+            next_generation: u32,
+        ) -> Result<(), VmmAllocationError> {
+            self.invoke(Call::Remap(current_generation, next_generation))
         }
 
         fn lane_count(&self) -> usize {
@@ -634,6 +650,7 @@ mod tests {
             spill_tiled_transition(
                 &mut state,
                 &mut spill,
+                0,
                 pointer(&mut device),
                 host.len(),
                 &mut host,
@@ -641,7 +658,7 @@ mod tests {
             .unwrap();
         }
         assert_eq!(host, (0..40_u8).collect::<Vec<_>>());
-        assert_eq!(state, VmmAllocationState::Unmapped);
+        assert_eq!(state, VmmAllocationState::Unmapped { generation: 0 });
         assert_eq!(
             spill.calls,
             [
@@ -656,7 +673,7 @@ mod tests {
                 Call::D2h,
                 Call::TransferSync,
                 Call::Retire(32, 8),
-                Call::Unmap,
+                Call::Unmap(0),
             ]
         );
 
@@ -666,6 +683,8 @@ mod tests {
             restore_tiled_transition(
                 &mut state,
                 &mut restore,
+                0,
+                1,
                 pointer(&mut device),
                 source.len(),
                 &source,
@@ -677,7 +696,7 @@ mod tests {
         assert_eq!(
             restore.calls,
             [
-                Call::Remap,
+                Call::Remap(0, 1),
                 Call::Prefetch(0, 16),
                 Call::H2d,
                 Call::TransferSync,
@@ -695,6 +714,137 @@ mod tests {
     }
 
     #[test]
+    fn rust_mock_covers_one_hundred_generation_control_flow_and_data() {
+        let mut device = (0..40_u8).collect::<Vec<_>>();
+        let mut host = vec![0_u8; device.len()];
+        let stable_address = pointer(&mut device);
+        let mut state = VmmAllocationState::Mapped { generation: 0 };
+
+        for current_generation in 0..100_u32 {
+            let mut spill = MockOps::new(16);
+            unsafe {
+                spill_tiled_transition(
+                    &mut state,
+                    &mut spill,
+                    current_generation,
+                    stable_address,
+                    device.len(),
+                    &mut host,
+                )
+                .unwrap();
+            }
+            assert_eq!(host, device);
+            assert_eq!(
+                state,
+                VmmAllocationState::Unmapped {
+                    generation: current_generation,
+                }
+            );
+
+            for byte in &mut host {
+                *byte = byte.wrapping_add(1);
+            }
+            let next_generation = current_generation + 1;
+            let mut restore = MockOps::new(16);
+            unsafe {
+                restore_tiled_transition(
+                    &mut state,
+                    &mut restore,
+                    current_generation,
+                    next_generation,
+                    stable_address,
+                    device.len(),
+                    &host,
+                )
+                .unwrap();
+            }
+            assert_eq!(device, host);
+            assert_eq!(pointer(&mut device), stable_address);
+            assert_eq!(
+                state,
+                VmmAllocationState::Mapped {
+                    generation: next_generation,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn stale_skipped_and_overflowed_generations_poison_before_cuda_work() {
+        let mut device = vec![0_u8; 40];
+        let mut host = vec![0_u8; 40];
+
+        let mut state = VmmAllocationState::Mapped { generation: 3 };
+        let mut operations = MockOps::new(16);
+        assert_eq!(
+            unsafe {
+                spill_tiled_transition(
+                    &mut state,
+                    &mut operations,
+                    2,
+                    pointer(&mut device),
+                    host.len(),
+                    &mut host,
+                )
+            },
+            Err(VmmAllocationError::GenerationMismatch {
+                expected: 2,
+                actual: 3,
+            })
+        );
+        assert_eq!(state, VmmAllocationState::Poisoned);
+        assert!(operations.calls.is_empty());
+
+        for (actual_generation, current_generation, next_generation, expected_error) in [
+            (
+                3,
+                2,
+                3,
+                VmmAllocationError::GenerationMismatch {
+                    expected: 2,
+                    actual: 3,
+                },
+            ),
+            (
+                3,
+                3,
+                5,
+                VmmAllocationError::InvalidGenerationStep {
+                    current: 3,
+                    next: 5,
+                },
+            ),
+            (
+                u32::MAX,
+                u32::MAX,
+                0,
+                VmmAllocationError::GenerationOverflow(u32::MAX),
+            ),
+        ] {
+            let mut state = VmmAllocationState::Unmapped {
+                generation: actual_generation,
+            };
+            let mut operations = MockOps::new(16);
+            assert_eq!(
+                unsafe {
+                    restore_tiled_transition(
+                        &mut state,
+                        &mut operations,
+                        current_generation,
+                        next_generation,
+                        pointer(&mut device),
+                        host.len(),
+                        &host,
+                    )
+                },
+                Err(expected_error)
+            );
+            assert_eq!(state, VmmAllocationState::Poisoned);
+            assert!(operations.calls.is_empty());
+        }
+    }
+
+    #[test]
     fn every_tiled_stage_failure_poison_state_and_rejects_retry() {
         for failure in [
             Call::JoinAll,
@@ -702,7 +852,7 @@ mod tests {
             Call::D2h,
             Call::TransferSync,
             Call::Retire(0, 16),
-            Call::Unmap,
+            Call::Unmap(0),
         ] {
             let mut device = vec![0_u8; 40];
             let mut host = vec![0_u8; 40];
@@ -712,6 +862,7 @@ mod tests {
                 spill_tiled_transition(
                     &mut state,
                     &mut operations,
+                    0,
                     pointer(&mut device),
                     host.len(),
                     &mut host,
@@ -724,6 +875,7 @@ mod tests {
                 spill_tiled_transition(
                     &mut state,
                     &mut retry,
+                    0,
                     pointer(&mut device),
                     host.len(),
                     &mut host,
@@ -734,7 +886,7 @@ mod tests {
         }
 
         for failure in [
-            Call::Remap,
+            Call::Remap(0, 1),
             Call::Prefetch(0, 16),
             Call::H2d,
             Call::TransferSync,
@@ -744,12 +896,14 @@ mod tests {
         ] {
             let mut device = vec![0_u8; 40];
             let host = vec![0_u8; 40];
-            let mut state = VmmAllocationState::Unmapped;
+            let mut state = VmmAllocationState::Unmapped { generation: 0 };
             let mut operations = MockOps::failing(16, failure);
             assert!(unsafe {
                 restore_tiled_transition(
                     &mut state,
                     &mut operations,
+                    0,
+                    1,
                     pointer(&mut device),
                     host.len(),
                     &host,

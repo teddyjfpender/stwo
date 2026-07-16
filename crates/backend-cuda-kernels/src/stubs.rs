@@ -2994,16 +2994,19 @@ pub unsafe extern "C" fn stwo_vmm_allocation_create(
 pub unsafe extern "C" fn stwo_vmm_allocation_unmap_release(
     _handle: *mut core::ffi::c_void,
     _context_handle: *mut core::ffi::c_void,
+    _expected_generation: u32,
 ) -> i32 {
     no_cuda_symbol("stwo_vmm_allocation_unmap_release")
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn stwo_vmm_allocation_remap_generation1(
+pub unsafe extern "C" fn stwo_vmm_allocation_remap_next(
     _handle: *mut core::ffi::c_void,
     _context_handle: *mut core::ffi::c_void,
+    _current_generation: u32,
+    _next_generation: u32,
 ) -> i32 {
-    no_cuda_symbol("stwo_vmm_allocation_remap_generation1")
+    no_cuda_symbol("stwo_vmm_allocation_remap_next")
 }
 
 #[unsafe(no_mangle)]
