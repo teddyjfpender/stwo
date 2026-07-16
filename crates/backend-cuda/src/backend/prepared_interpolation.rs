@@ -16,6 +16,13 @@ use super::exec_context::{
     check_cuda, ArenaError, ArenaSlice, ArenaSlotId, CudaRuntimeError, DeviceArena,
 };
 
+mod authority;
+pub use authority::{
+    InterpolationAbiAccess, InterpolationAbiArgument, InterpolationAbiArgumentKind,
+    InterpolationAuthorityError, InterpolationBatchAuthority, InterpolationEffectAbi,
+    InterpolationPrimitiveAbi, InterpolationPrimitiveAuthority,
+};
+
 const WORD_BYTES: usize = core::mem::size_of::<u32>();
 const POINTER_WORDS: usize = core::mem::size_of::<*mut u32>().div_ceil(WORD_BYTES);
 

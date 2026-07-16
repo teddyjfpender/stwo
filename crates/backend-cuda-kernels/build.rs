@@ -121,6 +121,7 @@ fn main() {
     emit_command_reruns(nvcc_path.as_deref());
     let nvcc_available = command_version(&nvcc_requested, true).is_some();
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR must be set"));
+    write_static_cuda_source_identity(&out_dir);
     let aot_constraint_max_instrs = generated_aot_constraint_max_instrs();
     let aot_constraint_max_live_u32_lanes = generated_aot_constraint_max_live_u32_lanes();
     if !nvcc_available {
@@ -480,6 +481,61 @@ fn kernel_sources() -> Vec<PathBuf> {
     sources.sort();
     assert!(!sources.is_empty(), "no .cu kernels found under cuda/");
     sources
+}
+
+fn write_static_cuda_source_identity(out_dir: &std::path::Path) {
+    const DOMAIN: &[u8] = b"stwo-cuda-static-source-set-v1\0";
+    let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    let cuda = manifest.join("cuda");
+    let mut files = kernel_sources();
+    collect_extension(&cuda, "cuh", &mut files);
+    files.sort();
+    files.dedup();
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(DOMAIN);
+    hasher.update(&encoded_len(files.len()));
+    for file in files {
+        let relative = file
+            .strip_prefix(&manifest)
+            .expect("static CUDA source belongs to this crate")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let bytes = std::fs::read(&file).expect("read static CUDA authority source");
+        hasher.update(&encoded_len(relative.len()));
+        hasher.update(relative.as_bytes());
+        hasher.update(&encoded_len(bytes.len()));
+        hasher.update(&bytes);
+    }
+    let identity = *hasher.finalize().as_bytes();
+    std::fs::write(
+        out_dir.join("static_cuda_source_identity.rs"),
+        format!(
+            "pub(crate) const STATIC_CUDA_SOURCE_IDENTITY: [u8; 32] = {};\n",
+            rust_digest(&identity)
+        ),
+    )
+    .expect("write static CUDA source identity");
+}
+
+fn encoded_len(value: usize) -> [u8; 8] {
+    u64::try_from(value)
+        .expect("static CUDA source identity length fits u64")
+        .to_le_bytes()
+}
+
+fn collect_extension(dir: &std::path::Path, extension: &str, out: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(dir).expect("cuda/ directory must exist") {
+        let path = entry.expect("readable cuda/ directory entry").path();
+        if path.is_dir() {
+            if path.file_name().is_some_and(|name| name == "generated") {
+                continue;
+            }
+            collect_extension(&path, extension, out);
+        } else if path.extension().is_some_and(|actual| actual == extension) {
+            out.push(path);
+        }
+    }
 }
 
 fn collect_cu(dir: &std::path::Path, out: &mut Vec<PathBuf>) {

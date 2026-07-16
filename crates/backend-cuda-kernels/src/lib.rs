@@ -21,11 +21,19 @@ pub mod raw;
 #[cfg(not(stwo_cuda_link))]
 mod stubs;
 
+include!(concat!(env!("OUT_DIR"), "/static_cuda_source_identity.rs"));
+
 /// True when the CUDA kernels were compiled and linked into this build.
 pub const CUDA_KERNELS_BUILT: bool = cfg!(stwo_cuda_link);
 
 /// `"cuda"` when the kernels were compiled, `"no-cuda"` for the stub build.
 pub const BUILD_MODE: &str = env!("STWO_CUDA_BUILD_MODE");
+
+/// Collision-resistant identity of every ordinary CUDA translation unit and
+/// header compiled into the static archive. Generated AOT cubins are excluded.
+pub const fn static_cuda_source_identity() -> [u8; 32] {
+    STATIC_CUDA_SOURCE_IDENTITY
+}
 
 #[cfg(test)]
 mod tests {
@@ -34,6 +42,7 @@ mod tests {
     #[test]
     fn build_mode_is_consistent() {
         assert_eq!(BUILD_MODE == "cuda", CUDA_KERNELS_BUILT);
+        assert_ne!(static_cuda_source_identity(), [0; 32]);
     }
 
     #[test]

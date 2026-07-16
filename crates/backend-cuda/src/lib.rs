@@ -100,9 +100,12 @@ pub use backend::prepared_fri_final::{
     FriFinalWorkspaceSlots, PreparedFriFinalError, PreparedFriFinalGraph,
 };
 pub use backend::prepared_interpolation::{
-    b2n_chunk_ranges, b2n_stage_intervals, InterpolationBatch, InterpolationColumn,
-    InterpolationLaunchMode, PreparedInterpolationError, PreparedInterpolationGraph,
-    INTERPOLATION_MAX_BATCH_COLUMNS, INTERPOLATION_POINTER_ALIGNMENT_WORDS,
+    b2n_chunk_ranges, b2n_stage_intervals, InterpolationAbiAccess, InterpolationAbiArgument,
+    InterpolationAbiArgumentKind, InterpolationAuthorityError, InterpolationBatch,
+    InterpolationBatchAuthority, InterpolationColumn, InterpolationEffectAbi,
+    InterpolationLaunchMode, InterpolationPrimitiveAbi, InterpolationPrimitiveAuthority,
+    PreparedInterpolationError, PreparedInterpolationGraph, INTERPOLATION_MAX_BATCH_COLUMNS,
+    INTERPOLATION_POINTER_ALIGNMENT_WORDS,
 };
 pub use backend::prepared_memory_trace::{
     MemoryBaseTracePart, PreparedMemoryBaseTraceError, PreparedMemoryBaseTraceGraph,
