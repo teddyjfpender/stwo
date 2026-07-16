@@ -42,8 +42,8 @@ constexpr int BG_N_SUB = 48;
 struct BlakeGResidentOutputs {
     uint32_t *trace[BG_N_TRACE];
     uint32_t *lookup;
-    // Replacement-only compact source: c[53..73], word-major. Exactly one of
-    // lookup/aux is non-null.
+    // Replacement-only compact source: c[53..73], word-major. At most one of
+    // lookup/aux is non-null; direct mode deliberately leaves both null.
     uint32_t *aux;
     uint32_t *sub;
 };

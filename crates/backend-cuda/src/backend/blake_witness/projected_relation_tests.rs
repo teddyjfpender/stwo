@@ -129,10 +129,10 @@ fn projected_columns(
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct SixInputRow {
-    trace: [u32; BG_N_TRACE],
+pub(super) struct SixInputRow {
+    pub(super) trace: [u32; BG_N_TRACE],
     auxiliary: [u32; BG_N_AUX],
-    tuples: [[u32; 4]; 16],
+    pub(super) tuples: [[u32; 4]; 16],
     final_tuple: [u32; 21],
     enabler: u32,
 }
@@ -159,7 +159,7 @@ impl SixInputRow {
 
 /// Host oracle for the exact six-input device evaluator. Every triple sum is
 /// explicitly wrapping: the CUDA body uses `uint32_t`, not field addition.
-fn evaluate_six_inputs(inputs: [u32; 6], row: usize, n_real: usize) -> SixInputRow {
+pub(super) fn evaluate_six_inputs(inputs: [u32; 6], row: usize, n_real: usize) -> SixInputRow {
     let [in0, in1, in2, in3, in4, in5] = inputs;
     let lo16 = |value: u32| value & 0xffff;
     let hi16 = |value: u32| value >> 16;
@@ -350,7 +350,7 @@ fn combine(words: &[u32], alphas: &[SecureField; 21], z: SecureField) -> SecureF
     })
 }
 
-fn direct_fractions(
+pub(super) fn direct_fractions(
     row: &SixInputRow,
     alphas: &[SecureField; 21],
     z: SecureField,
@@ -387,7 +387,7 @@ fn legacy_fractions(
     })
 }
 
-fn chain(fractions: [SecureField; 9]) -> [SecureField; 9] {
+pub(super) fn chain(fractions: [SecureField; 9]) -> [SecureField; 9] {
     let mut sum = SecureField::zero();
     fractions.map(|fraction| {
         sum += fraction;

@@ -133,3 +133,7 @@ pub fn blake_g_projected_relation_identity_is_exact(
 #[cfg(test)]
 #[path = "projected_relation_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "projected_relation_native_tests.rs"]
+mod native_tests;
