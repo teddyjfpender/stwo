@@ -350,19 +350,33 @@ fn combine(words: &[u32], alphas: &[SecureField; 21], z: SecureField) -> SecureF
     })
 }
 
+pub(super) fn direct_denominators(
+    row: &SixInputRow,
+    alphas: &[SecureField; 21],
+    z: SecureField,
+) -> [SecureField; 17] {
+    std::array::from_fn(|index| {
+        if index < row.tuples.len() {
+            combine(&row.tuples[index], alphas, z)
+        } else {
+            combine(&row.final_tuple, alphas, z)
+        }
+    })
+}
+
 pub(super) fn direct_fractions(
     row: &SixInputRow,
     alphas: &[SecureField; 21],
     z: SecureField,
 ) -> [SecureField; 9] {
+    let denominators = direct_denominators(row, alphas, z);
     std::array::from_fn(|column| {
         if column < 8 {
-            let left = combine(&row.tuples[2 * column], alphas, z);
-            let right = combine(&row.tuples[2 * column + 1], alphas, z);
+            let left = denominators[2 * column];
+            let right = denominators[2 * column + 1];
             (left + right) / (left * right)
         } else {
-            -SecureField::from(BaseField::from_u32_unchecked(row.enabler))
-                / combine(&row.final_tuple, alphas, z)
+            -SecureField::from(BaseField::from_u32_unchecked(row.enabler)) / denominators[16]
         }
     })
 }

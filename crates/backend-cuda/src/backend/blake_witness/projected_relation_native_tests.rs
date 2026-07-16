@@ -6,14 +6,14 @@ use num_traits::Zero;
 use stwo::core::fields::qm31::SecureField;
 
 use super::super::{BG_N_DATA_INPUTS, BG_N_TRACE};
-use super::tests::{chain, direct_fractions, evaluate_six_inputs};
+use super::tests::{chain, direct_denominators, direct_fractions, evaluate_six_inputs};
 use crate::{ArenaLayout, ArenaSlice, ArenaSlotId, ArenaSlotSpec, CudaExecContext, DeviceArena};
 
-// Cross both 256-thread launch boundaries, leave the final block partial, and
-// put the real/padded boundary inside the middle block.  A one-block fixture
-// cannot expose block-indexing or cross-block multiplicity defects.
-const ROWS: usize = 513;
-const N_REAL: usize = 389;
+// Run four full 256-thread blocks plus a one-row tail.  The real/padded
+// boundary sits one row into block three, and repeated block-head vectors
+// create cross-block multiplicity contention.
+const ROWS: usize = 1025;
+const N_REAL: usize = 769;
 const LAUNCH_BLOCK_ROWS: usize = 256;
 const RELATION_COLUMNS: usize = 9;
 const RELATION_COORDINATES: usize = 4 * RELATION_COLUMNS;
@@ -133,6 +133,14 @@ fn expected(
         .enumerate()
         .map(|(row, &inputs)| evaluate_six_inputs(inputs, row, N_REAL))
         .collect::<Vec<_>>();
+    for (row, oracle) in oracle_rows.iter().enumerate() {
+        assert!(
+            direct_denominators(oracle, alphas, z)
+                .into_iter()
+                .all(|denominator| !denominator.is_zero()),
+            "zero direct Blake-G denominator at row {row}"
+        );
+    }
     let chains = oracle_rows
         .iter()
         .map(|row| chain(direct_fractions(row, alphas, z)))
@@ -295,8 +303,9 @@ fn fixture_inputs() -> Vec<[u32; BG_N_DATA_INPUTS]> {
     let mut state = 0xd1b5_4a32u32;
     (0..ROWS)
         .map(|row| {
-            if row < boundaries.len() {
-                boundaries[row]
+            let block_row = row % LAUNCH_BLOCK_ROWS;
+            if block_row < boundaries.len() {
+                boundaries[block_row]
             } else {
                 std::array::from_fn(|_| {
                     state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
@@ -307,39 +316,52 @@ fn fixture_inputs() -> Vec<[u32; BG_N_DATA_INPUTS]> {
         .collect()
 }
 
-fn fixture_challenges() -> ([SecureField; 21], SecureField) {
-    // Match LookupElements::from_z_alpha: the relation consumes successive
-    // powers of one full-QM31 transcript challenge, not independent base-field
-    // scalars.  Non-zero coordinates in both quadratic limbs make every output
-    // coordinate observable to the oracle.
-    let alpha = SecureField::from_u32_unchecked(4, 3, 2, 1);
+fn challenge_powers(alpha: SecureField) -> [SecureField; 21] {
     let mut power = SecureField::from(1u32);
-    let alphas = std::array::from_fn(|_| {
+    std::array::from_fn(|_| {
         let result = power;
         power *= alpha;
         result
-    });
-    (alphas, SecureField::from_u32_unchecked(1, 2, 3, 4))
+    })
+}
+
+fn eager_challenges() -> ([SecureField; 21], SecureField) {
+    // Match LookupElements::from_z_alpha with a full-QM31 transcript pair.
+    (
+        challenge_powers(SecureField::from_u32_unchecked(3, 5, 7, 11)),
+        SecureField::from_u32_unchecked(13, 17, 19, 23),
+    )
+}
+
+fn replay_challenges() -> ([SecureField; 21], SecureField) {
+    (
+        challenge_powers(SecureField::from_u32_unchecked(29, 31, 37, 41)),
+        SecureField::from_u32_unchecked(43, 47, 53, 59),
+    )
 }
 
 #[test]
 fn direct_blake_g_native_fixture_is_adversarial() {
-    assert!(ROWS > 2 * LAUNCH_BLOCK_ROWS);
-    assert_ne!(ROWS % LAUNCH_BLOCK_ROWS, 0);
-    assert_eq!(N_REAL / LAUNCH_BLOCK_ROWS, 1);
-    assert_ne!(N_REAL % LAUNCH_BLOCK_ROWS, 0);
+    assert_eq!(ROWS / LAUNCH_BLOCK_ROWS, 4);
+    assert_eq!(ROWS % LAUNCH_BLOCK_ROWS, 1);
+    assert_eq!(N_REAL / LAUNCH_BLOCK_ROWS, 3);
+    assert_eq!(N_REAL % LAUNCH_BLOCK_ROWS, 1);
 
     let inputs = fixture_inputs();
-    let (alphas, z) = fixture_challenges();
-    let expected = expected(&inputs, &alphas, z);
-    assert_all_extension_coordinates_observable(&expected);
-    assert!(!expected.claimed_sum.is_zero());
+    let (eager_alphas, eager_z) = eager_challenges();
+    let eager = expected(&inputs, &eager_alphas, eager_z);
+    assert_all_extension_coordinates_observable(&eager);
+    assert!(!eager.claimed_sum.is_zero());
     assert_eq!(
-        expected
+        eager
             .counts
             .map(|counts| counts.into_iter().map(u64::from).sum::<u64>()),
         [8, 2, 2, 2, 2].map(|per_row| per_row * ROWS as u64)
     );
+    let (replay_alphas, replay_z) = replay_challenges();
+    let replay = expected(&inputs, &replay_alphas, replay_z);
+    assert_all_extension_coordinates_observable(&replay);
+    assert!(!replay.claimed_sum.is_zero());
     let last_real = evaluate_six_inputs(inputs[N_REAL - 1], N_REAL - 1, N_REAL);
     let first_padding = evaluate_six_inputs(inputs[N_REAL], N_REAL, N_REAL);
     assert_eq!((last_real.trace[52], first_padding.trace[52]), (1, 0));
@@ -377,7 +399,7 @@ fn direct_blake_g_native_matches_host_oracle_eager_and_replay() {
     );
 
     let mut input_rows = fixture_inputs();
-    let (alphas, z) = fixture_challenges();
+    let (alphas, z) = eager_challenges();
     let eager_expected = expected(&input_rows, &alphas, z);
     assert_all_extension_coordinates_observable(&eager_expected);
 
@@ -482,9 +504,17 @@ fn direct_blake_g_native_matches_host_oracle_eager_and_replay() {
     input_rows[0][0] ^= 0x1357_9bdf;
     input_rows[N_REAL - 1][5] = input_rows[N_REAL - 1][5].wrapping_add(1);
     input_rows[N_REAL][2] ^= u32::MAX;
-    input_rows[ROWS - 1][3] = 0;
+    input_rows[ROWS - 1][3] ^= 0xa5a5_5a5a;
     let replay_input_columns = upload_inputs(arena.context(), &input_slices, &input_rows);
-    let replay_expected = expected(&input_rows, &alphas, z);
+    let (replay_alphas, replay_z) = replay_challenges();
+    let replay_alpha_words = replay_alphas
+        .iter()
+        .flat_map(|alpha| alpha.to_m31_array().map(|coordinate| coordinate.0))
+        .collect::<Vec<_>>();
+    let replay_z_words = replay_z.to_m31_array().map(|coordinate| coordinate.0);
+    upload(arena.context(), alpha_slice, &replay_alpha_words);
+    upload(arena.context(), z_slice, &replay_z_words);
+    let replay_expected = expected(&input_rows, &replay_alphas, replay_z);
     assert_all_extension_coordinates_observable(&replay_expected);
     clear_counts(arena.context(), &count_slices);
     unsafe {
