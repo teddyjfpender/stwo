@@ -1,13 +1,14 @@
 //! Stable-address whole-allocation VMM storage for one bounded reclaim cycle.
 //!
 //! The only legal lifecycle is mapped generation 0, unmapped after a complete
-//! D2H spill, then mapped generation 1 before H2D restore. Unmapping consumes a
-//! proof that every auxiliary lane joined and the main stream completed.
+//! D2H spill, then physically remapped and restored before publishing mapped
+//! generation 1. Unmapping consumes proof that every auxiliary lane joined and
+//! the main stream completed; restore forks the new bytes into every lane.
 
-use core::cell::Cell;
 use core::ffi::c_void;
 use core::marker::PhantomData;
 use core::ptr::NonNull;
+use std::rc::Rc;
 
 use super::exec_context::{
     check_cuda, CudaExecContext, CudaQuiescence, CudaRuntimeError, JoinedCudaLanes,
@@ -82,21 +83,26 @@ impl From<CudaRuntimeError> for VmmAllocationError {
 ///
 /// This allocation is independent of [`super::exec_context::DeviceArena`]. A
 /// graph may retain `stable_address`, but replay is legal only while `state` is
-/// mapped. The owner context and the allocation must remain on one host thread.
-pub struct VmmAllocation {
+/// mapped. The exact owner context is borrowed for the allocation's lifetime,
+/// making context-before-allocation destruction impossible. A workspace can
+/// hold this value by borrowing an externally owned context or arena; it needs
+/// no self-reference. Both values remain confined to one owning host thread.
+pub struct VmmAllocation<'context> {
     handle: NonNull<c_void>,
     stable_address: NonNull<c_void>,
     bytes: usize,
     granularity: usize,
-    owner_context: NonNull<c_void>,
+    owner_context: &'context CudaExecContext,
     state: VmmAllocationState,
-    _not_sync: PhantomData<Cell<()>>,
+    // VMM transitions are host-side boundaries owned by one scheduler thread.
+    _same_thread: PhantomData<Rc<()>>,
 }
 
-unsafe impl Send for VmmAllocation {}
-
-impl VmmAllocation {
-    pub fn new(context: &CudaExecContext, bytes: usize) -> Result<Self, VmmAllocationError> {
+impl<'context> VmmAllocation<'context> {
+    pub fn new(
+        context: &'context CudaExecContext,
+        bytes: usize,
+    ) -> Result<Self, VmmAllocationError> {
         if bytes == 0 {
             return Err(VmmAllocationError::InvalidSize(bytes));
         }
@@ -163,11 +169,11 @@ impl VmmAllocation {
             stable_address,
             bytes,
             granularity,
-            owner_context: context.identity_token(),
+            owner_context: context,
             state: VmmAllocationState::Mapped {
                 generation: INITIAL_GENERATION,
             },
-            _not_sync: PhantomData,
+            _same_thread: PhantomData,
         })
     }
 
@@ -193,16 +199,16 @@ impl VmmAllocation {
     /// # Safety
     ///
     /// `host_destination` must name writable pinned host memory of exactly
-    /// `bytes`. No producer may retain access beyond the validated lane joins.
+    /// `bytes`. The caller must hold exclusive scheduling authority over the
+    /// owner context: no copied launch handle may enqueue concurrent work. No
+    /// producer may retain access beyond the validated lane joins.
     pub unsafe fn spill_to_host(
         &mut self,
-        context: &CudaExecContext,
         host_destination: NonNull<c_void>,
         bytes: usize,
     ) -> Result<(), VmmAllocationError> {
-        self.require_owner(context)?;
         require_exact_bytes(self.bytes, bytes)?;
-        let mut operations = CudaVmmOps::new(self.handle, context);
+        let mut operations = CudaVmmOps::new(self.handle, self.owner_context);
         unsafe {
             spill_transition(
                 &mut self.state,
@@ -214,23 +220,22 @@ impl VmmAllocation {
         }
     }
 
-    /// Remap generation 1 at the same virtual address, then enqueue a complete
-    /// H2D restore on the owner main stream.
+    /// Remap generation 1 at the same virtual address, enqueue a complete H2D
+    /// restore, then fork the restored main-stream state into every owned lane.
     ///
     /// # Safety
     ///
     /// `host_source` must name readable pinned host memory of exactly `bytes`
     /// and remain live until later owner-stream synchronization. The caller must
-    /// order every lane consumer after the main-stream restore.
+    /// hold exclusive scheduling authority over the owner context; lane
+    /// consumers must be enqueued only after this checked fork sequence returns.
     pub unsafe fn restore_from_host(
         &mut self,
-        context: &CudaExecContext,
         host_source: NonNull<c_void>,
         bytes: usize,
     ) -> Result<(), VmmAllocationError> {
-        self.require_owner(context)?;
         require_exact_bytes(self.bytes, bytes)?;
-        let mut operations = CudaVmmOps::new(self.handle, context);
+        let mut operations = CudaVmmOps::new(self.handle, self.owner_context);
         unsafe {
             restore_transition(
                 &mut self.state,
@@ -241,16 +246,9 @@ impl VmmAllocation {
             )
         }
     }
-
-    fn require_owner(&self, context: &CudaExecContext) -> Result<(), VmmAllocationError> {
-        if context.identity_token() != self.owner_context {
-            return Err(VmmAllocationError::ContextMismatch);
-        }
-        Ok(())
-    }
 }
 
-impl Drop for VmmAllocation {
+impl Drop for VmmAllocation<'_> {
     fn drop(&mut self) {
         let code = unsafe {
             stwo_backend_cuda_kernels::raw::stwo_vmm_allocation_destroy(self.handle.as_ptr())
@@ -286,6 +284,8 @@ trait VmmOps {
     fn sync_main(&mut self) -> Result<(), VmmAllocationError>;
     fn unmap_release(&mut self) -> Result<(), VmmAllocationError>;
     fn remap_generation1(&mut self) -> Result<(), VmmAllocationError>;
+    fn lane_count(&self) -> usize;
+    fn fork_lane(&mut self, lane: usize) -> Result<(), VmmAllocationError>;
 
     unsafe fn copy_h2d(
         &mut self,
@@ -376,6 +376,15 @@ impl VmmOps for CudaVmmOps<'_> {
         Ok(())
     }
 
+    fn lane_count(&self) -> usize {
+        self.context.lane_count()
+    }
+
+    fn fork_lane(&mut self, lane: usize) -> Result<(), VmmAllocationError> {
+        self.context.fork_lane(lane)?;
+        Ok(())
+    }
+
     unsafe fn copy_h2d(
         &mut self,
         destination: NonNull<c_void>,
@@ -451,6 +460,12 @@ unsafe fn restore_transition(
         *state = VmmAllocationState::Poisoned;
         return Err(error);
     }
+    for lane in 0..operations.lane_count() {
+        if let Err(error) = operations.fork_lane(lane) {
+            *state = VmmAllocationState::Poisoned;
+            return Err(error);
+        }
+    }
     *state = VmmAllocationState::Mapped {
         generation: RESTORED_GENERATION,
     };
@@ -469,6 +484,7 @@ mod tests {
         Unmap,
         Remap,
         H2d,
+        Fork(usize),
     }
 
     #[derive(Default)]
@@ -514,6 +530,14 @@ mod tests {
             self.invoke(Call::Remap)
         }
 
+        fn lane_count(&self) -> usize {
+            3
+        }
+
+        fn fork_lane(&mut self, lane: usize) -> Result<(), VmmAllocationError> {
+            self.invoke(Call::Fork(lane))
+        }
+
         unsafe fn copy_h2d(
             &mut self,
             _destination: NonNull<c_void>,
@@ -545,7 +569,16 @@ mod tests {
         unsafe {
             restore_transition(&mut state, &mut restore, pointer(), pointer(), 64).unwrap();
         }
-        assert_eq!(restore.calls, [Call::Remap, Call::H2d]);
+        assert_eq!(
+            restore.calls,
+            [
+                Call::Remap,
+                Call::H2d,
+                Call::Fork(0),
+                Call::Fork(1),
+                Call::Fork(2),
+            ]
+        );
         assert_eq!(state, VmmAllocationState::Mapped { generation: 1 });
 
         let mut rejected = MockOps::default();
@@ -583,10 +616,25 @@ mod tests {
     }
 
     #[test]
-    fn every_restore_failure_poison_state_and_cannot_retry() {
+    fn every_restore_and_partial_fork_failure_poison_state_and_cannot_retry() {
         for (fail_at, expected) in [
             (Call::Remap, vec![Call::Remap]),
             (Call::H2d, vec![Call::Remap, Call::H2d]),
+            (Call::Fork(0), vec![Call::Remap, Call::H2d, Call::Fork(0)]),
+            (
+                Call::Fork(1),
+                vec![Call::Remap, Call::H2d, Call::Fork(0), Call::Fork(1)],
+            ),
+            (
+                Call::Fork(2),
+                vec![
+                    Call::Remap,
+                    Call::H2d,
+                    Call::Fork(0),
+                    Call::Fork(1),
+                    Call::Fork(2),
+                ],
+            ),
         ] {
             let mut state = VmmAllocationState::Unmapped;
             let mut operations = MockOps {
