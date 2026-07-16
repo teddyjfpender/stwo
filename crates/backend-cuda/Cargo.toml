@@ -7,6 +7,7 @@ description = "CUDA GPU proving backend for STWO (compile-gated; stub without nv
 
 [features]
 parallel = ["stwo/parallel", "stwo-constraint-framework/parallel"]
+test-only-empty-aot-pack = ["stwo-backend-cuda-kernels/test-only-empty-aot-pack"]
 
 [dependencies]
 blake3.workspace = true

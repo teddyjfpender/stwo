@@ -397,6 +397,12 @@ fn direct_blake_g_native_matches_host_oracle_eager_and_replay() {
         stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT,
         "native Blake-G admission cannot run against CUDA stubs"
     );
+    #[cfg(feature = "test-only-empty-aot-pack")]
+    assert_eq!(
+        stwo_backend_cuda_kernels::aot_pack::aot_pack_entries(),
+        0,
+        "the cheap direct oracle must not pay for unrelated generated AOT cubins"
+    );
 
     let mut input_rows = fixture_inputs();
     let (alphas, z) = eager_challenges();

@@ -122,6 +122,31 @@ pub fn aot_pack_contains(cache_key: u64, sm_major: u32, sm_minor: u32) -> bool {
 mod manifest_tests {
     use super::*;
 
+    #[cfg(all(stwo_cuda_link, not(feature = "test-only-empty-aot-pack")))]
+    fn generated_source_keys() -> std::collections::BTreeSet<u64> {
+        let generated = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("cuda")
+            .join("generated");
+        std::fs::read_dir(generated)
+            .expect("read generated AOT source directory")
+            .map(|entry| entry.expect("read generated AOT source entry").path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "cu"))
+            .map(|path| {
+                let stem = path
+                    .file_stem()
+                    .expect("generated AOT source has a stem")
+                    .to_string_lossy();
+                u64::from_str_radix(
+                    stem.rsplit('_')
+                        .next()
+                        .expect("generated AOT source has a cache key"),
+                    16,
+                )
+                .expect("generated AOT source cache key is hexadecimal")
+            })
+            .collect()
+    }
+
     #[test]
     fn empty_pack_is_explicitly_unbound() {
         if AOT_INDEX.is_empty() {
@@ -148,5 +173,37 @@ mod manifest_tests {
             assert!(aot_pack_contains(cache_key, sm / 10, sm % 10));
         }
         assert!(!aot_pack_contains(0, u32::MAX, u32::MAX));
+    }
+
+    #[cfg(all(stwo_cuda_link, not(feature = "test-only-empty-aot-pack")))]
+    #[test]
+    fn default_cuda_build_embeds_every_generated_source_for_every_arch() {
+        use std::collections::BTreeSet;
+
+        let source_keys = generated_source_keys();
+        let index_keys: BTreeSet<u64> = AOT_INDEX.iter().map(|entry| entry.0).collect();
+        let architectures: BTreeSet<u32> = AOT_INDEX.iter().map(|entry| entry.1).collect();
+
+        assert!(!source_keys.is_empty());
+        assert!(!architectures.is_empty());
+        assert_eq!(index_keys, source_keys);
+        assert_eq!(AOT_INDEX.len(), source_keys.len() * architectures.len());
+        for cache_key in source_keys {
+            for sm in &architectures {
+                assert!(aot_pack_contains(cache_key, sm / 10, sm % 10));
+            }
+        }
+    }
+
+    #[cfg(feature = "test-only-empty-aot-pack")]
+    #[test]
+    fn test_only_pack_is_empty_and_fails_closed() {
+        assert!(AOT_PACK.is_empty());
+        assert_eq!(aot_pack_entries(), 0);
+        assert_eq!(aot_pack_manifest_hash(), 0);
+        assert_eq!(aot_pack_constraint_max_instrs(), 0);
+        assert_eq!(aot_pack_constraint_max_live_u32_lanes(), 0);
+        assert!(!aot_pack_supports_arch(8, 6));
+        assert!(!aot_pack_contains(0, 8, 6));
     }
 }

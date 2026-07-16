@@ -7,3 +7,9 @@ license = "Apache-2.0"
 
 [lib]
 path = "src/lib.rs"
+
+[features]
+# Compile the ordinary CUDA archive but deliberately embed no generated AOT
+# cubins. This exists only for narrow native kernel differential tests; strict
+# resident proving fails closed on the resulting empty pack.
+test-only-empty-aot-pack = []

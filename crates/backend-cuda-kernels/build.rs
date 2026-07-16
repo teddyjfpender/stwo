@@ -345,7 +345,7 @@ fn main() {
         .map(|(source, ..)| source.clone())
         .collect();
     assert_eq!(
-        generated_aot_sources(),
+        aot_sources_for_build(),
         expected_aot_sources,
         "generated AOT source set changed while nvcc was running; retry the build"
     );
@@ -482,6 +482,14 @@ fn generated_aot_sources() -> Vec<PathBuf> {
     sources
 }
 
+fn aot_sources_for_build() -> Vec<PathBuf> {
+    if cfg!(feature = "test-only-empty-aot-pack") {
+        Vec::new()
+    } else {
+        generated_aot_sources()
+    }
+}
+
 /// Compile every `cuda/generated/*.cu` (kernel_emit output: self-contained AOT
 /// module sources named `<kind>_<label>_<cache_key:016x>.cu`) to a standalone
 /// cubin per arch at -O3, and embed them as one pack + index. The runtime's
@@ -501,7 +509,7 @@ fn build_aot_pack(
     constraint_max_instrs: usize,
     constraint_max_live_u32_lanes: usize,
 ) -> Vec<(PathBuf, PathBuf, u128)> {
-    let sources = generated_aot_sources();
+    let sources = aot_sources_for_build();
 
     let cubin_dir = out_dir.join("aot_cubins");
     std::fs::create_dir_all(&cubin_dir).expect("create aot cubin cache dir");
