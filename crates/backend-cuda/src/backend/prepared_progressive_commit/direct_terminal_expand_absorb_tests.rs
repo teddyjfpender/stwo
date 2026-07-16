@@ -1,6 +1,9 @@
 use super::*;
+use crate::backend::exec_context::ArenaSlice;
 use crate::backend::prepared_decommit::TraceTreeRole;
+use crate::backend::prepared_progressive_commit::direct_terminal_expand_absorb_binding::validate_slab;
 use crate::backend::progressive_commit::ProgressiveCommitGroupGeometry;
+use crate::backend::progressive_commit_in_place::PROGRESSIVE_IN_PLACE_SCRATCH_WORDS;
 
 fn programs(
     logs: &[u32],
@@ -139,5 +142,50 @@ fn validation_rejects_cross_program_identity() {
             &other_terminal,
         ),
         Err(DirectTerminalExpandAbsorbError::ProgramIdentity)
+    );
+}
+
+#[test]
+fn binding_rejects_a_compact_sized_successor_slab() {
+    let (base, domain, compact, fused, direct, terminal) = programs(&[3, 4, 5], 6);
+    let program = DirectTerminalExpandAbsorbProgram::compile(
+        &base, &domain, &compact, &fused, &direct, &terminal,
+    )
+    .unwrap();
+    let qualified = program.receipt().qualified_slab_capacity_words;
+    assert_eq!(qualified, domain.slab_words());
+    assert!(qualified > compact.slab_words());
+
+    let slab = ArenaSlice::dangling_for_test(1, qualified);
+    let leaves = slab
+        .checked_subslice(0, base.requirements().merkle.leaf_words)
+        .unwrap();
+    let scratch = slab
+        .checked_subslice(
+            qualified - PROGRESSIVE_IN_PLACE_SCRATCH_WORDS,
+            PROGRESSIVE_IN_PLACE_SCRATCH_WORDS,
+        )
+        .unwrap();
+    validate_slab(&program, &domain, slab, leaves, scratch).unwrap();
+
+    let compact_slab = ArenaSlice::dangling_for_test(1, compact.slab_words());
+    let compact_leaves = compact_slab
+        .checked_subslice(0, base.requirements().merkle.leaf_words)
+        .unwrap();
+    let compact_scratch = compact_slab
+        .checked_subslice(
+            compact.slab_words() - PROGRESSIVE_IN_PLACE_SCRATCH_WORDS,
+            PROGRESSIVE_IN_PLACE_SCRATCH_WORDS,
+        )
+        .unwrap();
+    assert_eq!(
+        validate_slab(
+            &program,
+            &domain,
+            compact_slab,
+            compact_leaves,
+            compact_scratch,
+        ),
+        Err(DirectCompactDomainBindingError::ProgramIdentity)
     );
 }

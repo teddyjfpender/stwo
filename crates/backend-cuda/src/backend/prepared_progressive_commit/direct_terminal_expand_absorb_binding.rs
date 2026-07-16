@@ -159,7 +159,7 @@ pub fn direct_terminal_expand_absorb_arena_slot_requirements(
     Ok(workspace)
 }
 
-fn validate_slab(
+pub(super) fn validate_slab(
     program: &DirectTerminalExpandAbsorbProgram,
     domain: &DomainCooperativeProgram,
     slab: ArenaSlice,
