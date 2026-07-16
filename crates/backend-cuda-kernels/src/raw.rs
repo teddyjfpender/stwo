@@ -2484,6 +2484,7 @@ extern "C" {
         handle: *mut core::ffi::c_void,
         out_stream: *mut *mut core::ffi::c_void,
     ) -> i32;
+    pub fn stwo_exec_context_device(handle: *mut core::ffi::c_void, out_device: *mut i32) -> i32;
     pub fn stwo_exec_context_timing_begin(
         handle: *mut core::ffi::c_void,
         out_interval_capacity: *mut u32,
@@ -2504,6 +2505,7 @@ extern "C" {
     ) -> i32;
     pub fn stwo_exec_context_lane_fork(handle: *mut core::ffi::c_void, lane: u32) -> i32;
     pub fn stwo_exec_context_lane_join(handle: *mut core::ffi::c_void, lane: u32) -> i32;
+    pub fn stwo_exec_context_join_all_lanes(handle: *mut core::ffi::c_void) -> i32;
     pub fn stwo_exec_context_alloc_u32(
         handle: *mut core::ffi::c_void,
         count: usize,
@@ -2540,6 +2542,26 @@ extern "C" {
         src: *const core::ffi::c_void,
         bytes: usize,
     ) -> i32;
+
+    // Whole-allocation VMM storage. One handle owns a stable virtual address and
+    // permits exactly one reclaim/remap cycle (generation 0 -> unmapped -> 1).
+    pub fn stwo_vmm_allocation_create(
+        context_handle: *mut core::ffi::c_void,
+        requested_bytes: usize,
+        out_handle: *mut *mut core::ffi::c_void,
+        out_ptr: *mut *mut core::ffi::c_void,
+        out_mapped_bytes: *mut usize,
+        out_granularity: *mut usize,
+    ) -> i32;
+    pub fn stwo_vmm_allocation_unmap_release(
+        handle: *mut core::ffi::c_void,
+        context_handle: *mut core::ffi::c_void,
+    ) -> i32;
+    pub fn stwo_vmm_allocation_remap_generation1(
+        handle: *mut core::ffi::c_void,
+        context_handle: *mut core::ffi::c_void,
+    ) -> i32;
+    pub fn stwo_vmm_allocation_destroy(handle: *mut core::ffi::c_void) -> i32;
 
     // Opaque CUDA graph lifecycle rooted on the context main stream. Explicit
     // proof-owned lane fork/join edges admit auxiliary streams into the same

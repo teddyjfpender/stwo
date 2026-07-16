@@ -2843,6 +2843,14 @@ pub unsafe extern "C" fn stwo_exec_context_stream(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_exec_context_device(
+    _handle: *mut core::ffi::c_void,
+    _out_device: *mut i32,
+) -> i32 {
+    no_cuda_symbol("stwo_exec_context_device")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stwo_exec_context_timing_begin(
     _handle: *mut core::ffi::c_void,
     _out_interval_capacity: *mut u32,
@@ -2896,6 +2904,11 @@ pub unsafe extern "C" fn stwo_exec_context_lane_join(
     _lane: u32,
 ) -> i32 {
     no_cuda_symbol("stwo_exec_context_lane_join")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_exec_context_join_all_lanes(_handle: *mut core::ffi::c_void) -> i32 {
+    no_cuda_symbol("stwo_exec_context_join_all_lanes")
 }
 
 #[unsafe(no_mangle)]
@@ -2963,6 +2976,39 @@ pub unsafe extern "C" fn stwo_exec_context_memcpy_d2h_async(
     _bytes: usize,
 ) -> i32 {
     no_cuda_symbol("stwo_exec_context_memcpy_d2h_async")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_vmm_allocation_create(
+    _context_handle: *mut core::ffi::c_void,
+    _requested_bytes: usize,
+    _out_handle: *mut *mut core::ffi::c_void,
+    _out_ptr: *mut *mut core::ffi::c_void,
+    _out_mapped_bytes: *mut usize,
+    _out_granularity: *mut usize,
+) -> i32 {
+    no_cuda_symbol("stwo_vmm_allocation_create")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_vmm_allocation_unmap_release(
+    _handle: *mut core::ffi::c_void,
+    _context_handle: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_vmm_allocation_unmap_release")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_vmm_allocation_remap_generation1(
+    _handle: *mut core::ffi::c_void,
+    _context_handle: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_vmm_allocation_remap_generation1")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_vmm_allocation_destroy(_handle: *mut core::ffi::c_void) -> i32 {
+    no_cuda_symbol("stwo_vmm_allocation_destroy")
 }
 
 #[unsafe(no_mangle)]

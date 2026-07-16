@@ -192,6 +192,18 @@ pub struct CudaLaunchContext {
     stream: NonNull<c_void>,
 }
 
+/// Proof that every context-owned component lane has enqueued a join into the
+/// main stream. Only the VMM spill path can construct or consume this token.
+pub(super) struct JoinedCudaLanes<'a> {
+    context: &'a CudaExecContext,
+}
+
+/// Proof that all joined lanes and subsequent main-stream work have completed.
+/// VMM unmapping requires this token; a bare context sync cannot produce it.
+pub(super) struct CudaQuiescence {
+    context_token: NonNull<c_void>,
+}
+
 // CUDA streams may be enqueued from multiple host threads. Ownership and
 // destruction remain with the non-Sync CudaExecContext.
 unsafe impl Send for CudaLaunchContext {}
@@ -217,6 +229,36 @@ impl CudaLaunchContext {
             )
         };
         check_cuda("exec_context_stream_sync", code)
+    }
+}
+
+impl<'a> JoinedCudaLanes<'a> {
+    /// Enqueue the full-allocation spill copy after every lane join.
+    ///
+    /// # Safety
+    ///
+    /// `dst` must be writable and `src` readable for `bytes`. Both ranges must
+    /// remain live until [`Self::sync_main`] succeeds.
+    pub(super) unsafe fn memcpy_d2h_async(
+        &self,
+        dst: *mut c_void,
+        src: *const c_void,
+        bytes: usize,
+    ) -> Result<(), CudaRuntimeError> {
+        unsafe { self.context.memcpy_d2h_async(dst, src, bytes) }
+    }
+
+    pub(super) fn sync_main(self) -> Result<CudaQuiescence, CudaRuntimeError> {
+        self.context.sync()?;
+        Ok(CudaQuiescence {
+            context_token: self.context.identity_token(),
+        })
+    }
+}
+
+impl CudaQuiescence {
+    pub(super) fn context_token(&self) -> NonNull<c_void> {
+        self.context_token
     }
 }
 
@@ -444,6 +486,17 @@ impl CudaExecContext {
         check_cuda("exec_context_lane_join", code)?;
         self.record(|telemetry| telemetry.lane_joins += 1);
         Ok(())
+    }
+
+    /// Join every owned lane into the main stream before a whole-allocation
+    /// spill. Native code rejects this operation while graph capture is active.
+    pub(super) fn join_all_lanes_for_vmm(&self) -> Result<JoinedCudaLanes<'_>, CudaRuntimeError> {
+        let code = unsafe {
+            stwo_backend_cuda_kernels::raw::stwo_exec_context_join_all_lanes(self.handle.as_ptr())
+        };
+        check_cuda("exec_context_join_all_lanes", code)?;
+        self.record(|telemetry| telemetry.lane_joins += self.lanes.len() as u64);
+        Ok(JoinedCudaLanes { context: self })
     }
 
     pub(crate) fn identity_token(&self) -> NonNull<c_void> {

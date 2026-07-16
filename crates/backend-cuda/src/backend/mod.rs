@@ -53,6 +53,7 @@ pub mod quotient_numerator_staged_single_write;
 pub mod quotient_producer_b2n;
 pub mod relation_graph;
 mod secure_column;
+pub mod vmm_allocation;
 
 pub use backend::CudaBackend;
 pub use logup::finalize_raw_logup;

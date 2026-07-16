@@ -264,6 +264,7 @@ pub use backend::relation_graph::{
     RELATION_FUSED_MASK_WORDS, RELATION_FUSED_MAX_COLUMNS, RELATION_FUSED_MAX_INSTANCES,
     RELATION_FUSED_MAX_TUPLE_WORDS, RELATION_POINTER_ALIGNMENT_WORDS,
 };
+pub use backend::vmm_allocation::{VmmAllocation, VmmAllocationError, VmmAllocationState};
 mod columns;
 
 pub use backend::{

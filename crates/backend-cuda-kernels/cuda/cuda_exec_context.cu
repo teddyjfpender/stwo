@@ -38,6 +38,7 @@ struct StwoExecContext {
     cudaEvent_t timing_events[STWO_EXEC_TIMING_EVENT_COUNT];
     uint32_t timing_marker_count;
     cudaMemPool_t pool;
+    int device_id;
 };
 
 StwoExecContext *context_from(void *handle) {
@@ -211,6 +212,7 @@ extern "C" int stwo_exec_context_create(void **out_handle) {
     }
     ctx->timing_marker_count = 0;
     ctx->pool = nullptr;
+    ctx->device_id = -1;
 
     cudaError_t err = cudaStreamCreateWithFlags(&ctx->stream, cudaStreamNonBlocking);
     if (err != cudaSuccess) {
@@ -256,6 +258,7 @@ extern "C" int stwo_exec_context_create(void **out_handle) {
         delete ctx;
         return err;
     }
+    ctx->device_id = device_id;
 
     cudaMemPoolProps props = {};
     props.allocType = cudaMemAllocationTypePinned;
@@ -404,6 +407,20 @@ extern "C" int stwo_exec_context_stream(void *handle, void **out_stream) {
     return *out_stream == nullptr ? cudaErrorInvalidResourceHandle : cudaSuccess;
 }
 
+// Device identity captured when the context was created. VMM allocations use
+// this instead of process-global current-device state for fail-closed ownership.
+extern "C" int stwo_exec_context_device(void *handle, int *out_device) {
+    if (handle == nullptr || out_device == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    const int device = context_from(handle)->device_id;
+    if (device < 0) {
+        return cudaErrorInvalidDevice;
+    }
+    *out_device = device;
+    return cudaSuccess;
+}
+
 // Diagnostic-only device timeline. Events are created on first use, before the
 // first recorded marker, and then reused across warm proofs. Recording a marker
 // is asynchronous; elapsed time is queried only after the proof's existing
@@ -532,6 +549,35 @@ extern "C" int stwo_exec_context_lane_join(void *handle, uint32_t lane) {
         return err;
     }
     return cudaStreamWaitEvent(ctx->stream, ctx->lane_joins[lane], 0);
+}
+
+// Enqueue a join from every owned component lane back to the main stream. This
+// is deliberately rejected during graph capture: host-side VMM unmapping is a
+// transcript-boundary operation and must never become part of a graph epoch.
+extern "C" int stwo_exec_context_join_all_lanes(void *handle) {
+    if (handle == nullptr) {
+        return cudaErrorInvalidResourceHandle;
+    }
+    StwoExecContext *ctx = context_from(handle);
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    cudaError_t err = cudaStreamIsCapturing(ctx->stream, &capture_status);
+    if (err != cudaSuccess) {
+        return err;
+    }
+    if (capture_status != cudaStreamCaptureStatusNone) {
+        return cudaErrorStreamCaptureUnsupported;
+    }
+    for (uint32_t lane = 0; lane < STWO_EXEC_LANE_COUNT; ++lane) {
+        err = cudaEventRecord(ctx->lane_joins[lane], ctx->lanes[lane]);
+        if (err != cudaSuccess) {
+            return err;
+        }
+        err = cudaStreamWaitEvent(ctx->stream, ctx->lane_joins[lane], 0);
+        if (err != cudaSuccess) {
+            return err;
+        }
+    }
+    return cudaSuccess;
 }
 
 // Allocate `count` u32 from the context's pool, ordered on its stream. The returned

@@ -47,6 +47,12 @@ mod tests {
         assert_ne!(raw::stwo_exec_context_timing_begin as usize, 0);
         assert_ne!(raw::stwo_exec_context_timing_mark as usize, 0);
         assert_ne!(raw::stwo_exec_context_timing_elapsed as usize, 0);
+        assert_ne!(raw::stwo_exec_context_device as usize, 0);
+        assert_ne!(raw::stwo_exec_context_join_all_lanes as usize, 0);
+        assert_ne!(raw::stwo_vmm_allocation_create as usize, 0);
+        assert_ne!(raw::stwo_vmm_allocation_unmap_release as usize, 0);
+        assert_ne!(raw::stwo_vmm_allocation_remap_generation1 as usize, 0);
+        assert_ne!(raw::stwo_vmm_allocation_destroy as usize, 0);
         assert_ne!(raw::stwo_preprocessed_alloc_u32_checked as usize, 0);
         assert_ne!(raw::stwo_preprocessed_copy_h2d_checked as usize, 0);
         assert_ne!(raw::stwo_preprocessed_gen_seq_checked as usize, 0);
@@ -58,6 +64,26 @@ mod tests {
         assert_ne!(raw::stwo_blake2s_compact_expand_absorb_quad_on as usize, 0);
         assert_ne!(raw::blake_g_write_trace_fused_direct_into_on as usize, 0);
         assert_ne!(raw::stwo_relation_blake_g_inputs_on as usize, 0);
+    }
+
+    #[test]
+    fn vmm_abi_is_whole_allocation_and_generation_bounded() {
+        type Create = unsafe extern "C" fn(
+            *mut core::ffi::c_void,
+            usize,
+            *mut *mut core::ffi::c_void,
+            *mut *mut core::ffi::c_void,
+            *mut usize,
+            *mut usize,
+        ) -> i32;
+        type Transition =
+            unsafe extern "C" fn(*mut core::ffi::c_void, *mut core::ffi::c_void) -> i32;
+        type Destroy = unsafe extern "C" fn(*mut core::ffi::c_void) -> i32;
+
+        let _: Create = raw::stwo_vmm_allocation_create;
+        let _: Transition = raw::stwo_vmm_allocation_unmap_release;
+        let _: Transition = raw::stwo_vmm_allocation_remap_generation1;
+        let _: Destroy = raw::stwo_vmm_allocation_destroy;
     }
 
     #[test]
