@@ -2563,6 +2563,78 @@ extern "C" {
     ) -> i32;
     pub fn stwo_vmm_allocation_destroy(handle: *mut core::ffi::c_void) -> i32;
 
+    // Dedicated one-owner/one-peer CUDA IPC exchange storage. The memory and
+    // event handles are exactly CUDA_IPC_HANDLE_SIZE (64) opaque bytes.
+    pub fn stwo_ipc_exchange_context_uuid(
+        context_handle: *mut core::ffi::c_void,
+        out_uuid: *mut u8,
+    ) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    pub fn stwo_ipc_exchange_owner_create(
+        context_handle: *mut core::ffi::c_void,
+        logical_bytes: usize,
+        initial_generation: u64,
+        expected_owner_uuid: *const u8,
+        out_handle: *mut *mut core::ffi::c_void,
+        out_pointer: *mut *mut core::ffi::c_void,
+        out_allocation_bytes: *mut usize,
+        out_memory_handle: *mut u8,
+        out_ready_event_handle: *mut u8,
+        out_consumed_event_handle: *mut u8,
+    ) -> i32;
+    pub fn stwo_ipc_exchange_owner_publish(
+        handle: *mut core::ffi::c_void,
+        context_handle: *mut core::ffi::c_void,
+        source: *const core::ffi::c_void,
+        bytes: usize,
+        generation: u64,
+    ) -> i32;
+    pub fn stwo_ipc_exchange_owner_reclaim(
+        handle: *mut core::ffi::c_void,
+        context_handle: *mut core::ffi::c_void,
+        generation: u64,
+    ) -> i32;
+    pub fn stwo_ipc_exchange_owner_mark_peer_closed(
+        handle: *mut core::ffi::c_void,
+        context_handle: *mut core::ffi::c_void,
+        generation: u64,
+    ) -> i32;
+    pub fn stwo_ipc_exchange_owner_close(
+        handle: *mut core::ffi::c_void,
+        context_handle: *mut core::ffi::c_void,
+    ) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    pub fn stwo_ipc_exchange_import_open(
+        context_handle: *mut core::ffi::c_void,
+        logical_bytes: usize,
+        allocation_bytes: usize,
+        initial_generation: u64,
+        expected_peer_uuid: *const u8,
+        memory_handle: *const u8,
+        ready_event_handle: *const u8,
+        consumed_event_handle: *const u8,
+        out_handle: *mut *mut core::ffi::c_void,
+        out_remote_pointer: *mut *mut core::ffi::c_void,
+    ) -> i32;
+    pub fn stwo_ipc_exchange_import_consume(
+        handle: *mut core::ffi::c_void,
+        context_handle: *mut core::ffi::c_void,
+        destination: *mut core::ffi::c_void,
+        bytes: usize,
+        generation: u64,
+    ) -> i32;
+    pub fn stwo_ipc_exchange_import_arm_next(
+        handle: *mut core::ffi::c_void,
+        context_handle: *mut core::ffi::c_void,
+        next_generation: u64,
+    ) -> i32;
+    pub fn stwo_ipc_exchange_import_close(
+        handle: *mut core::ffi::c_void,
+        context_handle: *mut core::ffi::c_void,
+        generation: u64,
+    ) -> i32;
+    pub fn stwo_ipc_exchange_import_destroy(handle: *mut core::ffi::c_void) -> i32;
+
     // Opaque CUDA graph lifecycle rooted on the context main stream. Explicit
     // proof-owned lane fork/join edges admit auxiliary streams into the same
     // captured segment; host transcript work remains outside.

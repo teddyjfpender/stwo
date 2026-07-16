@@ -14,6 +14,7 @@ pub mod exec_tables;
 mod field;
 mod fri;
 mod fused_commit;
+pub mod ipc_exchange;
 mod jit;
 pub mod jit_witness;
 mod logup;

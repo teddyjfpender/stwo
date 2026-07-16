@@ -53,6 +53,17 @@ mod tests {
         assert_ne!(raw::stwo_vmm_allocation_unmap_release as usize, 0);
         assert_ne!(raw::stwo_vmm_allocation_remap_generation1 as usize, 0);
         assert_ne!(raw::stwo_vmm_allocation_destroy as usize, 0);
+        assert_ne!(raw::stwo_ipc_exchange_context_uuid as usize, 0);
+        assert_ne!(raw::stwo_ipc_exchange_owner_create as usize, 0);
+        assert_ne!(raw::stwo_ipc_exchange_owner_publish as usize, 0);
+        assert_ne!(raw::stwo_ipc_exchange_owner_reclaim as usize, 0);
+        assert_ne!(raw::stwo_ipc_exchange_owner_mark_peer_closed as usize, 0);
+        assert_ne!(raw::stwo_ipc_exchange_owner_close as usize, 0);
+        assert_ne!(raw::stwo_ipc_exchange_import_open as usize, 0);
+        assert_ne!(raw::stwo_ipc_exchange_import_consume as usize, 0);
+        assert_ne!(raw::stwo_ipc_exchange_import_arm_next as usize, 0);
+        assert_ne!(raw::stwo_ipc_exchange_import_close as usize, 0);
+        assert_ne!(raw::stwo_ipc_exchange_import_destroy as usize, 0);
         assert_ne!(raw::stwo_preprocessed_alloc_u32_checked as usize, 0);
         assert_ne!(raw::stwo_preprocessed_copy_h2d_checked as usize, 0);
         assert_ne!(raw::stwo_preprocessed_gen_seq_checked as usize, 0);
@@ -84,6 +95,64 @@ mod tests {
         let _: Transition = raw::stwo_vmm_allocation_unmap_release;
         let _: Transition = raw::stwo_vmm_allocation_remap_generation1;
         let _: Destroy = raw::stwo_vmm_allocation_destroy;
+    }
+
+    #[test]
+    fn ipc_exchange_abi_is_dedicated_exact_extent_and_generation_bounded() {
+        type Publish = unsafe extern "C" fn(
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *const core::ffi::c_void,
+            usize,
+            u64,
+        ) -> i32;
+        type Generation =
+            unsafe extern "C" fn(*mut core::ffi::c_void, *mut core::ffi::c_void, u64) -> i32;
+        type Consume = unsafe extern "C" fn(
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            usize,
+            u64,
+        ) -> i32;
+
+        let _: Publish = raw::stwo_ipc_exchange_owner_publish;
+        let _: Generation = raw::stwo_ipc_exchange_owner_reclaim;
+        let _: Generation = raw::stwo_ipc_exchange_owner_mark_peer_closed;
+        let _: Consume = raw::stwo_ipc_exchange_import_consume;
+        let _: Generation = raw::stwo_ipc_exchange_import_arm_next;
+        let _: Generation = raw::stwo_ipc_exchange_import_close;
+    }
+
+    #[test]
+    fn ipc_exchange_source_has_no_pool_host_or_nccl_fallback() {
+        let source = include_str!("../cuda/cuda_ipc_exchange.cu");
+        for required in [
+            "cudaMalloc(&owner->allocation",
+            "kIpcAllocationAlignment = 2u * 1024u * 1024u",
+            "require_exact_allocation",
+            "cudaIpcGetMemHandle",
+            "cudaIpcOpenMemHandle",
+            "cudaEventRecordExternal",
+            "cudaEventWaitExternal",
+        ] {
+            assert!(
+                source.contains(required),
+                "missing IPC contract: {required}"
+            );
+        }
+        for forbidden in [
+            "cudaMallocAsync",
+            "cudaMallocFromPoolAsync",
+            "cudaMemcpyHostToDevice",
+            "cudaMemcpyDeviceToHost",
+            "nccl",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "IPC exchange gained forbidden fallback: {forbidden}"
+            );
+        }
     }
 
     #[test]

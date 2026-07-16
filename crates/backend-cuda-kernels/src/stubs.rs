@@ -3012,6 +3012,117 @@ pub unsafe extern "C" fn stwo_vmm_allocation_destroy(_handle: *mut core::ffi::c_
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_ipc_exchange_context_uuid(
+    _context_handle: *mut core::ffi::c_void,
+    _out_uuid: *mut u8,
+) -> i32 {
+    no_cuda_symbol("stwo_ipc_exchange_context_uuid")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_ipc_exchange_owner_create(
+    _context_handle: *mut core::ffi::c_void,
+    _logical_bytes: usize,
+    _initial_generation: u64,
+    _expected_owner_uuid: *const u8,
+    _out_handle: *mut *mut core::ffi::c_void,
+    _out_pointer: *mut *mut core::ffi::c_void,
+    _out_allocation_bytes: *mut usize,
+    _out_memory_handle: *mut u8,
+    _out_ready_event_handle: *mut u8,
+    _out_consumed_event_handle: *mut u8,
+) -> i32 {
+    no_cuda_symbol("stwo_ipc_exchange_owner_create")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_ipc_exchange_owner_publish(
+    _handle: *mut core::ffi::c_void,
+    _context_handle: *mut core::ffi::c_void,
+    _source: *const core::ffi::c_void,
+    _bytes: usize,
+    _generation: u64,
+) -> i32 {
+    no_cuda_symbol("stwo_ipc_exchange_owner_publish")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_ipc_exchange_owner_reclaim(
+    _handle: *mut core::ffi::c_void,
+    _context_handle: *mut core::ffi::c_void,
+    _generation: u64,
+) -> i32 {
+    no_cuda_symbol("stwo_ipc_exchange_owner_reclaim")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_ipc_exchange_owner_mark_peer_closed(
+    _handle: *mut core::ffi::c_void,
+    _context_handle: *mut core::ffi::c_void,
+    _generation: u64,
+) -> i32 {
+    no_cuda_symbol("stwo_ipc_exchange_owner_mark_peer_closed")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_ipc_exchange_owner_close(
+    _handle: *mut core::ffi::c_void,
+    _context_handle: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_ipc_exchange_owner_close")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_ipc_exchange_import_open(
+    _context_handle: *mut core::ffi::c_void,
+    _logical_bytes: usize,
+    _allocation_bytes: usize,
+    _initial_generation: u64,
+    _expected_peer_uuid: *const u8,
+    _memory_handle: *const u8,
+    _ready_event_handle: *const u8,
+    _consumed_event_handle: *const u8,
+    _out_handle: *mut *mut core::ffi::c_void,
+    _out_remote_pointer: *mut *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_ipc_exchange_import_open")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_ipc_exchange_import_consume(
+    _handle: *mut core::ffi::c_void,
+    _context_handle: *mut core::ffi::c_void,
+    _destination: *mut core::ffi::c_void,
+    _bytes: usize,
+    _generation: u64,
+) -> i32 {
+    no_cuda_symbol("stwo_ipc_exchange_import_consume")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_ipc_exchange_import_arm_next(
+    _handle: *mut core::ffi::c_void,
+    _context_handle: *mut core::ffi::c_void,
+    _next_generation: u64,
+) -> i32 {
+    no_cuda_symbol("stwo_ipc_exchange_import_arm_next")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_ipc_exchange_import_close(
+    _handle: *mut core::ffi::c_void,
+    _context_handle: *mut core::ffi::c_void,
+    _generation: u64,
+) -> i32 {
+    no_cuda_symbol("stwo_ipc_exchange_import_close")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_ipc_exchange_import_destroy(_handle: *mut core::ffi::c_void) -> i32 {
+    no_cuda_symbol("stwo_ipc_exchange_import_destroy")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stwo_graph_capture_begin(_handle: *mut core::ffi::c_void) -> i32 {
     no_cuda_symbol("stwo_graph_capture_begin")
 }
