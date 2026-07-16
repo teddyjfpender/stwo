@@ -1,0 +1,123 @@
+# syntax=docker/dockerfile:1.11@sha256:10c699f1b6c8bdc8f6b4ce8974855dd8542f1768c26eb240237b8f1c9c6c9976
+
+FROM nvidia/cuda:12.8.2-devel-ubuntu24.04@sha256:38ce689230907646c84d57c37653259f8a021ba8c1b1525fa2a0d9654cc895e0
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ARG DEBIAN_FRONTEND=noninteractive
+ENV TZ=Etc/UTC \
+    RUSTUP_HOME=/opt/rust/rustup \
+    CARGO_HOME=/opt/rust/cargo \
+    PATH=/opt/cmake/bin:/opt/rust/cargo/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    CMAKE_GENERATOR=Ninja \
+    CMAKE_C_COMPILER_LAUNCHER=ccache \
+    CMAKE_CXX_COMPILER_LAUNCHER=ccache \
+    CMAKE_CUDA_COMPILER_LAUNCHER=ccache \
+    CCACHE_COMPILERCHECK=content \
+    CCACHE_DIR=/workspace/.cache/ccache \
+    CUDA_CACHE_PATH=/workspace/.cache/cuda \
+    RUSTC_WRAPPER=/usr/local/bin/sccache \
+    SCCACHE_DIR=/workspace/.cache/sccache \
+    STWO_GPU_DEV_IMAGE_VERSION=2026-07-16.1
+
+RUN set -eux; \
+    test "$(dpkg --print-architecture)" = amd64; \
+    apt-get update -qq; \
+    apt-get install -y -qq --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        clang \
+        curl \
+        git \
+        jq \
+        libssl-dev \
+        lld \
+        openssh-server \
+        pkg-config \
+        python3 \
+        python3-pip \
+        python3-venv \
+        rsync \
+        unzip \
+        xz-utils \
+        zstd; \
+    curl -fsSL --retry 5 \
+        https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/nsight-systems-2026.1.3_2026.1.3.425-1_amd64.deb \
+        -o /tmp/nsight-systems.deb; \
+    echo "c7309f1c9850f66a9eb95e7215883b8e8e439df6f65ea0cecd81e6b0181a4e83  /tmp/nsight-systems.deb" \
+        | sha256sum -c -; \
+    apt-get install -y -qq --no-install-recommends /tmp/nsight-systems.deb; \
+    test "$(dpkg-query -W -f='${Version}' nsight-systems-2026.1.3)" = \
+        "2026.1.3.425-261338342291v0"; \
+    rm -f /tmp/nsight-systems.deb; \
+    rm -rf /var/lib/apt/lists/*
+
+RUN set -eux; \
+    curl -fsSL --retry 5 \
+        https://github.com/Kitware/CMake/releases/download/v4.3.3/cmake-4.3.3-linux-x86_64.tar.gz \
+        -o /tmp/cmake.tar.gz; \
+    echo "927b2368a946c37269c3a66225ab00544e756459cdd0b5d0da438694fb9ff802  /tmp/cmake.tar.gz" \
+        | sha256sum -c -; \
+    mkdir -p /opt/cmake; \
+    tar -xzf /tmp/cmake.tar.gz -C /opt/cmake --strip-components=1; \
+    curl -fsSL --retry 5 \
+        https://github.com/ninja-build/ninja/releases/download/v1.13.2/ninja-linux.zip \
+        -o /tmp/ninja.zip; \
+    echo "5749cbc4e668273514150a80e387a957f933c6ed3f5f11e03fb30955e2bbead6  /tmp/ninja.zip" \
+        | sha256sum -c -; \
+    unzip -q /tmp/ninja.zip -d /usr/local/bin; \
+    chmod 0555 /usr/local/bin/ninja; \
+    rm /tmp/cmake.tar.gz /tmp/ninja.zip
+
+RUN set -eux; \
+    curl -fsSL --retry 5 \
+        https://static.rust-lang.org/rustup/archive/1.29.0/x86_64-unknown-linux-gnu/rustup-init \
+        -o /tmp/rustup-init; \
+    echo "4acc9acc76d5079515b46346a485974457b5a79893cfb01112423c89aeb5aa10  /tmp/rustup-init" \
+        | sha256sum -c -; \
+    chmod 0555 /tmp/rustup-init; \
+    /tmp/rustup-init -y --no-modify-path --profile minimal --default-toolchain none; \
+    rustup set auto-self-update disable; \
+    rustup toolchain install nightly-2025-07-14 --profile minimal \
+        --component clippy --component rustfmt; \
+    rustup toolchain install nightly-2025-06-23 --profile minimal \
+        --component clippy --component rustfmt; \
+    rustup default nightly-2025-07-14; \
+    rm /tmp/rustup-init
+
+RUN set -eux; \
+    curl -fsSL --retry 5 \
+        https://github.com/mozilla/sccache/releases/download/v0.16.0/sccache-v0.16.0-x86_64-unknown-linux-musl.tar.gz \
+        -o /tmp/sccache.tar.gz; \
+    echo "aec995a83ad3dff3d14b6314e08858b7b73d35ca85a5bcf3d3a9ec07dee35588  /tmp/sccache.tar.gz" \
+        | sha256sum -c -; \
+    tar -xzf /tmp/sccache.tar.gz -C /tmp; \
+    install -m 0555 \
+        /tmp/sccache-v0.16.0-x86_64-unknown-linux-musl/sccache \
+        /usr/local/bin/sccache; \
+    curl -fsSL --retry 5 \
+        https://github.com/ccache/ccache/releases/download/v4.13.6/ccache-4.13.6-linux-x86_64-musl-static.tar.gz \
+        -o /tmp/ccache.tar.gz; \
+    echo "09e0547a0c3b250a76675c33130366f1399f3580842fb360c052520d56214ead  /tmp/ccache.tar.gz" \
+        | sha256sum -c -; \
+    tar -xzf /tmp/ccache.tar.gz -C /tmp; \
+    install -m 0555 \
+        /tmp/ccache-4.13.6-linux-x86_64-musl-static/ccache \
+        /usr/local/bin/ccache; \
+    rm -rf /tmp/sccache* /tmp/ccache*
+
+COPY --chmod=0555 gpu-lab/docker/consumer-dev-accept /usr/local/bin/stwo-gpu-dev-accept
+COPY --chmod=0555 gpu-lab/docker/consumer-dev-entrypoint /usr/local/bin/stwo-gpu-dev-entrypoint
+COPY gpu-lab/docker/consumer-dev-sshd.conf /etc/ssh/sshd_config.d/20-stwo-consumer-dev.conf
+
+RUN mkdir -p /run/sshd /workspace/.cache/{ccache,cuda,sccache} \
+    && /usr/local/bin/stwo-gpu-dev-accept
+
+WORKDIR /workspace
+EXPOSE 22
+
+HEALTHCHECK --interval=5m --timeout=60s --start-period=30s --retries=3 \
+    CMD ["/usr/local/bin/stwo-gpu-dev-accept"]
+
+ENTRYPOINT ["/usr/local/bin/stwo-gpu-dev-entrypoint"]
+CMD ["/usr/sbin/sshd", "-D", "-e"]

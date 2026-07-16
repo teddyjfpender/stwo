@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+umask 077
+install -d -m 0700 /root/.ssh
+
+if [[ -z "${PUBLIC_KEY:-}" || "$PUBLIC_KEY" == *$'\r'* ]]; then
+    rm -f /root/.ssh/authorized_keys
+    printf 'PUBLIC_KEY must contain one or more SSH public keys\n' >&2
+    exit 1
+fi
+authorized_keys=$(mktemp /root/.ssh/authorized_keys.XXXXXX)
+printf '%s' "$PUBLIC_KEY" > "$authorized_keys"
+[[ "$PUBLIC_KEY" == *$'\n' ]] || printf '\n' >> "$authorized_keys"
+chmod 0600 "$authorized_keys"
+key_count=0
+invalid_public_key=false
+while IFS= read -r public_key; do
+    if [[ -z "$public_key" ]] \
+        || ! printf '%s\n' "$public_key" | ssh-keygen -l -f - >/dev/null 2>&1; then
+        invalid_public_key=true
+        break
+    fi
+    ((key_count += 1))
+done < "$authorized_keys"
+if [[ "$invalid_public_key" == true ]] || ((key_count == 0)); then
+    rm -f "$authorized_keys" /root/.ssh/authorized_keys
+    printf 'PUBLIC_KEY contains a blank or invalid SSH public key\n' >&2
+    exit 1
+fi
+mv -f "$authorized_keys" /root/.ssh/authorized_keys
+
+install -d -m 0700 \
+    /workspace/.cache/ccache \
+    /workspace/.cache/cuda \
+    /workspace/.cache/sccache
+
+session_environment=$(mktemp /root/.ssh/environment.XXXXXX)
+cat > "$session_environment" <<'ENVIRONMENT'
+LD_LIBRARY_PATH=/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/lib64
+LIBRARY_PATH=/usr/local/cuda/lib64/stubs
+ENVIRONMENT
+for name in RUNPOD_POD_ID RUNPOD_VOLUME_ID RUNPOD_DC_ID RUNPOD_GPU_COUNT; do
+    value=${!name:-}
+    if [[ -n "$value" ]]; then
+        [[ "$value" =~ ^[A-Za-z0-9._:-]+$ ]] || {
+            printf 'unsafe %s value\n' "$name" >&2
+            exit 1
+        }
+        printf '%s=%s\n' "$name" "$value" >> "$session_environment"
+    fi
+done
+chmod 0600 "$session_environment"
+mv -f "$session_environment" /root/.ssh/environment
+
+mkdir -p /run/sshd
+ssh-keygen -A
+umask 022
+
+exec /opt/nvidia/nvidia_entrypoint.sh "$@"
