@@ -13,6 +13,13 @@ use super::exec_context::{
 };
 use super::prepared_execution_tables::PreparedExecutionTablesView;
 
+mod authority;
+pub use authority::{
+    EcOpAbiAccess, EcOpAbiArgument, EcOpAbiArgumentKind, EcOpAuthorityError, EcOpCompositeAbi,
+    EcOpCompositeContract, EcOpEffectAbi, EcOpExecutionTableShape, EcOpKernelLaunch,
+    EcOpKernelStage,
+};
+
 pub const EC_OP_TRACE_COLUMNS: usize = 273;
 pub const EC_OP_LOOKUP_WORDS_PER_ROW: usize = 488;
 pub const EC_OP_PARTIAL_INPUT_COLUMNS: usize = 127;
