@@ -27,6 +27,27 @@ const INSTANCE_GEOMETRY_WORDS: usize = 11;
 const FRACTION_INVERSE_BLOCK_VALUES: usize = 1024;
 const M31_MODULUS: u64 = 0x7fff_ffff;
 const LARGE_MEMORY_VALUE_ID_BASE: u32 = 0x4000_0000;
+const BLAKE_G_INPUT_COLUMNS: u32 = 6;
+const BLAKE_G_LOGUP_COLUMNS: usize = 9;
+const BLAKE_G_RELATION_IDS: [u32; 17] = [
+    112_558_620,
+    112_558_620,
+    521_092_554,
+    521_092_554,
+    648_362_599,
+    45_448_144,
+    648_362_599,
+    45_448_144,
+    112_558_620,
+    112_558_620,
+    521_092_554,
+    521_092_554,
+    62_225_763,
+    95_781_001,
+    62_225_763,
+    95_781_001,
+    1_139_985_212,
+];
 /// Mirror of `RELATION_SCAN_TICKET_WORDS` in `relation_scan.cuh`: the ticket
 /// counter (word 0) plus padding to keep the descriptor QM31 fields 16-byte
 /// aligned.
@@ -182,6 +203,9 @@ pub enum RelationTupleKind {
     /// One source-table pointer per tuple operand. Tuple word zero remains the
     /// descriptor's sealed relation id, so no constants are materialized.
     ProjectedColumns = 7,
+    /// Exact Blake-G row reconstruction from six uncommitted input columns.
+    /// Only the isolated fused kernel may execute this descriptor kind.
+    BlakeGInputs = 8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -248,6 +272,9 @@ pub enum RelationSourceLayout {
     /// One column pointer per tuple operand; relation ids and standard
     /// multiplicities stay in their existing descriptors.
     ProjectedColumns { columns: u32 },
+    /// Six canonical Blake-G raw input columns. The relation kernel derives
+    /// every operand and the real-row enabler without an intermediate slab.
+    BlakeGInputs,
     /// `[id0, mult0, id1, mult1, ...]` column pointers.
     MemoryAddress { chunks: u32 },
     /// `[value limbs..., multiplicity]` column pointers.
@@ -263,6 +290,7 @@ impl RelationSourceLayout {
         let count = match self {
             Self::LookupWords { .. } => 1,
             Self::ProjectedColumns { columns } => columns,
+            Self::BlakeGInputs => BLAKE_G_INPUT_COLUMNS,
             Self::MemoryAddress { chunks } => chunks
                 .checked_mul(2)
                 .ok_or(RelationGraphError::SizeOverflow)?,
@@ -319,6 +347,41 @@ pub struct RelationKernelProgram {
     pub batches: Vec<RelationBatchProgram>,
 }
 
+/// Admission gate for the isolated six-input Blake-G relation kernel. The
+/// descriptor order is part of its ABI: eight paired XOR columns followed by
+/// one negative, enabler-gated Blake-G column.
+pub fn blake_g_inputs_batch_is_exact(batch: &RelationBatchProgram) -> bool {
+    if batch.source_layout != RelationSourceLayout::BlakeGInputs
+        || batch.columns.len() != BLAKE_G_LOGUP_COLUMNS
+        || batch.columns[..8]
+            .iter()
+            .any(|column| column.uses.len() != 2)
+        || batch.columns[8].uses.len() != 1
+    {
+        return false;
+    }
+    batch
+        .columns
+        .iter()
+        .flat_map(|column| &column.uses)
+        .enumerate()
+        .all(|(index, relation_use)| {
+            let final_use = index + 1 == BLAKE_G_RELATION_IDS.len();
+            relation_use.tuple_kind == RelationTupleKind::BlakeGInputs
+                && relation_use.tuple_arg == index as u32
+                && relation_use.tuple_words == if final_use { 21 } else { 4 }
+                && relation_use.relation_id == BLAKE_G_RELATION_IDS[index]
+                && relation_use.multiplicity_kind
+                    == if final_use {
+                        RelationMultiplicityKind::Enabler
+                    } else {
+                        RelationMultiplicityKind::One
+                    }
+                && relation_use.multiplicity_arg == 0
+                && relation_use.negative == final_use
+        })
+}
+
 impl RelationKernelProgram {
     pub fn validate(&self) -> Result<(), RelationGraphError> {
         if self.relation_graph_hash == 0 {
@@ -333,6 +396,11 @@ impl RelationKernelProgram {
                 return Err(RelationGraphError::EmptyBatch(batch_index));
             }
             let _ = batch.source_layout.pointer_count()?;
+            if matches!(batch.source_layout, RelationSourceLayout::BlakeGInputs)
+                && !blake_g_inputs_batch_is_exact(batch)
+            {
+                return Err(RelationGraphError::InvalidBlakeGInputsBatch);
+            }
             for column in &batch.columns {
                 let _ = column.to_words()?;
                 use_count = use_count
@@ -601,6 +669,14 @@ pub fn relation_graph_requirements_for_mode(
     mode: RelationLaunchMode,
 ) -> Result<RelationGraphRequirements, RelationGraphError> {
     program.validate()?;
+    if mode != RelationLaunchMode::Fused
+        && program
+            .batches
+            .iter()
+            .any(|batch| matches!(batch.source_layout, RelationSourceLayout::BlakeGInputs))
+    {
+        return Err(RelationGraphError::BlakeGInputsRequireFused);
+    }
     let instance_count = program.batches.iter().try_fold(0usize, |count, batch| {
         count
             .checked_add(batch.instances.len())
@@ -821,6 +897,15 @@ fn validate_use(
             .checked_sub(1)
             .and_then(|operand_words| relation_use.tuple_arg.checked_add(operand_words))
             .is_some_and(|end| end <= columns),
+        (RelationSourceLayout::BlakeGInputs, RelationTupleKind::BlakeGInputs) => {
+            relation_use.tuple_arg < BLAKE_G_RELATION_IDS.len() as u32
+                && relation_use.tuple_words
+                    == if relation_use.tuple_arg + 1 == BLAKE_G_RELATION_IDS.len() as u32 {
+                        21
+                    } else {
+                        4
+                    }
+        }
         (RelationSourceLayout::MemoryAddress { chunks }, RelationTupleKind::MemoryAddressChunk) => {
             relation_use.tuple_arg < chunks && relation_use.tuple_words == 3
         }
@@ -892,6 +977,8 @@ fn validate_use(
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RelationGraphError {
     InvalidGraphHash,
+    InvalidBlakeGInputsBatch,
+    BlakeGInputsRequireFused,
     MissingAlphaPowers,
     EmptyBatch(usize),
     InvalidColumnArity(usize),
@@ -1011,6 +1098,9 @@ struct PreparedInstance {
     n_source_pointers: u32,
     /// Static fused-lane eligibility (see [`relation_batch_fused_eligible`]).
     fused_eligible: bool,
+    /// Isolated six-input Blake-G body. It is deliberately excluded from the
+    /// generic fused mask so its register allocation cannot affect other AIRs.
+    blake_g_inputs: bool,
 }
 
 /// Descriptor-complete executable relation graph. The arena borrow makes every
@@ -1260,6 +1350,7 @@ impl<'a> PreparedRelationGraph<'a> {
                 n_source_pointers: u32::try_from(expected_sources)
                     .map_err(|_| RelationGraphError::SizeOverflow)?,
                 fused_eligible: relation_batch_fused_eligible(batch),
+                blake_g_inputs: matches!(batch.source_layout, RelationSourceLayout::BlakeGInputs),
             });
         }
 
@@ -1408,18 +1499,25 @@ impl<'a> PreparedRelationGraph<'a> {
         if self.instances.is_empty() {
             return Ok(());
         }
-        let eligibility = self
+        let generic_eligibility = self
             .instances
             .iter()
-            .map(|instance| instance.fused_eligible)
+            .map(|instance| instance.fused_eligible && !instance.blake_g_inputs)
             .collect::<Vec<_>>();
+        let has_blake_g_inputs = self
+            .instances
+            .iter()
+            .any(|instance| instance.blake_g_inputs);
         // Fail closed: proofs beyond the mask capacity, or with no eligible
         // instance, run the whole 3-stage lane even when fused was requested.
         let fused_mask = match mode {
-            RelationLaunchMode::Fused => {
-                fused_eligibility_mask(&eligibility).filter(|_| eligibility.contains(&true))
+            RelationLaunchMode::Fused
+                if generic_eligibility.contains(&true) || has_blake_g_inputs =>
+            {
+                fused_eligibility_mask(&generic_eligibility)
             }
             RelationLaunchMode::ThreeStage => None,
+            RelationLaunchMode::Fused => None,
         };
         match fused_mask {
             Some(mask) => self.launch_fused_body(&mask),
@@ -1488,24 +1586,50 @@ impl<'a> PreparedRelationGraph<'a> {
     ) -> Result<(), RelationGraphError> {
         let stream = self.arena.context().stream_raw().as_ptr();
         let geometry = self.fraction_geometry.as_u32_ptr().cast_const();
-        check_cuda("relation_fused_on", unsafe {
-            stwo_backend_cuda_kernels::raw::stwo_relation_fused_on(
-                self.pointer_table(0)?.cast(),
-                self.pointer_table(1)?.cast(),
-                self.pointer_table(2)?.cast(),
-                geometry,
-                self.n_instances()?,
-                self.fraction_chain_blocks,
-                self.alphas.as_u32_ptr().cast_const(),
-                self.n_alpha_powers()?,
-                self.z.as_u32_ptr().cast_const(),
-                mask.as_ptr(),
-                stream,
-            )
-        })?;
+        if mask.iter().any(|&word| word != 0) {
+            check_cuda("relation_fused_on", unsafe {
+                stwo_backend_cuda_kernels::raw::stwo_relation_fused_on(
+                    self.pointer_table(0)?.cast(),
+                    self.pointer_table(1)?.cast(),
+                    self.pointer_table(2)?.cast(),
+                    geometry,
+                    self.n_instances()?,
+                    self.fraction_chain_blocks,
+                    self.alphas.as_u32_ptr().cast_const(),
+                    self.n_alpha_powers()?,
+                    self.z.as_u32_ptr().cast_const(),
+                    mask.as_ptr(),
+                    stream,
+                )
+            })?;
+        }
+        for instance in self
+            .instances
+            .iter()
+            .filter(|instance| instance.blake_g_inputs)
+        {
+            check_cuda("relation_blake_g_inputs_on", unsafe {
+                stwo_backend_cuda_kernels::raw::stwo_relation_blake_g_inputs_on(
+                    instance.source_pointers.as_u32_ptr().cast_const().cast(),
+                    instance.n_source_pointers,
+                    instance.output.rows,
+                    instance.n_real_rows,
+                    self.alphas.as_u32_ptr().cast_const(),
+                    self.n_alpha_powers()?,
+                    self.z.as_u32_ptr().cast_const(),
+                    instance.output_pointers.as_u32_ptr().cast_const().cast(),
+                    instance.output.columns,
+                    stream,
+                )
+            })?;
+        }
         // Statically ineligible instances keep the exact per-instance 3-stage
         // sequence (pairs, then in-place slab inverse + fraction chain).
-        for instance in self.instances.iter().filter(|i| !i.fused_eligible) {
+        for instance in self
+            .instances
+            .iter()
+            .filter(|instance| !instance.fused_eligible && !instance.blake_g_inputs)
+        {
             check_cuda("relation_pairs_on", unsafe {
                 stwo_backend_cuda_kernels::raw::stwo_relation_pairs_on(
                     instance.source_pointers.as_u32_ptr().cast_const().cast(),
@@ -1897,6 +2021,55 @@ mod tests {
         }
     }
 
+    fn blake_g_inputs_batch() -> RelationBatchProgram {
+        let mut use_index = 0usize;
+        let columns = (0..BLAKE_G_LOGUP_COLUMNS)
+            .map(|column| {
+                let arity = if column < 8 { 2 } else { 1 };
+                let uses = (0..arity)
+                    .map(|_| {
+                        let final_use = use_index + 1 == BLAKE_G_RELATION_IDS.len();
+                        let relation_use = RelationUseDescriptor {
+                            tuple_kind: RelationTupleKind::BlakeGInputs,
+                            tuple_arg: use_index as u32,
+                            tuple_words: if final_use { 21 } else { 4 },
+                            relation_id: BLAKE_G_RELATION_IDS[use_index],
+                            multiplicity_kind: if final_use {
+                                RelationMultiplicityKind::Enabler
+                            } else {
+                                RelationMultiplicityKind::One
+                            },
+                            multiplicity_arg: 0,
+                            negative: final_use,
+                        };
+                        use_index += 1;
+                        relation_use
+                    })
+                    .collect();
+                RelationColumnDescriptor { uses }
+            })
+            .collect();
+        assert_eq!(use_index, BLAKE_G_RELATION_IDS.len());
+        RelationBatchProgram {
+            source_layout: RelationSourceLayout::BlakeGInputs,
+            columns,
+            instances: vec![RelationRowExtent::Exact {
+                n_real_rows: 6,
+                padded_rows: 8,
+                source_offset_rows: 0,
+            }],
+        }
+    }
+
+    fn blake_g_inputs_program() -> RelationKernelProgram {
+        RelationKernelProgram {
+            relation_graph_hash: 0xb1a6_e601,
+            template_use_count: BLAKE_G_RELATION_IDS.len(),
+            max_alpha_powers: 21,
+            batches: vec![blake_g_inputs_batch()],
+        }
+    }
+
     fn sample_slots() -> RelationGraphSlots {
         let mut next = 0u32;
         let mut id = || {
@@ -1984,6 +2157,89 @@ mod tests {
             slot_requirements[11].alignment_words,
             RELATION_POINTER_ALIGNMENT_WORDS
         );
+    }
+
+    #[test]
+    fn exact_blake_g_inputs_descriptor_is_fused_only_and_six_source() {
+        let program = blake_g_inputs_program();
+        let batch = &program.batches[0];
+        assert!(blake_g_inputs_batch_is_exact(batch));
+        assert_eq!(batch.source_layout.pointer_count().unwrap(), 6);
+        assert!(program.validate().is_ok());
+        assert_eq!(
+            program.requirements_for_mode(RelationLaunchMode::ThreeStage),
+            Err(RelationGraphError::BlakeGInputsRequireFused)
+        );
+        let requirements = program
+            .requirements_for_mode(RelationLaunchMode::Fused)
+            .unwrap();
+        assert_eq!(requirements.instances.len(), 1);
+        assert_eq!(
+            requirements.instances[0].source_pointer_words,
+            6 * POINTER_WORDS
+        );
+        assert_eq!(requirements.instances[0].output_coordinate_count, 36);
+        assert_eq!(
+            requirements.instances[0].output_words,
+            8 * 9 * SECURE_FIELD_WORDS
+        );
+        assert_eq!(requirements.instances[0].denominator_words, 1);
+        assert_eq!(
+            requirements.instances[0].claimed_sum_words,
+            SECURE_FIELD_WORDS
+        );
+    }
+
+    #[test]
+    fn blake_g_inputs_descriptor_mutations_fail_closed() {
+        fn rejected(
+            mut batch: RelationBatchProgram,
+            mutate: impl FnOnce(&mut RelationBatchProgram),
+        ) {
+            mutate(&mut batch);
+            assert!(!blake_g_inputs_batch_is_exact(&batch));
+            let mut program = blake_g_inputs_program();
+            program.batches[0] = batch;
+            assert_eq!(
+                program.validate(),
+                Err(RelationGraphError::InvalidBlakeGInputsBatch)
+            );
+        }
+
+        let canonical = blake_g_inputs_batch();
+        rejected(canonical.clone(), |batch| {
+            batch.columns.pop().map(drop).unwrap()
+        });
+        rejected(canonical.clone(), |batch| {
+            batch.columns[0].uses.pop().map(drop).unwrap()
+        });
+        rejected(canonical.clone(), |batch| {
+            batch.columns[0].uses[0].tuple_kind = RelationTupleKind::LookupWords
+        });
+        rejected(canonical.clone(), |batch| {
+            batch.columns[0].uses[0].tuple_arg = 1
+        });
+        rejected(canonical.clone(), |batch| {
+            batch.columns[0].uses[0].tuple_words = 5
+        });
+        rejected(canonical.clone(), |batch| {
+            batch.columns[0].uses[0].relation_id ^= 1
+        });
+        rejected(canonical.clone(), |batch| {
+            batch.columns[0].uses[0].multiplicity_kind = RelationMultiplicityKind::Enabler
+        });
+        rejected(canonical.clone(), |batch| {
+            batch.columns[0].uses[0].multiplicity_arg = 1
+        });
+        rejected(canonical.clone(), |batch| {
+            batch.columns[0].uses[0].negative = true
+        });
+        rejected(canonical.clone(), |batch| {
+            batch.columns[8].uses[0].negative = false
+        });
+        rejected(canonical, |batch| {
+            batch.columns[8].uses[0].multiplicity_kind = RelationMultiplicityKind::One
+        });
     }
 
     #[test]

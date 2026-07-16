@@ -254,15 +254,15 @@ pub use backend::quotient_producer_b2n::{
     QUOTIENT_PRODUCER_B2N_REQUIRED_SM_ARCH, QUOTIENT_PRODUCER_BATCH_INVERSE_CHUNK,
 };
 pub use backend::relation_graph::{
-    relation_batch_fused_eligible, relation_batch_one_read_eligible, relation_graph_requirements,
-    PreparedRelationGraph, PreparedRelationOutput, RelationArenaSlotRequirement,
-    RelationBatchProgram, RelationChallenges, RelationColumnDescriptor, RelationGraphError,
-    RelationGraphRequirements, RelationGraphSlots, RelationInstanceRequirement,
-    RelationInstanceSlots, RelationInstanceSources, RelationKernelProgram, RelationLaunchMode,
-    RelationMultiplicityKind, RelationRowExtent, RelationSourceLayout, RelationTailMode,
-    RelationTupleKind, RelationUseDescriptor, RELATION_FUSED_MASK_WORDS,
-    RELATION_FUSED_MAX_COLUMNS, RELATION_FUSED_MAX_INSTANCES, RELATION_FUSED_MAX_TUPLE_WORDS,
-    RELATION_POINTER_ALIGNMENT_WORDS,
+    blake_g_inputs_batch_is_exact, relation_batch_fused_eligible, relation_batch_one_read_eligible,
+    relation_graph_requirements, PreparedRelationGraph, PreparedRelationOutput,
+    RelationArenaSlotRequirement, RelationBatchProgram, RelationChallenges,
+    RelationColumnDescriptor, RelationGraphError, RelationGraphRequirements, RelationGraphSlots,
+    RelationInstanceRequirement, RelationInstanceSlots, RelationInstanceSources,
+    RelationKernelProgram, RelationLaunchMode, RelationMultiplicityKind, RelationRowExtent,
+    RelationSourceLayout, RelationTailMode, RelationTupleKind, RelationUseDescriptor,
+    RELATION_FUSED_MASK_WORDS, RELATION_FUSED_MAX_COLUMNS, RELATION_FUSED_MAX_INSTANCES,
+    RELATION_FUSED_MAX_TUPLE_WORDS, RELATION_POINTER_ALIGNMENT_WORDS,
 };
 mod columns;
 

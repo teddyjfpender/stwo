@@ -1897,6 +1897,21 @@ extern "C" {
         stream: *mut core::ffi::c_void,
     ) -> i32;
 
+    /// Isolated exact Blake-G relation body. Six raw input columns produce all
+    /// 36 interaction coordinates without a flattened lookup slab.
+    pub fn stwo_relation_blake_g_inputs_on(
+        sources: *const *const u32,
+        n_sources: u32,
+        n_rows: u32,
+        n_real: u32,
+        alpha_powers: *const u32,
+        n_alpha_powers: u32,
+        z: *const u32,
+        outputs: *const *mut u32,
+        n_outputs: u32,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
     pub fn stwo_relation_fraction_chain_on(
         outputs: *const *mut u32,
         denominators: *mut u32,
@@ -2209,6 +2224,18 @@ extern "C" {
         column_length: u32,
         trace_cols_host: *const *mut u32,
         aux: *mut u32,
+        luts_host: *const *const u32,
+        counts_host: *const *mut u32,
+        stream: *mut c_void,
+    ) -> i32;
+
+    /// Replacement producer/feed fusion. The enabler is synthesized and no
+    /// flattened lookup or auxiliary relation slab is written.
+    pub fn blake_g_write_trace_fused_direct_into_on(
+        input_cols_host: *const *const u32,
+        n_rows: u32,
+        column_length: u32,
+        trace_cols_host: *const *mut u32,
         luts_host: *const *const u32,
         counts_host: *const *mut u32,
         stream: *mut c_void,

@@ -245,6 +245,22 @@ pub unsafe extern "C" fn stwo_relation_fused_on(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_relation_blake_g_inputs_on(
+    _sources: *const *const u32,
+    _n_sources: u32,
+    _n_rows: u32,
+    _n_real: u32,
+    _alpha_powers: *const u32,
+    _n_alpha_powers: u32,
+    _z: *const u32,
+    _outputs: *const *mut u32,
+    _n_outputs: u32,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_relation_blake_g_inputs_on")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stwo_relation_fraction_chain_on(
     _outputs: *const *mut u32,
     _denominators: *mut u32,
@@ -752,6 +768,28 @@ pub unsafe extern "C" fn blake_g_write_trace_fused_projected_into_on(
         stream,
     );
     no_cuda_symbol("blake_g_write_trace_fused_projected_into_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn blake_g_write_trace_fused_direct_into_on(
+    input_cols_host: *const *const u32,
+    n_rows: u32,
+    column_length: u32,
+    trace_cols_host: *const *mut u32,
+    luts_host: *const *const u32,
+    counts_host: *const *mut u32,
+    stream: *mut core::ffi::c_void,
+) -> i32 {
+    let _ = (
+        input_cols_host,
+        n_rows,
+        column_length,
+        trace_cols_host,
+        luts_host,
+        counts_host,
+        stream,
+    );
+    no_cuda_symbol("blake_g_write_trace_fused_direct_into_on")
 }
 
 #[unsafe(no_mangle)]

@@ -249,7 +249,7 @@ impl WitnessWorkspaceRequirements {
         &self,
         slots: &WitnessWorkspaceSlots,
     ) -> Result<Vec<WitnessArenaSlotRequirement>, PreparedWitnessError> {
-        self.arena_slot_requirements_inner(slots, true, true)
+        self.arena_slot_requirements_inner(slots, true, true, true, self.input_column_words.len())
     }
 
     /// Arena requirements when the execution-table descriptor pair is supplied
@@ -259,7 +259,7 @@ impl WitnessWorkspaceRequirements {
         &self,
         slots: &WitnessWorkspaceSlots,
     ) -> Result<Vec<WitnessArenaSlotRequirement>, PreparedWitnessError> {
-        self.arena_slot_requirements_inner(slots, false, true)
+        self.arena_slot_requirements_inner(slots, false, true, true, self.input_column_words.len())
     }
 
     /// Exact native Blake-G contract: the fused producer never executes the
@@ -274,25 +274,80 @@ impl WitnessWorkspaceRequirements {
                 "retired sub destination must alias the existing dummy",
             ));
         }
-        self.arena_slot_requirements_inner(slots, false, false)
+        self.arena_slot_requirements_inner(slots, false, true, false, self.input_column_words.len())
+    }
+
+    /// Replacement Blake-G contract: six raw inputs stay live, while the
+    /// enabler is synthesized from `row < n_real` and both flattened writer
+    /// tails are absent. Their logical slot IDs must all name the existing
+    /// one-word multiplicity dummy, making accidental materialization fail
+    /// before arena construction.
+    pub fn arena_slot_requirements_for_blake_g_direct_with_prepared_execution_tables(
+        &self,
+        slots: &WitnessWorkspaceSlots,
+    ) -> Result<Vec<WitnessArenaSlotRequirement>, PreparedWitnessError> {
+        let canonical = self.row_count > 0
+            && self.input_column_words.len() == BG_N_RECORDED_INPUTS
+            && self
+                .input_column_words
+                .iter()
+                .all(|&words| words == self.row_count)
+            && self.input_pointer_words == pointer_words(BG_N_RECORDED_INPUTS)?
+            && self.output_column_words.len() == BG_N_TRACE
+            && self
+                .output_column_words
+                .iter()
+                .all(|&words| words == self.row_count)
+            && self.output_pointer_words == pointer_words(BG_N_TRACE)?
+            && self.multiplicity_column_words.is_empty()
+            && self.multiplicity_pointer_words == POINTER_WORDS
+            && self.multiplicity_dummy_words == Some(1)
+            && self.lookup_words
+                == self
+                    .row_count
+                    .checked_mul(BG_N_LOOKUP_WORDS)
+                    .ok_or(PreparedWitnessError::SizeOverflow)?
+            && self.sub_words
+                == self
+                    .row_count
+                    .checked_mul(BG_N_SUB_WORDS)
+                    .ok_or(PreparedWitnessError::SizeOverflow)?;
+        if !canonical {
+            return Err(PreparedWitnessError::BlakeGFusionShape(
+                "direct blake_g workspace geometry drifted",
+            ));
+        }
+        if slots.multiplicity_dummy != Some(slots.lookup_words)
+            || slots.multiplicity_dummy != Some(slots.sub_words)
+        {
+            return Err(PreparedWitnessError::BlakeGFusionShape(
+                "retired lookup and sub destinations must alias the existing dummy",
+            ));
+        }
+        self.arena_slot_requirements_inner(slots, false, false, false, BG_N_DATA_INPUTS)
     }
 
     fn arena_slot_requirements_inner(
         &self,
         slots: &WitnessWorkspaceSlots,
         include_execution_tables: bool,
+        include_lookup_words: bool,
         include_sub_words: bool,
+        input_columns: usize,
     ) -> Result<Vec<WitnessArenaSlotRequirement>, PreparedWitnessError> {
-        validate_slot_shape(self, slots)?;
+        validate_slot_shape(self, slots, input_columns)?;
         let mut result = Vec::new();
         result.extend(
             slots
                 .input_columns
                 .iter()
-                .zip(&self.input_column_words)
+                .zip(&self.input_column_words[..input_columns])
                 .map(|(&id, &len_words)| words(id, len_words)),
         );
-        result.push(pointers(slots.input_pointers, self.input_pointer_words));
+        result.push(pointers(
+            slots.input_pointers,
+            pointer_words(input_columns)?,
+        ));
         if include_execution_tables {
             result.extend([
                 pointers(
@@ -329,7 +384,9 @@ impl WitnessWorkspaceRequirements {
         {
             result.push(words(id, len_words));
         }
-        result.push(words(slots.lookup_words, self.lookup_words));
+        if include_lookup_words {
+            result.push(words(slots.lookup_words, self.lookup_words));
+        }
         if include_sub_words {
             result.push(words(slots.sub_words, self.sub_words));
         }
@@ -504,6 +561,7 @@ enum WitnessExecutionTables<'a> {
 enum WitnessLaunchContract {
     Recorded,
     BlakeGFused,
+    BlakeGDirect,
 }
 
 /// Fail-closed identity gate for the hand-lowered Blake-G implementation.
@@ -665,6 +723,30 @@ impl<'a> PreparedWitnessGraph<'a> {
         )
     }
 
+    /// Prepare the replacement Blake-G producer/feed body. Only the six raw
+    /// data inputs and 53 committed trace columns are retained; the recorded
+    /// enabler input, lookup slab, and sub slab are structurally absent.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_blake_g_direct_with_execution_tables(
+        arena: &'a DeviceArena,
+        program: &WitnessProgram,
+        row_count: usize,
+        tables: PreparedExecutionTablesView<'a>,
+        slots: &WitnessWorkspaceSlots,
+        mode: PreparedWitnessMode,
+    ) -> Result<Self, PreparedWitnessError> {
+        Self::prepare_inner(
+            arena,
+            program,
+            row_count,
+            &[],
+            WitnessExecutionTables::Prepared(tables),
+            slots,
+            mode,
+            WitnessLaunchContract::BlakeGDirect,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn prepare_inner(
         arena: &'a DeviceArena,
@@ -681,8 +763,10 @@ impl<'a> PreparedWitnessGraph<'a> {
         }
         jit_witness::isa::validate_isa_layout().map_err(PreparedWitnessError::InvalidIsa)?;
         let requirements = witness_workspace_requirements(program, row_count, multiplicity_words)?;
-        if launch_contract == WitnessLaunchContract::BlakeGFused
-            && !blake_g_fusion_program_is_exact(program)
+        if matches!(
+            launch_contract,
+            WitnessLaunchContract::BlakeGFused | WitnessLaunchContract::BlakeGDirect
+        ) && !blake_g_fusion_program_is_exact(program)
         {
             return Err(PreparedWitnessError::BlakeGFusionShape(
                 "recorded blake_g program identity drifted",
@@ -701,19 +785,29 @@ impl<'a> PreparedWitnessGraph<'a> {
                         slots,
                     )?
             }
-            (WitnessExecutionTables::Legacy(_), WitnessLaunchContract::BlakeGFused) => {
+            (WitnessExecutionTables::Prepared(_), WitnessLaunchContract::BlakeGDirect) => {
+                requirements
+                    .arena_slot_requirements_for_blake_g_direct_with_prepared_execution_tables(
+                        slots,
+                    )?
+            }
+            (
+                WitnessExecutionTables::Legacy(_),
+                WitnessLaunchContract::BlakeGFused | WitnessLaunchContract::BlakeGDirect,
+            ) => {
                 return Err(PreparedWitnessError::BlakeGFusionShape(
                     "fused blake_g requires prepared execution tables",
                 ));
             }
         };
 
-        let input_columns = bind_many(
-            arena,
-            &slots.input_columns,
-            &requirements.input_column_words,
-            1,
-        )?;
+        let direct_blake_g = launch_contract == WitnessLaunchContract::BlakeGDirect;
+        let input_column_words = if direct_blake_g {
+            &requirements.input_column_words[..BG_N_DATA_INPUTS]
+        } else {
+            &requirements.input_column_words
+        };
+        let input_columns = bind_many(arena, &slots.input_columns, input_column_words, 1)?;
         let output_columns = bind_many(
             arena,
             &slots.output_columns,
@@ -729,7 +823,7 @@ impl<'a> PreparedWitnessGraph<'a> {
         let input_pointers = bind_slot(
             arena,
             slots.input_pointers,
-            requirements.input_pointer_words,
+            pointer_words(input_column_words.len())?,
             WITNESS_POINTER_ALIGNMENT_WORDS,
         )?;
         let (execution_table_pointers, execution_table_strides) = match tables {
@@ -774,12 +868,18 @@ impl<'a> PreparedWitnessGraph<'a> {
             (None, None) => None,
             _ => unreachable!("slot shape validated"),
         };
-        let lookup_words = bind_slot(arena, slots.lookup_words, requirements.lookup_words, 1)?;
+        let lookup_words = if direct_blake_g {
+            multiplicity_dummy.ok_or(PreparedWitnessError::BlakeGFusionShape(
+                "direct blake_g is missing its one-word dummy",
+            ))?
+        } else {
+            bind_slot(arena, slots.lookup_words, requirements.lookup_words, 1)?
+        };
         let sub_words = match launch_contract {
             WitnessLaunchContract::Recorded => {
                 bind_slot(arena, slots.sub_words, requirements.sub_words, 1)?
             }
-            WitnessLaunchContract::BlakeGFused => {
+            WitnessLaunchContract::BlakeGFused | WitnessLaunchContract::BlakeGDirect => {
                 multiplicity_dummy.ok_or(PreparedWitnessError::BlakeGFusionShape(
                     "fused blake_g is missing its one-word dummy",
                 ))?
@@ -807,8 +907,8 @@ impl<'a> PreparedWitnessGraph<'a> {
                 execution_table_strides,
                 output_pointers,
                 multiplicity_pointers,
-                lookup_words,
             ])
+            .chain((!direct_blake_g).then_some(lookup_words))
             .chain(multiplicity_dummy)
             .chain((launch_contract == WitnessLaunchContract::Recorded).then_some(sub_words))
             .chain(prepared_table_data.into_iter().flatten());
@@ -956,14 +1056,56 @@ impl<'a> PreparedWitnessGraph<'a> {
         luts: [ArenaSlice; 4],
         counts: [ArenaSlice; 5],
     ) -> Result<PreparedWitnessLaunchTelemetry, PreparedWitnessError> {
+        self.launch_blake_g_native_on(
+            launch,
+            n_real_rows,
+            luts,
+            counts,
+            WitnessLaunchContract::BlakeGFused,
+        )
+    }
+
+    /// Launch the replacement producer/feed body without materializing either
+    /// writer tail. The six input slices remain available to the isolated
+    /// direct relation body after this launch.
+    pub fn launch_blake_g_direct_on(
+        &self,
+        launch: CudaLaunchContext,
+        n_real_rows: usize,
+        luts: [ArenaSlice; 4],
+        counts: [ArenaSlice; 5],
+    ) -> Result<PreparedWitnessLaunchTelemetry, PreparedWitnessError> {
+        self.launch_blake_g_native_on(
+            launch,
+            n_real_rows,
+            luts,
+            counts,
+            WitnessLaunchContract::BlakeGDirect,
+        )
+    }
+
+    fn launch_blake_g_native_on(
+        &self,
+        launch: CudaLaunchContext,
+        n_real_rows: usize,
+        luts: [ArenaSlice; 4],
+        counts: [ArenaSlice; 5],
+        contract: WitnessLaunchContract,
+    ) -> Result<PreparedWitnessLaunchTelemetry, PreparedWitnessError> {
         if launch.identity_token() != self.arena.context().identity_token() {
             return Err(CudaRuntimeError::ContextMismatch.into());
         }
-        if self.launch_contract != WitnessLaunchContract::BlakeGFused
+        if self.launch_contract != contract
             || self.identity.label != "blake_g"
-            || self.input_columns.len() != BG_N_RECORDED_INPUTS
+            || self.input_columns.len()
+                != if contract == WitnessLaunchContract::BlakeGDirect {
+                    BG_N_DATA_INPUTS
+                } else {
+                    BG_N_RECORDED_INPUTS
+                }
             || self.output_columns.len() != BG_N_TRACE
-            || self.lookup_words.len_words() < BG_N_LOOKUP_WORDS * self.row_count as usize
+            || (contract == WitnessLaunchContract::BlakeGFused
+                && self.lookup_words.len_words() < BG_N_LOOKUP_WORDS * self.row_count as usize)
             || n_real_rows > self.row_count as usize
         {
             return Err(PreparedWitnessError::BlakeGFusionShape(
@@ -989,7 +1131,7 @@ impl<'a> PreparedWitnessGraph<'a> {
             .iter()
             .copied()
             .chain(self.output_columns.iter().copied())
-            .chain(core::iter::once(self.lookup_words))
+            .chain((contract == WitnessLaunchContract::BlakeGFused).then_some(self.lookup_words))
             .chain(luts)
             .chain(counts);
         ensure_physically_disjoint(live_slices)?;
@@ -1000,17 +1142,35 @@ impl<'a> PreparedWitnessGraph<'a> {
             std::array::from_fn(|column| self.output_columns[column].as_u32_ptr());
         let lut_ptrs = luts.map(|slice| slice.as_u32_ptr().cast_const());
         let count_ptrs = counts.map(ArenaSlice::as_u32_ptr);
+        let n_real_rows =
+            u32::try_from(n_real_rows).map_err(|_| PreparedWitnessError::SizeOverflow)?;
         let code = unsafe {
-            stwo_backend_cuda_kernels::raw::blake_g_write_trace_fused_into_on(
-                inputs.as_ptr(),
-                u32::try_from(n_real_rows).map_err(|_| PreparedWitnessError::SizeOverflow)?,
-                self.row_count,
-                outputs.as_ptr(),
-                self.lookup_words.as_u32_ptr(),
-                lut_ptrs.as_ptr(),
-                count_ptrs.as_ptr(),
-                launch.stream_raw().as_ptr(),
-            )
+            match contract {
+                WitnessLaunchContract::BlakeGFused => {
+                    stwo_backend_cuda_kernels::raw::blake_g_write_trace_fused_into_on(
+                        inputs.as_ptr(),
+                        n_real_rows,
+                        self.row_count,
+                        outputs.as_ptr(),
+                        self.lookup_words.as_u32_ptr(),
+                        lut_ptrs.as_ptr(),
+                        count_ptrs.as_ptr(),
+                        launch.stream_raw().as_ptr(),
+                    )
+                }
+                WitnessLaunchContract::BlakeGDirect => {
+                    stwo_backend_cuda_kernels::raw::blake_g_write_trace_fused_direct_into_on(
+                        inputs.as_ptr(),
+                        n_real_rows,
+                        self.row_count,
+                        outputs.as_ptr(),
+                        lut_ptrs.as_ptr(),
+                        count_ptrs.as_ptr(),
+                        launch.stream_raw().as_ptr(),
+                    )
+                }
+                WitnessLaunchContract::Recorded => unreachable!("native contract selected above"),
+            }
         };
         if code == 0 {
             Ok(PreparedWitnessLaunchTelemetry::KERNEL)
@@ -1081,7 +1241,14 @@ impl<'a> PreparedWitnessGraph<'a> {
     }
 
     pub fn is_blake_g_fused(&self) -> bool {
-        self.launch_contract == WitnessLaunchContract::BlakeGFused
+        matches!(
+            self.launch_contract,
+            WitnessLaunchContract::BlakeGFused | WitnessLaunchContract::BlakeGDirect
+        )
+    }
+
+    pub fn is_blake_g_direct(&self) -> bool {
+        self.launch_contract == WitnessLaunchContract::BlakeGDirect
     }
 
     /// Immutable descriptor slices, useful to seal the exact Graph-A ABI during
@@ -1177,12 +1344,9 @@ fn truncate_bound_slot(
 fn validate_slot_shape(
     requirements: &WitnessWorkspaceRequirements,
     slots: &WitnessWorkspaceSlots,
+    input_columns: usize,
 ) -> Result<(), PreparedWitnessError> {
-    check_count(
-        "input_columns",
-        requirements.input_column_words.len(),
-        slots.input_columns.len(),
-    )?;
+    check_count("input_columns", input_columns, slots.input_columns.len())?;
     check_count(
         "output_columns",
         requirements.output_column_words.len(),
@@ -1547,6 +1711,82 @@ mod tests {
             ),
             Err(PreparedWitnessError::BlakeGFusionShape(_))
         ));
+    }
+
+    #[test]
+    fn direct_blake_contract_retains_six_inputs_and_omits_both_writer_tails() {
+        let rows = 1 << 20;
+        let requirements = WitnessWorkspaceRequirements {
+            row_count: rows,
+            input_column_words: vec![rows; BG_N_RECORDED_INPUTS],
+            input_pointer_words: pointer_words(BG_N_RECORDED_INPUTS).unwrap(),
+            execution_table_pointer_words: pointer_words(EXECUTION_TABLE_POINTERS).unwrap(),
+            execution_table_stride_words: EXECUTION_TABLE_STRIDES,
+            output_column_words: vec![rows; BG_N_TRACE],
+            output_pointer_words: pointer_words(BG_N_TRACE).unwrap(),
+            multiplicity_column_words: vec![],
+            multiplicity_pointer_words: POINTER_WORDS,
+            multiplicity_dummy_words: Some(1),
+            lookup_words: rows * BG_N_LOOKUP_WORDS,
+            sub_words: rows * BG_N_SUB_WORDS,
+        };
+        let mut slots = slots(&requirements);
+        let retired_enabler = slots.input_columns.pop().unwrap();
+        let dummy = slots.multiplicity_dummy.unwrap();
+        slots.lookup_words = dummy;
+        slots.sub_words = dummy;
+
+        let direct = requirements
+            .arena_slot_requirements_for_blake_g_direct_with_prepared_execution_tables(&slots)
+            .unwrap();
+        assert_eq!(
+            direct
+                .iter()
+                .find(|entry| entry.id == slots.input_pointers)
+                .unwrap()
+                .len_words,
+            pointer_words(BG_N_DATA_INPUTS).unwrap()
+        );
+        assert_eq!(
+            direct
+                .iter()
+                .filter(|entry| slots.input_columns.contains(&entry.id))
+                .count(),
+            BG_N_DATA_INPUTS
+        );
+        assert!(!direct.iter().any(|entry| entry.id == retired_enabler));
+        assert_eq!(
+            direct.iter().filter(|entry| entry.id == dummy).count(),
+            1,
+            "lookup/sub aliases must produce one addressable sentinel"
+        );
+        assert!(!direct.iter().any(|entry| {
+            entry.len_words == requirements.lookup_words
+                || entry.len_words == requirements.sub_words
+        }));
+
+        let mut materialized_lookup = slots.clone();
+        materialized_lookup.lookup_words = retired_enabler;
+        assert!(matches!(
+            requirements.arena_slot_requirements_for_blake_g_direct_with_prepared_execution_tables(
+                &materialized_lookup
+            ),
+            Err(PreparedWitnessError::BlakeGFusionShape(_))
+        ));
+        let mut seventh_input = slots;
+        seventh_input.input_columns.push(retired_enabler);
+        assert_eq!(
+            requirements
+                .arena_slot_requirements_for_blake_g_direct_with_prepared_execution_tables(
+                    &seventh_input
+                )
+                .unwrap_err(),
+            PreparedWitnessError::SlotShapeMismatch {
+                role: "input_columns",
+                expected: BG_N_DATA_INPUTS,
+                actual: BG_N_RECORDED_INPUTS,
+            }
+        );
     }
 
     #[test]

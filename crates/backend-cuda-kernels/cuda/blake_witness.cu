@@ -568,7 +568,7 @@ static int blake_g_write_trace_fused_into_on_impl(
     cudaStream_t stream
 ) {
     if (column_length == 0 || n_rows > column_length || input_cols_host == nullptr ||
-        trace_cols_host == nullptr || (lookup == nullptr) == (aux == nullptr) ||
+        trace_cols_host == nullptr || (lookup != nullptr && aux != nullptr) ||
         luts_host == nullptr ||
         counts_host == nullptr) {
         return static_cast<int>(cudaErrorInvalidValue);
@@ -627,6 +627,16 @@ extern "C" int blake_g_write_trace_fused_projected_into_on(
     return blake_g_write_trace_fused_into_on_impl(
         input_cols_host, n_rows, column_length, trace_cols_host, nullptr, aux,
         luts_host, counts_host, stream);
+}
+
+extern "C" int blake_g_write_trace_fused_direct_into_on(
+    const uint32_t *const *input_cols_host, uint32_t n_rows,
+    uint32_t column_length, uint32_t *const *trace_cols_host,
+    const uint32_t *const *luts_host, uint32_t *const *counts_host,
+    cudaStream_t stream) {
+    return blake_g_write_trace_fused_into_on_impl(
+        input_cols_host, n_rows, column_length, trace_cols_host, nullptr,
+        nullptr, luts_host, counts_host, stream);
 }
 
 extern "C" void blake_g_xor_count(
