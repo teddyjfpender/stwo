@@ -282,9 +282,40 @@ pub struct WitnessProgram {
 }
 
 impl WitnessProgram {
-    /// FNV-1a over the instruction stream + structural counts (NOT the label). Same
-    /// hash construction as the constraint lane's `metal_evaluation_program_semantic_hash_v1`
-    /// so the two lanes' cache-key discipline is identical.
+    /// Collision-resistant identity of the exact typed program body. The
+    /// human label is deliberately excluded; instruction count, every encoded
+    /// instruction field, and all six structural counts are domain-separated.
+    pub fn semantic_identity(&self) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"stwo-cuda-witness-program-semantic-identity-v1\0");
+        hasher.update(
+            &u64::try_from(self.insts.len())
+                .expect("witness instruction count fits u64")
+                .to_le_bytes(),
+        );
+        for inst in &self.insts {
+            hasher.update(&[inst.op, inst.pad]);
+            hasher.update(&inst.dst.to_le_bytes());
+            hasher.update(&inst.a.to_le_bytes());
+            hasher.update(&inst.b.to_le_bytes());
+            hasher.update(&inst.imm.to_le_bytes());
+        }
+        for count in [
+            self.n_regs,
+            self.n_inputs,
+            self.n_cols,
+            self.n_mult_tables,
+            self.n_lookup_words,
+            self.n_sub_words,
+        ] {
+            hasher.update(&count.to_le_bytes());
+        }
+        *hasher.finalize().as_bytes()
+    }
+
+    /// Non-authoritative FNV-1a cache key over the instruction stream and
+    /// structural counts (not the label). Authority must use
+    /// [`semantic_identity`](Self::semantic_identity).
     pub fn semantic_hash(&self) -> u64 {
         let mut hash = 0xcbf29ce484222325u64;
         let mut mix = |bytes: &[u8]| {
@@ -389,10 +420,45 @@ mod tests {
         let mut relabeled = base.clone();
         relabeled.label = "assert_eq_opcode".to_string();
         assert_eq!(base.semantic_hash(), relabeled.semantic_hash());
+        assert_eq!(base.semantic_identity(), relabeled.semantic_identity());
+        assert_eq!(
+            base.semantic_identity()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+            "259930b2e215076bccab908784c41a8837ec01f85689a7d4dbcf7d944ef2622d"
+        );
 
         // A real bytecode difference must change it.
         let mut mutated = base.clone();
         mutated.insts[0].imm = 1;
         assert_ne!(base.semantic_hash(), mutated.semantic_hash());
+        assert_ne!(base.semantic_identity(), mutated.semantic_identity());
+
+        for field in 0..5 {
+            let mut mutated = base.clone();
+            match field {
+                0 => mutated.insts[0].op += 1,
+                1 => mutated.insts[0].pad += 1,
+                2 => mutated.insts[0].dst += 1,
+                3 => mutated.insts[0].a += 1,
+                4 => mutated.insts[0].b += 1,
+                _ => unreachable!(),
+            }
+            assert_ne!(base.semantic_identity(), mutated.semantic_identity());
+        }
+        for count in 0..6 {
+            let mut mutated = base.clone();
+            match count {
+                0 => mutated.n_regs += 1,
+                1 => mutated.n_inputs += 1,
+                2 => mutated.n_cols += 1,
+                3 => mutated.n_mult_tables += 1,
+                4 => mutated.n_lookup_words += 1,
+                5 => mutated.n_sub_words += 1,
+                _ => unreachable!(),
+            }
+            assert_ne!(base.semantic_identity(), mutated.semantic_identity());
+        }
     }
 }

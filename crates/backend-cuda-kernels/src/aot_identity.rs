@@ -10,16 +10,144 @@ const CUBIN_DOMAIN: &[u8] = b"stwo-cuda-aot-cubin-identity-v1\0";
 // source bytes because they are deliberately not embedded beside the cubins.
 #[allow(dead_code)]
 const SOURCE_DOMAIN: &[u8] = b"stwo-cuda-aot-source-identity-v1\0";
-const KERNEL_AUTHORITY_DOMAIN: &[u8] = b"stwo-cuda-aot-kernel-authority-v1\0";
+const ABI_SCHEMA_DOMAIN: &[u8] = b"stwo-cuda-aot-abi-schema-v1\0";
+const KERNEL_AUTHORITY_DOMAIN: &[u8] = b"stwo-cuda-aot-kernel-authority-v2\0";
 const PACK_DOMAIN: &[u8] = b"stwo-cuda-aot-pack-identity-v1\0";
 
-/// The generator currently proves only the exported symbol declaration. It
-/// does not emit a structured argument, range, alias, or read/write schema.
+/// Strength of the generator-owned schema bound into one authority entry.
+/// Unsupported families remain exported-symbol-only.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 #[repr(u8)]
 pub enum AotKernelSchemaScope {
     ExportedSymbolOnly = 1,
+    StructuredAbi = 2,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum AotKernelAbiKind {
+    U32 = 1,
+    DevicePointerU32 = 2,
+    DevicePointerTableU32 = 3,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum AotKernelAbiAccess {
+    Read = 1,
+    Write = 2,
+    ReadWrite = 3,
+    LaunchRowCount = 4,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AotKernelAbiArgument {
+    pub ordinal: u8,
+    pub name: &'static str,
+    pub kind: AotKernelAbiKind,
+    /// Coarse pointee access only. This does not authorize extents or aliases.
+    pub access: AotKernelAbiAccess,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AotKernelAbiSchema {
+    RecordedWitnessV1,
+}
+
+impl AotKernelAbiSchema {
+    pub const fn manifest_tag(self) -> &'static str {
+        match self {
+            Self::RecordedWitnessV1 => "recorded_witness_v1",
+        }
+    }
+
+    pub const fn family(self) -> &'static str {
+        match self {
+            Self::RecordedWitnessV1 => "recorded_witness",
+        }
+    }
+
+    pub const fn version(self) -> u32 {
+        match self {
+            Self::RecordedWitnessV1 => 1,
+        }
+    }
+
+    pub const fn arguments(self) -> &'static [AotKernelAbiArgument] {
+        match self {
+            Self::RecordedWitnessV1 => &RECORDED_WITNESS_V1_ARGUMENTS,
+        }
+    }
+
+    pub fn identity(self) -> [u8; 32] {
+        abi_schema_identity(self)
+    }
+}
+
+const RECORDED_WITNESS_V1_ARGUMENTS: [AotKernelAbiArgument; 8] = [
+    abi_argument(
+        0,
+        "input_cols",
+        AotKernelAbiKind::DevicePointerTableU32,
+        AotKernelAbiAccess::Read,
+    ),
+    abi_argument(
+        1,
+        "table_bases",
+        AotKernelAbiKind::DevicePointerTableU32,
+        AotKernelAbiAccess::Read,
+    ),
+    abi_argument(
+        2,
+        "table_strides",
+        AotKernelAbiKind::DevicePointerU32,
+        AotKernelAbiAccess::Read,
+    ),
+    abi_argument(
+        3,
+        "out_cols",
+        AotKernelAbiKind::DevicePointerTableU32,
+        AotKernelAbiAccess::Write,
+    ),
+    abi_argument(
+        4,
+        "mult_counts",
+        AotKernelAbiKind::DevicePointerTableU32,
+        AotKernelAbiAccess::ReadWrite,
+    ),
+    abi_argument(
+        5,
+        "lookup_words",
+        AotKernelAbiKind::DevicePointerU32,
+        AotKernelAbiAccess::Write,
+    ),
+    abi_argument(
+        6,
+        "sub_words",
+        AotKernelAbiKind::DevicePointerU32,
+        AotKernelAbiAccess::Write,
+    ),
+    abi_argument(
+        7,
+        "row_count",
+        AotKernelAbiKind::U32,
+        AotKernelAbiAccess::LaunchRowCount,
+    ),
+];
+
+const fn abi_argument(
+    ordinal: u8,
+    name: &'static str,
+    kind: AotKernelAbiKind,
+    access: AotKernelAbiAccess,
+) -> AotKernelAbiArgument {
+    AotKernelAbiArgument {
+        ordinal,
+        name,
+        kind,
+        access,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -37,7 +165,25 @@ pub(crate) struct KernelAuthorityIdentityInput<'a> {
     pub cache_key: u64,
     pub sm: u32,
     pub cubin_identity: [u8; 32],
+    pub abi_schema_identity: [u8; 32],
+    pub program_identity: [u8; 32],
     pub schema_scope: AotKernelSchemaScope,
+}
+
+pub(crate) fn abi_schema_identity(schema: AotKernelAbiSchema) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(ABI_SCHEMA_DOMAIN);
+    hasher.update(&encoded_len(schema.family().as_bytes()));
+    hasher.update(schema.family().as_bytes());
+    hasher.update(&schema.version().to_le_bytes());
+    hasher.update(&encoded_usize(schema.arguments().len()));
+    for argument in schema.arguments() {
+        hasher.update(&[argument.ordinal]);
+        hasher.update(&encoded_len(argument.name.as_bytes()));
+        hasher.update(argument.name.as_bytes());
+        hasher.update(&[argument.kind as u8, argument.access as u8]);
+    }
+    *hasher.finalize().as_bytes()
 }
 
 #[allow(dead_code)]
@@ -67,6 +213,15 @@ pub(crate) fn kernel_authority_identity(input: KernelAuthorityIdentityInput<'_>)
         || input.kernel_symbol.is_empty()
         || input.sm == 0
         || input.cubin_identity == ZERO_IDENTITY
+        || match input.schema_scope {
+            AotKernelSchemaScope::ExportedSymbolOnly => input.abi_schema_identity != ZERO_IDENTITY,
+            AotKernelSchemaScope::StructuredAbi => {
+                input.abi_schema_identity == ZERO_IDENTITY
+                    || input.program_identity == ZERO_IDENTITY
+            }
+        }
+        || (input.schema_scope == AotKernelSchemaScope::ExportedSymbolOnly
+            && input.program_identity != ZERO_IDENTITY)
     {
         return ZERO_IDENTITY;
     }
@@ -79,6 +234,8 @@ pub(crate) fn kernel_authority_identity(input: KernelAuthorityIdentityInput<'_>)
     hasher.update(&input.cache_key.to_le_bytes());
     hasher.update(&input.sm.to_le_bytes());
     hasher.update(&input.cubin_identity);
+    hasher.update(&input.abi_schema_identity);
+    hasher.update(&input.program_identity);
     hasher.update(&[input.schema_scope as u8]);
     *hasher.finalize().as_bytes()
 }
@@ -147,6 +304,8 @@ mod tests {
             cache_key: A.cache_key,
             sm: A.sm,
             cubin_identity: cubin_identity(A),
+            abi_schema_identity: ZERO_IDENTITY,
+            program_identity: ZERO_IDENTITY,
             schema_scope: AotKernelSchemaScope::ExportedSymbolOnly,
         }
     }
@@ -215,6 +374,25 @@ mod tests {
     }
 
     #[test]
+    fn recorded_witness_schema_is_ordinal_complete_and_typed() {
+        let schema = AotKernelAbiSchema::RecordedWitnessV1;
+        assert_eq!(schema.family(), "recorded_witness");
+        assert_eq!(schema.version(), 1);
+        assert_eq!(schema.arguments().len(), 8);
+        for (ordinal, argument) in schema.arguments().iter().enumerate() {
+            assert_eq!(usize::from(argument.ordinal), ordinal);
+        }
+        assert_eq!(schema.arguments()[0].name, "input_cols");
+        assert_eq!(schema.arguments()[4].access, AotKernelAbiAccess::ReadWrite);
+        assert_eq!(schema.arguments()[7].kind, AotKernelAbiKind::U32);
+        assert_eq!(
+            schema.arguments()[7].access,
+            AotKernelAbiAccess::LaunchRowCount
+        );
+        assert_ne!(abi_schema_identity(schema), ZERO_IDENTITY);
+    }
+
+    #[test]
     fn kernel_authority_covers_every_canonical_entry_field() {
         let baseline = kernel_authority_identity(authority());
         assert_ne!(baseline, ZERO_IDENTITY);
@@ -246,12 +424,44 @@ mod tests {
                 }),
                 ..authority()
             },
+            KernelAuthorityIdentityInput {
+                abi_schema_identity: abi_schema_identity(AotKernelAbiSchema::RecordedWitnessV1),
+                program_identity: [7; 32],
+                schema_scope: AotKernelSchemaScope::StructuredAbi,
+                ..authority()
+            },
         ] {
             assert_ne!(baseline, kernel_authority_identity(changed));
         }
         assert_eq!(
             kernel_authority_identity(KernelAuthorityIdentityInput {
                 source_identity: ZERO_IDENTITY,
+                ..authority()
+            }),
+            ZERO_IDENTITY
+        );
+        assert_eq!(
+            kernel_authority_identity(KernelAuthorityIdentityInput {
+                abi_schema_identity: ZERO_IDENTITY,
+                program_identity: [7; 32],
+                schema_scope: AotKernelSchemaScope::StructuredAbi,
+                ..authority()
+            }),
+            ZERO_IDENTITY
+        );
+        assert_eq!(
+            kernel_authority_identity(KernelAuthorityIdentityInput {
+                abi_schema_identity: abi_schema_identity(AotKernelAbiSchema::RecordedWitnessV1),
+                program_identity: ZERO_IDENTITY,
+                schema_scope: AotKernelSchemaScope::StructuredAbi,
+                ..authority()
+            }),
+            ZERO_IDENTITY
+        );
+        assert_eq!(
+            kernel_authority_identity(KernelAuthorityIdentityInput {
+                abi_schema_identity: abi_schema_identity(AotKernelAbiSchema::RecordedWitnessV1),
+                program_identity: [7; 32],
                 ..authority()
             }),
             ZERO_IDENTITY
@@ -281,7 +491,11 @@ mod tests {
         );
         assert_eq!(
             hex(kernel_authority_identity(authority())),
-            "a8542b493576bd7b2880f9ad62c49e69aca32cacaa329f95a818218d456dddbb"
+            "a81919754481adaba8dbb3c903f3be0a694794a890ecd258c82887656eec1c41"
+        );
+        assert_eq!(
+            hex(abi_schema_identity(AotKernelAbiSchema::RecordedWitnessV1)),
+            "0a9f1fe69907e769f718018a09642ec9a4597179c35d24d75e581ad6ea4f2744"
         );
     }
 

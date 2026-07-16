@@ -13,13 +13,16 @@
 //! identity, while per-key strict lookup proves complete source/shape coverage;
 //! a matching policy tag alone never admits a partial or stale pack.
 
-pub use stwo_backend_cuda_kernels::aot_pack::{AotKernelAuthority, AotKernelSchemaScope};
+pub use stwo_backend_cuda_kernels::aot_pack::{
+    AotKernelAbiAccess, AotKernelAbiArgument, AotKernelAbiKind, AotKernelAbiSchema,
+    AotKernelAuthority, AotKernelSchemaScope,
+};
 
 /// Collision-resistant identity of the exact AOT cubins and generation
 /// policies embedded in this binary. All-zero means absent or policy-invalid
 /// and is never source authority. Compiled proofs that require source/symbol
-/// provenance must retain each [`loaded_kernel_authority`] identity; argument
-/// and effect authority is not available.
+/// or structured ABI provenance must retain each [`loaded_kernel_authority`]
+/// identity.
 pub fn loaded_manifest_identity() -> [u8; 32] {
     let identity = stwo_backend_cuda_kernels::aot_pack::aot_pack_identity();
     if identity == [0; 32]
@@ -41,8 +44,8 @@ pub fn loaded_cubin_identity(cache_key: u64, sm_major: u32, sm_minor: u32) -> [u
 
 /// Exact source/symbol/semantic/binary authority for one loaded kernel.
 /// `None` means absent or rejected with the containing pack. The schema scope
-/// is intentionally exported-symbol-only until kernel emission provides a
-/// structured argument and read/write contract.
+/// is structured only for typed generator families which emit an exact
+/// argument/access contract; unsupported families remain symbol-only.
 pub fn loaded_kernel_authority(
     cache_key: u64,
     sm_major: u32,
@@ -145,6 +148,10 @@ pub struct EmittedKernel {
     pub cache_key: u64,
     pub semantic_hash: u64,
     pub source: String,
+    /// Structured only when the typed source emitter owns an exact ABI schema.
+    pub abi_schema: Option<AotKernelAbiSchema>,
+    /// Collision-resistant typed-program identity; absent for unsupported families.
+    pub program_identity: Option<[u8; 32]>,
 }
 
 /// One split part of a prepared constraint program. `rc_base` is the exact
@@ -288,6 +295,8 @@ pub fn composition_wave_kernel_source(
         cache_key: identity.cache_key,
         semantic_hash: identity.semantic_hash,
         source,
+        abi_schema: None,
+        program_identity: None,
     })
 }
 
@@ -410,6 +419,8 @@ pub fn constraint_program_with_live_cap<F: FrameworkEval>(
                     cache_key: cuda_codegen::jit_cache_key(semantic_hash),
                     semantic_hash,
                     source,
+                    abi_schema: None,
+                    program_identity: None,
                 },
                 rc_base: part.rc_base,
                 wave_fragment: ConstraintWaveFragment {
@@ -483,6 +494,8 @@ pub fn witness_kernel_source(
         cache_key: super::jit_witness::codegen::witness_jit_cache_key(semantic_hash),
         semantic_hash,
         source,
+        abi_schema: Some(AotKernelAbiSchema::RecordedWitnessV1),
+        program_identity: Some(program.semantic_identity()),
     })
 }
 
@@ -725,6 +738,26 @@ mod tests {
             &[11, 17]
         ));
         assert!(!composition_wave_semantic_hashes_match(&identities, &[11]));
+    }
+
+    #[test]
+    fn ordinary_witness_emitter_owns_the_recorded_witness_abi() {
+        let mut recorder = WitnessRecorder::new("aot_witness_abi");
+        let input = recorder.input(0);
+        recorder.col_write(0, input);
+        let program = recorder.finish();
+        let emitted = witness_kernel_source(&program).unwrap();
+        assert_eq!(emitted.program_identity, Some(program.semantic_identity()));
+        let schema = emitted.abi_schema.unwrap();
+        assert_eq!(schema, AotKernelAbiSchema::RecordedWitnessV1);
+        assert_eq!(schema.arguments().len(), 8);
+        assert_eq!(schema.arguments()[0].name, "input_cols");
+        assert_eq!(schema.arguments()[4].access, AotKernelAbiAccess::ReadWrite);
+        assert_eq!(schema.arguments()[7].name, "row_count");
+        assert_eq!(
+            schema.arguments()[7].access,
+            AotKernelAbiAccess::LaunchRowCount
+        );
     }
 
     #[test]

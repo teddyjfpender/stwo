@@ -7,12 +7,15 @@
 
 const ZERO_IDENTITY: [u8; 32] = [0; 32];
 
-pub use crate::aot_identity::AotKernelSchemaScope;
+pub use crate::aot_identity::{
+    AotKernelAbiAccess, AotKernelAbiArgument, AotKernelAbiKind, AotKernelAbiSchema,
+    AotKernelSchemaScope,
+};
 
 /// Immutable authority for one exact generated source and target cubin.
 ///
-/// [`AotKernelSchemaScope::ExportedSymbolOnly`] is deliberately narrow: the
-/// generator does not yet emit argument, range, alias, or read/write schemas.
+/// Unsupported generator families remain exported-symbol-only. A structured
+/// schema is present only when the typed Rust emitter supplied it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AotKernelAuthority {
     source_identity: [u8; 32],
@@ -21,6 +24,9 @@ pub struct AotKernelAuthority {
     cache_key: u64,
     target_sm: u32,
     cubin_identity: [u8; 32],
+    abi_schema: Option<AotKernelAbiSchema>,
+    abi_schema_identity: [u8; 32],
+    program_identity: [u8; 32],
     identity: [u8; 32],
     schema_scope: AotKernelSchemaScope,
 }
@@ -34,10 +40,12 @@ impl AotKernelAuthority {
         self.kernel_symbol
     }
 
+    /// Legacy FNV semantic/cache tag. Never use this as program authority.
     pub fn semantic_hash(self) -> u64 {
         self.semantic_hash
     }
 
+    /// Lookup key only; collision-resistant authority is [`Self::identity`].
     pub fn cache_key(self) -> u64 {
         self.cache_key
     }
@@ -49,6 +57,19 @@ impl AotKernelAuthority {
 
     pub fn cubin_identity(self) -> [u8; 32] {
         self.cubin_identity
+    }
+
+    pub fn abi_schema(self) -> Option<AotKernelAbiSchema> {
+        self.abi_schema
+    }
+
+    pub fn abi_schema_identity(self) -> [u8; 32] {
+        self.abi_schema_identity
+    }
+
+    /// Collision-resistant typed-program identity, or zero when unsupported.
+    pub fn program_identity(self) -> [u8; 32] {
+        self.program_identity
     }
 
     /// Canonical digest over every field exposed by this entry.
@@ -141,7 +162,7 @@ pub fn aot_pack_entries_for_arch(sm_major: u32, sm_minor: u32) -> usize {
 /// Collision-resistant identity of the exact AOT cubins and generation
 /// policies embedded in this binary. This intentionally remains binary-pack
 /// identity: source-aware consumers must retain each [`AotKernelAuthority`]
-/// identity, and neither identity claims argument or read/write effects.
+/// identity. Only authorities carrying `StructuredAbi` claim argument access.
 ///
 /// An empty/stub pack deliberately returns all-zero so the GPU-native runtime
 /// fails closed instead of constructing authority that later falls through to
@@ -164,8 +185,8 @@ pub fn aot_cubin_identity(cache_key: u64, sm_major: u32, sm_minor: u32) -> [u8; 
 }
 
 /// Canonical source/binary authority for one exact `(cache_key, SM)` entry.
-/// Returns `None` for an absent, malformed, or unsealed pack. The returned
-/// schema proves only the exported CUDA symbol, not its arguments or effects.
+/// Returns `None` for an absent, malformed, or unsealed pack. Structured ABI
+/// metadata is present only for generator families which emit it.
 pub fn aot_kernel_authority(
     cache_key: u64,
     sm_major: u32,
@@ -293,7 +314,22 @@ fn pack_is_well_formed(
             || authority.target_sm == 0
             || authority.cubin_identity == ZERO_IDENTITY
             || authority.identity == ZERO_IDENTITY
-            || authority.schema_scope != AotKernelSchemaScope::ExportedSymbolOnly
+        {
+            return false;
+        }
+        let expected_abi_identity = authority
+            .abi_schema
+            .map(AotKernelAbiSchema::identity)
+            .unwrap_or(ZERO_IDENTITY);
+        let expected_scope = if authority.abi_schema.is_some() {
+            AotKernelSchemaScope::StructuredAbi
+        } else {
+            AotKernelSchemaScope::ExportedSymbolOnly
+        };
+        if authority.abi_schema_identity != expected_abi_identity
+            || authority.schema_scope != expected_scope
+            || (authority.abi_schema.is_some() && authority.program_identity == ZERO_IDENTITY)
+            || (authority.abi_schema.is_none() && authority.program_identity != ZERO_IDENTITY)
         {
             return false;
         }
@@ -317,6 +353,8 @@ fn pack_is_well_formed(
                 cache_key: authority.cache_key,
                 sm: authority.target_sm,
                 cubin_identity,
+                abi_schema_identity: authority.abi_schema_identity,
+                program_identity: authority.program_identity,
                 schema_scope: authority.schema_scope,
             },
         );
@@ -410,7 +448,11 @@ mod manifest_tests {
             );
             assert_eq!(
                 authority.schema_scope(),
-                AotKernelSchemaScope::ExportedSymbolOnly
+                if authority.abi_schema().is_some() {
+                    AotKernelSchemaScope::StructuredAbi
+                } else {
+                    AotKernelSchemaScope::ExportedSymbolOnly
+                }
             );
         }
         assert!(!aot_pack_contains(0, u32::MAX, u32::MAX));
@@ -441,6 +483,13 @@ mod manifest_tests {
                     aot_identity::cubin_identity(input)
                 );
                 assert_eq!(
+                    authority.abi_schema_identity,
+                    authority
+                        .abi_schema
+                        .map(AotKernelAbiSchema::identity)
+                        .unwrap_or(ZERO_IDENTITY)
+                );
+                assert_eq!(
                     authority.identity,
                     aot_identity::kernel_authority_identity(
                         aot_identity::KernelAuthorityIdentityInput {
@@ -450,6 +499,8 @@ mod manifest_tests {
                             cache_key: authority.cache_key,
                             sm: authority.target_sm,
                             cubin_identity: authority.cubin_identity,
+                            abi_schema_identity: authority.abi_schema_identity,
+                            program_identity: authority.program_identity,
                             schema_scope: authority.schema_scope,
                         }
                     )
@@ -518,6 +569,16 @@ mod manifest_tests {
         changed[0].authority.identity = ZERO_IDENTITY;
         assert!(!test_pack_is_well_formed(&pack, pack_identity, &changed));
         let mut changed = valid;
+        changed[0].authority.abi_schema = Some(AotKernelAbiSchema::RecordedWitnessV1);
+        assert!(!test_pack_is_well_formed(&pack, pack_identity, &changed));
+        let mut changed = valid;
+        changed[0].authority.abi_schema_identity =
+            aot_identity::abi_schema_identity(AotKernelAbiSchema::RecordedWitnessV1);
+        assert!(!test_pack_is_well_formed(&pack, pack_identity, &changed));
+        let mut changed = valid;
+        changed[0].authority.program_identity = [7; 32];
+        assert!(!test_pack_is_well_formed(&pack, pack_identity, &changed));
+        let mut changed = valid;
         changed[0].offset = 1;
         assert!(!test_pack_is_well_formed(&pack, pack_identity, &changed));
         let mut changed = valid;
@@ -552,6 +613,9 @@ mod manifest_tests {
             cache_key,
             target_sm: sm,
             cubin_identity,
+            abi_schema: None,
+            abi_schema_identity: ZERO_IDENTITY,
+            program_identity: ZERO_IDENTITY,
             identity: aot_identity::kernel_authority_identity(
                 aot_identity::KernelAuthorityIdentityInput {
                     source_identity,
@@ -560,6 +624,8 @@ mod manifest_tests {
                     cache_key,
                     sm,
                     cubin_identity,
+                    abi_schema_identity: ZERO_IDENTITY,
+                    program_identity: ZERO_IDENTITY,
                     schema_scope: AotKernelSchemaScope::ExportedSymbolOnly,
                 },
             ),
@@ -615,6 +681,8 @@ mod manifest_tests {
             let source_bytes = std::fs::read(generated.join(&source.file)).unwrap();
             assert_eq!(authority.kernel_symbol, source.kernel_symbol);
             assert_eq!(authority.semantic_hash, source.semantic_hash);
+            assert_eq!(authority.abi_schema, source.abi_schema);
+            assert_eq!(authority.program_identity, source.program_identity);
             assert_eq!(
                 authority.source_identity,
                 aot_identity::source_identity(&source_bytes)

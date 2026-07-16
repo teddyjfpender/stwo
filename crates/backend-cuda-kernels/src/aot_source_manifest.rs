@@ -1,10 +1,12 @@
 //! Strict parser for the checked-in AOT source manifest.
 //!
-//! The generator does not yet emit argument or effect schemas. This module
-//! admits only the metadata it does emit and validates the declared exported
-//! CUDA symbol against the exact generated source text.
+//! The generator emits a structured ABI only for ordinary recorded-witness
+//! kernels. Other families remain symbol-only and fail closed if they claim
+//! typed program or argument authority.
 
 use std::collections::BTreeSet;
+
+use super::aot_identity::AotKernelAbiSchema;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SourceManifestEntry {
@@ -14,6 +16,8 @@ pub(crate) struct SourceManifestEntry {
     pub cache_key: u64,
     pub semantic_hash: u64,
     pub file: String,
+    pub abi_schema: Option<AotKernelAbiSchema>,
+    pub program_identity: [u8; 32],
 }
 
 #[derive(serde::Deserialize)]
@@ -25,6 +29,8 @@ struct WireEntry {
     cache_key: String,
     semantic_hash: String,
     file: String,
+    abi_schema: Option<String>,
+    program_identity: Option<String>,
 }
 
 pub(crate) fn parse_source_manifest(bytes: &[u8]) -> Result<Vec<SourceManifestEntry>, String> {
@@ -57,6 +63,9 @@ pub(crate) fn parse_source_manifest(bytes: &[u8]) -> Result<Vec<SourceManifestEn
         }
         let cache_key = parse_lower_hex_u64(&entry.cache_key, index, "cache_key")?;
         let semantic_hash = parse_lower_hex_u64(&entry.semantic_hash, index, "semantic_hash")?;
+        let abi_schema = parse_abi_schema(index, &entry.kind, entry.abi_schema.as_deref())?;
+        let program_identity =
+            parse_program_identity(index, &entry.kind, entry.program_identity.as_deref())?;
         let expected_file = format!("{}_{}_{cache_key:016x}.cu", entry.kind, entry.label);
         if entry.file != expected_file || !is_plain_file_name(&entry.file) {
             return Err(format!(
@@ -86,9 +95,54 @@ pub(crate) fn parse_source_manifest(bytes: &[u8]) -> Result<Vec<SourceManifestEn
             cache_key,
             semantic_hash,
             file: entry.file,
+            abi_schema,
+            program_identity,
         });
     }
     Ok(entries)
+}
+
+fn parse_program_identity(
+    index: usize,
+    kind: &str,
+    identity: Option<&str>,
+) -> Result<[u8; 32], String> {
+    match (kind, identity) {
+        ("witness", Some(identity)) => {
+            let identity = parse_lower_hex_identity(identity, index, "program_identity")?;
+            if identity == [0; 32] {
+                return Err(format!(
+                    "AOT source manifest entry {index} has zero program_identity"
+                ));
+            }
+            Ok(identity)
+        }
+        ("witness", None) => Err(format!(
+            "AOT source manifest entry {index} lacks program_identity"
+        )),
+        (_, None) => Ok([0; 32]),
+        (_, Some(_)) => Err(format!(
+            "AOT source manifest entry {index} claims unsupported program identity"
+        )),
+    }
+}
+
+fn parse_abi_schema(
+    index: usize,
+    kind: &str,
+    tag: Option<&str>,
+) -> Result<Option<AotKernelAbiSchema>, String> {
+    let expected = AotKernelAbiSchema::RecordedWitnessV1;
+    match (kind, tag) {
+        ("witness", Some(tag)) if tag == expected.manifest_tag() => Ok(Some(expected)),
+        ("witness", _) => Err(format!(
+            "AOT source manifest entry {index} lacks the canonical recorded-witness ABI"
+        )),
+        (_, None) => Ok(None),
+        (_, Some(_)) => Err(format!(
+            "AOT source manifest entry {index} claims an unsupported structured ABI"
+        )),
+    }
 }
 
 /// Proves only the source-level exported symbol boundary. Argument types,
@@ -153,6 +207,35 @@ fn parse_lower_hex_u64(value: &str, index: usize, field: &'static str) -> Result
         .map_err(|error| format!("parse AOT source manifest {field}: {error}"))
 }
 
+fn parse_lower_hex_identity(
+    value: &str,
+    index: usize,
+    field: &'static str,
+) -> Result<[u8; 32], String> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(format!(
+            "AOT source manifest entry {index} has invalid {field}"
+        ));
+    }
+    let mut identity = [0; 32];
+    for (byte, digits) in identity.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
+        *byte = (lower_hex_nibble(digits[0]) << 4) | lower_hex_nibble(digits[1]);
+    }
+    Ok(identity)
+}
+
+fn lower_hex_nibble(byte: u8) -> u8 {
+    match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        _ => unreachable!("hexadecimal input was validated"),
+    }
+}
+
 fn is_cuda_identifier(value: &str) -> bool {
     let mut bytes = value.bytes();
     bytes
@@ -188,11 +271,13 @@ mod tests {
             "file":"constraint_add_ap_0000000000000001.cu"
           },
           {
+            "abi_schema":"recorded_witness_v1",
             "kind":"witness",
             "label":"mul",
             "kernel_name":"kernel_b",
             "cache_key":"0000000000000003",
             "semantic_hash":"0000000000000004",
+            "program_identity":"0101010101010101010101010101010101010101010101010101010101010101",
             "file":"witness_mul_0000000000000003.cu"
           }
         ]"#
@@ -205,6 +290,11 @@ mod tests {
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].cache_key, 1);
         assert_eq!(parsed[1].semantic_hash, 4);
+        assert_eq!(parsed[1].program_identity, [1; 32]);
+        assert_eq!(
+            parsed[1].abi_schema,
+            Some(AotKernelAbiSchema::RecordedWitnessV1)
+        );
 
         for mutation in [
             ("\"cache_key\":\"0000000000000001\"", "\"cache_key\":\"1\""),
@@ -220,6 +310,14 @@ mod tests {
             (
                 "\"file\":\"constraint_add_ap_0000000000000001.cu\"",
                 "\"file\":\"../kernel.cu\"",
+            ),
+            (
+                "\"abi_schema\":\"recorded_witness_v1\"",
+                "\"abi_schema\":\"unknown\"",
+            ),
+            (
+                "0101010101010101010101010101010101010101010101010101010101010101",
+                "0000000000000000000000000000000000000000000000000000000000000000",
             ),
         ] {
             let changed = String::from_utf8(manifest())
@@ -241,6 +339,43 @@ mod tests {
         let entries = serde_json::from_str::<Vec<serde_json::Value>>(&original).unwrap();
         let reordered = serde_json::to_vec(&[entries[1].clone(), entries[0].clone()]).unwrap();
         assert!(parse_source_manifest(&reordered).is_err());
+    }
+
+    #[test]
+    fn structured_abi_is_required_for_witness_and_rejected_for_constraint() {
+        let mut entries = serde_json::from_slice::<Vec<serde_json::Value>>(&manifest()).unwrap();
+        let abi = entries[1].get("abi_schema").unwrap().clone();
+        let program_identity = entries[1].get("program_identity").unwrap().clone();
+        entries[1].as_object_mut().unwrap().remove("abi_schema");
+        assert!(parse_source_manifest(&serde_json::to_vec(&entries).unwrap()).is_err());
+
+        entries[1]
+            .as_object_mut()
+            .unwrap()
+            .insert("abi_schema".into(), abi.clone());
+        entries[1]
+            .as_object_mut()
+            .unwrap()
+            .remove("program_identity");
+        assert!(parse_source_manifest(&serde_json::to_vec(&entries).unwrap()).is_err());
+
+        entries[1]
+            .as_object_mut()
+            .unwrap()
+            .insert("abi_schema".into(), abi.clone());
+        entries[1]
+            .as_object_mut()
+            .unwrap()
+            .insert("program_identity".into(), program_identity.clone());
+        entries[0]
+            .as_object_mut()
+            .unwrap()
+            .insert("abi_schema".into(), abi);
+        entries[0]
+            .as_object_mut()
+            .unwrap()
+            .insert("program_identity".into(), program_identity);
+        assert!(parse_source_manifest(&serde_json::to_vec(&entries).unwrap()).is_err());
     }
 
     #[test]
@@ -273,6 +408,17 @@ mod tests {
             .filter(|path| path.extension().is_some_and(|extension| extension == "cu"))
             .count();
         assert_eq!(entries.len(), source_files);
+        assert!(entries
+            .iter()
+            .filter(|entry| entry.kind == "witness")
+            .all(|entry| {
+                entry.abi_schema == Some(AotKernelAbiSchema::RecordedWitnessV1)
+                    && entry.program_identity != [0; 32]
+            }));
+        assert!(entries
+            .iter()
+            .filter(|entry| entry.kind == "constraint")
+            .all(|entry| entry.abi_schema.is_none() && entry.program_identity == [0; 32]));
         for entry in entries {
             let source = std::fs::read(generated.join(&entry.file)).unwrap();
             validate_exported_kernel_symbol(&source, &entry.kernel_symbol).unwrap();
