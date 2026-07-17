@@ -14,6 +14,19 @@ use super::exec_context::{
     DeviceArena,
 };
 
+mod authority;
+
+pub use authority::{
+    ExecutionTablesAbi, ExecutionTablesAbiAccess, ExecutionTablesAbiArgument,
+    ExecutionTablesAbiArgumentKind, ExecutionTablesAuthorityError, ExecutionTablesColumnEffect,
+    ExecutionTablesContract, ExecutionTablesEffectAbi, ExecutionTablesFixedField,
+    ExecutionTablesHostIngressEncoding, ExecutionTablesHostIngressField,
+    ExecutionTablesHostIngressGeometry, ExecutionTablesHostIngressRole,
+    ExecutionTablesKernelLaunch, ExecutionTablesLinkedContract, ExecutionTablesRowDomain,
+    ExecutionTablesStage, ExecutionTablesStageContract, ExecutionTablesStageEffect,
+    EXECUTION_TABLES_FIXED_ORDER, EXECUTION_TABLES_STAGE_ORDER,
+};
+
 const WORD_BYTES: usize = core::mem::size_of::<u32>();
 const F252_WORDS: usize = 8;
 const SMALL_WORDS: usize = 4;
