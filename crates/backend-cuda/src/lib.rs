@@ -203,7 +203,8 @@ pub use backend::prepared_witness::{
 pub use backend::prepared_witness_feed::{
     clear_witness_feed_destinations_once, witness_feed_clear_workspace_requirements,
     witness_feed_descriptor_fits_shared, witness_feed_privatized_footprint_words,
-    witness_feed_workspace_requirements, PreparedBlakeGFusedFeed, PreparedWitnessFeedClearGraph,
+    witness_feed_workspace_requirements, BlakeGDirectLutContentError,
+    BlakeGDirectLutContentIdentity, PreparedBlakeGFusedFeed, PreparedWitnessFeedClearGraph,
     PreparedWitnessFeedError, PreparedWitnessFeedGraph, WitnessFeedArenaSlotRequirement,
     WitnessFeedClearWorkspaceRequirements, WitnessFeedClearWorkspaceSlots, WitnessFeedLaunchMode,
     WitnessFeedWorkspaceRequirements, WitnessFeedWorkspaceSlots, WITNESS_FEED_DESCRIPTOR_WORDS,

@@ -10,6 +10,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::exec_context::{
     ArenaError, ArenaSlice, ArenaSlotId, CudaLaunchContext, CudaRuntimeError, DeviceArena,
 };
+use super::prepared_witness::{BLAKE_G_DIRECT_COUNT_WORDS, BLAKE_G_DIRECT_LUT_WORDS};
+
+mod blake_g_lut_content;
+pub use blake_g_lut_content::{BlakeGDirectLutContentError, BlakeGDirectLutContentIdentity};
 
 const WORD_BYTES: usize = core::mem::size_of::<u32>();
 const POINTER_WORDS: usize = core::mem::size_of::<*mut u32>().div_ceil(WORD_BYTES);
@@ -332,6 +336,7 @@ pub enum PreparedWitnessFeedError {
     ContextMismatch(ArenaSlotId),
     ConflictingDestination(ArenaSlotId),
     BlakeGFusionShape(&'static str),
+    BlakeGDirectLutContent(BlakeGDirectLutContentError),
     KernelLaunchFailed,
     Arena(ArenaError),
     Cuda(CudaRuntimeError),
@@ -354,6 +359,12 @@ impl From<ArenaError> for PreparedWitnessFeedError {
 impl From<CudaRuntimeError> for PreparedWitnessFeedError {
     fn from(value: CudaRuntimeError) -> Self {
         Self::Cuda(value)
+    }
+}
+
+impl From<BlakeGDirectLutContentError> for PreparedWitnessFeedError {
+    fn from(value: BlakeGDirectLutContentError) -> Self {
+        Self::BlakeGDirectLutContent(value)
     }
 }
 
@@ -863,6 +874,7 @@ pub struct PreparedBlakeGFusedFeed<'a> {
     arena: &'a DeviceArena,
     luts: [ArenaSlice; 4],
     counts: [ArenaSlice; 5],
+    lut_content_identity: BlakeGDirectLutContentIdentity,
 }
 
 impl<'a> PreparedBlakeGFusedFeed<'a> {
@@ -872,28 +884,23 @@ impl<'a> PreparedBlakeGFusedFeed<'a> {
         luts_host: [&[u32]; 4],
         counts: [ArenaSlice; 5],
     ) -> Result<Self, PreparedWitnessFeedError> {
-        const LUT_WORDS: [usize; 4] = [1 << 16, 1 << 8, 1 << 14, 1 << 18];
-        const COUNT_WORDS: [usize; 5] = [2 << 16, 16 << 20, 1 << 8, 1 << 14, 1 << 18];
         if luts
             .iter()
-            .zip(LUT_WORDS)
+            .zip(BLAKE_G_DIRECT_LUT_WORDS)
             .any(|(slice, words)| !slice.belongs_to(arena.context()) || slice.len_words() != words)
-            || counts.iter().zip(COUNT_WORDS).any(|(slice, words)| {
-                !slice.belongs_to(arena.context()) || slice.len_words() != words
-            })
+            || counts
+                .iter()
+                .zip(BLAKE_G_DIRECT_COUNT_WORDS)
+                .any(|(slice, words)| {
+                    !slice.belongs_to(arena.context()) || slice.len_words() != words
+                })
         {
             return Err(PreparedWitnessFeedError::BlakeGFusionShape(
                 "canonical LUT/count geometry drifted",
             ));
         }
-        for ((slice, host), expected_words) in luts.iter().zip(luts_host).zip(LUT_WORDS) {
-            if host.len() != expected_words
-                || host.iter().any(|&row| row as usize >= expected_words)
-            {
-                return Err(PreparedWitnessFeedError::BlakeGFusionShape(
-                    "canonical LUT contents drifted",
-                ));
-            }
+        let lut_content_identity = BlakeGDirectLutContentIdentity::from_host_words(luts_host)?;
+        for (slice, host) in luts.iter().zip(luts_host) {
             upload(arena, *slice, host)?;
         }
         ensure_distinct(luts.iter().chain(&counts).map(|slice| slice.id()))?;
@@ -902,6 +909,7 @@ impl<'a> PreparedBlakeGFusedFeed<'a> {
             arena,
             luts,
             counts,
+            lut_content_identity,
         })
     }
 
@@ -915,6 +923,13 @@ impl<'a> PreparedBlakeGFusedFeed<'a> {
 
     pub fn counts(&self) -> [ArenaSlice; 5] {
         self.counts
+    }
+
+    /// Backend-computed identity of every uploaded LUT word in canonical Direct
+    /// role order. Mutable count destinations are deliberately excluded: their
+    /// zero-before-producer authority belongs to the prepared clear graph.
+    pub const fn lut_content_identity(&self) -> &BlakeGDirectLutContentIdentity {
+        &self.lut_content_identity
     }
 }
 

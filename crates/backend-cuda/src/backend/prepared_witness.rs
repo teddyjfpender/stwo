@@ -1274,6 +1274,12 @@ impl<'a> PreparedWitnessGraph<'a> {
         self.row_count as usize
     }
 
+    /// Prepared writers are arena-instance capabilities, not merely bindings
+    /// to slot ids in a compatible CUDA context.
+    pub fn belongs_to(&self, arena: &DeviceArena) -> bool {
+        core::ptr::eq(self.arena, arena)
+    }
+
     /// Stable setup-only weight used for deterministic component-lane packing.
     pub fn estimated_work(&self) -> u64 {
         u64::from(self.row_count) * u64::from(self.instruction_count.max(1))
