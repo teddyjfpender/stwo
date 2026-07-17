@@ -17,6 +17,19 @@ fn compiler<'a>(command: &'a str, version: &'a [u8]) -> CompilerIdentity<'a> {
 }
 
 #[test]
+fn command_path_tracks_existing_explicit_executables_but_not_missing_paths() {
+    let existing = std::env::current_exe().unwrap();
+    assert_eq!(
+        command_path(existing.to_str().unwrap()).as_deref(),
+        Some(existing.as_path())
+    );
+
+    let missing = staging_path(&existing);
+    assert!(!missing.exists());
+    assert_eq!(command_path(missing.to_str().unwrap()), None);
+}
+
+#[test]
 fn compiler_fingerprint_covers_exact_invocation_and_policy() {
     let version = b"Cuda compilation tools, release 12.6";
     let flags = strings(&[

@@ -301,7 +301,7 @@ pub(crate) fn command_path(command: &str) -> Option<PathBuf> {
                 .find(|candidate| candidate.is_file())
         })
     };
-    candidate.map(|path| {
+    candidate.filter(|path| path.is_file()).map(|path| {
         if path.is_absolute() {
             path
         } else {
