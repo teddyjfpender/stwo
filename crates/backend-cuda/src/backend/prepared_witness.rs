@@ -22,6 +22,7 @@ use super::prepared_execution_tables::PreparedExecutionTablesView;
 use super::{aot, jit_witness};
 
 mod blake_g_direct_authority;
+mod installed_aot;
 mod phase_program;
 pub use blake_g_direct_authority::{
     BlakeGDirectAbiAccess, BlakeGDirectAbiArgument, BlakeGDirectAbiArgumentKind,
@@ -542,6 +543,19 @@ pub enum PreparedWitnessError {
     PhaseAotPreparationFailed([WitnessKernelIdentity; 2]),
     PhaseKernelLaunchFailed([WitnessKernelIdentity; 2]),
     StrictAotUnavailable(WitnessKernelIdentity),
+    StrictAotAuthorityMissing(WitnessKernelIdentity),
+    StrictAotAuthorityMismatch {
+        identity: WitnessKernelIdentity,
+        field: &'static str,
+    },
+    StrictAotInstall {
+        identity: WitnessKernelIdentity,
+        error: aot::InstalledAotFunctionError,
+    },
+    StrictAotReceiptMismatch {
+        identity: WitnessKernelIdentity,
+        field: &'static str,
+    },
     KernelPreparationFailed(WitnessKernelIdentity),
     KernelLaunchFailed(WitnessKernelIdentity),
     BlakeGDirectAuthority(BlakeGDirectAuthorityError),
@@ -609,6 +623,7 @@ pub struct PreparedWitnessGraph<'a> {
     arena: &'a DeviceArena,
     _tables: WitnessExecutionTables<'a>,
     identity: WitnessKernelIdentity,
+    installed_aot: Option<aot::InstalledAotFunction<'a>>,
     source: Option<CString>,
     kernel_name: CString,
     row_count: u32,
@@ -976,6 +991,7 @@ impl<'a> PreparedWitnessGraph<'a> {
             )
         };
         classify_kernel_preparation(&identity, prepared)?;
+        let installed_aot = installed_aot::install(arena.context(), &identity, program, row_count)?;
 
         let input_values = pointer_values(&input_columns);
         let output_values = pointer_values(&output_columns);
@@ -1011,6 +1027,7 @@ impl<'a> PreparedWitnessGraph<'a> {
             arena,
             _tables: tables,
             identity,
+            installed_aot,
             source,
             kernel_name,
             row_count: u32::try_from(row_count).expect("requirements validated row count"),
@@ -1268,6 +1285,14 @@ impl<'a> PreparedWitnessGraph<'a> {
 
     pub fn kernel_identity(&self) -> &WitnessKernelIdentity {
         &self.identity
+    }
+
+    /// Immutable authority and live-function receipt retained by a strict-AOT
+    /// graph. Pre-resolved graphs deliberately return `None`.
+    pub fn installed_aot_receipt(&self) -> Option<&aot::InstalledAotFunctionReceipt> {
+        self.installed_aot
+            .as_ref()
+            .map(aot::InstalledAotFunction::receipt)
     }
 
     pub fn row_count(&self) -> usize {

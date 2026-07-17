@@ -244,6 +244,7 @@ fn prepared_witness_eager_capture_and_mutated_replay_match_cpu() {
         PreparedWitnessMode::PreResolved,
     )
     .unwrap();
+    assert!(prepared.installed_aot_receipt().is_none());
     assert_eq!(prepared.row_count(), ROWS);
     assert_eq!(
         prepared.kernel_identity().semantic_hash,
@@ -341,4 +342,46 @@ fn prepared_witness_eager_capture_and_mutated_replay_match_cpu() {
         strict,
         Err(PreparedWitnessError::StrictAotUnavailable(_) | PreparedWitnessError::EmptyAotManifest)
     ));
+}
+
+/// Hardware-only authority gate for the checked-in add_opcode AOT artifact.
+///
+/// Run this test alone: strict AOT admission is process-wide and monotonic.
+#[test]
+#[ignore = "requires a CUDA device and an embedded AOT pack for its exact SM"]
+fn strict_prepared_witness_retains_the_exact_installed_aot_receipt() {
+    let program = stwo_backend_cuda::jit_witness::recorded_program("add_opcode").unwrap();
+    let row_count = 257;
+    let requirements = witness_workspace_requirements(program, row_count, &[]).unwrap();
+    let slots = workspace_slots(&requirements);
+    let arena = arena(&requirements, &slots);
+    let tables = DeviceExecutionTables::upload(&[0], &[[0; 8]], &[0]);
+
+    let prepared = PreparedWitnessGraph::prepare(
+        &arena,
+        program,
+        row_count,
+        &[],
+        &tables,
+        &slots,
+        PreparedWitnessMode::RequireEmbeddedAot,
+    )
+    .unwrap();
+    let receipt = prepared
+        .installed_aot_receipt()
+        .expect("strict graph retains its installed AOT authority");
+    assert_eq!(receipt.manifest_identity(), aot::loaded_manifest_identity());
+    assert_eq!(
+        receipt.kernel_symbol(),
+        prepared.kernel_identity().kernel_name.as_str()
+    );
+    assert_eq!(
+        receipt.semantic_hash(),
+        prepared.kernel_identity().semantic_hash
+    );
+    assert_eq!(receipt.cache_key(), prepared.kernel_identity().cache_key);
+    assert_eq!(receipt.program_identity(), program.semantic_identity());
+    assert_eq!(receipt.launch().grid(), [2, 1, 1]);
+    assert_eq!(receipt.launch().block(), [256, 1, 1]);
+    assert_eq!(receipt.launch().dynamic_shared_bytes(), 0);
 }
