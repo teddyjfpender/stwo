@@ -85,7 +85,7 @@ fn slots() -> WitnessFeedWorkspaceSlots {
     }
 }
 
-fn arena(
+fn make_arena(
     requirements: &WitnessFeedWorkspaceRequirements,
     slots: &WitnessFeedWorkspaceSlots,
 ) -> DeviceArena {
@@ -279,7 +279,7 @@ fn prepared_witness_feed_eager_capture_and_mutated_replay_match_host() {
     )
     .unwrap();
     let slots = slots();
-    let arena = arena(&requirements, &slots);
+    let arena = make_arena(&requirements, &slots);
     let source_slot = arena.bind(ArenaSlotId(1)).unwrap();
     let prepared = PreparedWitnessFeedGraph::prepare(
         &arena,
@@ -292,16 +292,62 @@ fn prepared_witness_feed_eager_capture_and_mutated_replay_match_host() {
         &slots,
     )
     .unwrap();
+    assert!(prepared.belongs_to(&arena));
+    assert_eq!(prepared.descriptors().id(), slots.descriptors);
+    assert_eq!(prepared.lut_pointers().id(), slots.lut_pointers);
+    assert_eq!(
+        prepared.multiplicity_pointers().id(),
+        slots.multiplicity_pointers
+    );
+    assert_eq!(prepared.source_upload_receipt(), None);
     let clear = PreparedWitnessFeedClearGraph::prepare(
         &arena,
         prepared.multiplicity_destinations(),
         clear_slots(),
     )
     .unwrap();
+    assert!(clear.belongs_to(&arena));
+    assert_eq!(
+        clear.destination_pointers().id(),
+        clear_slots().destination_pointers
+    );
+    assert_eq!(
+        clear.destination_lengths().id(),
+        clear_slots().destination_lengths
+    );
 
     let initial = source(0);
-    upload(&arena, source_slot, &initial);
-    arena.context().sync().unwrap();
+    let initial_receipt = prepared.upload_source(&initial).unwrap();
+    assert_eq!(initial_receipt.generation(), 1);
+    assert_eq!(prepared.source_upload_receipt(), Some(initial_receipt));
+    assert!(prepared.source_upload_is_current(&initial_receipt));
+    let short = &initial[..initial.len() - 1];
+    assert!(prepared.upload_source(short).is_err());
+    assert_eq!(
+        prepared.source_upload_receipt(),
+        Some(initial_receipt),
+        "pre-mutation extent rejection preserves the current receipt"
+    );
+
+    let other_arena = make_arena(&requirements, &slots);
+    let other_source_slot = other_arena.bind(ArenaSlotId(1)).unwrap();
+    let other = PreparedWitnessFeedGraph::prepare_with_mode(
+        &other_arena,
+        other_source_slot,
+        ROWS,
+        SUB_WORDS,
+        &descriptors,
+        &luts,
+        DESTINATION_WORDS,
+        &slots,
+        prepared.launch_mode(),
+    )
+    .unwrap();
+    let other_receipt = other.upload_source(&initial).unwrap();
+    assert!(other.source_upload_is_current(&other_receipt));
+    assert!(!other.source_upload_is_current(&initial_receipt));
+    assert!(!prepared.source_upload_is_current(&other_receipt));
+
     arena.context().reset_telemetry();
     clear.launch().unwrap();
     prepared.launch().unwrap();
@@ -337,7 +383,14 @@ fn prepared_witness_feed_eager_capture_and_mutated_replay_match_host() {
     );
 
     let mutated = source(5);
-    upload(&arena, source_slot, &mutated);
+    let mutated_receipt = prepared.upload_source(&mutated).unwrap();
+    assert_eq!(mutated_receipt.generation(), 2);
+    assert_ne!(
+        mutated_receipt.content_identity(),
+        initial_receipt.content_identity()
+    );
+    assert!(!prepared.source_upload_is_current(&initial_receipt));
+    assert!(prepared.source_upload_is_current(&mutated_receipt));
     graph.launch(arena.context()).unwrap();
     assert_eq!(
         snapshot(&arena, &prepared),
@@ -371,7 +424,7 @@ fn prepared_witness_feed_privatized_matches_global_atomics_and_host() {
     )
     .unwrap();
     let slots = slots();
-    let arena = arena(&requirements, &slots);
+    let arena = make_arena(&requirements, &slots);
     let source_slot = arena.bind(ArenaSlotId(1)).unwrap();
     let modes = [
         WitnessFeedLaunchMode::GlobalAtomics,

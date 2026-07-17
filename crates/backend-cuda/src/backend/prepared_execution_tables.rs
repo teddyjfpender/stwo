@@ -15,6 +15,7 @@ use super::exec_context::{
 };
 
 mod authority;
+mod ingest_receipt;
 
 pub use authority::{
     ExecutionTablesAbi, ExecutionTablesAbiAccess, ExecutionTablesAbiArgument,
@@ -26,6 +27,7 @@ pub use authority::{
     ExecutionTablesStage, ExecutionTablesStageContract, ExecutionTablesStageEffect,
     EXECUTION_TABLES_FIXED_ORDER, EXECUTION_TABLES_STAGE_ORDER,
 };
+pub use ingest_receipt::ExecutionTablesIngestReceipt;
 
 const WORD_BYTES: usize = core::mem::size_of::<u32>();
 const F252_WORDS: usize = 8;
@@ -243,7 +245,9 @@ pub enum PreparedExecutionTablesError {
         expected: usize,
         actual: usize,
     },
+    IngestGenerationOverflow,
     NotIngested,
+    Authority(ExecutionTablesAuthorityError),
     Arena(ArenaError),
     Cuda(CudaRuntimeError),
 }
@@ -265,6 +269,12 @@ impl From<ArenaError> for PreparedExecutionTablesError {
 impl From<CudaRuntimeError> for PreparedExecutionTablesError {
     fn from(value: CudaRuntimeError) -> Self {
         Self::Cuda(value)
+    }
+}
+
+impl From<ExecutionTablesAuthorityError> for PreparedExecutionTablesError {
+    fn from(value: ExecutionTablesAuthorityError) -> Self {
+        Self::Authority(value)
     }
 }
 
@@ -300,7 +310,7 @@ impl PreparedExecutionTablesView<'_> {
         (self.n_addrs, self.n_big, self.n_small)
     }
 
-    pub(crate) fn belongs_to(self, arena: &DeviceArena) -> bool {
+    pub fn belongs_to(self, arena: &DeviceArena) -> bool {
         core::ptr::eq(self.arena, arena)
             && self.table_pointers.context_token() == arena.context().identity_token()
             && self.table_strides.context_token() == arena.context().identity_token()
@@ -316,7 +326,7 @@ impl PreparedExecutionTablesView<'_> {
 /// shape. [`Self::launch`] performs only two explicit-stream kernel enqueues.
 pub struct PreparedExecutionTablesGraph<'a> {
     arena: &'a DeviceArena,
-    requirements: ExecutionTablesWorkspaceRequirements,
+    contract: ExecutionTablesContract,
     raw_addr_to_id: ArenaSlice,
     raw_f252_words: ArenaSlice,
     raw_small_words: ArenaSlice,
@@ -329,6 +339,7 @@ pub struct PreparedExecutionTablesGraph<'a> {
     big_output_pointers: Vec<*mut u32>,
     small_output_pointers: Vec<*mut u32>,
     initialized: Cell<bool>,
+    ingest_state: ingest_receipt::ExecutionTablesIngestState,
 }
 
 impl<'a> PreparedExecutionTablesGraph<'a> {
@@ -348,6 +359,7 @@ impl<'a> PreparedExecutionTablesGraph<'a> {
         {
             return Err(PreparedExecutionTablesError::InvalidRequirements);
         }
+        let contract = ExecutionTablesContract::compile(requirements)?;
         requirements.arena_slot_requirements(slots)?;
         let raw_addr_to_id = bind_slot(
             arena,
@@ -403,7 +415,7 @@ impl<'a> PreparedExecutionTablesGraph<'a> {
 
         Ok(Self {
             arena,
-            requirements: requirements.clone(),
+            contract,
             raw_addr_to_id,
             raw_f252_words,
             raw_small_words,
@@ -416,6 +428,7 @@ impl<'a> PreparedExecutionTablesGraph<'a> {
             big_output_pointers,
             small_output_pointers,
             initialized: Cell::new(false),
+            ingest_state: ingest_receipt::ExecutionTablesIngestState::new(),
         })
     }
 
@@ -424,21 +437,17 @@ impl<'a> PreparedExecutionTablesGraph<'a> {
         &self,
         host: ExecutionTablesHostData<'_>,
     ) -> Result<PreparedExecutionTablesIngestTelemetry, PreparedExecutionTablesError> {
-        check_host_shape(
-            "addr_to_id",
-            self.requirements.n_addrs,
-            host.addr_to_id.len(),
-        )?;
-        check_host_shape(
-            "f252_values",
-            self.requirements.n_big,
-            host.f252_values.len(),
-        )?;
-        check_host_shape(
-            "small_values",
-            self.requirements.n_small,
-            host.small_values.len(),
-        )?;
+        let requirements = self.contract.requirements();
+        let generation = self.ingest_state.next_generation()?;
+        let binding = ingest_receipt::ExecutionTablesIngestBinding::new(
+            self.arena,
+            &self.contract,
+            self.raw_addr_to_id,
+            self.raw_f252_words,
+            self.raw_small_words,
+        );
+        let receipt =
+            ExecutionTablesIngestReceipt::prepare(binding, &self.contract, host, generation)?;
 
         // Keep the explicit little-endian representation used by the legacy path;
         // the setup-only temporary remains alive through the single fence below.
@@ -455,6 +464,38 @@ impl<'a> PreparedExecutionTablesGraph<'a> {
             })
             .collect::<Vec<_>>();
         let first_ingest = !self.initialized.get();
+        let compact_bytes = requirements
+            .n_addrs
+            .checked_add(
+                requirements
+                    .n_big
+                    .checked_mul(F252_WORDS)
+                    .ok_or(PreparedExecutionTablesError::SizeOverflow)?,
+            )
+            .and_then(|words| {
+                requirements
+                    .n_small
+                    .checked_mul(SMALL_WORDS)
+                    .and_then(|small| words.checked_add(small))
+            })
+            .and_then(|words| words.checked_mul(WORD_BYTES))
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or(PreparedExecutionTablesError::SizeOverflow)?;
+        let descriptor_bytes = if first_ingest {
+            requirements
+                .table_pointer_words
+                .checked_add(requirements.table_stride_words)
+                .and_then(|words| words.checked_mul(WORD_BYTES))
+                .and_then(|bytes| u64::try_from(bytes).ok())
+                .ok_or(PreparedExecutionTablesError::SizeOverflow)?
+        } else {
+            0
+        };
+
+        // No earlier receipt may attest potentially changed device bytes once
+        // a fully validated attempt can begin. Failed attempts consume their
+        // generation and leave no current receipt.
+        self.ingest_state.begin(receipt);
         let upload_result = (|| {
             if first_ingest {
                 upload(self.arena, self.table_pointers, &self.descriptor_pointers)?;
@@ -470,44 +511,18 @@ impl<'a> PreparedExecutionTablesGraph<'a> {
         upload_result?;
         sync_result?;
         self.initialized.set(true);
-
-        let compact_bytes = self
-            .requirements
-            .n_addrs
-            .checked_add(
-                self.requirements
-                    .n_big
-                    .checked_mul(F252_WORDS)
-                    .ok_or(PreparedExecutionTablesError::SizeOverflow)?,
-            )
-            .and_then(|words| {
-                self.requirements
-                    .n_small
-                    .checked_mul(SMALL_WORDS)
-                    .and_then(|small| words.checked_add(small))
-            })
-            .and_then(|words| words.checked_mul(WORD_BYTES))
-            .ok_or(PreparedExecutionTablesError::SizeOverflow)?;
-        let descriptor_bytes = if first_ingest {
-            self.requirements
-                .table_pointer_words
-                .checked_add(self.requirements.table_stride_words)
-                .and_then(|words| words.checked_mul(WORD_BYTES))
-                .ok_or(PreparedExecutionTablesError::SizeOverflow)?
-        } else {
-            0
-        };
+        self.ingest_state.publish(receipt);
         Ok(PreparedExecutionTablesIngestTelemetry {
-            compact_h2d_bytes: compact_bytes as u64,
+            compact_h2d_bytes: compact_bytes,
             compact_h2d_copies: [
-                self.requirements.n_addrs,
-                self.requirements.n_big,
-                self.requirements.n_small,
+                requirements.n_addrs,
+                requirements.n_big,
+                requirements.n_small,
             ]
             .into_iter()
             .filter(|&len| len != 0)
             .count() as u64,
-            descriptor_h2d_bytes: descriptor_bytes as u64,
+            descriptor_h2d_bytes: descriptor_bytes,
             descriptor_h2d_copies: if first_ingest { 2 } else { 0 },
             sync_calls: 1,
         })
@@ -525,18 +540,19 @@ impl<'a> PreparedExecutionTablesGraph<'a> {
         &self,
         launch: CudaLaunchContext,
     ) -> Result<PreparedExecutionTablesLaunchTelemetry, PreparedExecutionTablesError> {
-        if !self.initialized.get() {
+        if !self.initialized.get() || self.ingest_state.receipt().is_none() {
             return Err(PreparedExecutionTablesError::NotIngested);
         }
         if launch.identity_token() != self.arena.context().identity_token() {
             return Err(CudaRuntimeError::ContextMismatch.into());
         }
+        let requirements = self.contract.requirements();
         let stream = launch.stream_raw().as_ptr();
         let big = unsafe {
             stwo_backend_cuda_kernels::raw::memory_limb_split_big_columns_on(
                 self.raw_f252_words.as_u32_ptr(),
-                self.requirements.n_big as u32,
-                self.requirements.big_column_words as u32,
+                requirements.n_big as u32,
+                requirements.big_column_words as u32,
                 self.big_output_pointers.as_ptr(),
                 stream,
             )
@@ -545,8 +561,8 @@ impl<'a> PreparedExecutionTablesGraph<'a> {
         let small = unsafe {
             stwo_backend_cuda_kernels::raw::memory_limb_split_small_columns_on(
                 self.raw_small_words.as_u32_ptr(),
-                self.requirements.n_small as u32,
-                self.requirements.small_column_words as u32,
+                requirements.n_small as u32,
+                requirements.small_column_words as u32,
                 self.small_output_pointers.as_ptr(),
                 stream,
             )
@@ -556,7 +572,7 @@ impl<'a> PreparedExecutionTablesGraph<'a> {
     }
 
     pub fn view(&self) -> Result<PreparedExecutionTablesView<'a>, PreparedExecutionTablesError> {
-        if !self.initialized.get() {
+        if !self.initialized.get() || self.ingest_state.receipt().is_none() {
             return Err(PreparedExecutionTablesError::NotIngested);
         }
         let table_data: [ArenaSlice; EXECUTION_TABLE_POINTERS] =
@@ -566,19 +582,42 @@ impl<'a> PreparedExecutionTablesGraph<'a> {
                 .collect::<Vec<_>>()
                 .try_into()
                 .expect("execution-table pointer geometry is fixed");
+        let requirements = self.contract.requirements();
         Ok(PreparedExecutionTablesView {
             arena: self.arena,
             table_pointers: self.table_pointers,
             table_strides: self.table_strides,
             table_data,
-            n_addrs: self.requirements.n_addrs,
-            n_big: self.requirements.n_big,
-            n_small: self.requirements.n_small,
+            n_addrs: requirements.n_addrs,
+            n_big: requirements.n_big,
+            n_small: requirements.n_small,
         })
+    }
+
+    pub fn contract(&self) -> &ExecutionTablesContract {
+        &self.contract
+    }
+
+    pub fn belongs_to(&self, arena: &DeviceArena) -> bool {
+        core::ptr::eq(self.arena, arena)
+            && std::iter::once(self.raw_addr_to_id)
+                .chain([self.raw_f252_words, self.raw_small_words])
+                .chain(self.big_limbs.iter().copied())
+                .chain(self.small_limbs.iter().copied())
+                .chain([self.table_pointers, self.table_strides])
+                .all(|slice| slice.belongs_to(arena.context()))
     }
 
     pub fn raw_addr_to_id(&self) -> ArenaSlice {
         self.raw_addr_to_id
+    }
+
+    pub fn raw_f252_words(&self) -> ArenaSlice {
+        self.raw_f252_words
+    }
+
+    pub fn raw_small_words(&self) -> ArenaSlice {
+        self.raw_small_words
     }
 
     pub fn big_limbs(&self) -> &[ArenaSlice] {
@@ -589,8 +628,31 @@ impl<'a> PreparedExecutionTablesGraph<'a> {
         &self.small_limbs
     }
 
+    pub fn table_pointers(&self) -> ArenaSlice {
+        self.table_pointers
+    }
+
+    pub fn table_strides(&self) -> ArenaSlice {
+        self.table_strides
+    }
+
+    pub fn ingest_receipt(&self) -> Option<ExecutionTablesIngestReceipt> {
+        self.ingest_state.receipt()
+    }
+
+    pub fn ingest_is_current(&self, receipt: &ExecutionTablesIngestReceipt) -> bool {
+        let binding = ingest_receipt::ExecutionTablesIngestBinding::new(
+            self.arena,
+            &self.contract,
+            self.raw_addr_to_id,
+            self.raw_f252_words,
+            self.raw_small_words,
+        );
+        self.ingest_state.is_current(receipt, binding)
+    }
+
     pub fn requirements(&self) -> &ExecutionTablesWorkspaceRequirements {
-        &self.requirements
+        self.contract.requirements()
     }
 }
 
@@ -652,22 +714,6 @@ fn upload<T: Copy>(
     Ok(())
 }
 
-fn check_host_shape(
-    role: &'static str,
-    expected: usize,
-    actual: usize,
-) -> Result<(), PreparedExecutionTablesError> {
-    if expected == actual {
-        Ok(())
-    } else {
-        Err(PreparedExecutionTablesError::HostShapeMismatch {
-            role,
-            expected,
-            actual,
-        })
-    }
-}
-
 fn ensure_distinct(ids: &[ArenaSlotId]) -> Result<(), PreparedExecutionTablesError> {
     let mut seen = BTreeSet::new();
     for &id in ids {
@@ -679,68 +725,4 @@ fn ensure_distinct(ids: &[ArenaSlotId]) -> Result<(), PreparedExecutionTablesErr
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn slots() -> ExecutionTablesWorkspaceSlots {
-        let mut next = 1u32;
-        let mut id = || {
-            let result = ArenaSlotId(next);
-            next += 1;
-            result
-        };
-        ExecutionTablesWorkspaceSlots {
-            raw_addr_to_id: id(),
-            raw_f252_words: id(),
-            raw_small_words: id(),
-            big_limbs: (0..EXECUTION_TABLE_BIG_LIMBS).map(|_| id()).collect(),
-            small_limbs: (0..EXECUTION_TABLE_SMALL_LIMBS).map(|_| id()).collect(),
-            table_pointers: id(),
-            table_strides: id(),
-        }
-    }
-
-    #[test]
-    fn pure_requirements_are_exact_and_fail_closed() {
-        let requirements = execution_tables_workspace_requirements(19, 17, 5).unwrap();
-        assert_eq!(requirements.raw_addr_to_id_words, 19);
-        assert_eq!(requirements.raw_f252_words, 17 * 8);
-        assert_eq!(requirements.raw_small_words, 5 * 4);
-        assert_eq!(requirements.big_column_words, 32);
-        assert_eq!(requirements.small_column_words, 16);
-        assert_eq!(requirements.table_pointer_words, 37 * POINTER_WORDS);
-        assert_eq!(requirements.table_stride_words, 3);
-        assert_eq!(
-            requirements
-                .arena_slot_requirements(&slots())
-                .unwrap()
-                .len(),
-            3 + 28 + 8 + 2
-        );
-
-        let empty = execution_tables_workspace_requirements(0, 0, 0).unwrap();
-        assert_eq!(empty.raw_addr_to_id_words, 1);
-        assert_eq!(empty.raw_f252_words, 1);
-        assert_eq!(empty.raw_small_words, 1);
-        assert_eq!(empty.big_column_words, 16);
-        assert_eq!(empty.small_column_words, 16);
-        let mut duplicate = slots();
-        duplicate.small_limbs[0] = duplicate.big_limbs[0];
-        assert_eq!(
-            requirements
-                .arena_slot_requirements(&duplicate)
-                .unwrap_err(),
-            PreparedExecutionTablesError::DuplicateSlot(duplicate.big_limbs[0])
-        );
-        let mut short = slots();
-        short.big_limbs.pop();
-        assert_eq!(
-            requirements.arena_slot_requirements(&short).unwrap_err(),
-            PreparedExecutionTablesError::SlotShapeMismatch {
-                role: "big_limbs",
-                expected: 28,
-                actual: 27,
-            }
-        );
-    }
-}
+mod tests;

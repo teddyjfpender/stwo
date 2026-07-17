@@ -5,6 +5,7 @@
 //! is one explicit-stream kernel enqueue with no allocation, copy, or synchronization.
 
 use core::ffi::c_void;
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::exec_context::{
@@ -15,6 +16,7 @@ use super::prepared_witness::{BLAKE_G_DIRECT_COUNT_WORDS, BLAKE_G_DIRECT_LUT_WOR
 mod authority;
 mod blake_g_lut_content;
 mod clear_authority;
+mod source_upload;
 pub use authority::{
     WitnessFeedAbi, WitnessFeedAbiAccess, WitnessFeedAbiArgument, WitnessFeedAbiArgumentKind,
     WitnessFeedAuthorityError, WitnessFeedContract, WitnessFeedDescriptorField,
@@ -30,6 +32,7 @@ pub use clear_authority::{
     WitnessFeedClearDestinationEffect, WitnessFeedClearEffectAbi, WitnessFeedClearEffectGeometry,
     WitnessFeedClearKernelLaunch, WitnessFeedClearLinkedContract,
 };
+pub use source_upload::WitnessFeedSourceUploadReceipt;
 
 const WORD_BYTES: usize = core::mem::size_of::<u32>();
 const POINTER_WORDS: usize = core::mem::size_of::<*mut u32>().div_ceil(WORD_BYTES);
@@ -360,6 +363,7 @@ pub enum PreparedWitnessFeedError {
     BlakeGDirectLutContent(BlakeGDirectLutContentError),
     FeedAuthority(WitnessFeedAuthorityError),
     ClearAuthority(WitnessFeedClearAuthorityError),
+    SourceUploadGenerationOverflow,
     KernelLaunchFailed,
     Arena(ArenaError),
     Cuda(CudaRuntimeError),
@@ -905,6 +909,8 @@ pub struct PreparedWitnessFeedGraph<'a> {
     lut_pointers: ArenaSlice,
     multiplicity_destinations: Vec<ArenaSlice>,
     multiplicity_pointers: ArenaSlice,
+    source_upload_generation: Cell<u64>,
+    source_upload_receipt: Cell<Option<WitnessFeedSourceUploadReceipt>>,
 }
 
 /// Source-free prepared binding for the exact Blake-G producer/feed fusion.
@@ -1027,14 +1033,21 @@ impl<'a> PreparedWitnessFeedClearGraph<'a> {
                 bind_external_min(arena, destination, expected_words)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        upload(arena, destination_pointers, &pointer_values(&destinations))?;
+        let pointers = pointer_values(&destinations);
         let lengths = requirements
             .destination_words
             .iter()
             .map(|&words| u32::try_from(words).map_err(|_| PreparedWitnessFeedError::SizeOverflow))
             .collect::<Result<Vec<_>, _>>()?;
-        upload(arena, destination_lengths, &lengths)?;
-        arena.context().sync()?;
+        let upload_result = (|| {
+            upload(arena, destination_pointers, &pointers)?;
+            upload(arena, destination_lengths, &lengths)
+        })();
+        // Always drain a possibly enqueued earlier copy before the borrowed
+        // pointer/length vectors can be dropped.
+        let sync_result = arena.context().sync();
+        upload_result?;
+        sync_result?;
         Ok(Self {
             arena,
             contract,
@@ -1071,6 +1084,24 @@ impl<'a> PreparedWitnessFeedClearGraph<'a> {
 
     pub fn destinations(&self) -> &[ArenaSlice] {
         &self.destinations
+    }
+
+    pub fn belongs_to(&self, arena: &DeviceArena) -> bool {
+        core::ptr::eq(self.arena, arena)
+            && self
+                .destinations
+                .iter()
+                .copied()
+                .chain([self.destination_pointers, self.destination_lengths])
+                .all(|slice| slice.belongs_to(arena.context()))
+    }
+
+    pub fn destination_pointers(&self) -> ArenaSlice {
+        self.destination_pointers
+    }
+
+    pub fn destination_lengths(&self) -> ArenaSlice {
+        self.destination_lengths
     }
 
     pub fn requirements(&self) -> &WitnessFeedClearWorkspaceRequirements {
@@ -1170,19 +1201,25 @@ impl<'a> PreparedWitnessFeedGraph<'a> {
                 .chain(std::iter::once(multiplicity_pointers.id())),
         )?;
 
-        upload(arena, descriptors, descriptors_host)?;
-        for (destination, lut) in lut_tables.iter().copied().zip(luts_host) {
-            upload(arena, destination, lut)?;
-        }
         let lut_pointer_values = if lut_tables.is_empty() {
             vec![0usize]
         } else {
             pointer_values(&lut_tables)
         };
         let multiplicity_pointer_values = pointer_values(&multiplicity_destinations);
-        upload(arena, lut_pointers, &lut_pointer_values)?;
-        upload(arena, multiplicity_pointers, &multiplicity_pointer_values)?;
-        arena.context().sync()?;
+        let upload_result = (|| {
+            upload(arena, descriptors, descriptors_host)?;
+            for (destination, lut) in lut_tables.iter().copied().zip(luts_host) {
+                upload(arena, destination, lut)?;
+            }
+            upload(arena, lut_pointers, &lut_pointer_values)?;
+            upload(arena, multiplicity_pointers, &multiplicity_pointer_values)
+        })();
+        // Drain after any enqueue failure so all borrowed host descriptors,
+        // LUTs, and pointer tables remain live through the last possible copy.
+        let sync_result = arena.context().sync();
+        upload_result?;
+        sync_result?;
 
         Ok(Self {
             arena,
@@ -1193,6 +1230,8 @@ impl<'a> PreparedWitnessFeedGraph<'a> {
             lut_pointers,
             multiplicity_destinations,
             multiplicity_pointers,
+            source_upload_generation: Cell::new(0),
+            source_upload_receipt: Cell::new(None),
         })
     }
 
@@ -1256,8 +1295,23 @@ impl<'a> PreparedWitnessFeedGraph<'a> {
         self.source
     }
 
-    /// Upload the immutable word-major source before graph capture.
-    pub fn upload_source(&self, words: &[u32]) -> Result<(), PreparedWitnessFeedError> {
+    pub fn belongs_to(&self, arena: &DeviceArena) -> bool {
+        core::ptr::eq(self.arena, arena)
+            && std::iter::once(self.source)
+                .chain(std::iter::once(self.descriptors))
+                .chain(self.lut_tables.iter().copied())
+                .chain(std::iter::once(self.lut_pointers))
+                .chain(self.multiplicity_destinations.iter().copied())
+                .chain(std::iter::once(self.multiplicity_pointers))
+                .all(|slice| slice.belongs_to(arena.context()))
+    }
+
+    /// Upload or refresh the statement-varying word-major source before graph
+    /// capture and publish the only current receipt after the copy is fenced.
+    pub fn upload_source(
+        &self,
+        words: &[u32],
+    ) -> Result<WitnessFeedSourceUploadReceipt, PreparedWitnessFeedError> {
         if words.len() != self.contract.requirements().source_words {
             return Err(PreparedWitnessFeedError::SlotSizeMismatch {
                 slot: self.source.id(),
@@ -1265,9 +1319,43 @@ impl<'a> PreparedWitnessFeedGraph<'a> {
                 actual_words: words.len(),
             });
         }
-        upload(self.arena, self.source, words)?;
-        self.arena.context().sync()?;
-        Ok(())
+        let generation =
+            source_upload::next_source_upload_generation(self.source_upload_generation.get())?;
+        let binding = source_upload::WitnessFeedSourceUploadBinding::new(
+            self.arena,
+            &self.contract,
+            self.source,
+        );
+        let receipt = WitnessFeedSourceUploadReceipt::prepare(binding, words, generation)?;
+
+        // Once a valid attempt begins, no earlier receipt may attest the
+        // potentially changed device bytes. Advance independently so a failed
+        // attempt cannot reuse its generation on a later retry.
+        self.source_upload_generation.set(generation);
+        self.source_upload_receipt.set(None);
+        let upload_result = upload(self.arena, self.source, words);
+        // Drain even after an enqueue error: an earlier or partial async copy
+        // may still reference the borrowed host words.
+        let sync_result = self.arena.context().sync();
+        upload_result?;
+        sync_result?;
+
+        self.source_upload_receipt.set(Some(receipt));
+        Ok(receipt)
+    }
+
+    pub fn source_upload_receipt(&self) -> Option<WitnessFeedSourceUploadReceipt> {
+        self.source_upload_receipt.get()
+    }
+
+    pub fn source_upload_is_current(&self, receipt: &WitnessFeedSourceUploadReceipt) -> bool {
+        let binding = source_upload::WitnessFeedSourceUploadBinding::new(
+            self.arena,
+            &self.contract,
+            self.source,
+        );
+        self.source_upload_receipt.get() == Some(*receipt)
+            && receipt.matches(binding, self.source_upload_generation.get())
     }
 
     pub fn multiplicity_destinations(&self) -> &[ArenaSlice] {
@@ -1276,6 +1364,18 @@ impl<'a> PreparedWitnessFeedGraph<'a> {
 
     pub fn lut_tables(&self) -> &[ArenaSlice] {
         &self.lut_tables
+    }
+
+    pub fn descriptors(&self) -> ArenaSlice {
+        self.descriptors
+    }
+
+    pub fn lut_pointers(&self) -> ArenaSlice {
+        self.lut_pointers
+    }
+
+    pub fn multiplicity_pointers(&self) -> ArenaSlice {
+        self.multiplicity_pointers
     }
 
     /// Immutable descriptor storage sealed into the captured kernel arguments.
