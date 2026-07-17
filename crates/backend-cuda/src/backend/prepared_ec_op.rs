@@ -14,11 +14,13 @@ use super::exec_context::{
 use super::prepared_execution_tables::PreparedExecutionTablesView;
 
 mod authority;
+mod segment_start_receipt;
 pub use authority::{
     EcOpAbiAccess, EcOpAbiArgument, EcOpAbiArgumentKind, EcOpAuthorityError, EcOpCompositeAbi,
     EcOpCompositeContract, EcOpEffectAbi, EcOpExecutionTableShape, EcOpKernelLaunch,
     EcOpKernelStage,
 };
+pub use segment_start_receipt::EcOpSegmentStartReceipt;
 
 pub const EC_OP_TRACE_COLUMNS: usize = 273;
 pub const EC_OP_LOOKUP_WORDS_PER_ROW: usize = 488;
@@ -170,6 +172,8 @@ pub enum PreparedEcOpError {
     CudaUnavailable,
     InvalidRowCount(usize),
     InvalidSegmentStart,
+    SegmentStartGenerationOverflow,
+    SegmentStartNotIngested,
     InvalidMultiplicityGeometry,
     SegmentOutOfBounds {
         start: usize,
@@ -189,6 +193,7 @@ pub enum PreparedEcOpError {
     },
     DuplicateSlot(ArenaSlotId),
     ExecutionTableContextMismatch,
+    Authority(EcOpAuthorityError),
     Arena(ArenaError),
     Cuda(CudaRuntimeError),
 }
@@ -210,6 +215,12 @@ impl From<ArenaError> for PreparedEcOpError {
 impl From<CudaRuntimeError> for PreparedEcOpError {
     fn from(value: CudaRuntimeError) -> Self {
         Self::Cuda(value)
+    }
+}
+
+impl From<EcOpAuthorityError> for PreparedEcOpError {
+    fn from(value: EcOpAuthorityError) -> Self {
+        Self::Authority(value)
     }
 }
 
@@ -242,6 +253,7 @@ impl PreparedEcOpLaunchTelemetry {
 
 pub struct PreparedEcOpGraph<'a> {
     arena: &'a DeviceArena,
+    contract: EcOpCompositeContract,
     execution_table_pointers: ArenaSlice,
     n_addresses: u32,
     n_big: u32,
@@ -258,6 +270,7 @@ pub struct PreparedEcOpGraph<'a> {
     big_counts: ArenaSlice,
     small_counts: ArenaSlice,
     range_check_8_counts: ArenaSlice,
+    segment_start_state: segment_start_receipt::EcOpSegmentStartState,
 }
 
 impl<'a> PreparedEcOpGraph<'a> {
@@ -294,6 +307,14 @@ impl<'a> PreparedEcOpGraph<'a> {
         {
             return Err(PreparedEcOpError::InvalidMultiplicityGeometry);
         }
+        let contract = EcOpCompositeContract::compile(
+            requirements,
+            EcOpExecutionTableShape {
+                n_addresses,
+                n_big,
+                n_small,
+            },
+        )?;
 
         let trace_columns = bind_many(arena, &slots.trace_columns, requirements.row_count)?;
         let lookup_words = bind_slot(arena, slots.lookup_words, requirements.lookup_words)?;
@@ -326,6 +347,7 @@ impl<'a> PreparedEcOpGraph<'a> {
 
         Ok(Self {
             arena,
+            contract,
             execution_table_pointers: execution_tables.table_pointers(),
             n_addresses: u32::try_from(n_addresses).map_err(|_| PreparedEcOpError::SizeOverflow)?,
             n_big: u32::try_from(n_big).map_err(|_| PreparedEcOpError::SizeOverflow)?,
@@ -344,6 +366,7 @@ impl<'a> PreparedEcOpGraph<'a> {
             big_counts,
             small_counts,
             range_check_8_counts,
+            segment_start_state: segment_start_receipt::EcOpSegmentStartState::new(),
         })
     }
 
@@ -371,6 +394,14 @@ impl<'a> PreparedEcOpGraph<'a> {
             });
         }
         let value = u32::try_from(segment_start).map_err(|_| PreparedEcOpError::SizeOverflow)?;
+        let generation = self.segment_start_state.next_generation()?;
+        let binding = segment_start_receipt::EcOpSegmentStartBinding::new(
+            self.arena,
+            &self.contract,
+            self.segment_start,
+        );
+        let receipt = EcOpSegmentStartReceipt::prepare(binding, value, generation)?;
+        self.segment_start_state.begin(receipt);
         unsafe {
             self.arena.context().fill_u32_async(
                 self.segment_start.as_u32_ptr(),
@@ -378,6 +409,7 @@ impl<'a> PreparedEcOpGraph<'a> {
                 self.segment_start.len_words(),
             )?;
         }
+        self.segment_start_state.publish(receipt);
         Ok(PreparedEcOpIngestTelemetry {
             h2d_bytes: 0,
             h2d_copies: 0,
@@ -394,6 +426,9 @@ impl<'a> PreparedEcOpGraph<'a> {
         &self,
         launch: CudaLaunchContext,
     ) -> Result<PreparedEcOpLaunchTelemetry, PreparedEcOpError> {
+        if self.segment_start_state.receipt().is_none() {
+            return Err(PreparedEcOpError::SegmentStartNotIngested);
+        }
         if launch.identity_token() != self.arena.context().identity_token() {
             return Err(CudaRuntimeError::ContextMismatch.into());
         }
@@ -430,6 +465,43 @@ impl<'a> PreparedEcOpGraph<'a> {
 
     pub fn trace_columns(&self) -> &[ArenaSlice] {
         &self.trace_columns
+    }
+
+    pub fn contract(&self) -> &EcOpCompositeContract {
+        &self.contract
+    }
+
+    pub fn belongs_to(&self, arena: &DeviceArena) -> bool {
+        core::ptr::eq(self.arena, arena)
+            && std::iter::once(self.execution_table_pointers)
+                .chain(std::iter::once(self.segment_start))
+                .chain(self.trace_columns.iter().copied())
+                .chain(std::iter::once(self.lookup_words))
+                .chain(self.partial_input_columns.iter().copied())
+                .chain([
+                    self.address_counts,
+                    self.big_counts,
+                    self.small_counts,
+                    self.range_check_8_counts,
+                ])
+                .all(|slice| slice.belongs_to(arena.context()))
+    }
+
+    pub fn execution_table_pointers(&self) -> ArenaSlice {
+        self.execution_table_pointers
+    }
+
+    pub fn segment_start_receipt(&self) -> Option<EcOpSegmentStartReceipt> {
+        self.segment_start_state.receipt()
+    }
+
+    pub fn segment_start_is_current(&self, receipt: &EcOpSegmentStartReceipt) -> bool {
+        let binding = segment_start_receipt::EcOpSegmentStartBinding::new(
+            self.arena,
+            &self.contract,
+            self.segment_start,
+        );
+        self.segment_start_state.is_current(receipt, binding)
     }
 
     pub fn lookup_words(&self) -> ArenaSlice {

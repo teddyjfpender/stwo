@@ -75,10 +75,10 @@ pub use backend::prepared_ec_op::{
     ec_op_workspace_requirements, EcOpAbiAccess, EcOpAbiArgument, EcOpAbiArgumentKind,
     EcOpArenaSlotRequirement, EcOpAuthorityError, EcOpCompositeAbi, EcOpCompositeContract,
     EcOpEffectAbi, EcOpExecutionTableShape, EcOpKernelLaunch, EcOpKernelStage,
-    EcOpMultiplicityGeometry, EcOpWorkspaceRequirements, EcOpWorkspaceSlots, PreparedEcOpError,
-    PreparedEcOpGraph, PreparedEcOpIngestTelemetry, PreparedEcOpLaunchTelemetry,
-    EC_OP_LOOKUP_WORDS_PER_ROW, EC_OP_PARTIAL_INPUT_COLUMNS, EC_OP_PARTIAL_PADDED_ROUNDS,
-    EC_OP_PARTIAL_REAL_ROUNDS, EC_OP_TRACE_COLUMNS,
+    EcOpMultiplicityGeometry, EcOpSegmentStartReceipt, EcOpWorkspaceRequirements,
+    EcOpWorkspaceSlots, PreparedEcOpError, PreparedEcOpGraph, PreparedEcOpIngestTelemetry,
+    PreparedEcOpLaunchTelemetry, EC_OP_LOOKUP_WORDS_PER_ROW, EC_OP_PARTIAL_INPUT_COLUMNS,
+    EC_OP_PARTIAL_PADDED_ROUNDS, EC_OP_PARTIAL_REAL_ROUNDS, EC_OP_TRACE_COLUMNS,
 };
 pub use backend::prepared_execution_tables::{
     execution_tables_workspace_requirements, ExecutionTablesAbi, ExecutionTablesAbiAccess,
