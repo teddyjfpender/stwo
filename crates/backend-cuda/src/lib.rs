@@ -216,9 +216,15 @@ pub use backend::prepared_witness_input::{
     witness_input_seed_requirements, PreparedWitnessInputCompactGraph,
     PreparedWitnessInputGatherError, PreparedWitnessInputGatherGraph,
     PreparedWitnessInputSeedGraph, WitnessInputCompactLayout, WitnessInputCompactRequirements,
-    WitnessInputCompactSlots, WitnessInputGatherArenaSlotRequirement, WitnessInputGatherEdge,
-    WitnessInputGatherEdgePlan, WitnessInputGatherRequirements, WitnessInputGatherSlots,
-    WitnessInputSeedRequirements, WitnessInputSeedSlots, WITNESS_INPUT_GATHER_DESCRIPTOR_WORDS,
+    WitnessInputCompactSlots, WitnessInputGatherAbi, WitnessInputGatherAbiAccess,
+    WitnessInputGatherAbiArgument, WitnessInputGatherAbiArgumentKind,
+    WitnessInputGatherArenaSlotRequirement, WitnessInputGatherAuthorityError,
+    WitnessInputGatherContract, WitnessInputGatherDescriptorField, WitnessInputGatherEdge,
+    WitnessInputGatherEdgePlan, WitnessInputGatherEffectAbi, WitnessInputGatherEffectGeometry,
+    WitnessInputGatherOutputEffect, WitnessInputGatherPackedEdgeEffect,
+    WitnessInputGatherRequirements, WitnessInputGatherRowDomain, WitnessInputGatherSlots,
+    WitnessInputGatherWrapperLaunch, WitnessInputSeedRequirements, WitnessInputSeedSlots,
+    WITNESS_INPUT_GATHER_DESCRIPTOR_ORDER, WITNESS_INPUT_GATHER_DESCRIPTOR_WORDS,
     WITNESS_INPUT_GATHER_PACKED_LANES, WITNESS_INPUT_GATHER_POINTER_ALIGNMENT_WORDS,
 };
 pub use backend::progressive_commit::{
