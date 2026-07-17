@@ -119,12 +119,17 @@ PY
 fi
 
 RUST_VOLUME="stwo-cuda-rustup"
+TARGET_VOLUME="stwo-cuda-linux-target"
 
 container_cargo() {
-  # Rust toolchain lives in a named volume so repeat runs skip the install.
+  # Keep both the toolchain and Linux artifacts off the host target tree. The
+  # latter avoids cross-architecture cache corruption on macOS and makes repeat
+  # archive/link gates incremental.
   docker run --rm --platform linux/amd64 \
     -v "$PWD:/workspace" -v "${RUST_VOLUME}:/root/.rustup" \
     -v "${RUST_VOLUME}-cargo:/root/.cargo" \
+    -v "${TARGET_VOLUME}:/target" \
+    -e CARGO_TARGET_DIR=/target \
     -e STWO_CUDA_OBJ_CACHE=/workspace/.docker_cuda_obj_cache \
     -e STWO_CUDA_ARCH="${ARCH}" -e STWO_CUDA_BUILD_JOBS="${JOBS}" \
     -e CARGO_BUILD_JOBS="${JOBS}" \
