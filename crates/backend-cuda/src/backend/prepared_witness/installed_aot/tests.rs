@@ -121,17 +121,26 @@ fn retained_handle_borrows_the_graph_context_and_never_launches_eagerly() {
 #[test]
 fn recorded_launch_geometry_matches_the_legacy_wrapper_exactly() {
     let native = include_str!("../../../../../backend-cuda-kernels/cuda/runtime_jit.cu");
+    assert!(native
+        .contains("constexpr uint32_t ceil_div_nonzero_u32(uint32_t value, uint32_t divisor)"));
     assert!(native.contains(
         "const unsigned block = 256;  // must match the generated kernel's __launch_bounds__"
     ));
-    assert!(native.contains("const unsigned grid = (row_count + block - 1) / block;"));
+    assert!(native.contains("ceil_div_nonzero_u32(kU32Max, 256u) == 16777216u"));
+    assert!(!native.contains("(row_count + block - 1) / block"));
+    assert_eq!(
+        native
+            .matches("const unsigned grid = ceil_div_nonzero_u32(row_count, block);")
+            .count(),
+        5
+    );
 
     for (rows, grid) in [
         (1usize, 1u32),
         (255, 1),
         (256, 1),
         (257, 2),
-        (u32::MAX as usize - 255, (u32::MAX - 255) / 256),
+        (u32::MAX as usize, u32::MAX.div_ceil(256)),
     ] {
         let facts = recorded_launch_facts(rows).unwrap();
         assert_eq!(facts.grid(), [grid, 1, 1]);
@@ -141,14 +150,6 @@ fn recorded_launch_geometry_matches_the_legacy_wrapper_exactly() {
     assert_eq!(
         recorded_launch_facts(0).unwrap_err(),
         PreparedWitnessError::ZeroRows
-    );
-    assert_eq!(
-        recorded_launch_facts(u32::MAX as usize - 254).unwrap_err(),
-        PreparedWitnessError::RowCountOverflow
-    );
-    assert_eq!(
-        recorded_launch_facts(u32::MAX as usize).unwrap_err(),
-        PreparedWitnessError::RowCountOverflow
     );
     if let Some(too_many_rows) = (u32::MAX as usize).checked_add(1) {
         assert_eq!(

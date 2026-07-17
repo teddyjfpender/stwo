@@ -196,14 +196,8 @@ fn recorded_launch_facts(
         return Err(PreparedWitnessError::ZeroRows);
     }
     let rows = u32::try_from(row_count).map_err(|_| PreparedWitnessError::RowCountOverflow)?;
-    // Match the unchanged legacy wrapper exactly. Its u32 `(rows + 255) /
-    // 256` expression would wrap in the top 255-value tail; reject that tail
-    // during strict admission instead of retaining a different launch receipt.
-    let rounded_rows = rows
-        .checked_add(RECORDED_WITNESS_BLOCK_THREADS - 1)
-        .ok_or(PreparedWitnessError::RowCountOverflow)?;
     InstalledAotLaunchFacts::new(
-        [rounded_rows / RECORDED_WITNESS_BLOCK_THREADS, 1, 1],
+        [rows.div_ceil(RECORDED_WITNESS_BLOCK_THREADS), 1, 1],
         [RECORDED_WITNESS_BLOCK_THREADS, 1, 1],
         0,
     )

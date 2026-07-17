@@ -209,6 +209,19 @@ static_assert(sizeof(StwoCudaCompositionWavePart) == 48,
 static_assert(alignof(StwoCudaCompositionWavePart) == 8,
               "composition wave part alignment");
 
+// Call only after the wrapper's zero-row no-op guard. Subtracting before
+// dividing avoids the u32 overflow in `(value + divisor - 1) / divisor`.
+constexpr uint32_t ceil_div_nonzero_u32(uint32_t value, uint32_t divisor) {
+    return 1u + (value - 1u) / divisor;
+}
+constexpr uint32_t kU32Max = ~uint32_t{0};
+static_assert(ceil_div_nonzero_u32(1u, 256u) == 1u, "ceil-div one row");
+static_assert(ceil_div_nonzero_u32(255u, 256u) == 1u, "ceil-div partial block");
+static_assert(ceil_div_nonzero_u32(256u, 256u) == 1u, "ceil-div full block");
+static_assert(ceil_div_nonzero_u32(257u, 256u) == 2u, "ceil-div next block");
+static_assert(ceil_div_nonzero_u32(kU32Max, 256u) == 16777216u,
+              "ceil-div u32 maximum");
+
 struct AotCounters {
     std::atomic<uint64_t> aot_loads{0};
     std::atomic<uint64_t> aot_cache_hits{0};
@@ -1821,6 +1834,7 @@ extern "C" bool stwo_cuda_jit_eval_fused(
     if (!get_or_compile(source, kernel_name, cache_key, relax_opt, &function)) {
         return false;
     }
+    if (row_count == 0) return true;
 
     void *args[] = {
         (void *)&trace_values, (void *)&interaction_offsets, (void *)&base_params,
@@ -1830,7 +1844,7 @@ extern "C" bool stwo_cuda_jit_eval_fused(
         (void *)&rc_base,
     };
     const unsigned block = 128;  // must match the generated kernel's __launch_bounds__
-    const unsigned grid = (row_count + block - 1) / block;
+    const unsigned grid = ceil_div_nonzero_u32(row_count, block);
     // A launch failure happens before any device write, so returning false here still
     // permits the CPU fallback. After a successful enqueue the kernel updates the
     // accumulator in place; an asynchronous execution fault becomes a sticky context
@@ -1875,6 +1889,7 @@ extern "C" bool stwo_cuda_jit_eval_fused_on(
     if (!get_or_compile(source, kernel_name, cache_key, relax_opt, &function)) {
         return false;
     }
+    if (row_count == 0) return true;
     void *args[] = {
         (void *)&trace_values, (void *)&interaction_offsets, (void *)&base_params,
         (void *)&ext_params,   (void *)&random_coeff_powers, (void *)&denom_inv,
@@ -1883,8 +1898,7 @@ extern "C" bool stwo_cuda_jit_eval_fused_on(
         (void *)&rc_base,
     };
     const unsigned block = 128;
-    const unsigned grid = (row_count + block - 1) / block;
-    if (row_count == 0) return true;
+    const unsigned grid = ceil_div_nonzero_u32(row_count, block);
     if (cuLaunchKernel(function, grid, 1, 1, block, 1, 1, 0, (CUstream)stream, args,
                        nullptr) != CUDA_SUCCESS) {
         fprintf(stderr, "stwo resident AOT: cuLaunchKernel failed for %s\n", kernel_name);
@@ -1923,7 +1937,7 @@ extern "C" bool stwo_cuda_jit_eval_composition_wave_on(
         (void *)&row_count,
     };
     const unsigned block = 128;
-    const unsigned grid = (row_count + block - 1) / block;
+    const unsigned grid = ceil_div_nonzero_u32(row_count, block);
     if (cuLaunchKernel(function, grid, 1, 1, block, 1, 1, 0, (CUstream)stream, args,
                        nullptr) != CUDA_SUCCESS) {
         fprintf(stderr, "stwo resident AOT: composition wave launch failed for %s\n",
@@ -1983,6 +1997,9 @@ extern "C" bool stwo_cuda_jit_witness_launch(
     if (!get_or_compile(source, kernel_name, cache_key, relax_opt, &function)) {
         return false;
     }
+    if (row_count == 0) {
+        return true;  // nothing to launch; a 0-row component is a no-op success.
+    }
 
     void *args[] = {
         (void *)&input_cols,   (void *)&table_bases, (void *)&table_strides,
@@ -1990,10 +2007,7 @@ extern "C" bool stwo_cuda_jit_witness_launch(
         (void *)&sub_words,    (void *)&row_count,
     };
     const unsigned block = 256;  // must match the generated kernel's __launch_bounds__
-    const unsigned grid = (row_count + block - 1) / block;
-    if (row_count == 0) {
-        return true;  // nothing to launch; a 0-row component is a no-op success.
-    }
+    const unsigned grid = ceil_div_nonzero_u32(row_count, block);
     if (cuLaunchKernel(function, grid, 1, 1, block, 1, 1, 0, (CUstream)stream, args, nullptr) !=
         CUDA_SUCCESS) {
         fprintf(stderr, "stwo witness-JIT: cuLaunchKernel failed for %s\n", kernel_name);
@@ -2043,7 +2057,7 @@ extern "C" bool stwo_cuda_jit_witness_phase_pair_launch(
         (void *)&sub_words,     (void *)&phase_scratch, (void *)&row_count,
     };
     const unsigned block = 256;
-    const unsigned grid = 1u + (row_count - 1u) / block;
+    const unsigned grid = ceil_div_nonzero_u32(row_count, block);
     for (unsigned phase = 0; phase < 2; ++phase) {
         if (cuLaunchKernel(functions[phase], grid, 1, 1, block, 1, 1, 0,
                            (CUstream)stream, args, nullptr) != CUDA_SUCCESS) {
