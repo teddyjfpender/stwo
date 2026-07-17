@@ -157,7 +157,7 @@ static int witness_feed_counts_on(
         return 0;
     }
     const uint32_t block = 256;
-    uint32_t grid = (column_length + block - 1) / block;
+    uint32_t grid = 1u + (column_length - 1u) / block;
     witness_feed_counts_kernel<<<grid, block, 0, stream>>>(
         sub_words_dev, column_length, descs_dev, n_descs, luts_dev, counts_dev);
     if (cudaGetLastError() != cudaSuccess) {
@@ -430,7 +430,7 @@ static int witness_feed_counts_privatized_on(
         return 0;
     }
     const uint32_t block = 256;
-    uint32_t grid = (column_length + block - 1) / block;
+    uint32_t grid = 1u + (column_length - 1u) / block;
     witness_feed_counts_privatized_kernel<<<grid, block, 0, stream>>>(
         sub_words_dev, column_length, descs_dev, n_descs, luts_dev,
         counts_dev);

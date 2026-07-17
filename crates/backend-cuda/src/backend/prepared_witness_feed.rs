@@ -12,8 +12,17 @@ use super::exec_context::{
 };
 use super::prepared_witness::{BLAKE_G_DIRECT_COUNT_WORDS, BLAKE_G_DIRECT_LUT_WORDS};
 
+mod authority;
 mod blake_g_lut_content;
 mod clear_authority;
+pub use authority::{
+    WitnessFeedAbi, WitnessFeedAbiAccess, WitnessFeedAbiArgument, WitnessFeedAbiArgumentKind,
+    WitnessFeedAuthorityError, WitnessFeedContract, WitnessFeedDescriptorField,
+    WitnessFeedDescriptorKind, WitnessFeedDestinationEffect, WitnessFeedDestinationRange,
+    WitnessFeedEffectAbi, WitnessFeedEffectGeometry, WitnessFeedKernelLaunch,
+    WitnessFeedLinkedContract, WitnessFeedLutRead, WitnessFeedRowDomain, WitnessFeedSourceRead,
+    WITNESS_FEED_DESCRIPTOR_FIELD_ORDER,
+};
 pub use blake_g_lut_content::{BlakeGDirectLutContentError, BlakeGDirectLutContentIdentity};
 pub use clear_authority::{
     WitnessFeedClearAbi, WitnessFeedClearAbiAccess, WitnessFeedClearAbiArgument,
@@ -255,6 +264,11 @@ pub enum PreparedWitnessFeedError {
         word: usize,
         bits: u32,
     },
+    NonzeroUnusedDescriptorWord {
+        descriptor: usize,
+        word: usize,
+        value: u32,
+    },
     SourceRangeOverflow {
         descriptor: usize,
     },
@@ -344,6 +358,7 @@ pub enum PreparedWitnessFeedError {
     ConflictingDestination(ArenaSlotId),
     BlakeGFusionShape(&'static str),
     BlakeGDirectLutContent(BlakeGDirectLutContentError),
+    FeedAuthority(WitnessFeedAuthorityError),
     ClearAuthority(WitnessFeedClearAuthorityError),
     KernelLaunchFailed,
     Arena(ArenaError),
@@ -373,6 +388,12 @@ impl From<CudaRuntimeError> for PreparedWitnessFeedError {
 impl From<BlakeGDirectLutContentError> for PreparedWitnessFeedError {
     fn from(value: BlakeGDirectLutContentError) -> Self {
         Self::BlakeGDirectLutContent(value)
+    }
+}
+
+impl From<WitnessFeedAuthorityError> for PreparedWitnessFeedError {
+    fn from(value: WitnessFeedAuthorityError) -> Self {
+        Self::FeedAuthority(value)
     }
 }
 
@@ -681,6 +702,13 @@ fn validate_fold_descriptor(
     used_destinations: &mut [bool],
     destination_table_sizes: &mut [Option<usize>],
 ) -> Result<(), PreparedWitnessFeedError> {
+    if entry[13] != 0 {
+        return Err(PreparedWitnessFeedError::NonzeroUnusedDescriptorWord {
+            descriptor,
+            word: 13,
+            value: entry[13],
+        });
+    }
     let mut tuple_bits = 0u32;
     for word in 0..WITNESS_FEED_MAX_TUPLE_WORDS {
         let bits = entry[2 + word];
@@ -870,15 +898,13 @@ fn pointer_words(count: usize) -> Result<usize, PreparedWitnessFeedError> {
 /// One allocation-free, capture-safe feed launch.
 pub struct PreparedWitnessFeedGraph<'a> {
     arena: &'a DeviceArena,
-    requirements: WitnessFeedWorkspaceRequirements,
+    contract: WitnessFeedContract,
     source: ArenaSlice,
     descriptors: ArenaSlice,
     lut_tables: Vec<ArenaSlice>,
     lut_pointers: ArenaSlice,
     multiplicity_destinations: Vec<ArenaSlice>,
     multiplicity_pointers: ArenaSlice,
-    /// Kernel symbol selected at prepare; both symbols are always compiled.
-    mode: WitnessFeedLaunchMode,
 }
 
 /// Source-free prepared binding for the exact Blake-G producer/feed fusion.
@@ -1110,6 +1136,8 @@ impl<'a> PreparedWitnessFeedGraph<'a> {
             luts_host,
             multiplicity_words,
         )?;
+        let contract =
+            WitnessFeedContract::compile(&requirements, descriptors_host, luts_host, mode)?;
         requirements.arena_slot_requirements(slots)?;
         let source = bind_external_min(arena, source, requirements.source_words)?;
 
@@ -1158,14 +1186,13 @@ impl<'a> PreparedWitnessFeedGraph<'a> {
 
         Ok(Self {
             arena,
-            requirements,
+            contract,
             source,
             descriptors,
             lut_tables,
             lut_pointers,
             multiplicity_destinations,
             multiplicity_pointers,
-            mode,
         })
     }
 
@@ -1178,14 +1205,15 @@ impl<'a> PreparedWitnessFeedGraph<'a> {
         if launch.identity_token() != self.arena.context().identity_token() {
             return Err(CudaRuntimeError::ContextMismatch.into());
         }
+        let requirements = self.contract.requirements();
         let code = unsafe {
-            match self.mode {
+            match self.contract.launch_mode() {
                 WitnessFeedLaunchMode::GlobalAtomics => {
                     stwo_backend_cuda_kernels::raw::stwo_witness_feed_counts_on(
                         self.source.as_u32_ptr().cast_const(),
-                        self.requirements.row_count as u32,
+                        requirements.row_count as u32,
                         self.descriptors.as_u32_ptr().cast_const(),
-                        self.requirements.descriptor_count as u32,
+                        requirements.descriptor_count as u32,
                         self.lut_pointers.as_u32_ptr().cast(),
                         self.multiplicity_pointers.as_u32_ptr().cast(),
                         launch.stream_raw().as_ptr(),
@@ -1194,9 +1222,9 @@ impl<'a> PreparedWitnessFeedGraph<'a> {
                 WitnessFeedLaunchMode::Privatized => {
                     stwo_backend_cuda_kernels::raw::stwo_witness_feed_counts_privatized_on(
                         self.source.as_u32_ptr().cast_const(),
-                        self.requirements.row_count as u32,
+                        requirements.row_count as u32,
                         self.descriptors.as_u32_ptr().cast_const(),
-                        self.requirements.descriptor_count as u32,
+                        requirements.descriptor_count as u32,
                         self.lut_pointers.as_u32_ptr().cast(),
                         self.multiplicity_pointers.as_u32_ptr().cast(),
                         launch.stream_raw().as_ptr(),
@@ -1213,11 +1241,15 @@ impl<'a> PreparedWitnessFeedGraph<'a> {
 
     /// Kernel selection sealed at prepare.
     pub fn launch_mode(&self) -> WitnessFeedLaunchMode {
-        self.mode
+        self.contract.launch_mode()
     }
 
     pub fn requirements(&self) -> &WitnessFeedWorkspaceRequirements {
-        &self.requirements
+        self.contract.requirements()
+    }
+
+    pub fn contract(&self) -> &WitnessFeedContract {
+        &self.contract
     }
 
     pub fn source(&self) -> ArenaSlice {
@@ -1226,10 +1258,10 @@ impl<'a> PreparedWitnessFeedGraph<'a> {
 
     /// Upload the immutable word-major source before graph capture.
     pub fn upload_source(&self, words: &[u32]) -> Result<(), PreparedWitnessFeedError> {
-        if words.len() != self.requirements.source_words {
+        if words.len() != self.contract.requirements().source_words {
             return Err(PreparedWitnessFeedError::SlotSizeMismatch {
                 slot: self.source.id(),
-                expected_words: self.requirements.source_words,
+                expected_words: self.contract.requirements().source_words,
                 actual_words: words.len(),
             });
         }
