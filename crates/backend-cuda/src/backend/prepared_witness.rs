@@ -10,8 +10,8 @@ use std::collections::BTreeSet;
 use std::ffi::CString;
 
 use super::blake_witness::{
-    BG_FUSED_SEMANTIC_HASH, BG_N_DATA_INPUTS, BG_N_LOOKUP_WORDS, BG_N_RECORDED_INPUTS,
-    BG_N_SUB_WORDS, BG_N_TRACE,
+    BG_FUSED_PROGRAM_IDENTITY, BG_FUSED_SEMANTIC_HASH, BG_N_DATA_INPUTS, BG_N_LOOKUP_WORDS,
+    BG_N_RECORDED_INPUTS, BG_N_SUB_WORDS, BG_N_TRACE,
 };
 use super::exec_context::{
     ArenaError, ArenaSlice, ArenaSlotId, CudaLaunchContext, CudaRuntimeError, DeviceArena,
@@ -21,7 +21,15 @@ use super::jit_witness::isa::{WitnessOp, WitnessProgram};
 use super::prepared_execution_tables::PreparedExecutionTablesView;
 use super::{aot, jit_witness};
 
+mod blake_g_direct_authority;
 mod phase_program;
+pub use blake_g_direct_authority::{
+    BlakeGDirectAbiAccess, BlakeGDirectAbiArgument, BlakeGDirectAbiArgumentKind,
+    BlakeGDirectAuthorityError, BlakeGDirectCompositeAbi, BlakeGDirectCompositeContract,
+    BlakeGDirectCountDestination, BlakeGDirectEffectAbi, BlakeGDirectLut, BlakeGDirectRowDomain,
+    BlakeGDirectWrapperLaunch, BLAKE_G_DIRECT_BLOCK_THREADS, BLAKE_G_DIRECT_COUNT_ORDER,
+    BLAKE_G_DIRECT_COUNT_WORDS, BLAKE_G_DIRECT_LUT_ORDER, BLAKE_G_DIRECT_LUT_WORDS,
+};
 pub use phase_program::{phase_scratch_words, PreparedWitnessPhaseProgram};
 
 const WORD_BYTES: usize = core::mem::size_of::<u32>();
@@ -536,6 +544,7 @@ pub enum PreparedWitnessError {
     StrictAotUnavailable(WitnessKernelIdentity),
     KernelPreparationFailed(WitnessKernelIdentity),
     KernelLaunchFailed(WitnessKernelIdentity),
+    BlakeGDirectAuthority(BlakeGDirectAuthorityError),
     BlakeGFusionShape(&'static str),
     Arena(ArenaError),
     Cuda(CudaRuntimeError),
@@ -561,6 +570,12 @@ impl From<CudaRuntimeError> for PreparedWitnessError {
     }
 }
 
+impl From<BlakeGDirectAuthorityError> for PreparedWitnessError {
+    fn from(value: BlakeGDirectAuthorityError) -> Self {
+        Self::BlakeGDirectAuthority(value)
+    }
+}
+
 /// Allocation-free prepared witness launch. The borrowed tables and arena make every
 /// address captured by the kernel structurally outlive this plan.
 #[derive(Clone, Copy)]
@@ -581,6 +596,7 @@ enum WitnessLaunchContract {
 /// the recorded writer until the native lowering is re-proven and re-pinned.
 pub fn blake_g_fusion_program_is_exact(program: &WitnessProgram) -> bool {
     program.label == "blake_g"
+        && program.semantic_identity() == BG_FUSED_PROGRAM_IDENTITY
         && program.semantic_hash() == BG_FUSED_SEMANTIC_HASH
         && program.n_inputs as usize == BG_N_RECORDED_INPUTS
         && program.n_cols as usize == BG_N_TRACE
@@ -609,6 +625,7 @@ pub struct PreparedWitnessGraph<'a> {
     lookup_words: ArenaSlice,
     sub_words: ArenaSlice,
     launch_contract: WitnessLaunchContract,
+    blake_g_direct_contract: Option<BlakeGDirectCompositeContract>,
 }
 
 impl<'a> PreparedWitnessGraph<'a> {
@@ -742,12 +759,14 @@ impl<'a> PreparedWitnessGraph<'a> {
     pub fn prepare_blake_g_direct_with_execution_tables(
         arena: &'a DeviceArena,
         program: &WitnessProgram,
+        n_real_rows: usize,
         row_count: usize,
         tables: PreparedExecutionTablesView<'a>,
         slots: &WitnessWorkspaceSlots,
         mode: PreparedWitnessMode,
     ) -> Result<Self, PreparedWitnessError> {
-        Self::prepare_inner(
+        let contract = BlakeGDirectCompositeContract::compile(program, n_real_rows, row_count)?;
+        let mut prepared = Self::prepare_inner(
             arena,
             program,
             row_count,
@@ -756,7 +775,9 @@ impl<'a> PreparedWitnessGraph<'a> {
             slots,
             mode,
             WitnessLaunchContract::BlakeGDirect,
-        )
+        )?;
+        prepared.blake_g_direct_contract = Some(contract);
+        Ok(prepared)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1007,6 +1028,7 @@ impl<'a> PreparedWitnessGraph<'a> {
             lookup_words,
             sub_words,
             launch_contract,
+            blake_g_direct_contract: None,
         })
     }
 
@@ -1127,11 +1149,33 @@ impl<'a> PreparedWitnessGraph<'a> {
                 "recorded blake_g witness geometry drifted",
             ));
         }
-        const LUT_WORDS: [usize; 4] = [1 << 16, 1 << 8, 1 << 14, 1 << 18];
-        const COUNT_WORDS: [usize; 5] = [2 << 16, 16 << 20, 1 << 8, 1 << 14, 1 << 18];
-        if luts.iter().zip(LUT_WORDS).any(|(slice, words)| {
+        let direct_authority = if contract == WitnessLaunchContract::BlakeGDirect {
+            let authority = self.blake_g_direct_contract.as_ref().ok_or(
+                PreparedWitnessError::BlakeGFusionShape("direct blake_g authority is missing"),
+            )?;
+            let input_words: [usize; BG_N_DATA_INPUTS] =
+                std::array::from_fn(|index| self.input_columns[index].len_words());
+            let trace_words: [usize; BG_N_TRACE] =
+                std::array::from_fn(|index| self.output_columns[index].len_words());
+            authority.validate_bound_geometry(
+                n_real_rows,
+                self.row_count as usize,
+                &input_words,
+                &trace_words,
+            )?;
+            Some(*authority)
+        } else {
+            None
+        };
+        let lut_words = direct_authority
+            .map(BlakeGDirectCompositeContract::lut_words)
+            .unwrap_or(BLAKE_G_DIRECT_LUT_WORDS);
+        let count_words = direct_authority
+            .map(BlakeGDirectCompositeContract::count_words)
+            .unwrap_or(BLAKE_G_DIRECT_COUNT_WORDS);
+        if luts.iter().zip(lut_words).any(|(slice, words)| {
             !slice.belongs_to(self.arena.context()) || slice.len_words() != words
-        }) || counts.iter().zip(COUNT_WORDS).any(|(slice, words)| {
+        }) || counts.iter().zip(count_words).any(|(slice, words)| {
             !slice.belongs_to(self.arena.context()) || slice.len_words() != words
         }) {
             return Err(PreparedWitnessError::BlakeGFusionShape(
@@ -1264,6 +1308,10 @@ impl<'a> PreparedWitnessGraph<'a> {
 
     pub fn is_blake_g_direct(&self) -> bool {
         self.launch_contract == WitnessLaunchContract::BlakeGDirect
+    }
+
+    pub const fn blake_g_direct_contract(&self) -> Option<&BlakeGDirectCompositeContract> {
+        self.blake_g_direct_contract.as_ref()
     }
 
     /// Immutable descriptor slices, useful to seal the exact Graph-A ABI during

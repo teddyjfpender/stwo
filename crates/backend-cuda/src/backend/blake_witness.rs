@@ -29,6 +29,14 @@ pub const BG_N_DATA_INPUTS: usize = 6;
 pub const BG_N_RECORDED_INPUTS: usize = 7;
 /// Exact recorded row-body identity implemented by the native fused kernel.
 pub const BG_FUSED_SEMANTIC_HASH: u64 = 0x8eec_56c3_6f57_b843;
+/// Collision-resistant identity of that exact recorded row body.
+///
+/// Unlike [`BG_FUSED_SEMANTIC_HASH`], this is an authority identity rather
+/// than a cache/telemetry key.
+pub const BG_FUSED_PROGRAM_IDENTITY: [u8; 32] = [
+    0xaa, 0xf9, 0xaf, 0xa6, 0xc3, 0x0d, 0x51, 0x4b, 0x41, 0x2d, 0x65, 0x1f, 0x91, 0x5d, 0x3b, 0x90,
+    0x56, 0xac, 0x07, 0x9f, 0xe6, 0x86, 0xd8, 0xba, 0xc5, 0x96, 0xe9, 0x9b, 0x26, 0x24, 0x71, 0x63,
+];
 /// Number of auxiliary operand columns emitted alongside the trace (split low
 /// parts + rot7/rot8 limbs the interaction and count feeds need).
 pub const BG_N_AUX: usize = 20;

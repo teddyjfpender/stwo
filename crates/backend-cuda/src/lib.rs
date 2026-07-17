@@ -190,9 +190,14 @@ pub use backend::prepared_quotient_numerator::{
 };
 pub use backend::prepared_witness::{
     blake_g_fusion_program_is_exact, phase_scratch_words, witness_workspace_requirements,
-    PreparedWitnessError, PreparedWitnessGraph, PreparedWitnessLaunchTelemetry,
-    PreparedWitnessMode, PreparedWitnessPhaseProgram, WitnessArenaSlotRequirement,
-    WitnessKernelIdentity, WitnessWorkspaceRequirements, WitnessWorkspaceSlots,
+    BlakeGDirectAbiAccess, BlakeGDirectAbiArgument, BlakeGDirectAbiArgumentKind,
+    BlakeGDirectAuthorityError, BlakeGDirectCompositeAbi, BlakeGDirectCompositeContract,
+    BlakeGDirectCountDestination, BlakeGDirectEffectAbi, BlakeGDirectLut, BlakeGDirectRowDomain,
+    BlakeGDirectWrapperLaunch, PreparedWitnessError, PreparedWitnessGraph,
+    PreparedWitnessLaunchTelemetry, PreparedWitnessMode, PreparedWitnessPhaseProgram,
+    WitnessArenaSlotRequirement, WitnessKernelIdentity, WitnessWorkspaceRequirements,
+    WitnessWorkspaceSlots, BLAKE_G_DIRECT_BLOCK_THREADS, BLAKE_G_DIRECT_COUNT_ORDER,
+    BLAKE_G_DIRECT_COUNT_WORDS, BLAKE_G_DIRECT_LUT_ORDER, BLAKE_G_DIRECT_LUT_WORDS,
     WITNESS_POINTER_ALIGNMENT_WORDS,
 };
 pub use backend::prepared_witness_feed::{
