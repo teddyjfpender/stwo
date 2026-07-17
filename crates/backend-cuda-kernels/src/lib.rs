@@ -278,6 +278,13 @@ mod tests {
     }
 
     #[test]
+    fn ipc_exchange_uses_the_driver_uuid_v2_api() {
+        let source = include_str!("../cuda/cuda_ipc_exchange.cu");
+        assert_eq!(source.matches("cuDeviceGetUuid_v2(").count(), 2);
+        assert!(!source.contains("cudaDeviceGetUuid("));
+    }
+
+    #[test]
     fn witness_phase_pair_abi_is_scratch_explicit() {
         type PhasePairFn = unsafe extern "C" fn(
             *const *const core::ffi::c_char,
