@@ -3441,12 +3441,18 @@ pub unsafe extern "C" fn stwo_witness_casm_input_scatter_on(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn stwo_witness_input_compact_sort_temp_bytes(_rows: u32) -> usize {
+pub unsafe extern "C" fn stwo_witness_input_compact_sort_temp_bytes(
+    _rows: u32,
+    _out_bytes: *mut usize,
+) -> i32 {
     no_cuda_symbol("stwo_witness_input_compact_sort_temp_bytes")
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn stwo_witness_input_compact_scan_temp_bytes(_rows: u32) -> usize {
+pub unsafe extern "C" fn stwo_witness_input_compact_scan_temp_bytes(
+    _rows: u32,
+    _out_bytes: *mut usize,
+) -> i32 {
     no_cuda_symbol("stwo_witness_input_compact_scan_temp_bytes")
 }
 

@@ -228,7 +228,7 @@ fn source_closure_seals_exact_wrapper_kernel_descriptor_and_stream_launch() {
         "__global__ void witness_input_gather_kernel(",
         "extern \"C\" int stwo_witness_input_gather_on(",
         "const uint32_t block = 256;",
-        "uint32_t grid = (consumer_rows + block - 1) / block;",
+        "uint32_t grid = 1u + (consumer_rows - 1u) / block;",
         "witness_input_gather_kernel<<<grid, block, 0, (cudaStream_t)stream>>>",
         "uint32_t source_global_row = row < total_real_rows ? row : (row & 15u);",
     ] {

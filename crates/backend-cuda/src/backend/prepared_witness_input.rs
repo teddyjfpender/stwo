@@ -13,6 +13,10 @@ use super::exec_context::{
 };
 
 mod authority;
+mod compact_authority;
+mod seed_authority;
+mod static_build;
+
 pub use authority::{
     WitnessInputGatherAbi, WitnessInputGatherAbiAccess, WitnessInputGatherAbiArgument,
     WitnessInputGatherAbiArgumentKind, WitnessInputGatherAuthorityError,
@@ -20,6 +24,24 @@ pub use authority::{
     WitnessInputGatherEffectGeometry, WitnessInputGatherOutputEffect,
     WitnessInputGatherPackedEdgeEffect, WitnessInputGatherRowDomain,
     WitnessInputGatherWrapperLaunch, WITNESS_INPUT_GATHER_DESCRIPTOR_ORDER,
+};
+pub use compact_authority::{
+    WitnessInputCompactAbi, WitnessInputCompactAbiAccess, WitnessInputCompactAbiArgument,
+    WitnessInputCompactAbiArgumentKind, WitnessInputCompactAuthorityError,
+    WitnessInputCompactContract, WitnessInputCompactCubStage, WitnessInputCompactEffectAbi,
+    WitnessInputCompactEffectGeometry, WitnessInputCompactExecution, WitnessInputCompactFixedField,
+    WitnessInputCompactIndexBuffer, WitnessInputCompactKernelLaunch,
+    WitnessInputCompactKernelStage, WitnessInputCompactKeyBuffer,
+    WitnessInputCompactLinkedContract, WitnessInputCompactOutputEffect,
+    WitnessInputCompactRowDomain, WitnessInputCompactScratchEffect,
+    WitnessInputCompactSourceEffect, WitnessInputCompactStage, WITNESS_INPUT_COMPACT_FIXED_ORDER,
+};
+pub use seed_authority::{
+    WitnessInputSeedAbi, WitnessInputSeedAbiAccess, WitnessInputSeedAbiArgument,
+    WitnessInputSeedAbiArgumentKind, WitnessInputSeedAuthorityError, WitnessInputSeedColumnEffect,
+    WitnessInputSeedColumnValue, WitnessInputSeedContract, WitnessInputSeedEffectAbi,
+    WitnessInputSeedEffectGeometry, WitnessInputSeedFixedField, WitnessInputSeedKernelLaunch,
+    WitnessInputSeedLinkedContract, WitnessInputSeedRowDomain, WITNESS_INPUT_SEED_FIXED_ORDER,
 };
 
 const WORD_BYTES: usize = core::mem::size_of::<u32>();
@@ -32,6 +54,21 @@ pub const WITNESS_INPUT_GATHER_POINTER_ALIGNMENT_WORDS: usize =
 const WITNESS_INPUT_COMPACT_SORT_OVERHEAD_WORDS: usize = 4096;
 const WITNESS_INPUT_COMPACT_SCAN_OVERHEAD_WORDS: usize = 1024;
 const WITNESS_INPUT_COMPACT_NO_SLOT: u32 = u32::MAX;
+
+type WitnessInputCompactTempBytesQuery = unsafe extern "C" fn(u32, *mut usize) -> i32;
+
+fn checked_witness_input_compact_temp_bytes(
+    query: WitnessInputCompactTempBytesQuery,
+    rows: u32,
+) -> Result<usize, i32> {
+    let mut bytes = 0;
+    let status = unsafe { query(rows, &mut bytes) };
+    if status != 0 || bytes == 0 {
+        Err(status)
+    } else {
+        Ok(bytes)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WitnessInputGatherEdge {
@@ -275,6 +312,8 @@ pub enum PreparedWitnessInputGatherError {
         required_bytes: usize,
         actual_bytes: usize,
     },
+    SortScratchQueryFailed(i32),
+    ScanScratchQueryFailed(i32),
     Arena(ArenaError),
     Cuda(CudaRuntimeError),
 }
@@ -781,22 +820,22 @@ impl<'a> PreparedWitnessInputCompactGraph<'a> {
             }
         }
 
-        let sort_temp_bytes = unsafe {
-            stwo_backend_cuda_kernels::raw::stwo_witness_input_compact_sort_temp_bytes(
-                requirements.sort_rows as u32,
-            )
-        };
+        let sort_temp_bytes = checked_witness_input_compact_temp_bytes(
+            stwo_backend_cuda_kernels::raw::stwo_witness_input_compact_sort_temp_bytes,
+            requirements.sort_rows as u32,
+        )
+        .map_err(PreparedWitnessInputGatherError::SortScratchQueryFailed)?;
         if sort_temp_bytes > sort_temp.len_bytes() {
             return Err(PreparedWitnessInputGatherError::SortScratchTooSmall {
                 required_bytes: sort_temp_bytes,
                 actual_bytes: sort_temp.len_bytes(),
             });
         }
-        let scan_temp_bytes = unsafe {
-            stwo_backend_cuda_kernels::raw::stwo_witness_input_compact_scan_temp_bytes(
-                requirements.sort_rows as u32,
-            )
-        };
+        let scan_temp_bytes = checked_witness_input_compact_temp_bytes(
+            stwo_backend_cuda_kernels::raw::stwo_witness_input_compact_scan_temp_bytes,
+            requirements.sort_rows as u32,
+        )
+        .map_err(PreparedWitnessInputGatherError::ScanScratchQueryFailed)?;
         if scan_temp_bytes > scan_temp.len_bytes() {
             return Err(PreparedWitnessInputGatherError::ScanScratchTooSmall {
                 required_bytes: scan_temp_bytes,
@@ -1327,6 +1366,21 @@ fn ensure_distinct(
 mod tests {
     use super::*;
 
+    unsafe extern "C" fn successful_temp_query(rows: u32, out_bytes: *mut usize) -> i32 {
+        assert_eq!(rows, 64);
+        unsafe { out_bytes.write(2048) };
+        0
+    }
+
+    unsafe extern "C" fn failed_temp_query(_rows: u32, out_bytes: *mut usize) -> i32 {
+        unsafe { out_bytes.write(2048) };
+        719
+    }
+
+    unsafe extern "C" fn zero_temp_query(_rows: u32, _out_bytes: *mut usize) -> i32 {
+        0
+    }
+
     fn edges() -> [WitnessInputGatherEdge; 2] {
         [
             WitnessInputGatherEdge {
@@ -1359,6 +1413,22 @@ mod tests {
             truncate_bound_slot(ArenaSlice::dangling_for_test(9, 64), 112, 1),
             Err(PreparedWitnessInputGatherError::SlotSizeMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn compact_temp_queries_require_success_and_nonzero_bytes() {
+        assert_eq!(
+            checked_witness_input_compact_temp_bytes(successful_temp_query, 64),
+            Ok(2048)
+        );
+        assert_eq!(
+            checked_witness_input_compact_temp_bytes(failed_temp_query, 64),
+            Err(719)
+        );
+        assert_eq!(
+            checked_witness_input_compact_temp_bytes(zero_temp_query, 64),
+            Err(0)
+        );
     }
 
     #[test]

@@ -3075,8 +3075,8 @@ extern "C" {
         iota_dev: *mut u32,
         stream: *mut c_void,
     ) -> i32;
-    pub fn stwo_witness_input_compact_sort_temp_bytes(rows: u32) -> usize;
-    pub fn stwo_witness_input_compact_scan_temp_bytes(rows: u32) -> usize;
+    pub fn stwo_witness_input_compact_sort_temp_bytes(rows: u32, out_bytes: *mut usize) -> i32;
+    pub fn stwo_witness_input_compact_scan_temp_bytes(rows: u32, out_bytes: *mut usize) -> i32;
     #[allow(clippy::too_many_arguments)]
     pub fn stwo_witness_input_compact_on(
         producer_subs_dev: *const *const u32,

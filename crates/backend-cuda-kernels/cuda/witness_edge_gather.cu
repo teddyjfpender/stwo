@@ -67,7 +67,7 @@ extern "C" int stwo_witness_edge_gather(
         return 1;
     }
     const uint32_t block = 256;
-    uint32_t grid = (consumer_rows + block - 1) / block;
+    uint32_t grid = 1u + (consumer_rows - 1u) / block;
     witness_edge_gather_kernel<<<grid, block>>>(
         producer_sub_dev, producer_rows, word_base, words_per_instance, n_instances,
         consumer_rows, consumer_cols_dev);
@@ -143,7 +143,7 @@ extern "C" int stwo_witness_input_gather_on(
         return 1;
     }
     const uint32_t block = 256;
-    uint32_t grid = (consumer_rows + block - 1) / block;
+    uint32_t grid = 1u + (consumer_rows - 1u) / block;
     witness_input_gather_kernel<<<grid, block, 0, (cudaStream_t)stream>>>(
         producer_subs_dev, edge_descs_dev, n_edges, input_width, total_real_rows,
         consumer_rows, consumer_cols_dev, include_enabler, include_iota);
@@ -198,7 +198,7 @@ extern "C" int stwo_witness_input_seed_on(
         return 1;
     }
     const uint32_t block = 256;
-    uint32_t grid = (consumer_rows + block - 1) / block;
+    uint32_t grid = 1u + (consumer_rows - 1u) / block;
     witness_input_seed_kernel<<<grid, block, 0, (cudaStream_t)stream>>>(
         scalars_dev, n_scalars, n_real_rows, consumer_rows, consumer_cols_dev,
         include_enabler, include_iota);
@@ -423,27 +423,55 @@ __global__ void witness_input_compact_finalize_kernel(
     }
 }
 
-extern "C" size_t stwo_witness_input_compact_sort_temp_bytes(uint32_t rows) {
+extern "C" int stwo_witness_input_compact_sort_temp_bytes(
+    uint32_t rows,
+    size_t *out_bytes
+) {
+    if (out_bytes == nullptr) {
+        return (int)cudaErrorInvalidValue;
+    }
+    *out_bytes = 0;
     if (rows == 0) {
-        return 0;
+        return (int)cudaErrorInvalidValue;
     }
     size_t bytes = 0;
-    cub::DeviceRadixSort::SortPairs(
+    cudaError_t error = cub::DeviceRadixSort::SortPairs(
         nullptr, bytes,
         (const uint32_t *)nullptr, (uint32_t *)nullptr,
         (const uint32_t *)nullptr, (uint32_t *)nullptr,
         rows, 0, 32);
-    return bytes;
+    if (error != cudaSuccess) {
+        return (int)error;
+    }
+    if (bytes == 0) {
+        return (int)cudaErrorInvalidValue;
+    }
+    *out_bytes = bytes;
+    return (int)cudaSuccess;
 }
 
-extern "C" size_t stwo_witness_input_compact_scan_temp_bytes(uint32_t rows) {
+extern "C" int stwo_witness_input_compact_scan_temp_bytes(
+    uint32_t rows,
+    size_t *out_bytes
+) {
+    if (out_bytes == nullptr) {
+        return (int)cudaErrorInvalidValue;
+    }
+    *out_bytes = 0;
     if (rows == 0) {
-        return 0;
+        return (int)cudaErrorInvalidValue;
     }
     size_t bytes = 0;
-    cub::DeviceScan::InclusiveSum(
+    cudaError_t error = cub::DeviceScan::InclusiveSum(
         nullptr, bytes, (const uint32_t *)nullptr, (uint32_t *)nullptr, rows);
-    return bytes;
+    if (error != cudaSuccess) {
+        return (int)error;
+    }
+    if (bytes == 0) {
+        return (int)cudaErrorInvalidValue;
+    }
+    *out_bytes = bytes;
+    return (int)cudaSuccess;
 }
 
 extern "C" int stwo_witness_input_compact_on(
@@ -483,7 +511,7 @@ extern "C" int stwo_witness_input_compact_on(
     cudaStream_t cuda_stream = (cudaStream_t)stream;
     const uint32_t block = 256;
     uint32_t sort_grid = (sort_rows + block - 1u) / block;
-    uint32_t consumer_grid = (consumer_rows + block - 1u) / block;
+    uint32_t consumer_grid = 1u + (consumer_rows - 1u) / block;
     witness_input_compact_gather_kernel<<<sort_grid, block, 0, cuda_stream>>>(
         producer_subs_dev, edge_descs_dev, n_edges, tuple_words, total_rows,
         sort_rows, tuples_dev, indices_a_dev);
