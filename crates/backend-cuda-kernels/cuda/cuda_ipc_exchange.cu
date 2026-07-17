@@ -127,8 +127,8 @@ int require_uuid(int device, const uint8_t *expected_uuid) {
         return static_cast<int>(cudaErrorInvalidValue);
     }
     cudaUUID_t actual{};
-    cudaError_t error = cudaDeviceGetUuid(&actual, device);
-    if (error != cudaSuccess) {
+    CUresult error = cuDeviceGetUuid_v2(&actual, device);
+    if (error != CUDA_SUCCESS) {
         return static_cast<int>(error);
     }
     return std::memcmp(actual.bytes, expected_uuid, sizeof(actual.bytes)) == 0
@@ -301,8 +301,8 @@ extern "C" int stwo_ipc_exchange_context_uuid(
         return result;
     }
     cudaUUID_t uuid{};
-    cudaError_t error = cudaDeviceGetUuid(&uuid, identity.device);
-    if (error != cudaSuccess) {
+    CUresult error = cuDeviceGetUuid_v2(&uuid, identity.device);
+    if (error != CUDA_SUCCESS) {
         return static_cast<int>(error);
     }
     std::memcpy(out_uuid, uuid.bytes, sizeof(uuid.bytes));
