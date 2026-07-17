@@ -5,23 +5,23 @@ const STATIC_BUILD_SOURCE: &[u8] = include_bytes!("static_build.rs");
 const STATIC_BUILD_SOURCE_DOMAIN: &[u8] = b"stwo-cuda-witness-input-static-build-source-v1\0";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct StaticBuildBinding {
-    pub(super) module_build_identity: [u8; 32],
-    pub(super) static_build_source_identity: [u8; 32],
-    pub(super) target_sm: u32,
-    pub(super) sm_identity: [u8; 32],
-    pub(super) identity: [u8; 32],
+pub(crate) struct StaticBuildBinding {
+    pub(crate) module_build_identity: [u8; 32],
+    pub(crate) static_build_source_identity: [u8; 32],
+    pub(crate) target_sm: u32,
+    pub(crate) sm_identity: [u8; 32],
+    pub(crate) identity: [u8; 32],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum StaticBuildBindError {
+pub(crate) enum StaticBuildBindError {
     InconsistentBuildMetadata,
     BuildReceiptUnavailable,
     BuildReceiptMismatch,
     UnsupportedTargetSm(u32),
 }
 
-pub(super) fn bind_static_build(
+pub(crate) fn bind_static_build(
     domain: &[u8],
     contract_identity: [u8; 32],
     target_sm: u32,
@@ -123,7 +123,7 @@ fn binding_from_fields(
 }
 
 #[cfg(test)]
-pub(super) fn binding_for_test(
+pub(crate) fn binding_for_test(
     domain: &[u8],
     contract_identity: [u8; 32],
     actual_build_identity: [u8; 32],
@@ -142,7 +142,7 @@ pub(super) fn binding_for_test(
 }
 
 #[cfg(test)]
-pub(super) fn validate_binding_for_test(
+pub(crate) fn validate_binding_for_test(
     binding: &StaticBuildBinding,
     domain: &[u8],
     contract_identity: [u8; 32],

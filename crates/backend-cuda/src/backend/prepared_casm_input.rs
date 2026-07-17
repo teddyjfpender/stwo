@@ -11,6 +11,16 @@ use std::collections::BTreeSet;
 use super::exec_context::{ArenaError, ArenaSlice, ArenaSlotId, CudaRuntimeError, DeviceArena};
 use super::prepared_witness_input::WitnessInputGatherArenaSlotRequirement;
 
+mod authority;
+
+pub use authority::{
+    WitnessCasmInputAbi, WitnessCasmInputAbiAccess, WitnessCasmInputAbiArgument,
+    WitnessCasmInputAbiArgumentKind, WitnessCasmInputAuthorityError, WitnessCasmInputColumnEffect,
+    WitnessCasmInputColumnValue, WitnessCasmInputContract, WitnessCasmInputEffectAbi,
+    WitnessCasmInputEffectGeometry, WitnessCasmInputFixedField, WitnessCasmInputKernelLaunch,
+    WitnessCasmInputLinkedContract, WitnessCasmInputRowDomain, WITNESS_CASM_INPUT_FIXED_ORDER,
+};
+
 const WORD_BYTES: usize = core::mem::size_of::<u32>();
 
 pub const WITNESS_CASM_STATE_WORDS: usize = 3;

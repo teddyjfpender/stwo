@@ -15,7 +15,7 @@ use super::exec_context::{
 mod authority;
 mod compact_authority;
 mod seed_authority;
-mod static_build;
+pub(crate) mod static_build;
 
 pub use authority::{
     WitnessInputGatherAbi, WitnessInputGatherAbiAccess, WitnessInputGatherAbiArgument,
