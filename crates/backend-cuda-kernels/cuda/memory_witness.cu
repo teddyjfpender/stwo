@@ -363,8 +363,8 @@ int memory_limb_split_columns_on_impl(
     uint32_t *const *limb_cols_host,
     cudaStream_t stream
 ) {
-    if (column_length == 0 || values == nullptr || limb_cols_host == nullptr ||
-        stream == nullptr || n_values > column_length) {
+    if (column_length == 0 || (n_values != 0 && values == nullptr) ||
+        limb_cols_host == nullptr || stream == nullptr || n_values > column_length) {
         return static_cast<int>(cudaErrorInvalidValue);
     }
     MemoryResidentOutputs outputs = {};

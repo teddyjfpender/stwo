@@ -94,8 +94,8 @@ fn contract_seals_host_ingress_stage_order_and_exact_raw_abis() {
                 argument(
                     0,
                     "values",
-                    ExecutionTablesAbiArgumentKind::DeviceConstPointerU32,
-                    ExecutionTablesAbiAccess::ReadValues,
+                    ExecutionTablesAbiArgumentKind::OptionalDeviceConstPointerU32,
+                    ExecutionTablesAbiAccess::ReadValuesWhenNonEmpty,
                 ),
                 argument(
                     1,
@@ -241,6 +241,35 @@ fn launch_grid_is_checked_at_the_largest_canonical_u32_column() {
 }
 
 #[test]
+fn empty_tables_have_no_source_read_and_the_wrapper_accepts_null_exactly_then() {
+    let requirements = execution_tables_workspace_requirements(0, 0, 0).unwrap();
+    let contract = ExecutionTablesContract::compile(&requirements).unwrap();
+    assert_eq!(
+        ExecutionTablesAbiArgumentKind::OptionalDeviceConstPointerU32 as u8,
+        5
+    );
+    assert_eq!(
+        ExecutionTablesAbiAccess::ReadValuesWhenNonEmpty as u8,
+        6
+    );
+    for stage in contract.stages() {
+        assert_eq!(stage.effect_geometry().real_rows, 0);
+        assert_eq!(stage.effect_geometry().source_read_words, 0);
+        assert_eq!(
+            stage.abi().arguments()[0],
+            argument(
+                0,
+                "values",
+                ExecutionTablesAbiArgumentKind::OptionalDeviceConstPointerU32,
+                ExecutionTablesAbiAccess::ReadValuesWhenNonEmpty,
+            )
+        );
+    }
+    let source = include_str!("../../../../../backend-cuda-kernels/cuda/memory_witness.cu");
+    assert!(source.contains("(n_values != 0 && values == nullptr)"));
+}
+
+#[test]
 fn canonical_and_derived_mutations_fail_closed() {
     let baseline = requirements();
     let mut mutations = Vec::new();
@@ -318,6 +347,7 @@ fn source_closure_and_target_sm_build_are_identity_bearing() {
         "extern \"C\" int memory_limb_split_small_columns_on(",
         "memory_limb_split_columns_on_impl<8, 28>",
         "memory_limb_split_columns_on_impl<4, 8>",
+        "(n_values != 0 && values == nullptr)",
         "n_values > column_length",
     ] {
         assert!(

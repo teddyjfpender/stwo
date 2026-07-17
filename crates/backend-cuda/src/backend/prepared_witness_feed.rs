@@ -13,7 +13,14 @@ use super::exec_context::{
 use super::prepared_witness::{BLAKE_G_DIRECT_COUNT_WORDS, BLAKE_G_DIRECT_LUT_WORDS};
 
 mod blake_g_lut_content;
+mod clear_authority;
 pub use blake_g_lut_content::{BlakeGDirectLutContentError, BlakeGDirectLutContentIdentity};
+pub use clear_authority::{
+    WitnessFeedClearAbi, WitnessFeedClearAbiAccess, WitnessFeedClearAbiArgument,
+    WitnessFeedClearAbiArgumentKind, WitnessFeedClearAuthorityError, WitnessFeedClearContract,
+    WitnessFeedClearDestinationEffect, WitnessFeedClearEffectAbi, WitnessFeedClearEffectGeometry,
+    WitnessFeedClearKernelLaunch, WitnessFeedClearLinkedContract,
+};
 
 const WORD_BYTES: usize = core::mem::size_of::<u32>();
 const POINTER_WORDS: usize = core::mem::size_of::<*mut u32>().div_ceil(WORD_BYTES);
@@ -337,6 +344,7 @@ pub enum PreparedWitnessFeedError {
     ConflictingDestination(ArenaSlotId),
     BlakeGFusionShape(&'static str),
     BlakeGDirectLutContent(BlakeGDirectLutContentError),
+    ClearAuthority(WitnessFeedClearAuthorityError),
     KernelLaunchFailed,
     Arena(ArenaError),
     Cuda(CudaRuntimeError),
@@ -365,6 +373,12 @@ impl From<CudaRuntimeError> for PreparedWitnessFeedError {
 impl From<BlakeGDirectLutContentError> for PreparedWitnessFeedError {
     fn from(value: BlakeGDirectLutContentError) -> Self {
         Self::BlakeGDirectLutContent(value)
+    }
+}
+
+impl From<WitnessFeedClearAuthorityError> for PreparedWitnessFeedError {
+    fn from(value: WitnessFeedClearAuthorityError) -> Self {
+        Self::ClearAuthority(value)
     }
 }
 
@@ -933,10 +947,13 @@ impl<'a> PreparedBlakeGFusedFeed<'a> {
     }
 }
 
-/// One launch clears the complete union of arena-owned multiplicity slabs.
+/// One launch clears the exact ordered destination list supplied at prepare.
+///
+/// Proof-wide union completeness belongs to the producer catalog that binds
+/// this graph; the backend contract deliberately does not infer semantic roles.
 pub struct PreparedWitnessFeedClearGraph<'a> {
     arena: &'a DeviceArena,
-    requirements: WitnessFeedClearWorkspaceRequirements,
+    contract: WitnessFeedClearContract,
     destinations: Vec<ArenaSlice>,
     destination_pointers: ArenaSlice,
     destination_lengths: ArenaSlice,
@@ -957,6 +974,7 @@ impl<'a> PreparedWitnessFeedClearGraph<'a> {
                 .map(|destination| destination.len_words())
                 .collect::<Vec<_>>(),
         )?;
+        let contract = WitnessFeedClearContract::compile(&requirements)?;
         requirements.arena_slot_requirements(slots)?;
         let destination_pointers = bind_min(
             arena,
@@ -993,7 +1011,7 @@ impl<'a> PreparedWitnessFeedClearGraph<'a> {
         arena.context().sync()?;
         Ok(Self {
             arena,
-            requirements,
+            contract,
             destinations,
             destination_pointers,
             destination_lengths,
@@ -1008,12 +1026,13 @@ impl<'a> PreparedWitnessFeedClearGraph<'a> {
         if launch.identity_token() != self.arena.context().identity_token() {
             return Err(CudaRuntimeError::ContextMismatch.into());
         }
+        let requirements = self.contract.requirements();
         let code = unsafe {
             stwo_backend_cuda_kernels::raw::stwo_witness_feed_clear_on(
                 self.destination_pointers.as_u32_ptr().cast(),
                 self.destination_lengths.as_u32_ptr().cast_const(),
-                self.requirements.destination_words.len() as u32,
-                self.requirements.max_destination_words as u32,
+                requirements.destination_words.len() as u32,
+                requirements.max_destination_words as u32,
                 launch.stream_raw().as_ptr(),
             )
         };
@@ -1029,7 +1048,11 @@ impl<'a> PreparedWitnessFeedClearGraph<'a> {
     }
 
     pub fn requirements(&self) -> &WitnessFeedClearWorkspaceRequirements {
-        &self.requirements
+        self.contract.requirements()
+    }
+
+    pub fn contract(&self) -> &WitnessFeedClearContract {
+        &self.contract
     }
 }
 

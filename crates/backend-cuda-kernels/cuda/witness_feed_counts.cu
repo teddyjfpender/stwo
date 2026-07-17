@@ -492,7 +492,7 @@ extern "C" int stwo_witness_feed_clear_on(
         return 0;
     }
     const uint32_t block = 256;
-    dim3 grid((max_words + block - 1) / block, n_destinations, 1);
+    dim3 grid(1u + (max_words - 1u) / block, n_destinations, 1);
     witness_feed_clear_kernel<<<grid, block, 0, (cudaStream_t)stream>>>(
         destinations_dev, lengths_dev);
     if (cudaGetLastError() != cudaSuccess) {

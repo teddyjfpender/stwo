@@ -82,10 +82,18 @@ pub use backend::prepared_ec_op::{
 };
 pub use backend::prepared_execution_tables::{
     execution_tables_workspace_requirements, ExecutionTablesArenaSlotRequirement,
-    ExecutionTablesHostData, ExecutionTablesWorkspaceRequirements, ExecutionTablesWorkspaceSlots,
-    PreparedExecutionTablesError, PreparedExecutionTablesGraph,
+    ExecutionTablesAbi, ExecutionTablesAbiAccess, ExecutionTablesAbiArgument,
+    ExecutionTablesAbiArgumentKind, ExecutionTablesAuthorityError, ExecutionTablesColumnEffect,
+    ExecutionTablesContract, ExecutionTablesEffectAbi, ExecutionTablesFixedField,
+    ExecutionTablesHostData, ExecutionTablesHostIngressEncoding,
+    ExecutionTablesHostIngressField, ExecutionTablesHostIngressGeometry,
+    ExecutionTablesHostIngressRole, ExecutionTablesKernelLaunch, ExecutionTablesLinkedContract,
+    ExecutionTablesRowDomain, ExecutionTablesStage, ExecutionTablesStageContract,
+    ExecutionTablesStageEffect, ExecutionTablesWorkspaceRequirements,
+    ExecutionTablesWorkspaceSlots, PreparedExecutionTablesError, PreparedExecutionTablesGraph,
     PreparedExecutionTablesIngestTelemetry, PreparedExecutionTablesLaunchTelemetry,
-    PreparedExecutionTablesView, EXECUTION_TABLE_BIG_LIMBS, EXECUTION_TABLE_POINTERS,
+    PreparedExecutionTablesView, EXECUTION_TABLES_FIXED_ORDER, EXECUTION_TABLES_STAGE_ORDER,
+    EXECUTION_TABLE_BIG_LIMBS, EXECUTION_TABLE_POINTERS,
     EXECUTION_TABLE_POINTER_ALIGNMENT_WORDS, EXECUTION_TABLE_SMALL_LIMBS, EXECUTION_TABLE_STRIDES,
 };
 pub use backend::prepared_fixed_table::{
@@ -211,9 +219,14 @@ pub use backend::prepared_witness_feed::{
     witness_feed_workspace_requirements, BlakeGDirectLutContentError,
     BlakeGDirectLutContentIdentity, PreparedBlakeGFusedFeed, PreparedWitnessFeedClearGraph,
     PreparedWitnessFeedError, PreparedWitnessFeedGraph, WitnessFeedArenaSlotRequirement,
-    WitnessFeedClearWorkspaceRequirements, WitnessFeedClearWorkspaceSlots, WitnessFeedLaunchMode,
-    WitnessFeedWorkspaceRequirements, WitnessFeedWorkspaceSlots, WITNESS_FEED_DESCRIPTOR_WORDS,
-    WITNESS_FEED_MAX_TUPLE_WORDS, WITNESS_FEED_NO_LUT, WITNESS_FEED_POINTER_ALIGNMENT_WORDS,
+    WitnessFeedClearAbi, WitnessFeedClearAbiAccess, WitnessFeedClearAbiArgument,
+    WitnessFeedClearAbiArgumentKind, WitnessFeedClearAuthorityError, WitnessFeedClearContract,
+    WitnessFeedClearDestinationEffect, WitnessFeedClearEffectAbi,
+    WitnessFeedClearEffectGeometry, WitnessFeedClearKernelLaunch,
+    WitnessFeedClearLinkedContract, WitnessFeedClearWorkspaceRequirements,
+    WitnessFeedClearWorkspaceSlots, WitnessFeedLaunchMode, WitnessFeedWorkspaceRequirements,
+    WitnessFeedWorkspaceSlots, WITNESS_FEED_DESCRIPTOR_WORDS, WITNESS_FEED_MAX_TUPLE_WORDS,
+    WITNESS_FEED_NO_LUT, WITNESS_FEED_POINTER_ALIGNMENT_WORDS,
     WITNESS_FEED_PRIVATIZED_SHARED_BYTES, WITNESS_FEED_PRIVATIZED_SHARED_WORDS,
 };
 pub use backend::prepared_witness_input::{

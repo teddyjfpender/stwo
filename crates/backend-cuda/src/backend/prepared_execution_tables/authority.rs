@@ -92,7 +92,7 @@ pub struct ExecutionTablesHostIngressGeometry {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum ExecutionTablesAbiArgumentKind {
-    DeviceConstPointerU32 = 1,
+    OptionalDeviceConstPointerU32 = 5,
     U32 = 2,
     HostConstPointerTableDeviceMutU32 = 3,
     CudaStream = 4,
@@ -101,7 +101,7 @@ pub enum ExecutionTablesAbiArgumentKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum ExecutionTablesAbiAccess {
-    ReadValues = 1,
+    ReadValuesWhenNonEmpty = 6,
     RealRowCount = 2,
     ColumnRowCount = 3,
     ReadHostPointersWriteDeviceColumns = 4,
@@ -481,8 +481,8 @@ const ARGUMENTS: [ExecutionTablesAbiArgument; 5] = [
     argument(
         0,
         "values",
-        ExecutionTablesAbiArgumentKind::DeviceConstPointerU32,
-        ExecutionTablesAbiAccess::ReadValues,
+        ExecutionTablesAbiArgumentKind::OptionalDeviceConstPointerU32,
+        ExecutionTablesAbiAccess::ReadValuesWhenNonEmpty,
     ),
     argument(
         1,
