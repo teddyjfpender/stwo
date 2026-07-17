@@ -1182,6 +1182,13 @@ impl DeviceArena {
         &self.context
     }
 
+    /// Process-local equality token for receipts installed on this arena's
+    /// execution context. It is runtime admission evidence only and must never
+    /// enter a semantic, artifact, program, or proof identity.
+    pub fn exec_context_token(&self) -> u64 {
+        self.context.identity_token().as_ptr() as usize as u64
+    }
+
     pub fn base_ptr(&self) -> NonNull<u32> {
         self.base
     }
