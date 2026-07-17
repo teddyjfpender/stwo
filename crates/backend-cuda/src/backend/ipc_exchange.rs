@@ -20,6 +20,49 @@ pub use wire::{
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IpcExchangePhase {
+    Published,
+    Consumed,
+    Reclaimed,
+    Armed,
+}
+
+/// Backend-issued authority that one exact IPC operation was accepted by CUDA.
+///
+/// The private fields and constructor prevent the coordinator from fabricating
+/// progress. The receipt proves successful enqueue, while the IPC events carry
+/// the corresponding device-ordering dependency.
+#[must_use = "forward this receipt to the fleet coordinator"]
+#[derive(Debug, Eq, PartialEq)]
+pub struct IpcExchangePhaseReceipt {
+    key: IpcExchangeKey,
+    phase: IpcExchangePhase,
+    generation: u64,
+}
+
+impl IpcExchangePhaseReceipt {
+    const fn new(key: IpcExchangeKey, phase: IpcExchangePhase, generation: u64) -> Self {
+        Self {
+            key,
+            phase,
+            generation,
+        }
+    }
+
+    pub const fn key(&self) -> IpcExchangeKey {
+        self.key
+    }
+
+    pub const fn phase(&self) -> IpcExchangePhase {
+        self.phase
+    }
+
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IpcExchangeOwnerState {
     Local { generation: u64 },
     Idle { generation: u64 },
@@ -175,11 +218,11 @@ impl<'context> CudaIpcExchangeOwner<'context> {
         source: NonNull<c_void>,
         bytes: usize,
         generation: u64,
-    ) -> Result<(), IpcExchangeError> {
+    ) -> Result<IpcExchangePhaseReceipt, IpcExchangeError> {
         require_bytes(self.descriptor.key.logical_bytes, bytes)?;
         let handle = self.raw_handle();
         let context = self.context.identity_token();
-        owner_publish_transition(&mut self.state, generation, || {
+        owner_publish_transition(&mut self.state, self.descriptor.key, generation, || {
             let code = unsafe {
                 stwo_backend_cuda_kernels::raw::stwo_ipc_exchange_owner_publish(
                     handle.as_ptr(),
@@ -194,10 +237,13 @@ impl<'context> CudaIpcExchangeOwner<'context> {
     }
 
     /// Enqueue a wait for the peer's consumed event before any buffer reuse.
-    pub fn reclaim(&mut self, generation: u64) -> Result<(), IpcExchangeError> {
+    pub fn reclaim(
+        &mut self,
+        generation: u64,
+    ) -> Result<IpcExchangePhaseReceipt, IpcExchangeError> {
         let handle = self.raw_handle();
         let context = self.context.identity_token();
-        owner_reclaim_transition(&mut self.state, generation, || {
+        owner_reclaim_transition(&mut self.state, self.descriptor.key, generation, || {
             let code = unsafe {
                 stwo_backend_cuda_kernels::raw::stwo_ipc_exchange_owner_reclaim(
                     handle.as_ptr(),
@@ -358,11 +404,11 @@ impl<'context> CudaIpcExchangeImport<'context> {
         destination: NonNull<c_void>,
         bytes: usize,
         generation: u64,
-    ) -> Result<(), IpcExchangeError> {
+    ) -> Result<IpcExchangePhaseReceipt, IpcExchangeError> {
         require_bytes(self.descriptor.key.logical_bytes, bytes)?;
         let handle = self.raw_handle();
         let context = self.context.identity_token();
-        import_consume_transition(&mut self.state, generation, || {
+        import_consume_transition(&mut self.state, self.descriptor.key, generation, || {
             let code = unsafe {
                 stwo_backend_cuda_kernels::raw::stwo_ipc_exchange_import_consume(
                     handle.as_ptr(),
@@ -378,19 +424,27 @@ impl<'context> CudaIpcExchangeImport<'context> {
 
     /// Arm only after the coordinator confirms the owner enqueued its consumed
     /// wait; this prevents a wait from binding the previous event generation.
-    pub fn arm_next(&mut self, next_generation: u64) -> Result<(), IpcExchangeError> {
+    pub fn arm_next(
+        &mut self,
+        next_generation: u64,
+    ) -> Result<IpcExchangePhaseReceipt, IpcExchangeError> {
         let handle = self.raw_handle();
         let context = self.context.identity_token();
-        import_arm_transition(&mut self.state, next_generation, || {
-            let code = unsafe {
-                stwo_backend_cuda_kernels::raw::stwo_ipc_exchange_import_arm_next(
-                    handle.as_ptr(),
-                    context.as_ptr(),
-                    next_generation,
-                )
-            };
-            check_cuda("ipc_exchange_import_arm_next", code)
-        })
+        import_arm_transition(
+            &mut self.state,
+            self.descriptor.key,
+            next_generation,
+            || {
+                let code = unsafe {
+                    stwo_backend_cuda_kernels::raw::stwo_ipc_exchange_import_arm_next(
+                        handle.as_ptr(),
+                        context.as_ptr(),
+                        next_generation,
+                    )
+                };
+                check_cuda("ipc_exchange_import_arm_next", code)
+            },
+        )
     }
 
     pub fn close(mut self) -> Result<IpcPeerCloseReceipt, IpcExchangeError> {
@@ -473,23 +527,29 @@ fn require_owner_generation(
 
 fn owner_publish_transition(
     state: &mut IpcExchangeOwnerState,
+    key: IpcExchangeKey,
     generation: u64,
     operation: impl FnOnce() -> Result<(), CudaRuntimeError>,
-) -> Result<(), IpcExchangeError> {
+) -> Result<IpcExchangePhaseReceipt, IpcExchangeError> {
     require_owner_generation(*state, generation, false)?;
     if let Err(error) = operation() {
         *state = IpcExchangeOwnerState::Poisoned;
         return Err(error.into());
     }
     *state = IpcExchangeOwnerState::Published { generation };
-    Ok(())
+    Ok(IpcExchangePhaseReceipt::new(
+        key,
+        IpcExchangePhase::Published,
+        generation,
+    ))
 }
 
 fn owner_reclaim_transition(
     state: &mut IpcExchangeOwnerState,
+    key: IpcExchangeKey,
     generation: u64,
     operation: impl FnOnce() -> Result<(), CudaRuntimeError>,
-) -> Result<(), IpcExchangeError> {
+) -> Result<IpcExchangePhaseReceipt, IpcExchangeError> {
     require_owner_generation(*state, generation, true)?;
     let next = generation
         .checked_add(1)
@@ -502,14 +562,19 @@ fn owner_reclaim_transition(
         return Err(error.into());
     }
     *state = IpcExchangeOwnerState::Idle { generation: next };
-    Ok(())
+    Ok(IpcExchangePhaseReceipt::new(
+        key,
+        IpcExchangePhase::Reclaimed,
+        generation,
+    ))
 }
 
 fn import_consume_transition(
     state: &mut IpcExchangeImportState,
+    key: IpcExchangeKey,
     generation: u64,
     operation: impl FnOnce() -> Result<(), CudaRuntimeError>,
-) -> Result<(), IpcExchangeError> {
+) -> Result<IpcExchangePhaseReceipt, IpcExchangeError> {
     let IpcExchangeImportState::Awaiting {
         generation: expected,
     } = *state
@@ -522,14 +587,19 @@ fn import_consume_transition(
         return Err(error.into());
     }
     *state = IpcExchangeImportState::Consumed { generation };
-    Ok(())
+    Ok(IpcExchangePhaseReceipt::new(
+        key,
+        IpcExchangePhase::Consumed,
+        generation,
+    ))
 }
 
 fn import_arm_transition(
     state: &mut IpcExchangeImportState,
+    key: IpcExchangeKey,
     next_generation: u64,
     operation: impl FnOnce() -> Result<(), CudaRuntimeError>,
-) -> Result<(), IpcExchangeError> {
+) -> Result<IpcExchangePhaseReceipt, IpcExchangeError> {
     let IpcExchangeImportState::Consumed { generation } = *state else {
         return Err(IpcExchangeError::InvalidImportState(*state));
     };
@@ -547,7 +617,11 @@ fn import_arm_transition(
     *state = IpcExchangeImportState::Awaiting {
         generation: next_generation,
     };
-    Ok(())
+    Ok(IpcExchangePhaseReceipt::new(
+        key,
+        IpcExchangePhase::Armed,
+        next_generation,
+    ))
 }
 
 #[cfg(test)]

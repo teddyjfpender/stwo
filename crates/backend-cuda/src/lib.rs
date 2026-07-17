@@ -33,9 +33,9 @@ pub use backend::exec_context::{
 pub use backend::ipc_exchange::{
     cuda_context_device_uuid, CudaDeviceUuid, CudaIpcExchangeImport, CudaIpcExchangeOwner,
     IpcExchangeDescriptor, IpcExchangeError, IpcExchangeImportState, IpcExchangeKey,
-    IpcExchangeOwnerState, IpcPeerCloseReceipt, CUDA_DEVICE_UUID_BYTES, CUDA_IPC_HANDLE_BYTES,
-    IPC_EXCHANGE_ALLOCATION_ALIGNMENT, IPC_EXCHANGE_CLOSE_RECEIPT_BYTES,
-    IPC_EXCHANGE_DESCRIPTOR_BYTES,
+    IpcExchangeOwnerState, IpcExchangePhase, IpcExchangePhaseReceipt, IpcPeerCloseReceipt,
+    CUDA_DEVICE_UUID_BYTES, CUDA_IPC_HANDLE_BYTES, IPC_EXCHANGE_ALLOCATION_ALIGNMENT,
+    IPC_EXCHANGE_CLOSE_RECEIPT_BYTES, IPC_EXCHANGE_DESCRIPTOR_BYTES,
 };
 pub use backend::pcs_driver::{
     prove_values_with_config as prove_cuda_pcs_values, CudaPcsDriverConfig, CudaPcsDriverError,

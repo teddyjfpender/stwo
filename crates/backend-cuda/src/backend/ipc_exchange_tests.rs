@@ -130,22 +130,22 @@ fn mock_lifecycle_requires_consumed_ack_before_reuse_and_next_wait() {
     let mut owner = IpcExchangeOwnerState::Idle { generation: 9 };
     let mut imported = IpcExchangeImportState::Awaiting { generation: 9 };
 
-    owner_publish_transition(&mut owner, 9, || {
+    let published = owner_publish_transition(&mut owner, key(), 9, || {
         calls.push(Call::Publish);
         Ok(())
     })
     .unwrap();
-    import_consume_transition(&mut imported, 9, || {
+    let consumed = import_consume_transition(&mut imported, key(), 9, || {
         calls.push(Call::Consume);
         Ok(())
     })
     .unwrap();
-    owner_reclaim_transition(&mut owner, 9, || {
+    let reclaimed = owner_reclaim_transition(&mut owner, key(), 9, || {
         calls.push(Call::Reclaim);
         Ok(())
     })
     .unwrap();
-    import_arm_transition(&mut imported, 10, || {
+    let armed = import_arm_transition(&mut imported, key(), 10, || {
         calls.push(Call::Arm);
         Ok(())
     })
@@ -160,13 +160,23 @@ fn mock_lifecycle_requires_consumed_ack_before_reuse_and_next_wait() {
         imported,
         IpcExchangeImportState::Awaiting { generation: 10 }
     );
+    for (receipt, phase, generation) in [
+        (published, IpcExchangePhase::Published, 9),
+        (consumed, IpcExchangePhase::Consumed, 9),
+        (reclaimed, IpcExchangePhase::Reclaimed, 9),
+        (armed, IpcExchangePhase::Armed, 10),
+    ] {
+        assert_eq!(receipt.key(), key());
+        assert_eq!(receipt.phase(), phase);
+        assert_eq!(receipt.generation(), generation);
+    }
 }
 
 #[test]
 fn invalid_state_or_generation_enqueues_nothing_and_does_not_corrupt_state() {
     let mut called = false;
     let mut owner = IpcExchangeOwnerState::Idle { generation: 4 };
-    assert!(owner_publish_transition(&mut owner, 5, || {
+    assert!(owner_publish_transition(&mut owner, key(), 5, || {
         called = true;
         Ok(())
     })
@@ -175,7 +185,7 @@ fn invalid_state_or_generation_enqueues_nothing_and_does_not_corrupt_state() {
     assert_eq!(owner, IpcExchangeOwnerState::Idle { generation: 4 });
 
     let mut imported = IpcExchangeImportState::Consumed { generation: 4 };
-    assert!(import_consume_transition(&mut imported, 4, || {
+    assert!(import_consume_transition(&mut imported, key(), 4, || {
         called = true;
         Ok(())
     })
@@ -183,7 +193,7 @@ fn invalid_state_or_generation_enqueues_nothing_and_does_not_corrupt_state() {
     assert!(!called);
     assert_eq!(imported, IpcExchangeImportState::Consumed { generation: 4 });
 
-    assert!(import_arm_transition(&mut imported, 6, || {
+    assert!(import_arm_transition(&mut imported, key(), 6, || {
         called = true;
         Ok(())
     })
@@ -195,19 +205,21 @@ fn invalid_state_or_generation_enqueues_nothing_and_does_not_corrupt_state() {
 #[test]
 fn every_enqueued_operation_failure_poison_stops_the_generation() {
     let mut owner = IpcExchangeOwnerState::Idle { generation: 1 };
-    assert!(owner_publish_transition(&mut owner, 1, || Err(failure("publish"))).is_err());
+    assert!(owner_publish_transition(&mut owner, key(), 1, || Err(failure("publish"))).is_err());
     assert_eq!(owner, IpcExchangeOwnerState::Poisoned);
 
     let mut owner = IpcExchangeOwnerState::Published { generation: 1 };
-    assert!(owner_reclaim_transition(&mut owner, 1, || Err(failure("reclaim"))).is_err());
+    assert!(owner_reclaim_transition(&mut owner, key(), 1, || Err(failure("reclaim"))).is_err());
     assert_eq!(owner, IpcExchangeOwnerState::Poisoned);
 
     let mut imported = IpcExchangeImportState::Awaiting { generation: 1 };
-    assert!(import_consume_transition(&mut imported, 1, || Err(failure("consume"))).is_err());
+    assert!(
+        import_consume_transition(&mut imported, key(), 1, || Err(failure("consume"))).is_err()
+    );
     assert_eq!(imported, IpcExchangeImportState::Poisoned);
 
     let mut imported = IpcExchangeImportState::Consumed { generation: 1 };
-    assert!(import_arm_transition(&mut imported, 2, || Err(failure("arm"))).is_err());
+    assert!(import_arm_transition(&mut imported, key(), 2, || Err(failure("arm"))).is_err());
     assert_eq!(imported, IpcExchangeImportState::Poisoned);
 }
 
