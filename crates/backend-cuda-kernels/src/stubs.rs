@@ -2682,6 +2682,64 @@ pub unsafe extern "C" fn stwo_cuda_jit_get_pedersen_module_publication(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_cuda_jit_get_aot_function_publication(
+    _kernel_name: *const core::ffi::c_char,
+    _cache_key: u64,
+    out: *mut crate::raw::CudaAotFunctionPublication,
+) -> bool {
+    if let Some(out) = unsafe { out.as_mut() } {
+        *out = crate::raw::CudaAotFunctionPublication::default();
+    }
+    false
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_installed_aot_function_borrow_published_create(
+    _exec_context: *mut core::ffi::c_void,
+    _kernel_name: *const core::ffi::c_char,
+    _cache_key: u64,
+    _expected_sm: u32,
+    _expected_module_token: u64,
+    _expected_function_token: u64,
+    _expected_context_token: u64,
+    _argument_count: u32,
+    _grid_x: u32,
+    _grid_y: u32,
+    _grid_z: u32,
+    _block_x: u32,
+    _block_y: u32,
+    _block_z: u32,
+    _dynamic_shared_bytes: u32,
+    out_handle: *mut *mut core::ffi::c_void,
+    out_receipt: *mut crate::raw::CudaInstalledAotFunctionReceipt,
+) -> i32 {
+    if let Some(out_handle) = unsafe { out_handle.as_mut() } {
+        *out_handle = core::ptr::null_mut();
+    }
+    if let Some(out_receipt) = unsafe { out_receipt.as_mut() } {
+        *out_receipt = crate::raw::CudaInstalledAotFunctionReceipt::default();
+    }
+    no_cuda_symbol("stwo_installed_aot_function_borrow_published_create")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_installed_aot_function_launch(
+    _handle: *mut core::ffi::c_void,
+    _exec_context: *mut core::ffi::c_void,
+    _arguments: *mut *mut core::ffi::c_void,
+    _argument_count: u32,
+) -> i32 {
+    no_cuda_symbol("stwo_installed_aot_function_launch")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_installed_aot_function_destroy(
+    _handle: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_installed_aot_function_destroy")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stwo_cuda_jit_reset_aot_stats() {}
 
 #[unsafe(no_mangle)]

@@ -9,7 +9,7 @@ const ZERO_IDENTITY: [u8; 32] = [0; 32];
 
 pub use crate::aot_identity::{
     AotKernelAbiAccess, AotKernelAbiArgument, AotKernelAbiKind, AotKernelAbiSchema,
-    AotKernelSchemaScope,
+    AotKernelModuleGlobals, AotKernelSchemaScope,
 };
 
 /// Immutable authority for one exact generated source and target cubin.
@@ -29,6 +29,7 @@ pub struct AotKernelAuthority {
     program_identity: [u8; 32],
     identity: [u8; 32],
     schema_scope: AotKernelSchemaScope,
+    module_globals: AotKernelModuleGlobals,
 }
 
 impl AotKernelAuthority {
@@ -79,6 +80,10 @@ impl AotKernelAuthority {
 
     pub fn schema_scope(self) -> AotKernelSchemaScope {
         self.schema_scope
+    }
+
+    pub fn module_globals(self) -> AotKernelModuleGlobals {
+        self.module_globals
     }
 }
 
@@ -326,8 +331,20 @@ fn pack_is_well_formed(
         } else {
             AotKernelSchemaScope::ExportedSymbolOnly
         };
+        let globals_are_valid = match (authority.abi_schema, authority.module_globals) {
+            (None, AotKernelModuleGlobals::Unspecified)
+            | (
+                Some(AotKernelAbiSchema::RecordedWitnessV1),
+                AotKernelModuleGlobals::None | AotKernelModuleGlobals::WitnessPedersenV1,
+            )
+            | (Some(AotKernelAbiSchema::OrdinaryConstraintV1), AotKernelModuleGlobals::None) => {
+                true
+            }
+            _ => false,
+        };
         if authority.abi_schema_identity != expected_abi_identity
             || authority.schema_scope != expected_scope
+            || !globals_are_valid
             || (authority.abi_schema.is_some() && authority.program_identity == ZERO_IDENTITY)
             || (authority.abi_schema.is_none() && authority.program_identity != ZERO_IDENTITY)
         {
@@ -356,6 +373,7 @@ fn pack_is_well_formed(
                 abi_schema_identity: authority.abi_schema_identity,
                 program_identity: authority.program_identity,
                 schema_scope: authority.schema_scope,
+                module_globals: authority.module_globals,
             },
         );
         if cubin_identity != authority.cubin_identity || identity != authority.identity {
@@ -454,6 +472,16 @@ mod manifest_tests {
                     AotKernelSchemaScope::ExportedSymbolOnly
                 }
             );
+            assert!(match authority.abi_schema() {
+                None => authority.module_globals() == AotKernelModuleGlobals::Unspecified,
+                Some(AotKernelAbiSchema::OrdinaryConstraintV1) => {
+                    authority.module_globals() == AotKernelModuleGlobals::None
+                }
+                Some(AotKernelAbiSchema::RecordedWitnessV1) => matches!(
+                    authority.module_globals(),
+                    AotKernelModuleGlobals::None | AotKernelModuleGlobals::WitnessPedersenV1
+                ),
+            });
         }
         assert!(!aot_pack_contains(0, u32::MAX, u32::MAX));
         assert_eq!(aot_cubin_identity(0, u32::MAX, u32::MAX), ZERO_IDENTITY);
@@ -502,6 +530,7 @@ mod manifest_tests {
                             abi_schema_identity: authority.abi_schema_identity,
                             program_identity: authority.program_identity,
                             schema_scope: authority.schema_scope,
+                            module_globals: authority.module_globals,
                         }
                     )
                 );
@@ -627,9 +656,11 @@ mod manifest_tests {
                     abi_schema_identity: ZERO_IDENTITY,
                     program_identity: ZERO_IDENTITY,
                     schema_scope: AotKernelSchemaScope::ExportedSymbolOnly,
+                    module_globals: AotKernelModuleGlobals::Unspecified,
                 },
             ),
             schema_scope: AotKernelSchemaScope::ExportedSymbolOnly,
+            module_globals: AotKernelModuleGlobals::Unspecified,
         };
         AotIndexEntry {
             offset,

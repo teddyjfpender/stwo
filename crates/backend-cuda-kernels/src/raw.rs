@@ -383,7 +383,7 @@ pub struct CudaJitAotStats {
     pub strict_rejections: u64,
 }
 
-pub const CUDA_PEDERSEN_PUBLICATION_ABI_VERSION: u32 = 1;
+pub const CUDA_PEDERSEN_PUBLICATION_ABI_VERSION: u32 = 2;
 pub const CUDA_PEDERSEN_GLOBALS_ABSENT: u32 = 0;
 pub const CUDA_PEDERSEN_GLOBALS_PRESENT: u32 = 1;
 pub const CUDA_PEDERSEN_PUBLICATION_AOT: u32 = 1 << 0;
@@ -412,6 +412,7 @@ pub struct CudaPedersenModulePublication {
     pub globals_state: u32,
     pub cache_key: u64,
     pub module_token: u64,
+    pub function_token: u64,
     pub context_token: u64,
     pub columns_symbol_token: u64,
     pub rows_symbol_token: u64,
@@ -434,6 +435,7 @@ impl Default for CudaPedersenModulePublication {
             globals_state: 0,
             cache_key: 0,
             module_token: 0,
+            function_token: 0,
             context_token: 0,
             columns_symbol_token: 0,
             rows_symbol_token: 0,
@@ -443,18 +445,75 @@ impl Default for CudaPedersenModulePublication {
     }
 }
 
-const _: () = assert!(core::mem::size_of::<CudaPedersenModulePublication>() == 536);
+const _: () = assert!(core::mem::size_of::<CudaPedersenModulePublication>() == 544);
 const _: () = assert!(core::mem::align_of::<CudaPedersenModulePublication>() == 8);
 const _: () = assert!(core::mem::offset_of!(CudaPedersenModulePublication, cache_key) == 40);
-const _: () = assert!(core::mem::offset_of!(CudaPedersenModulePublication, column_pointers) == 88);
+const _: () = assert!(core::mem::offset_of!(CudaPedersenModulePublication, column_pointers) == 96);
+
+pub const CUDA_AOT_FUNCTION_PUBLICATION_ABI_VERSION: u32 = 1;
+pub const CUDA_AOT_FUNCTION_PUBLICATION_AOT: u32 = 1;
+
+/// Read-only publication of the exact function the legacy JIT/AOT cache will
+/// resolve for `(cache_key, current CUDA context, kernel_name)`.
+#[repr(C, align(8))]
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub struct CudaAotFunctionPublication {
+    pub abi_version: u32,
+    pub flags: u32,
+    pub device_ordinal: u32,
+    pub sm_major: u32,
+    pub sm_minor: u32,
+    pub reserved: u32,
+    pub cache_key: u64,
+    pub context_token: u64,
+    pub module_token: u64,
+    pub function_token: u64,
+}
+
+const _: () = assert!(core::mem::size_of::<CudaAotFunctionPublication>() == 56);
+const _: () = assert!(core::mem::align_of::<CudaAotFunctionPublication>() == 8);
+const _: () = assert!(core::mem::offset_of!(CudaAotFunctionPublication, cache_key) == 24);
+
+pub const CUDA_INSTALLED_AOT_FUNCTION_ABI_VERSION: u32 = 1;
+pub const CUDA_INSTALLED_AOT_BORROWED_PUBLISHED: u32 = 2;
+
+/// Native receipt for one context-bound installed AOT function.
+///
+/// Address tokens are process-local equality facts, never semantic identities.
+#[repr(C, align(8))]
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub struct CudaInstalledAotFunctionReceipt {
+    pub abi_version: u32,
+    pub ownership: u32,
+    pub device_ordinal: u32,
+    pub sm_major: u32,
+    pub sm_minor: u32,
+    pub argument_count: u32,
+    pub grid_x: u32,
+    pub grid_y: u32,
+    pub grid_z: u32,
+    pub block_x: u32,
+    pub block_y: u32,
+    pub block_z: u32,
+    pub dynamic_shared_bytes: u32,
+    pub reserved: u32,
+    pub context_token: u64,
+    pub module_token: u64,
+    pub function_token: u64,
+    pub stream_token: u64,
+}
+
+const _: () = assert!(core::mem::size_of::<CudaInstalledAotFunctionReceipt>() == 88);
+const _: () = assert!(core::mem::align_of::<CudaInstalledAotFunctionReceipt>() == 8);
+const _: () = assert!(core::mem::offset_of!(CudaInstalledAotFunctionReceipt, context_token) == 56);
 
 #[cfg(test)]
 mod pedersen_publication_abi_tests {
-    use super::CudaPedersenModulePublication;
+    use super::{CudaAotFunctionPublication, CudaPedersenModulePublication};
 
     #[test]
     fn publication_layout_and_native_contract_are_exact() {
-        assert_eq!(core::mem::size_of::<CudaPedersenModulePublication>(), 536);
+        assert_eq!(core::mem::size_of::<CudaPedersenModulePublication>(), 544);
         assert_eq!(core::mem::align_of::<CudaPedersenModulePublication>(), 8);
         assert_eq!(
             core::mem::offset_of!(CudaPedersenModulePublication, cache_key),
@@ -462,7 +521,7 @@ mod pedersen_publication_abi_tests {
         );
         assert_eq!(
             core::mem::offset_of!(CudaPedersenModulePublication, column_pointers),
-            88
+            96
         );
         type Query = unsafe extern "C" fn(
             *const core::ffi::c_char,
@@ -470,6 +529,17 @@ mod pedersen_publication_abi_tests {
             *mut CudaPedersenModulePublication,
         ) -> bool;
         let _: Query = super::stwo_cuda_jit_get_pedersen_module_publication;
+        type FunctionQuery = unsafe extern "C" fn(
+            *const core::ffi::c_char,
+            u64,
+            *mut CudaAotFunctionPublication,
+        ) -> bool;
+        let _: FunctionQuery = super::stwo_cuda_jit_get_aot_function_publication;
+        assert_eq!(core::mem::size_of::<CudaAotFunctionPublication>(), 56);
+        assert_eq!(
+            core::mem::offset_of!(CudaAotFunctionPublication, cache_key),
+            24
+        );
 
         let native = include_str!("../cuda/runtime_jit.cu");
         assert!(native.contains("cols_size != kColumnsBytes"));
@@ -480,6 +550,12 @@ mod pedersen_publication_abi_tests {
         assert!(native.contains("\"g_stwo_wit_pedersen_n_rows\") != CUDA_ERROR_NOT_FOUND"));
         assert!(native.contains("JitCacheKey{cache_key, context}"));
         assert!(native.contains("cached.origin != KernelOrigin::Aot"));
+        assert!(native.contains("receipt.function_token !="));
+        assert!(native.contains("cached.pedersen_publication.function_token !="));
+        assert!(native.contains("get_live_aot_function_publication"));
+        assert!(native.contains("cached.module != installed->module"));
+        assert!(native.contains("cuStreamGetCtx"));
+        assert!(!native.contains("create_owned_installed_function"));
         assert!(native.contains("if (!is_borrowed_pedersen_table_registered())"));
         let table_runtime = include_str!("../cuda/pedersen_table_init.cu");
         assert!(table_runtime.contains(
@@ -500,6 +576,14 @@ mod pedersen_publication_abi_tests {
                 )
             });
             assert_eq!(receipt, CudaPedersenModulePublication::default());
+            let mut function = CudaAotFunctionPublication {
+                abi_version: 99,
+                ..CudaAotFunctionPublication::default()
+            };
+            assert!(!unsafe {
+                super::stwo_cuda_jit_get_aot_function_publication(kernel.as_ptr(), 7, &mut function)
+            });
+            assert_eq!(function, CudaAotFunctionPublication::default());
         }
     }
 }
@@ -787,6 +871,38 @@ extern "C" {
         cache_key: u64,
         out: *mut CudaPedersenModulePublication,
     ) -> bool;
+    pub fn stwo_cuda_jit_get_aot_function_publication(
+        kernel_name: *const core::ffi::c_char,
+        cache_key: u64,
+        out: *mut CudaAotFunctionPublication,
+    ) -> bool;
+    #[allow(clippy::too_many_arguments)]
+    pub fn stwo_installed_aot_function_borrow_published_create(
+        exec_context: *mut c_void,
+        kernel_name: *const core::ffi::c_char,
+        cache_key: u64,
+        expected_sm: u32,
+        expected_module_token: u64,
+        expected_function_token: u64,
+        expected_context_token: u64,
+        argument_count: u32,
+        grid_x: u32,
+        grid_y: u32,
+        grid_z: u32,
+        block_x: u32,
+        block_y: u32,
+        block_z: u32,
+        dynamic_shared_bytes: u32,
+        out_handle: *mut *mut c_void,
+        out_receipt: *mut CudaInstalledAotFunctionReceipt,
+    ) -> i32;
+    pub fn stwo_installed_aot_function_launch(
+        handle: *mut c_void,
+        exec_context: *mut c_void,
+        arguments: *mut *mut c_void,
+        argument_count: u32,
+    ) -> i32;
+    pub fn stwo_installed_aot_function_destroy(handle: *mut c_void) -> i32;
     /// Reset counters only. Cached functions and their AOT/runtime provenance
     /// remain intact, so subsequent cache-hit accounting stays truthful.
     pub fn stwo_cuda_jit_reset_aot_stats();

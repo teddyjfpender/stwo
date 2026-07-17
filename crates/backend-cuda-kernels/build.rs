@@ -50,8 +50,9 @@ use static_module_identity::{
 #[path = "src/aot_identity.rs"]
 mod aot_identity;
 use aot_identity::{
-    cubin_identity, kernel_authority_identity, pack_identity, source_identity, AotKernelAbiSchema,
-    AotKernelSchemaScope, CubinIdentityInput, KernelAuthorityIdentityInput,
+    cubin_identity, kernel_authority_identity, module_globals_for_source, pack_identity,
+    source_identity, AotKernelAbiSchema, AotKernelModuleGlobals, AotKernelSchemaScope,
+    CubinIdentityInput, KernelAuthorityIdentityInput,
 };
 
 #[path = "src/aot_source_manifest.rs"]
@@ -69,6 +70,7 @@ struct AotBuildEntry {
     source_identity: [u8; 32],
     abi_schema: Option<AotKernelAbiSchema>,
     program_identity: [u8; 32],
+    module_globals: AotKernelModuleGlobals,
 }
 
 struct AotBuildSnapshot {
@@ -874,6 +876,13 @@ fn build_aot_pack(
         }
         .unwrap_or_else(|error| panic!("invalid generated source {}: {error}", source.display()));
         let exact_source_identity = source_identity(&source_bytes);
+        let module_globals = module_globals_for_source(metadata.abi_schema, &source_bytes)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "invalid generated module-global contract {}: {error}",
+                    source.display()
+                )
+            });
         assert_ne!(
             exact_source_identity,
             aot_identity::ZERO_IDENTITY,
@@ -935,6 +944,7 @@ fn build_aot_pack(
                 source_identity: exact_source_identity,
                 abi_schema: metadata.abi_schema,
                 program_identity: metadata.program_identity,
+                module_globals,
             });
         }
     }
@@ -1063,6 +1073,7 @@ fn write_aot_pack(
             abi_schema_identity: exact_abi_identity,
             program_identity: entry.program_identity,
             schema_scope: exact_schema_scope,
+            module_globals: entry.module_globals,
         });
         assert_ne!(
             authority_identity,
@@ -1102,12 +1113,19 @@ fn write_aot_pack(
                 "AotKernelSchemaScope::StructuredAbi"
             }
         };
+        let module_globals = match entry.module_globals {
+            AotKernelModuleGlobals::Unspecified => "AotKernelModuleGlobals::Unspecified",
+            AotKernelModuleGlobals::None => "AotKernelModuleGlobals::None",
+            AotKernelModuleGlobals::WitnessPedersenV1 => {
+                "AotKernelModuleGlobals::WitnessPedersenV1"
+            }
+        };
         rs.push_str(&format!(
             "    AotIndexEntry {{ offset: {off}, len: {len}, authority: AotKernelAuthority {{ \
              source_identity: {}, kernel_symbol: {:?}, semantic_hash: 0x{:016x}, \
              cache_key: 0x{:016x}, target_sm: {}, cubin_identity: {}, abi_schema: {abi_schema}, \
              abi_schema_identity: {}, program_identity: {}, identity: {}, \
-             schema_scope: {scope} }} }},\n",
+             schema_scope: {scope}, module_globals: {module_globals} }} }},\n",
             rust_digest(&entry.source_identity),
             entry.kernel_symbol,
             entry.semantic_hash,

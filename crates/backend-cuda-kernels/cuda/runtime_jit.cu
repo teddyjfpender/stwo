@@ -40,6 +40,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -64,12 +65,14 @@ extern "C" void get_pedersen_table_column_ptrs(unsigned **output_ptrs, uint32_t 
 // (the round-28 lesson, standard C13) and rust-lld fails on the Rust-side def.
 extern "C" bool stwo_aot_lookup(uint64_t cache_key, unsigned sm_major, unsigned sm_minor,
                                 const unsigned char **out_data, size_t *out_len);
+extern "C" int stwo_exec_context_stream(void *handle, void **out_stream);
+extern "C" int stwo_exec_context_device(void *handle, int *out_device);
 
 namespace {
 
 enum class KernelOrigin : uint8_t { Aot = 0, Runtime = 1 };
 
-constexpr uint32_t kPedersenPublicationAbiVersion = 1;
+constexpr uint32_t kPedersenPublicationAbiVersion = 2;
 constexpr uint32_t kPedersenGlobalsAbsent = 0;
 constexpr uint32_t kPedersenGlobalsPresent = 1;
 constexpr uint32_t kPedersenPublicationAot = 1u << 0;
@@ -95,6 +98,7 @@ struct StwoCudaPedersenModulePublication {
     uint32_t globals_state;
     uint64_t cache_key;
     uint64_t module_token;
+    uint64_t function_token;
     uint64_t context_token;
     uint64_t columns_symbol_token;
     uint64_t rows_symbol_token;
@@ -102,13 +106,13 @@ struct StwoCudaPedersenModulePublication {
     uint64_t column_pointers[56];
 };
 static_assert(sizeof(void *) == 8, "Pedersen module globals require 64-bit pointers");
-static_assert(sizeof(StwoCudaPedersenModulePublication) == 536,
+static_assert(sizeof(StwoCudaPedersenModulePublication) == 544,
               "Pedersen publication ABI size");
 static_assert(alignof(StwoCudaPedersenModulePublication) == 8,
               "Pedersen publication ABI alignment");
 static_assert(offsetof(StwoCudaPedersenModulePublication, cache_key) == 40,
               "Pedersen publication cache-key offset");
-static_assert(offsetof(StwoCudaPedersenModulePublication, column_pointers) == 88,
+static_assert(offsetof(StwoCudaPedersenModulePublication, column_pointers) == 96,
               "Pedersen publication pointer offset");
 
 struct CachedFunction {
@@ -127,6 +131,68 @@ struct StwoCudaJitAotStats {
     uint64_t runtime_loads;
     uint64_t runtime_cache_hits;
     uint64_t strict_rejections;
+};
+
+constexpr uint32_t kInstalledAotFunctionAbiVersion = 1;
+constexpr uint32_t kInstalledAotBorrowedPublished = 2;
+constexpr uint32_t kAotFunctionPublicationAbiVersion = 1;
+constexpr uint32_t kAotFunctionPublicationAot = 1;
+
+struct StwoCudaAotFunctionPublication {
+    uint32_t abi_version;
+    uint32_t flags;
+    uint32_t device_ordinal;
+    uint32_t sm_major;
+    uint32_t sm_minor;
+    uint32_t reserved;
+    uint64_t cache_key;
+    uint64_t context_token;
+    uint64_t module_token;
+    uint64_t function_token;
+};
+static_assert(sizeof(StwoCudaAotFunctionPublication) == 56,
+              "AOT function publication ABI size");
+static_assert(offsetof(StwoCudaAotFunctionPublication, cache_key) == 24,
+              "AOT function publication cache-key offset");
+
+struct StwoCudaInstalledAotFunctionReceipt {
+    uint32_t abi_version;
+    uint32_t ownership;
+    uint32_t device_ordinal;
+    uint32_t sm_major;
+    uint32_t sm_minor;
+    uint32_t argument_count;
+    uint32_t grid_x;
+    uint32_t grid_y;
+    uint32_t grid_z;
+    uint32_t block_x;
+    uint32_t block_y;
+    uint32_t block_z;
+    uint32_t dynamic_shared_bytes;
+    uint32_t reserved;
+    uint64_t context_token;
+    uint64_t module_token;
+    uint64_t function_token;
+    uint64_t stream_token;
+};
+static_assert(sizeof(StwoCudaInstalledAotFunctionReceipt) == 88,
+              "installed AOT receipt ABI size");
+static_assert(offsetof(StwoCudaInstalledAotFunctionReceipt, context_token) == 56,
+              "installed AOT context-token offset");
+
+struct InstalledAotFunction {
+    void *exec_context;
+    CUcontext context;
+    CUmodule module;
+    CUfunction function;
+    CUstream stream;
+    uint64_t cache_key;
+    uint32_t expected_sm;
+    uint32_t argument_count;
+    uint32_t grid[3];
+    uint32_t block[3];
+    uint32_t dynamic_shared_bytes;
+    std::string kernel_name;
 };
 
 struct StwoCudaCompositionWavePart {
@@ -287,7 +353,9 @@ bool try_use_cached_function(const CachedFunction &cached, const char *kernel_na
         cached.pedersen_publication.context_token !=
             static_cast<uint64_t>(reinterpret_cast<uintptr_t>(context)) ||
         cached.pedersen_publication.module_token !=
-            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(cached.module))) {
+            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(cached.module)) ||
+        cached.pedersen_publication.function_token !=
+            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(cached.function))) {
         return false;
     }
     if (cached.pedersen_publication.globals_state == kPedersenGlobalsPresent) {
@@ -665,6 +733,13 @@ static bool bind_loaded_module(CUmodule module, const char *kernel_name,
     CUevent publication_event = nullptr;
     if (!fill_witness_pedersen_globals(module, kernel_name, cache_key, origin,
                                         &publication, &publication_event)) {
+        cuModuleUnload(module);
+        return false;
+    }
+    publication.function_token =
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(function));
+    if (publication.function_token == 0) {
+        if (publication_event != nullptr) cuEventDestroy(publication_event);
         cuModuleUnload(module);
         return false;
     }
@@ -1131,6 +1206,56 @@ bool get_or_compile(const char *source, const char *kernel_name, uint64_t cache_
     return true;
 }
 
+bool get_live_aot_function_publication(
+    const char *kernel_name,
+    uint64_t cache_key,
+    StwoCudaAotFunctionPublication *out
+) {
+    if (out == nullptr) return false;
+    *out = StwoCudaAotFunctionPublication{};
+    if (kernel_name == nullptr) return false;
+
+    CUcontext context = nullptr;
+    CUdevice device = 0;
+    int sm_major = 0;
+    int sm_minor = 0;
+    if (!ensure_current_context(&context) ||
+        cuCtxGetDevice(&device) != CUDA_SUCCESS || device < 0 ||
+        cuDeviceGetAttribute(&sm_major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+                             device) != CUDA_SUCCESS ||
+        cuDeviceGetAttribute(&sm_minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+                             device) != CUDA_SUCCESS ||
+        sm_major < 0 || sm_minor < 0) {
+        return false;
+    }
+
+    JitCache &cache = jit_cache();
+    std::lock_guard<std::mutex> guard(cache.mutex);
+    auto found = cache.functions.find(JitCacheKey{cache_key, context});
+    if (found == cache.functions.end()) return false;
+    const CachedFunction &cached = found->second;
+    if (cached.origin != KernelOrigin::Aot || cached.kernel_name != kernel_name ||
+        cached.module == nullptr || cached.function == nullptr ||
+        cached.pedersen_publication.context_token !=
+            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(context))) {
+        return false;
+    }
+    *out = StwoCudaAotFunctionPublication{
+        kAotFunctionPublicationAbiVersion,
+        kAotFunctionPublicationAot,
+        static_cast<uint32_t>(device),
+        static_cast<uint32_t>(sm_major),
+        static_cast<uint32_t>(sm_minor),
+        0,
+        cache_key,
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(context)),
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(cached.module)),
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(cached.function)),
+    };
+    return out->context_token != 0 && out->module_token != 0 &&
+           out->function_token != 0;
+}
+
 bool get_live_pedersen_publication(
     const char *kernel_name,
     uint64_t cache_key,
@@ -1176,10 +1301,13 @@ bool get_live_pedersen_publication(
         receipt.pointer_count != 56 || receipt.columns_symbol_bytes != 448 ||
         receipt.rows_symbol_bytes != 4 || receipt.n_rows == 0 ||
         receipt.cache_key != cache_key || receipt.module_token == 0 ||
-        receipt.context_token == 0 || receipt.columns_symbol_token == 0 ||
+        receipt.function_token == 0 || receipt.context_token == 0 ||
+        receipt.columns_symbol_token == 0 ||
         receipt.rows_symbol_token == 0 || receipt.completion_event_token == 0 ||
         receipt.module_token !=
             static_cast<uint64_t>(reinterpret_cast<uintptr_t>(cached.module)) ||
+        receipt.function_token !=
+            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(cached.function)) ||
         receipt.context_token !=
             static_cast<uint64_t>(reinterpret_cast<uintptr_t>(context)) ||
         receipt.completion_event_token != static_cast<uint64_t>(reinterpret_cast<uintptr_t>(
@@ -1218,7 +1346,323 @@ bool get_live_pedersen_publication(
     return true;
 }
 
+static int current_installed_binding(
+    void *exec_context,
+    uint32_t expected_sm,
+    CUcontext *out_context,
+    CUstream *out_stream,
+    uint32_t *out_device,
+    uint32_t *out_sm_major,
+    uint32_t *out_sm_minor
+) {
+    if (exec_context == nullptr || expected_sm == 0 || out_context == nullptr ||
+        out_stream == nullptr || out_device == nullptr || out_sm_major == nullptr ||
+        out_sm_minor == nullptr) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    cudaError_t runtime_status = cudaFree(nullptr);
+    if (runtime_status != cudaSuccess) return static_cast<int>(runtime_status);
+    CUcontext context = nullptr;
+    CUdevice device = 0;
+    int context_device = -1;
+    int sm_major = 0;
+    int sm_minor = 0;
+    void *stream = nullptr;
+    CUcontext stream_context = nullptr;
+    if (cuCtxGetCurrent(&context) != CUDA_SUCCESS || context == nullptr ||
+        cuCtxGetDevice(&device) != CUDA_SUCCESS || device < 0 ||
+        stwo_exec_context_device(exec_context, &context_device) != 0 ||
+        context_device != static_cast<int>(device) ||
+        stwo_exec_context_stream(exec_context, &stream) != 0 || stream == nullptr ||
+        cuStreamGetCtx(reinterpret_cast<CUstream>(stream), &stream_context) != CUDA_SUCCESS ||
+        stream_context != context ||
+        cuDeviceGetAttribute(&sm_major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+                             device) != CUDA_SUCCESS ||
+        cuDeviceGetAttribute(&sm_minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+                             device) != CUDA_SUCCESS ||
+        sm_major < 0 || sm_minor < 0 ||
+        static_cast<uint32_t>(sm_major) * 10u + static_cast<uint32_t>(sm_minor) !=
+            expected_sm) {
+        return CUDA_ERROR_INVALID_CONTEXT;
+    }
+    *out_context = context;
+    *out_stream = reinterpret_cast<CUstream>(stream);
+    *out_device = static_cast<uint32_t>(device);
+    *out_sm_major = static_cast<uint32_t>(sm_major);
+    *out_sm_minor = static_cast<uint32_t>(sm_minor);
+    return CUDA_SUCCESS;
+}
+
+static int validate_installed_launch_facts(
+    CUdevice device,
+    CUfunction function,
+    const uint32_t grid[3],
+    const uint32_t block[3],
+    uint32_t dynamic_shared_bytes
+) {
+    if (function == nullptr || grid == nullptr || block == nullptr ||
+        grid[0] == 0 || grid[1] == 0 || grid[2] == 0 ||
+        block[0] == 0 || block[1] == 0 || block[2] == 0) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    int max_threads_function = 0;
+    int max_threads_device = 0;
+    int max_block[3] = {};
+    int max_grid[3] = {};
+    if (cuFuncGetAttribute(&max_threads_function,
+                           CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
+                           function) != CUDA_SUCCESS ||
+        cuDeviceGetAttribute(&max_threads_device,
+                             CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
+                             device) != CUDA_SUCCESS ||
+        cuDeviceGetAttribute(&max_block[0], CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_X,
+                             device) != CUDA_SUCCESS ||
+        cuDeviceGetAttribute(&max_block[1], CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_Y,
+                             device) != CUDA_SUCCESS ||
+        cuDeviceGetAttribute(&max_block[2], CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_Z,
+                             device) != CUDA_SUCCESS ||
+        cuDeviceGetAttribute(&max_grid[0], CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X,
+                             device) != CUDA_SUCCESS ||
+        cuDeviceGetAttribute(&max_grid[1], CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Y,
+                             device) != CUDA_SUCCESS ||
+        cuDeviceGetAttribute(&max_grid[2], CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Z,
+                             device) != CUDA_SUCCESS) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    uint64_t threads = static_cast<uint64_t>(block[0]) * block[1] * block[2];
+    if (threads > static_cast<uint64_t>(max_threads_function) ||
+        threads > static_cast<uint64_t>(max_threads_device)) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    for (unsigned axis = 0; axis < 3; ++axis) {
+        if (block[axis] > static_cast<uint32_t>(max_block[axis]) ||
+            grid[axis] > static_cast<uint32_t>(max_grid[axis])) {
+            return CUDA_ERROR_INVALID_VALUE;
+        }
+    }
+    if (dynamic_shared_bytes != 0) {
+        int max_dynamic_shared = 0;
+        if (cuFuncGetAttribute(&max_dynamic_shared,
+                               CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                               function) != CUDA_SUCCESS ||
+            dynamic_shared_bytes > static_cast<uint32_t>(max_dynamic_shared)) {
+            return CUDA_ERROR_INVALID_VALUE;
+        }
+    }
+    return CUDA_SUCCESS;
+}
+
+static void fill_installed_receipt(
+    const InstalledAotFunction &installed,
+    uint32_t ownership,
+    uint32_t device,
+    uint32_t sm_major,
+    uint32_t sm_minor,
+    StwoCudaInstalledAotFunctionReceipt *out
+) {
+    *out = StwoCudaInstalledAotFunctionReceipt{};
+    out->abi_version = kInstalledAotFunctionAbiVersion;
+    out->ownership = ownership;
+    out->device_ordinal = device;
+    out->sm_major = sm_major;
+    out->sm_minor = sm_minor;
+    out->argument_count = installed.argument_count;
+    out->grid_x = installed.grid[0];
+    out->grid_y = installed.grid[1];
+    out->grid_z = installed.grid[2];
+    out->block_x = installed.block[0];
+    out->block_y = installed.block[1];
+    out->block_z = installed.block[2];
+    out->dynamic_shared_bytes = installed.dynamic_shared_bytes;
+    out->context_token =
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(installed.context));
+    out->module_token =
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(installed.module));
+    out->function_token =
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(installed.function));
+    out->stream_token =
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(installed.stream));
+}
+
+static int create_borrowed_published_function(
+    void *exec_context,
+    const char *kernel_name,
+    uint64_t cache_key,
+    uint32_t expected_sm,
+    uint64_t expected_module_token,
+    uint64_t expected_function_token,
+    uint64_t expected_context_token,
+    uint32_t argument_count,
+    const uint32_t grid[3],
+    const uint32_t block[3],
+    uint32_t dynamic_shared_bytes,
+    void **out_handle,
+    StwoCudaInstalledAotFunctionReceipt *out_receipt
+) {
+    if (kernel_name == nullptr || kernel_name[0] == '\0' ||
+        expected_module_token == 0 || expected_function_token == 0 ||
+        expected_context_token == 0 || argument_count == 0 ||
+        out_handle == nullptr || out_receipt == nullptr) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    *out_handle = nullptr;
+    *out_receipt = StwoCudaInstalledAotFunctionReceipt{};
+    CUcontext context = nullptr;
+    CUstream stream = nullptr;
+    uint32_t device = 0;
+    uint32_t sm_major = 0;
+    uint32_t sm_minor = 0;
+    int status = current_installed_binding(exec_context, expected_sm, &context, &stream,
+                                           &device, &sm_major, &sm_minor);
+    if (status != CUDA_SUCCESS ||
+        expected_context_token !=
+            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(context))) {
+        return CUDA_ERROR_INVALID_CONTEXT;
+    }
+
+    StwoCudaAotFunctionPublication publication{};
+    if (!get_live_aot_function_publication(kernel_name, cache_key, &publication) ||
+        publication.module_token != expected_module_token ||
+        publication.function_token != expected_function_token ||
+        publication.context_token != expected_context_token) {
+        return CUDA_ERROR_NOT_FOUND;
+    }
+
+    JitCache &cache = jit_cache();
+    std::lock_guard<std::mutex> guard(cache.mutex);
+    auto found = cache.functions.find(JitCacheKey{cache_key, context});
+    if (found == cache.functions.end()) return CUDA_ERROR_NOT_FOUND;
+    const CachedFunction &cached = found->second;
+    if (cached.origin != KernelOrigin::Aot || cached.kernel_name != kernel_name ||
+        expected_module_token !=
+            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(cached.module)) ||
+        expected_function_token !=
+            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(cached.function))) {
+        return CUDA_ERROR_NOT_FOUND;
+    }
+    status = validate_installed_launch_facts(static_cast<CUdevice>(device), cached.function,
+                                             grid, block, dynamic_shared_bytes);
+    if (status != CUDA_SUCCESS) return status;
+    InstalledAotFunction *installed = new (std::nothrow) InstalledAotFunction{
+        exec_context,
+        context,
+        cached.module,
+        cached.function,
+        stream,
+        cache_key,
+        expected_sm,
+        argument_count,
+        {grid[0], grid[1], grid[2]},
+        {block[0], block[1], block[2]},
+        dynamic_shared_bytes,
+        std::string(kernel_name),
+    };
+    if (installed == nullptr) return CUDA_ERROR_OUT_OF_MEMORY;
+    fill_installed_receipt(*installed, kInstalledAotBorrowedPublished, device,
+                           sm_major, sm_minor, out_receipt);
+    *out_handle = installed;
+    return CUDA_SUCCESS;
+}
+
+static int launch_installed_function(
+    InstalledAotFunction *installed,
+    void *exec_context,
+    void **arguments,
+    uint32_t argument_count
+) {
+    if (installed == nullptr || exec_context == nullptr ||
+        exec_context != installed->exec_context || arguments == nullptr ||
+        argument_count != installed->argument_count) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    CUcontext context = nullptr;
+    CUstream stream = nullptr;
+    uint32_t device = 0;
+    uint32_t sm_major = 0;
+    uint32_t sm_minor = 0;
+    int status = current_installed_binding(
+        exec_context, installed->expected_sm, &context, &stream, &device, &sm_major,
+        &sm_minor);
+    if (status != CUDA_SUCCESS || context != installed->context ||
+        stream != installed->stream) {
+        return CUDA_ERROR_INVALID_CONTEXT;
+    }
+    CUstreamCaptureStatus capture_status = CU_STREAM_CAPTURE_STATUS_NONE;
+    if (cuStreamIsCapturing(stream, &capture_status) != CUDA_SUCCESS ||
+        capture_status != CU_STREAM_CAPTURE_STATUS_NONE) {
+        return CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED;
+    }
+
+    auto launch = [&]() {
+        return static_cast<int>(cuLaunchKernel(
+            installed->function, installed->grid[0], installed->grid[1],
+            installed->grid[2], installed->block[0], installed->block[1],
+            installed->block[2], installed->dynamic_shared_bytes, installed->stream,
+            arguments, nullptr));
+    };
+    JitCache &cache = jit_cache();
+    std::lock_guard<std::mutex> guard(cache.mutex);
+    auto found = cache.functions.find(JitCacheKey{installed->cache_key, context});
+    if (found == cache.functions.end()) return CUDA_ERROR_NOT_FOUND;
+    const CachedFunction &cached = found->second;
+    if (cached.origin != KernelOrigin::Aot ||
+        cached.kernel_name != installed->kernel_name ||
+        cached.module != installed->module || cached.function != installed->function) {
+        return CUDA_ERROR_NOT_FOUND;
+    }
+    return launch();
+}
+
+static int destroy_installed_function(InstalledAotFunction *installed) {
+    if (installed == nullptr) return CUDA_ERROR_INVALID_VALUE;
+    delete installed;
+    return CUDA_SUCCESS;
+}
+
 }  // namespace
+
+extern "C" int stwo_installed_aot_function_borrow_published_create(
+    void *exec_context,
+    const char *kernel_name,
+    uint64_t cache_key,
+    uint32_t expected_sm,
+    uint64_t expected_module_token,
+    uint64_t expected_function_token,
+    uint64_t expected_context_token,
+    uint32_t argument_count,
+    uint32_t grid_x,
+    uint32_t grid_y,
+    uint32_t grid_z,
+    uint32_t block_x,
+    uint32_t block_y,
+    uint32_t block_z,
+    uint32_t dynamic_shared_bytes,
+    void **out_handle,
+    StwoCudaInstalledAotFunctionReceipt *out_receipt
+) {
+    const uint32_t grid[3] = {grid_x, grid_y, grid_z};
+    const uint32_t block[3] = {block_x, block_y, block_z};
+    return create_borrowed_published_function(
+        exec_context, kernel_name, cache_key, expected_sm, expected_module_token,
+        expected_function_token, expected_context_token, argument_count, grid,
+        block, dynamic_shared_bytes, out_handle, out_receipt);
+}
+
+extern "C" int stwo_installed_aot_function_launch(
+    void *handle,
+    void *exec_context,
+    void **arguments,
+    uint32_t argument_count
+) {
+    return launch_installed_function(
+        reinterpret_cast<InstalledAotFunction *>(handle), exec_context, arguments,
+        argument_count);
+}
+
+extern "C" int stwo_installed_aot_function_destroy(void *handle) {
+    return destroy_installed_function(
+        reinterpret_cast<InstalledAotFunction *>(handle));
+}
 
 extern "C" void stwo_cuda_jit_set_require_aot(bool required) {
     // Strictness is monotonic. Relaxing it while other proof threads execute
@@ -1247,6 +1691,14 @@ extern "C" void stwo_cuda_jit_reset_aot_stats() {
     c.runtime_loads.store(0, std::memory_order_relaxed);
     c.runtime_cache_hits.store(0, std::memory_order_relaxed);
     c.strict_rejections.store(0, std::memory_order_relaxed);
+}
+
+extern "C" bool stwo_cuda_jit_get_aot_function_publication(
+    const char *kernel_name,
+    uint64_t cache_key,
+    StwoCudaAotFunctionPublication *out
+) {
+    return get_live_aot_function_publication(kernel_name, cache_key, out);
 }
 
 extern "C" bool stwo_cuda_jit_get_pedersen_module_publication(

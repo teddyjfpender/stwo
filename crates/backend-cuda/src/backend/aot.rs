@@ -13,9 +13,20 @@
 //! identity, while per-key strict lookup proves complete source/shape coverage;
 //! a matching policy tag alone never admits a partial or stale pack.
 
+mod function_publication;
+mod installed_function;
+
+pub use function_publication::{
+    loaded_aot_function_publication, LoadedAotFunctionPublication,
+    LoadedAotFunctionPublicationError,
+};
+pub use installed_function::{
+    CheckedAotArguments, InstalledAotFunction, InstalledAotFunctionError,
+    InstalledAotFunctionOwnership, InstalledAotFunctionReceipt, InstalledAotLaunchFacts,
+};
 pub use stwo_backend_cuda_kernels::aot_pack::{
     AotKernelAbiAccess, AotKernelAbiArgument, AotKernelAbiKind, AotKernelAbiSchema,
-    AotKernelAuthority, AotKernelSchemaScope,
+    AotKernelAuthority, AotKernelModuleGlobals, AotKernelSchemaScope,
 };
 
 /// Canonical identity the AOT pack binds to an emitted CUDA translation unit.

@@ -11,7 +11,7 @@ const CUBIN_DOMAIN: &[u8] = b"stwo-cuda-aot-cubin-identity-v1\0";
 #[allow(dead_code)]
 const SOURCE_DOMAIN: &[u8] = b"stwo-cuda-aot-source-identity-v1\0";
 const ABI_SCHEMA_DOMAIN: &[u8] = b"stwo-cuda-aot-abi-schema-v1\0";
-const KERNEL_AUTHORITY_DOMAIN: &[u8] = b"stwo-cuda-aot-kernel-authority-v2\0";
+const KERNEL_AUTHORITY_DOMAIN: &[u8] = b"stwo-cuda-aot-kernel-authority-v3\0";
 const PACK_DOMAIN: &[u8] = b"stwo-cuda-aot-pack-identity-v1\0";
 
 /// Strength of the generator-owned schema bound into one authority entry.
@@ -22,6 +22,21 @@ const PACK_DOMAIN: &[u8] = b"stwo-cuda-aot-pack-identity-v1\0";
 pub enum AotKernelSchemaScope {
     ExportedSymbolOnly = 1,
     StructuredAbi = 2,
+}
+
+/// Runtime module-global contract derived from the exact generated source.
+///
+/// `Unspecified` is deliberately not installable through the structured AOT
+/// function seam. The Pedersen variant names the only relocatable module
+/// globals currently emitted by the typed witness generator; it is not a claim
+/// that arbitrary CUDA globals can be discovered from a cubin.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+#[repr(u8)]
+pub enum AotKernelModuleGlobals {
+    Unspecified = 1,
+    None = 2,
+    WitnessPedersenV1 = 3,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -91,6 +106,40 @@ impl AotKernelAbiSchema {
     pub fn identity(self) -> [u8; 32] {
         abi_schema_identity(self)
     }
+}
+
+// This source is also compiled as build.rs' authority module; runtime code
+// consumes only the generated classification sealed into each pack entry.
+#[allow(dead_code)]
+pub(crate) fn module_globals_for_source(
+    schema: Option<AotKernelAbiSchema>,
+    source: &[u8],
+) -> Result<AotKernelModuleGlobals, &'static str> {
+    if schema.is_none() {
+        return Ok(AotKernelModuleGlobals::Unspecified);
+    }
+    let has_columns = contains_bytes(source, b"g_stwo_wit_pedersen_cols");
+    let has_rows = contains_bytes(source, b"g_stwo_wit_pedersen_n_rows");
+    if has_columns != has_rows {
+        return Err("generated witness source has a partial Pedersen-global contract");
+    }
+    match (schema, has_columns) {
+        (Some(AotKernelAbiSchema::RecordedWitnessV1), true) => {
+            Ok(AotKernelModuleGlobals::WitnessPedersenV1)
+        }
+        (Some(_), false) => Ok(AotKernelModuleGlobals::None),
+        (Some(AotKernelAbiSchema::OrdinaryConstraintV1), true) => {
+            Err("ordinary constraint source unexpectedly names witness Pedersen globals")
+        }
+        (None, _) => unreachable!("schema absence returned above"),
+    }
+}
+
+#[allow(dead_code)]
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|candidate| candidate == needle)
 }
 
 const RECORDED_WITNESS_V1_ARGUMENTS: [AotKernelAbiArgument; 8] = [
@@ -257,6 +306,7 @@ pub(crate) struct KernelAuthorityIdentityInput<'a> {
     pub abi_schema_identity: [u8; 32],
     pub program_identity: [u8; 32],
     pub schema_scope: AotKernelSchemaScope,
+    pub module_globals: AotKernelModuleGlobals,
 }
 
 pub(crate) fn abi_schema_identity(schema: AotKernelAbiSchema) -> [u8; 32] {
@@ -311,6 +361,16 @@ pub(crate) fn kernel_authority_identity(input: KernelAuthorityIdentityInput<'_>)
         }
         || (input.schema_scope == AotKernelSchemaScope::ExportedSymbolOnly
             && input.program_identity != ZERO_IDENTITY)
+        || match (input.schema_scope, input.module_globals) {
+            (AotKernelSchemaScope::ExportedSymbolOnly, AotKernelModuleGlobals::Unspecified) => {
+                false
+            }
+            (AotKernelSchemaScope::StructuredAbi, AotKernelModuleGlobals::None)
+            | (AotKernelSchemaScope::StructuredAbi, AotKernelModuleGlobals::WitnessPedersenV1) => {
+                false
+            }
+            _ => true,
+        }
     {
         return ZERO_IDENTITY;
     }
@@ -326,6 +386,7 @@ pub(crate) fn kernel_authority_identity(input: KernelAuthorityIdentityInput<'_>)
     hasher.update(&input.abi_schema_identity);
     hasher.update(&input.program_identity);
     hasher.update(&[input.schema_scope as u8]);
+    hasher.update(&[input.module_globals as u8]);
     *hasher.finalize().as_bytes()
 }
 
@@ -396,6 +457,7 @@ mod tests {
             abi_schema_identity: ZERO_IDENTITY,
             program_identity: ZERO_IDENTITY,
             schema_scope: AotKernelSchemaScope::ExportedSymbolOnly,
+            module_globals: AotKernelModuleGlobals::Unspecified,
         }
     }
 
@@ -551,11 +613,31 @@ mod tests {
                 abi_schema_identity: abi_schema_identity(AotKernelAbiSchema::RecordedWitnessV1),
                 program_identity: [7; 32],
                 schema_scope: AotKernelSchemaScope::StructuredAbi,
+                module_globals: AotKernelModuleGlobals::None,
+                ..authority()
+            },
+            KernelAuthorityIdentityInput {
+                module_globals: AotKernelModuleGlobals::None,
                 ..authority()
             },
         ] {
             assert_ne!(baseline, kernel_authority_identity(changed));
         }
+        let structured = KernelAuthorityIdentityInput {
+            abi_schema_identity: abi_schema_identity(AotKernelAbiSchema::RecordedWitnessV1),
+            program_identity: [7; 32],
+            schema_scope: AotKernelSchemaScope::StructuredAbi,
+            module_globals: AotKernelModuleGlobals::None,
+            ..authority()
+        };
+        assert_ne!(kernel_authority_identity(structured), ZERO_IDENTITY);
+        assert_ne!(
+            kernel_authority_identity(structured),
+            kernel_authority_identity(KernelAuthorityIdentityInput {
+                module_globals: AotKernelModuleGlobals::WitnessPedersenV1,
+                ..structured
+            })
+        );
         assert_eq!(
             kernel_authority_identity(KernelAuthorityIdentityInput {
                 source_identity: ZERO_IDENTITY,
@@ -568,6 +650,7 @@ mod tests {
                 abi_schema_identity: ZERO_IDENTITY,
                 program_identity: [7; 32],
                 schema_scope: AotKernelSchemaScope::StructuredAbi,
+                module_globals: AotKernelModuleGlobals::None,
                 ..authority()
             }),
             ZERO_IDENTITY
@@ -577,6 +660,7 @@ mod tests {
                 abi_schema_identity: abi_schema_identity(AotKernelAbiSchema::RecordedWitnessV1),
                 program_identity: ZERO_IDENTITY,
                 schema_scope: AotKernelSchemaScope::StructuredAbi,
+                module_globals: AotKernelModuleGlobals::None,
                 ..authority()
             }),
             ZERO_IDENTITY
@@ -599,6 +683,36 @@ mod tests {
     }
 
     #[test]
+    fn generated_source_global_contract_is_fail_closed() {
+        let globals = b"__device__ m31* g_stwo_wit_pedersen_cols[56];\n\
+              __device__ unsigned g_stwo_wit_pedersen_n_rows;";
+        assert_eq!(
+            module_globals_for_source(Some(AotKernelAbiSchema::RecordedWitnessV1), globals),
+            Ok(AotKernelModuleGlobals::WitnessPedersenV1)
+        );
+        assert_eq!(
+            module_globals_for_source(
+                Some(AotKernelAbiSchema::RecordedWitnessV1),
+                b"extern \"C\" __global__ void witness() {}"
+            ),
+            Ok(AotKernelModuleGlobals::None)
+        );
+        assert!(module_globals_for_source(
+            Some(AotKernelAbiSchema::RecordedWitnessV1),
+            b"g_stwo_wit_pedersen_cols"
+        )
+        .is_err());
+        assert!(
+            module_globals_for_source(Some(AotKernelAbiSchema::OrdinaryConstraintV1), globals)
+                .is_err()
+        );
+        assert_eq!(
+            module_globals_for_source(None, globals),
+            Ok(AotKernelModuleGlobals::Unspecified)
+        );
+    }
+
+    #[test]
     fn canonical_encoding_has_stable_golden_digests() {
         assert_eq!(
             hex(cubin_identity(A)),
@@ -614,7 +728,7 @@ mod tests {
         );
         assert_eq!(
             hex(kernel_authority_identity(authority())),
-            "a81919754481adaba8dbb3c903f3be0a694794a890ecd258c82887656eec1c41"
+            "18f662105377e4a43f0222df587cd60697d4fb9913273654e5704829d1bbc5d4"
         );
         assert_eq!(
             hex(abi_schema_identity(AotKernelAbiSchema::RecordedWitnessV1)),

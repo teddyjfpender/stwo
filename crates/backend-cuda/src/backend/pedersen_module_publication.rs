@@ -15,7 +15,9 @@ use stwo_backend_cuda_kernels::raw::{
     CUDA_PEDERSEN_PUBLICATION_ABI_VERSION, CUDA_PEDERSEN_PUBLICATION_REQUIRED_FLAGS,
 };
 
-use super::aot::{self, AotKernelAbiSchema, AotKernelAuthority, AotKernelSchemaScope};
+use super::aot::{
+    self, AotKernelAbiSchema, AotKernelAuthority, AotKernelModuleGlobals, AotKernelSchemaScope,
+};
 use super::pedersen_table::{
     registered_borrowed_pedersen_table, PedersenTableContentDigest, RegisteredPedersenTable,
     RegisteredPedersenTableError, PEDERSEN_TABLE_N_COLUMNS, PEDERSEN_TABLE_REGISTRATION_GENERATION,
@@ -46,6 +48,7 @@ pub struct PedersenModulePublicationReceipt {
     table_registration_generation: u64,
     device_ordinal: u32,
     module_token: u64,
+    function_token: u64,
     context_token: u64,
     columns_symbol_token: u64,
     rows_symbol_token: u64,
@@ -117,6 +120,11 @@ impl PedersenModulePublicationReceipt {
     /// Process-local equality token, never a semantic identity.
     pub const fn module_token(&self) -> u64 {
         self.module_token
+    }
+
+    /// Process-local equality token for the exact exported function.
+    pub const fn function_token(&self) -> u64 {
+        self.function_token
     }
 
     /// Process-local equality token, never a semantic identity.
@@ -256,6 +264,7 @@ fn validate_kernel_authority(
         || authority.target_sm() != expected_target_sm
         || authority.abi_schema() != Some(AotKernelAbiSchema::RecordedWitnessV1)
         || authority.schema_scope() != AotKernelSchemaScope::StructuredAbi
+        || authority.module_globals() != AotKernelModuleGlobals::WitnessPedersenV1
         || authority.kernel_symbol().is_empty()
         || authority.source_identity() == [0; 32]
         || authority.cubin_identity() == [0; 32]
@@ -288,6 +297,7 @@ fn validate_native_publication(
         || native.n_rows != expected_rows
         || native.cache_key != kernel_cache_key
         || native.module_token == 0
+        || native.function_token == 0
         || native.context_token == 0
         || native.columns_symbol_token == 0
         || native.rows_symbol_token == 0
@@ -366,6 +376,7 @@ pub fn loaded_aot_pedersen_module_publication(
         table_registration_generation: table.registration_generation,
         device_ordinal: native.device_ordinal,
         module_token: native.module_token,
+        function_token: native.function_token,
         context_token: native.context_token,
         columns_symbol_token: native.columns_symbol_token,
         rows_symbol_token: native.rows_symbol_token,
@@ -405,10 +416,11 @@ mod tests {
             globals_state: CUDA_PEDERSEN_GLOBALS_PRESENT,
             cache_key: 17,
             module_token: 0x100,
-            context_token: 0x200,
-            columns_symbol_token: 0x300,
-            rows_symbol_token: 0x400,
-            completion_event_token: 0x500,
+            function_token: 0x200,
+            context_token: 0x300,
+            columns_symbol_token: 0x400,
+            rows_symbol_token: 0x500,
+            completion_event_token: 0x600,
             column_pointers: table.column_pointers,
         }
     }
@@ -444,6 +456,7 @@ mod tests {
             |receipt| receipt.n_rows *= 2,
             |receipt| receipt.cache_key += 1,
             |receipt| receipt.module_token = 0,
+            |receipt| receipt.function_token = 0,
             |receipt| receipt.context_token = 0,
             |receipt| receipt.columns_symbol_token += 1,
             |receipt| receipt.rows_symbol_token += 1,
