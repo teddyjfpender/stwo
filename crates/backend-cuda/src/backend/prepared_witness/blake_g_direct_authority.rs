@@ -14,8 +14,10 @@ use super::{
 const ZERO_IDENTITY: [u8; 32] = [0; 32];
 const BINDER_SOURCE: &[u8] = include_bytes!("../prepared_witness.rs");
 const AUTHORITY_SOURCE: &[u8] = include_bytes!("blake_g_direct_authority.rs");
+const PREPARED_FEED_SOURCE: &[u8] = include_bytes!("../prepared_witness_feed.rs");
+const LUT_CONTENT_SOURCE: &[u8] = include_bytes!("../prepared_witness_feed/blake_g_lut_content.rs");
 
-const SOURCE_DOMAIN: &[u8] = b"stwo-cuda-static-blake-g-direct-source-v1\0";
+const SOURCE_DOMAIN: &[u8] = b"stwo-cuda-static-blake-g-direct-source-v2\0";
 const ABI_DOMAIN: &[u8] = b"stwo-cuda-static-blake-g-direct-abi-v1\0";
 const EFFECT_DOMAIN: &[u8] = b"stwo-cuda-static-blake-g-direct-effect-v1\0";
 const LAUNCH_DOMAIN: &[u8] = b"stwo-cuda-static-blake-g-direct-launch-v1\0";
@@ -457,11 +459,33 @@ const fn argument(
 }
 
 fn source_identity() -> [u8; 32] {
+    source_identity_from(
+        stwo_backend_cuda_kernels::static_cuda_source_identity(),
+        BINDER_SOURCE,
+        AUTHORITY_SOURCE,
+        PREPARED_FEED_SOURCE,
+        LUT_CONTENT_SOURCE,
+    )
+}
+
+fn source_identity_from(
+    static_cuda_source_identity: [u8; 32],
+    binder_source: &[u8],
+    authority_source: &[u8],
+    prepared_feed_source: &[u8],
+    lut_content_source: &[u8],
+) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(SOURCE_DOMAIN);
-    hasher.update(&stwo_backend_cuda_kernels::static_cuda_source_identity());
-    hash_bytes(&mut hasher, BINDER_SOURCE);
-    hash_bytes(&mut hasher, AUTHORITY_SOURCE);
+    hasher.update(&static_cuda_source_identity);
+    for source in [
+        binder_source,
+        authority_source,
+        prepared_feed_source,
+        lut_content_source,
+    ] {
+        hash_bytes(&mut hasher, source);
+    }
     *hasher.finalize().as_bytes()
 }
 

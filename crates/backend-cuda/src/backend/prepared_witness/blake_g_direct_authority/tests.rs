@@ -102,6 +102,57 @@ fn source_closure_proves_direct_wrapper_launch_and_effect_shape() {
     assert!(manifest.contains(
         "\"program_identity\": \"aaf9afa6c30d514b412d651f915d3b9056ac079fe686d8bac596e99b26247163\""
     ));
+
+    let prepared_feed = core::str::from_utf8(PREPARED_FEED_SOURCE).unwrap();
+    assert!(prepared_feed.contains("BlakeGDirectLutContentIdentity::from_host_words(luts_host)?"));
+    assert!(prepared_feed.contains("upload(arena, *slice, host)?"));
+    assert!(prepared_feed.contains("lut_content_identity: BlakeGDirectLutContentIdentity"));
+
+    let lut_content = core::str::from_utf8(LUT_CONTENT_SOURCE).unwrap();
+    assert!(lut_content.contains("for word in words"));
+    assert!(lut_content.contains("hasher.update(&word.to_le_bytes())"));
+    assert!(lut_content.contains("There is deliberately"));
+    assert!(lut_content.contains("no constructor from digest bytes"));
+}
+
+#[test]
+fn every_correctness_critical_source_changes_the_direct_identity() {
+    let cuda_identity = [0x11; 32];
+    let sources = [
+        BINDER_SOURCE,
+        AUTHORITY_SOURCE,
+        PREPARED_FEED_SOURCE,
+        LUT_CONTENT_SOURCE,
+    ];
+    let baseline = source_identity_from(
+        cuda_identity,
+        sources[0],
+        sources[1],
+        sources[2],
+        sources[3],
+    );
+
+    let mut changed_cuda = cuda_identity;
+    changed_cuda[0] ^= 1;
+    assert_ne!(
+        source_identity_from(changed_cuda, sources[0], sources[1], sources[2], sources[3],),
+        baseline
+    );
+    for changed_index in 0..sources.len() {
+        let mut changed = sources.map(<[u8]>::to_vec);
+        changed[changed_index][0] ^= 1;
+        assert_ne!(
+            source_identity_from(
+                cuda_identity,
+                &changed[0],
+                &changed[1],
+                &changed[2],
+                &changed[3],
+            ),
+            baseline,
+            "source {changed_index} was not sealed",
+        );
+    }
 }
 
 #[test]
