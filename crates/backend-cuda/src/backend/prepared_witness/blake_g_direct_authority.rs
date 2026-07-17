@@ -138,7 +138,8 @@ pub struct BlakeGDirectWrapperLaunch {
 }
 
 impl BlakeGDirectWrapperLaunch {
-    pub(crate) const fn audited_internal_kernel_symbol(self) -> &'static str {
+    /// Internal kernel whose launch facts this wrapper receipt audits.
+    pub const fn audited_internal_kernel_symbol(self) -> &'static str {
         "blake_g_write_trace_fused_scalar_kernel"
     }
 }
