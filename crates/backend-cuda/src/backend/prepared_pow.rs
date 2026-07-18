@@ -24,6 +24,10 @@ pub const POW_U64_ALIGNMENT_WORDS: usize = core::mem::align_of::<u64>() / WORD_B
 /// Low-bit width of the SIMD grind lattice (GRIND_LOW_BITS in
 /// `stwo::prover::backend::simd::grind`).
 pub const POW_GRIND_LOW_BITS: u32 = 20;
+/// Exclusive end of the SIMD grind index lattice. This mirrors the CUDA and
+/// SIMD requirement that the high limb remains below the M31 modulus.
+pub const POW_INDEX_LIMIT: u64 = (0x7fff_ffff_u64) << POW_GRIND_LOW_BITS;
+pub const POW_THREADS_PER_BLOCK: u32 = 256;
 /// Compiled search contract. The source-level unroll sweep selected u2 as the
 /// primary and u5 as the identical fallback. `__launch_bounds__(256, 6)` caps
 /// the compiler at the 75%-occupancy register envelope on SM90; the release
@@ -68,9 +72,110 @@ pub struct Blake2sPowArenaSlotRequirement {
     pub alignment_words: usize,
 }
 
+/// Shared geometry for one wait-all fleet PoW attempt. Every rank tile must be
+/// derived from this value; independently chosen launch widths are not a valid
+/// fleet partition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Blake2sPowFleetAttempt {
+    rank_count: u32,
+    start_index: u64,
+    end_index: u64,
+    grid_blocks: u32,
+}
+
+impl Blake2sPowFleetAttempt {
+    pub fn new(
+        rank_count: u32,
+        start_index: u64,
+        end_index: u64,
+        grid_blocks: u32,
+    ) -> Result<Self, PreparedBlake2sPowError> {
+        let workers_per_rank = u64::from(grid_blocks)
+            .checked_mul(u64::from(POW_THREADS_PER_BLOCK))
+            .ok_or(PreparedBlake2sPowError::InvalidRankTile)?;
+        workers_per_rank
+            .checked_mul(u64::from(rank_count))
+            .ok_or(PreparedBlake2sPowError::InvalidRankTile)?;
+        if rank_count == 0
+            || start_index >= end_index
+            || end_index > POW_INDEX_LIMIT
+            || grid_blocks == 0
+            || grid_blocks > i32::MAX as u32
+        {
+            return Err(PreparedBlake2sPowError::InvalidRankTile);
+        }
+        Ok(Self {
+            rank_count,
+            start_index,
+            end_index,
+            grid_blocks,
+        })
+    }
+
+    pub fn rank_tile(self, rank: u32) -> Result<Blake2sPowRankTile, PreparedBlake2sPowError> {
+        if rank >= self.rank_count {
+            return Err(PreparedBlake2sPowError::InvalidRankTile);
+        }
+        Ok(Blake2sPowRankTile {
+            attempt: self,
+            rank,
+        })
+    }
+
+    pub const fn rank_count(self) -> u32 {
+        self.rank_count
+    }
+
+    pub const fn start_index(self) -> u64 {
+        self.start_index
+    }
+
+    pub const fn end_index(self) -> u64 {
+        self.end_index
+    }
+
+    pub const fn grid_blocks(self) -> u32 {
+        self.grid_blocks
+    }
+}
+
+/// One rank's exact share of a shared [`Blake2sPowFleetAttempt`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Blake2sPowRankTile {
+    attempt: Blake2sPowFleetAttempt,
+    rank: u32,
+}
+
+impl Blake2sPowRankTile {
+    pub const fn attempt(self) -> Blake2sPowFleetAttempt {
+        self.attempt
+    }
+
+    pub const fn rank_count(self) -> u32 {
+        self.attempt.rank_count
+    }
+
+    pub const fn rank(self) -> u32 {
+        self.rank
+    }
+
+    pub const fn start_index(self) -> u64 {
+        self.attempt.start_index
+    }
+
+    pub const fn end_index(self) -> u64 {
+        self.attempt.end_index
+    }
+
+    pub const fn grid_blocks(self) -> u32 {
+        self.attempt.grid_blocks
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PreparedBlake2sPowError {
     InvalidPowBits(u32),
+    InvalidRankTile,
     ContextMismatch(ArenaSlotId),
     AliasedSlot(ArenaSlotId),
     StateTooSmall {
@@ -227,30 +332,80 @@ impl<'a> PreparedBlake2sPowGraph<'a> {
         })
     }
 
+    pub fn state_source(&self) -> ArenaSlice {
+        self.transcript_state
+    }
+
     pub fn nonce_destination(&self) -> ArenaSlice {
         self.transcript_nonce
+    }
+
+    /// Read the exact device transcript state at a fleet hand-off boundary.
+    pub fn read_state(
+        &self,
+    ) -> Result<[u32; BLAKE2S_TRANSCRIPT_STATE_WORDS], PreparedBlake2sPowError> {
+        let mut state = [0u32; BLAKE2S_TRANSCRIPT_STATE_WORDS];
+        unsafe {
+            self.arena.context().memcpy_d2h_async(
+                state.as_mut_ptr().cast(),
+                self.transcript_state.as_void_ptr().cast_const(),
+                core::mem::size_of_val(&state),
+            )?;
+        }
+        self.arena.context().sync()?;
+        Ok(state)
+    }
+
+    /// Install a coordinator-owned transcript state on a persistent PoW worker.
+    pub fn upload_state(
+        &self,
+        state: &[u32; BLAKE2S_TRANSCRIPT_STATE_WORDS],
+    ) -> Result<(), PreparedBlake2sPowError> {
+        unsafe {
+            self.arena.context().memcpy_h2d_async(
+                self.transcript_state.as_void_ptr(),
+                state.as_ptr().cast(),
+                core::mem::size_of_val(state),
+            )?;
+        }
+        self.arena.context().sync()?;
+        Ok(())
+    }
+
+    /// Read the rank-local minimum after [`Self::launch_rank_tile`]. This is a
+    /// worker result, not a transcript nonce; only a wait-all reducer may
+    /// publish the global minimum through [`Self::upload_nonce`].
+    pub fn read_rank_result(&self) -> Result<u64, PreparedBlake2sPowError> {
+        let mut words = [0u32; POW_NONCE_WORDS];
+        unsafe {
+            self.arena.context().memcpy_d2h_async(
+                words.as_mut_ptr().cast(),
+                self.best_nonce.as_void_ptr().cast_const(),
+                core::mem::size_of_val(&words),
+            )?;
+        }
+        self.arena.context().sync()?;
+        Ok(u64::from(words[0]) | (u64::from(words[1]) << 32))
+    }
+
+    /// Install the canonical wait-all minimum before the transcript absorbs it.
+    pub fn upload_nonce(&self, nonce: u64) -> Result<(), PreparedBlake2sPowError> {
+        let words = [nonce as u32, (nonce >> 32) as u32];
+        unsafe {
+            self.arena.context().memcpy_h2d_async(
+                self.transcript_nonce.as_void_ptr(),
+                words.as_ptr().cast(),
+                core::mem::size_of_val(&words),
+            )?;
+        }
+        self.arena.context().sync()?;
+        Ok(())
     }
 
     /// Initialize caller-owned scratch, hash the transcript prefix once, and
     /// enqueue the persistent search. No digest or nonce crosses the host.
     pub fn launch(&self) -> Result<(), PreparedBlake2sPowError> {
-        unsafe {
-            self.arena.context().memset_async(
-                self.best_nonce.as_void_ptr(),
-                0xff,
-                POW_NONCE_WORDS * WORD_BYTES,
-            )?;
-            self.arena.context().memset_async(
-                self.completed_blocks.as_void_ptr(),
-                0,
-                WORD_BYTES,
-            )?;
-            self.arena.context().memset_async(
-                self.transcript_nonce.as_void_ptr(),
-                0xff,
-                POW_NONCE_WORDS * WORD_BYTES,
-            )?;
-        }
+        self.initialize_monolithic_scratch()?;
         let code = unsafe {
             stwo_backend_cuda_kernels::raw::stwo_blake2s_pow_persistent_on(
                 self.transcript_state.as_u32_ptr().cast_const(),
@@ -263,6 +418,60 @@ impl<'a> PreparedBlake2sPowGraph<'a> {
             )
         };
         check_cuda("prepared_blake2s_pow", code)?;
+        Ok(())
+    }
+
+    /// Search one fleet rank's exact share of one attempt tile. The tile is a
+    /// launch parameter so a persistent worker can retry without rebuilding
+    /// its prepared arena bindings.
+    pub fn launch_rank_tile(
+        &self,
+        tile: Blake2sPowRankTile,
+    ) -> Result<(), PreparedBlake2sPowError> {
+        self.reset_best_nonce()?;
+        let code = unsafe {
+            stwo_backend_cuda_kernels::raw::stwo_blake2s_pow_rank_tile_on(
+                self.transcript_state.as_u32_ptr().cast_const(),
+                self.pow_bits,
+                tile.rank_count(),
+                tile.rank(),
+                tile.start_index(),
+                tile.end_index(),
+                tile.grid_blocks(),
+                self.prefix_digest.as_u32_ptr(),
+                self.best_nonce.as_u32_ptr().cast::<u64>(),
+                self.arena.context().stream_raw().as_ptr(),
+            )
+        };
+        check_cuda("prepared_blake2s_pow_rank_tile", code)?;
+        Ok(())
+    }
+
+    fn reset_best_nonce(&self) -> Result<(), PreparedBlake2sPowError> {
+        unsafe {
+            self.arena.context().memset_async(
+                self.best_nonce.as_void_ptr(),
+                0xff,
+                POW_NONCE_WORDS * WORD_BYTES,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn initialize_monolithic_scratch(&self) -> Result<(), PreparedBlake2sPowError> {
+        self.reset_best_nonce()?;
+        unsafe {
+            self.arena.context().memset_async(
+                self.completed_blocks.as_void_ptr(),
+                0,
+                WORD_BYTES,
+            )?;
+            self.arena.context().memset_async(
+                self.transcript_nonce.as_void_ptr(),
+                0xff,
+                POW_NONCE_WORDS * WORD_BYTES,
+            )?;
+        }
         Ok(())
     }
 }
@@ -649,6 +858,80 @@ mod tests {
     }
 
     #[test]
+    fn fleet_rank_tiles_cover_non_aligned_attempt_exactly_once() {
+        let rank_count = 4;
+        let grid_blocks = 1;
+        let start = 17;
+        let end = 3_019;
+        let workers_per_rank = u64::from(grid_blocks) * u64::from(POW_THREADS_PER_BLOCK);
+        let stride = workers_per_rank * u64::from(rank_count);
+        let mut visits = vec![0u8; usize::try_from(end - start).unwrap()];
+        let attempt = Blake2sPowFleetAttempt::new(rank_count, start, end, grid_blocks).unwrap();
+
+        for rank in 0..rank_count {
+            let tile = attempt.rank_tile(rank).unwrap();
+            assert_eq!(tile.rank_count(), rank_count);
+            assert_eq!(tile.rank(), rank);
+            assert_eq!(tile.start_index(), start);
+            assert_eq!(tile.end_index(), end);
+            assert_eq!(tile.grid_blocks(), grid_blocks);
+            for local_worker in 0..workers_per_rank {
+                let residue = u64::from(rank) * workers_per_rank + local_worker;
+                let tile_residue = start % stride;
+                let delta = if residue >= tile_residue {
+                    residue - tile_residue
+                } else {
+                    stride - (tile_residue - residue)
+                };
+                let mut index = start + delta;
+                while index < end {
+                    visits[usize::try_from(index - start).unwrap()] += 1;
+                    index += stride;
+                }
+            }
+        }
+        assert!(visits.iter().all(|&count| count == 1));
+    }
+
+    #[test]
+    fn invalid_fleet_rank_tiles_fail_closed() {
+        for geometry in [
+            (0, 0, 1, 1),
+            (2, 1, 1, 1),
+            (2, 2, 1, 1),
+            (2, 0, POW_INDEX_LIMIT + 1, 1),
+            (2, 0, 1, 0),
+        ] {
+            assert_eq!(
+                Blake2sPowFleetAttempt::new(geometry.0, geometry.1, geometry.2, geometry.3),
+                Err(PreparedBlake2sPowError::InvalidRankTile)
+            );
+        }
+        let attempt = Blake2sPowFleetAttempt::new(2, 0, 1, 1).unwrap();
+        assert_eq!(
+            attempt.rank_tile(2),
+            Err(PreparedBlake2sPowError::InvalidRankTile)
+        );
+    }
+
+    #[test]
+    fn extreme_valid_geometry_cannot_wrap_into_another_rank() {
+        let attempt =
+            Blake2sPowFleetAttempt::new(u32::MAX, 17, POW_INDEX_LIMIT, 8_388_609).unwrap();
+        let tile = attempt.rank_tile(u32::MAX - 1).unwrap();
+        let workers_per_rank = u64::from(tile.grid_blocks()) * u64::from(POW_THREADS_PER_BLOCK);
+        let stride = workers_per_rank * u64::from(tile.rank_count());
+        let residue = u64::from(tile.rank()) * workers_per_rank;
+        let tile_residue = tile.start_index() % stride;
+        let delta = if residue >= tile_residue {
+            residue - tile_residue
+        } else {
+            stride - (tile_residue - residue)
+        };
+        assert!(delta >= tile.end_index() - tile.start_index());
+    }
+
+    #[test]
     fn compiled_pow_variant_contract_is_pinned() {
         assert_eq!(POW_PRIMARY_ROUND_UNROLL, 2);
         assert_eq!(POW_FALLBACK_ROUND_UNROLL, 5);
@@ -658,8 +941,16 @@ mod tests {
         assert!(source.contains("constexpr int POW_PRIMARY_ROUND_UNROLL = 2;"));
         assert!(source.contains("constexpr int POW_FALLBACK_ROUND_UNROLL = 5;"));
         assert!(source.contains("__launch_bounds__(POW_BLOCK_SIZE, POW_MIN_BLOCKS_PER_SM)"));
-        assert_eq!(source.matches("pow_prefix_digest<<<").count(), 1);
+        assert_eq!(source.matches("pow_prefix_digest<<<").count(), 2);
         assert_eq!(source.matches("persistent_pow_search<").count(), 2);
+        assert_eq!(
+            source.matches("persistent_pow_rank_tile_search<").count(),
+            2
+        );
+        assert!(source.contains("residue >= tile_residue"));
+        assert!(source.contains("stride - (tile_residue - residue)"));
+        assert!(source.contains("delta < tile_length ? tile_start + delta : tile_end"));
+        assert!(source.contains("stride >= tile_end - index"));
         assert_eq!(source.matches("stwo_blake2s_hash2_device(").count(), 1);
         assert!(source.contains("pow_message_word("));
         assert!(source.contains("fixed_candidate_hash_word(prefix, candidate)"));

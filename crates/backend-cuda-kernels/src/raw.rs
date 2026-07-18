@@ -3249,6 +3249,23 @@ extern "C" {
         stream: *mut c_void,
     ) -> i32;
 
+    /// Search one global SIMD-lattice tile on one fleet rank. Rank residues
+    /// are disjoint and exhaustive; the output is the rank-local minimum or
+    /// `u64::MAX` when the tile contains no qualifying nonce for this rank.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stwo_blake2s_pow_rank_tile_on(
+        transcript_state: *const u32,
+        pow_bits: u32,
+        rank_count: u32,
+        rank: u32,
+        tile_start: u64,
+        tile_end: u64,
+        grid_blocks: u32,
+        prefix_digest: *mut u32,
+        best_nonce: *mut u64,
+        stream: *mut c_void,
+    ) -> i32;
+
     pub fn stwo_blake2s_sparse_leaf_group_on(
         leaf_indices: *const u32,
         leaf_count: *const u32,

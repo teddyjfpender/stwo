@@ -3626,6 +3626,22 @@ pub unsafe extern "C" fn stwo_blake2s_pow_persistent_on(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_blake2s_pow_rank_tile_on(
+    _transcript_state: *const u32,
+    _pow_bits: u32,
+    _rank_count: u32,
+    _rank: u32,
+    _tile_start: u64,
+    _tile_end: u64,
+    _grid_blocks: u32,
+    _prefix_digest: *mut u32,
+    _best_nonce: *mut u64,
+    _stream: *mut c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_blake2s_pow_rank_tile_on")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stwo_blake2s_sparse_leaf_group_on(
     _leaf_indices: *const u32,
     _leaf_count: *const u32,

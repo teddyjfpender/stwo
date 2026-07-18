@@ -1,6 +1,6 @@
 //! Native CUDA correctness and capture gate for final FRI and proof-of-work.
 //!
-//! Hardware admission must require exactly two passed tests from this target;
+//! Hardware admission must require exactly three passed tests from this target;
 //! a CPU/stub build compiles zero tests and is not soundness evidence.
 
 #![cfg(stwo_cuda_link)]
@@ -15,10 +15,11 @@ use stwo::core::utils::bit_reverse_index;
 use stwo::prover::backend::cpu::circle::slow_precompute_twiddles;
 use stwo::prover::backend::simd::SimdBackend;
 use stwo_backend_cuda::{
-    blake2s_pow_workspace_requirements, fri_final_workspace_requirements, ArenaLayout, ArenaSlice,
-    ArenaSlotId, ArenaSlotSpec, Blake2sPowArenaSlotRequirement, Blake2sPowWorkspaceSlots,
-    CudaExecContext, DeviceArena, FriFinalArenaSlotRequirement, FriFinalWorkspaceSlots,
-    FriWorkspaceConfig, PreparedBlake2sPowGraph, PreparedFriEvaluation, PreparedFriFinalGraph,
+    blake2s_pow_workspace_requirements, fri_final_workspace_requirements, pow_index_to_nonce,
+    ArenaLayout, ArenaSlice, ArenaSlotId, ArenaSlotSpec, Blake2sPowArenaSlotRequirement,
+    Blake2sPowFleetAttempt, Blake2sPowWorkspaceSlots, CudaExecContext, DeviceArena,
+    FriFinalArenaSlotRequirement, FriFinalWorkspaceSlots, FriWorkspaceConfig,
+    PreparedBlake2sPowGraph, PreparedFriEvaluation, PreparedFriFinalGraph,
 };
 
 const FRI_EVALUATION: ArenaSlotId = ArenaSlotId(50_000);
@@ -325,5 +326,111 @@ fn persistent_pow_eager_and_capture_return_simd_lattice_minimum() {
     assert_eq!(
         read_nonce(&arena, prepared.nonce_destination()),
         SimdBackend::grind(&second_channel, pow_bits)
+    );
+}
+
+fn host_rank_minimum(
+    channel: &Blake2sChannelGeneric<false>,
+    pow_bits: u32,
+    attempt: Blake2sPowFleetAttempt,
+    rank: u32,
+) -> u64 {
+    let workers_per_rank =
+        u64::from(attempt.grid_blocks()) * u64::from(stwo_backend_cuda::POW_THREADS_PER_BLOCK);
+    let stride = workers_per_rank * u64::from(attempt.rank_count());
+    (attempt.start_index()..attempt.end_index())
+        .filter(|index| (index % stride) / workers_per_rank == u64::from(rank))
+        .map(pow_index_to_nonce)
+        .find(|&nonce| channel.verify_pow_nonce(pow_bits, nonce))
+        .unwrap_or(u64::MAX)
+}
+
+#[test]
+fn fleet_pow_rank_tiles_match_independent_host_minima_and_capture_replay() {
+    let requirements = blake2s_pow_workspace_requirements();
+    let workspace_slots = Blake2sPowWorkspaceSlots {
+        best_nonce: POW_BEST,
+        completed_blocks: POW_COMPLETED,
+        prefix_digest: POW_PREFIX,
+    };
+    let mut requested = requirements
+        .arena_slot_requirements(workspace_slots)
+        .unwrap()
+        .into_iter()
+        .map(|requirement: Blake2sPowArenaSlotRequirement| {
+            (
+                requirement.id,
+                requirement.len_words,
+                requirement.alignment_words,
+            )
+        })
+        .collect::<Vec<_>>();
+    requested.extend([
+        (POW_STATE, requirements.state_words, 8),
+        (POW_NONCE, requirements.nonce_words, 2),
+    ]);
+    let arena = arena_from_requirements(requested);
+    let pow_bits = 10;
+    let prepared = PreparedBlake2sPowGraph::prepare(
+        &arena,
+        arena.bind(POW_STATE).unwrap(),
+        pow_bits,
+        arena.bind(POW_NONCE).unwrap(),
+        workspace_slots,
+    )
+    .unwrap();
+
+    let mut channel = Blake2sChannelGeneric::<false>::default();
+    channel.mix_u32s(&[7, 0x1234_5678, 0x90ab_cdef]);
+    prepared.upload_state(&transcript_state(&channel)).unwrap();
+    let attempt = Blake2sPowFleetAttempt::new(4, 17, 65_554, 2).unwrap();
+    let mut rank_minima = Vec::new();
+    for rank in 0..attempt.rank_count() {
+        prepared
+            .launch_rank_tile(attempt.rank_tile(rank).unwrap())
+            .unwrap();
+        let actual = prepared.read_rank_result().unwrap();
+        assert_eq!(
+            actual,
+            host_rank_minimum(&channel, pow_bits, attempt, rank),
+            "rank {rank}"
+        );
+        rank_minima.push(actual);
+    }
+    let actual_global = rank_minima.into_iter().min().unwrap();
+    let expected_global = (attempt.start_index()..attempt.end_index())
+        .map(pow_index_to_nonce)
+        .find(|&nonce| channel.verify_pow_nonce(pow_bits, nonce))
+        .unwrap_or(u64::MAX);
+    assert_eq!(actual_global, expected_global);
+
+    let no_hit_start = (0..10_000)
+        .find(|&start| {
+            (start..start + 17)
+                .map(pow_index_to_nonce)
+                .all(|nonce| !channel.verify_pow_nonce(pow_bits, nonce))
+        })
+        .unwrap();
+    let no_hit = Blake2sPowFleetAttempt::new(2, no_hit_start, no_hit_start + 17, 1).unwrap();
+    for rank in 0..no_hit.rank_count() {
+        prepared
+            .launch_rank_tile(no_hit.rank_tile(rank).unwrap())
+            .unwrap();
+        assert_eq!(prepared.read_rank_result().unwrap(), u64::MAX);
+    }
+
+    let captured_rank = attempt.rank_tile(0).unwrap();
+    let capture = arena.context().capture().unwrap();
+    prepared.launch_rank_tile(captured_rank).unwrap();
+    let graph = capture.finish().unwrap();
+    let mut replay_channel = Blake2sChannelGeneric::<false>::default();
+    replay_channel.mix_u32s(&[11, 22, 33, 44, 55]);
+    prepared
+        .upload_state(&transcript_state(&replay_channel))
+        .unwrap();
+    graph.launch(arena.context()).unwrap();
+    assert_eq!(
+        prepared.read_rank_result().unwrap(),
+        host_rank_minimum(&replay_channel, pow_bits, attempt, 0)
     );
 }

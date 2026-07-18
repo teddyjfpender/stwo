@@ -609,6 +609,7 @@ mod tests {
     fn prepared_final_fri_and_pow_symbols_are_linked_in_cuda_and_stub_builds() {
         assert_ne!(raw::stwo_fri_last_layer_on as usize, 0);
         assert_ne!(raw::stwo_blake2s_pow_persistent_on as usize, 0);
+        assert_ne!(raw::stwo_blake2s_pow_rank_tile_on as usize, 0);
     }
 
     #[test]

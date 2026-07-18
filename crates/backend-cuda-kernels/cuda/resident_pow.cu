@@ -334,6 +334,68 @@ void persistent_pow_search(
   }
 }
 
+template <int ROUND_UNROLL>
+__global__ __launch_bounds__(POW_BLOCK_SIZE, POW_MIN_BLOCKS_PER_SM)
+void persistent_pow_rank_tile_search(
+    const uint32_t *prefix_digest_words,
+    uint32_t pow_bits,
+    uint32_t rank_count,
+    uint32_t rank,
+    unsigned long long tile_start,
+    unsigned long long tile_end,
+    unsigned long long *best_nonce) {
+  __shared__ Blake2sHash prefixed_digest;
+  if (threadIdx.x < 8U) {
+    prefixed_digest.s[threadIdx.x] = prefix_digest_words[threadIdx.x];
+  }
+  __syncthreads();
+
+  const PowPrefixWords prefix{
+      prefixed_digest.s[0], prefixed_digest.s[1],
+      prefixed_digest.s[2], prefixed_digest.s[3],
+      prefixed_digest.s[4], prefixed_digest.s[5],
+      prefixed_digest.s[6], prefixed_digest.s[7]};
+
+  const unsigned long long local_worker =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const unsigned long long workers_per_rank =
+      static_cast<unsigned long long>(gridDim.x) * blockDim.x;
+  const unsigned long long stride =
+      workers_per_rank * static_cast<unsigned long long>(rank_count);
+  const unsigned long long residue =
+      static_cast<unsigned long long>(rank) * workers_per_rank + local_worker;
+  const unsigned long long tile_residue = tile_start % stride;
+  const unsigned long long delta =
+      residue >= tile_residue
+          ? residue - tile_residue
+          : stride - (tile_residue - residue);
+  const unsigned long long tile_length = tile_end - tile_start;
+  unsigned long long index =
+      delta < tile_length ? tile_start + delta : tile_end;
+
+  while (index < tile_end) {
+    const unsigned long long candidate = pow_index_to_nonce(index);
+    const unsigned long long best = atomicAdd(best_nonce, 0ULL);
+    if (candidate >= best) {
+      break;
+    }
+
+    uint32_t hash_word;
+    if constexpr (ROUND_UNROLL == POW_PRIMARY_ROUND_UNROLL) {
+      hash_word = fixed_candidate_hash_word(prefix, candidate);
+    } else {
+      hash_word = candidate_hash_word<ROUND_UNROLL>(prefixed_digest, candidate);
+    }
+    if (trailing_zeros(hash_word) >= pow_bits) {
+      atomicMin(best_nonce, candidate);
+    }
+    if (stride >= tile_end - index) {
+      break;
+    }
+    index += stride;
+  }
+}
+
 }  // namespace
 
 extern "C" int stwo_blake2s_pow_persistent_on(
@@ -373,5 +435,51 @@ extern "C" int stwo_blake2s_pow_persistent_on(
       <<<POW_GRID_SIZE, POW_BLOCK_SIZE, 0, stream>>>(
       prefix_digest, pow_bits, best_nonce, completed_blocks,
       transcript_nonce);
+  return static_cast<int>(cudaGetLastError());
+}
+
+extern "C" int stwo_blake2s_pow_rank_tile_on(
+    const uint32_t *transcript_state,
+    uint32_t pow_bits,
+    uint32_t rank_count,
+    uint32_t rank,
+    unsigned long long tile_start,
+    unsigned long long tile_end,
+    uint32_t grid_blocks,
+    uint32_t *prefix_digest,
+    unsigned long long *best_nonce,
+    void *stream_raw) {
+  if (transcript_state == nullptr || prefix_digest == nullptr ||
+      best_nonce == nullptr || stream_raw == nullptr || pow_bits > 32U ||
+      rank_count == 0U || rank >= rank_count || tile_start >= tile_end ||
+      tile_end > POW_INDEX_LIMIT || grid_blocks == 0U ||
+      grid_blocks > 0x7fffffffU) {
+    return static_cast<int>(cudaErrorInvalidValue);
+  }
+  const unsigned long long workers_per_rank =
+      static_cast<unsigned long long>(grid_blocks) * POW_BLOCK_SIZE;
+  if (static_cast<unsigned long long>(rank_count) >
+      ~0ULL / workers_per_rank) {
+    return static_cast<int>(cudaErrorInvalidValue);
+  }
+  const cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_raw);
+  pow_prefix_digest<<<1U, 1U, 0, stream>>>(
+      transcript_state, pow_bits, prefix_digest);
+  cudaError_t error = cudaGetLastError();
+  if (error != cudaSuccess) {
+    return static_cast<int>(error);
+  }
+  persistent_pow_rank_tile_search<POW_PRIMARY_ROUND_UNROLL>
+      <<<grid_blocks, POW_BLOCK_SIZE, 0, stream>>>(
+      prefix_digest, pow_bits, rank_count, rank, tile_start, tile_end,
+      best_nonce);
+  error = cudaGetLastError();
+  if (error != cudaErrorLaunchOutOfResources) {
+    return static_cast<int>(error);
+  }
+  persistent_pow_rank_tile_search<POW_FALLBACK_ROUND_UNROLL>
+      <<<grid_blocks, POW_BLOCK_SIZE, 0, stream>>>(
+      prefix_digest, pow_bits, rank_count, rank, tile_start, tile_end,
+      best_nonce);
   return static_cast<int>(cudaGetLastError());
 }

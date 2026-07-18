@@ -162,8 +162,9 @@ pub use backend::prepared_oods::{
 };
 pub use backend::prepared_pow::{
     blake2s_pow_workspace_requirements, pow_index_to_nonce, Blake2sPowArenaSlotRequirement,
-    Blake2sPowWorkspaceRequirements, Blake2sPowWorkspaceSlots, PreparedBlake2sPowError,
-    PreparedBlake2sPowGraph, POW_GRIND_LOW_BITS, POW_NONCE_WORDS, POW_U64_ALIGNMENT_WORDS,
+    Blake2sPowFleetAttempt, Blake2sPowRankTile, Blake2sPowWorkspaceRequirements,
+    Blake2sPowWorkspaceSlots, PreparedBlake2sPowError, PreparedBlake2sPowGraph, POW_GRIND_LOW_BITS,
+    POW_INDEX_LIMIT, POW_NONCE_WORDS, POW_THREADS_PER_BLOCK, POW_U64_ALIGNMENT_WORDS,
 };
 pub use backend::prepared_progressive_commit::{
     compact_domain_arena_slot_requirements, direct_compact_domain_arena_slot_requirements,
