@@ -6,7 +6,7 @@
 // passes and no ping/pong intermediate is written.
 //
 // Byte identity with the per-fold kernel sequence
-// (`fold_circle_into_line_device_alpha_kernel` / `fold_line_device_alpha_kernel`,
+// (`fold_circle_into_line_device_alpha_kernel` / `stwo_gpu_lab_fold_line_device_alpha`,
 // launched by `PreparedFriGraph::launch_fold` with alpha_squarings = 0, 1, 2):
 //
 //   1. Data dependence is strictly local: output element `i` of a triple fold
