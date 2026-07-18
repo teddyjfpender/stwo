@@ -160,7 +160,7 @@ impl From<PreparedOodsError> for OodsPassCollapseError {
 }
 
 /// Compiled, address-free proof that a shape is eligible for weight-pass collapse.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OodsPassCollapseProgram {
     identity: OodsPassCollapseIdentity,
     ordinary_requirements: OodsWorkspaceRequirements,

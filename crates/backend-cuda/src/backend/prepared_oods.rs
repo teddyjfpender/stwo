@@ -21,6 +21,8 @@ use super::exec_context::{
     check_cuda, ArenaError, ArenaSlice, ArenaSlotId, CudaRuntimeError, DeviceArena,
 };
 
+#[path = "prepared_oods/authority.rs"]
+mod authority;
 #[path = "prepared_oods/evaluation_launch.rs"]
 mod evaluation_launch;
 #[path = "prepared_oods/pass_collapse.rs"]
@@ -28,6 +30,15 @@ mod pass_collapse;
 #[cfg(test)]
 #[path = "prepared_oods/pass_collapse_tests.rs"]
 mod pass_collapse_tests;
+pub use authority::{
+    OodsExecutionAbi, OodsExecutionAbiAccess, OodsExecutionAbiArgument,
+    OodsExecutionAbiArgumentKind, OodsExecutionAccess, OodsExecutionAccessKind,
+    OodsExecutionAuthority, OodsExecutionAuthorityError, OodsExecutionColumn,
+    OodsExecutionHostCall, OodsExecutionHostCallKind, OodsExecutionInvocation,
+    OodsExecutionInvocationArgument, OodsExecutionInvocationValue, OodsExecutionKernelLaunch,
+    OodsExecutionLinkedAuthority, OodsExecutionScratch, OodsExecutionValueLayout,
+    OodsExecutionValueOwnership, OodsExecutionValueRole,
+};
 pub use pass_collapse::{
     oods_canonical_sample_order, OodsCanonicalSample, OodsPassCollapseBatchReceipt,
     OodsPassCollapseCohortReceipt, OodsPassCollapseCohortRejection, OodsPassCollapseError,
