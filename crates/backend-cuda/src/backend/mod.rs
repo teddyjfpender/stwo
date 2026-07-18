@@ -35,6 +35,7 @@ pub mod prepared_execution_tables;
 pub mod prepared_fixed_table;
 pub mod prepared_fri;
 pub mod prepared_fri_final;
+pub mod prepared_interaction_commit_authority;
 pub mod prepared_interpolation;
 pub mod prepared_memory_trace;
 pub mod prepared_oods;

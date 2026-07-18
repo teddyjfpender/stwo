@@ -120,6 +120,10 @@ pub use backend::prepared_fri_final::{
     fri_final_workspace_requirements, FriFinalArenaSlotRequirement, FriFinalWorkspaceRequirements,
     FriFinalWorkspaceSlots, PreparedFriFinalError, PreparedFriFinalGraph,
 };
+pub use backend::prepared_interaction_commit_authority::{
+    InteractionCommitAuthorityError, InteractionCommitLinkedAuthority,
+    InteractionCommitProgramAuthority,
+};
 pub use backend::prepared_interpolation::{
     b2n_chunk_ranges, b2n_stage_intervals, InterpolationAbiAccess, InterpolationAbiArgument,
     InterpolationAbiArgumentKind, InterpolationAuthorityError, InterpolationBatch,
