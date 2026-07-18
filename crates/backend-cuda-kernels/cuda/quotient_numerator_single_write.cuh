@@ -3,6 +3,15 @@
 
 #include "fields.cuh"
 
+struct StwoCudaFunctionAttributes;
+
+enum StwoQuotientNumeratorFunctionRole : uint32_t {
+    STWO_QUOTIENT_NUMERATOR_STAGED_PACKED = 0,
+    STWO_QUOTIENT_NUMERATOR_PREPACKED_PREPARE = 1,
+    STWO_QUOTIENT_NUMERATOR_PREPACKED_VALIDATE = 2,
+    STWO_QUOTIENT_NUMERATOR_PREPACKED_HOT = 3,
+};
+
 enum StwoQuotientNumeratorPrepackedStatus : uint32_t {
     STWO_QUOTIENT_PREPACKED_SUCCESS = 0,
     STWO_QUOTIENT_PREPACKED_PREPARE_GROUP_OFFSETS_NOT_CANONICAL = 1,
@@ -87,5 +96,10 @@ extern "C" int stwo_accumulate_quotient_numerator_prepacked_single_write_on(
         uint32_t *const *outputs_2,
         uint32_t *const *outputs_3,
         void *stream);
+
+// Exact attributes for the function loaded on the current CUDA device.
+extern "C" int stwo_quotient_numerator_single_write_function_attributes(
+        uint32_t role,
+        StwoCudaFunctionAttributes *out);
 
 #endif // QUOTIENT_NUMERATOR_SINGLE_WRITE_H

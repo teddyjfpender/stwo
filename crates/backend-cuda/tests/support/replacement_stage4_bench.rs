@@ -162,6 +162,7 @@ pub fn benchmark_mode_a(
         ]
         .into_iter()
         .collect(),
+        loaded_functions: Vec::new(),
         baseline_label: "exact-fused16-commit-program-cuda-graph".to_owned(),
         candidate_label: "exact-domain-cooperative-mode-a-cuda-graph".to_owned(),
         baseline,
@@ -323,6 +324,7 @@ pub fn benchmark_quotient(
         ]
         .into_iter()
         .collect(),
+        loaded_functions: Vec::new(),
         baseline_label: "legacy-batches-cuda-graph".to_owned(),
         candidate_label: "staged-packed-single-write-cuda-graph".to_owned(),
         baseline,

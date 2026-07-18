@@ -17,6 +17,9 @@ mod replacement_stage4_mode_a;
 mod replacement_stage4_quotient;
 #[path = "support/replacement_stage4_quotient_prepacked.rs"]
 mod replacement_stage4_quotient_prepacked;
+#[cfg(stwo_cuda_link)]
+#[path = "support/replacement_stage4_quotient_resources.rs"]
+mod replacement_stage4_quotient_resources;
 
 #[test]
 #[cfg_attr(not(stwo_cuda_link), ignore = "requires a native CUDA-linked backend")]
@@ -29,14 +32,22 @@ fn replacement_stage4_native_bytes_match() {
             "replacement admission cannot run against CUDA stubs"
         );
         memory_before.set(stwo_backend_cuda::gpu_memory_info());
-        let fixtures = vec![
-            replacement_stage4_quotient::run(),
-            replacement_stage4_quotient_prepacked::run(),
-            replacement_stage4_mode_a::run(),
-        ];
+        let fixture_filter = fixture_filter();
+        let fixtures = match fixture_filter {
+            FixtureFilter::All => vec![
+                replacement_stage4_quotient::run(),
+                replacement_stage4_quotient_prepacked::run(),
+                replacement_stage4_mode_a::run(),
+            ],
+            FixtureFilter::StagedPrepackedQuotient => {
+                vec![replacement_stage4_quotient_prepacked::run()]
+            }
+        };
         let performance_requested = std::env::var_os("STWO_STAGE4_NATIVE_PERF").is_some();
         let (performance, performance_failure) = if performance_requested {
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run_performance)) {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_performance(fixture_filter)
+            })) {
                 Ok(performance) => (performance, None),
                 Err(payload) => {
                     let failure = replacement_stage4_common::panic_message(payload.as_ref());
@@ -52,6 +63,7 @@ fn replacement_stage4_native_bytes_match() {
         };
         memory_after.set(stwo_backend_cuda::gpu_memory_info());
         let receipt = replacement_stage4_common::receipt(
+            fixture_filter.name(),
             fixtures,
             performance_requested,
             performance_failure,
@@ -75,7 +87,9 @@ fn replacement_stage4_native_bytes_match() {
 }
 
 #[cfg(stwo_cuda_link)]
-fn run_performance() -> Vec<replacement_stage4_common::PerformanceReceipt> {
+fn run_performance(
+    fixture_filter: FixtureFilter,
+) -> Vec<replacement_stage4_common::PerformanceReceipt> {
     let mut logs = std::env::var("STWO_STAGE4_NATIVE_PERF_LOGS")
         .unwrap_or_else(|_| "18,20".to_owned())
         .split(',')
@@ -90,24 +104,67 @@ fn run_performance() -> Vec<replacement_stage4_common::PerformanceReceipt> {
     assert!(logs.iter().all(|log| (4..=20).contains(log)));
     let warmups = env_usize("STWO_STAGE4_NATIVE_PERF_WARMUPS", 5, 1);
     let iterations = env_usize("STWO_STAGE4_NATIVE_PERF_ITERATIONS", 30, 2);
-    let mut output = Vec::with_capacity(3 * logs.len());
+    let mut output = Vec::new();
     for log in logs {
-        output.push(replacement_stage4_quotient::benchmark(
+        if fixture_filter == FixtureFilter::All {
+            output.push(replacement_stage4_quotient::benchmark(
+                log, warmups, iterations,
+            ));
+        }
+        output.extend(replacement_stage4_quotient_prepacked::benchmark(
             log, warmups, iterations,
         ));
-        output.push(replacement_stage4_quotient_prepacked::benchmark(
-            log, warmups, iterations,
-        ));
-        output.push(replacement_stage4_bench::benchmark_mode_a(
-            log, warmups, iterations,
-        ));
+        if fixture_filter == FixtureFilter::All {
+            output.push(replacement_stage4_bench::benchmark_mode_a(
+                log, warmups, iterations,
+            ));
+        }
     }
     output
 }
 
 #[cfg(not(stwo_cuda_link))]
-fn run_performance() -> Vec<replacement_stage4_common::PerformanceReceipt> {
+fn run_performance(_: FixtureFilter) -> Vec<replacement_stage4_common::PerformanceReceipt> {
     unreachable!("native performance mode requires CUDA")
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FixtureFilter {
+    All,
+    StagedPrepackedQuotient,
+}
+
+impl FixtureFilter {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::StagedPrepackedQuotient => "staged-prepacked-quotient",
+        }
+    }
+}
+
+fn fixture_filter() -> FixtureFilter {
+    parse_fixture_filter(
+        &std::env::var("STWO_STAGE4_NATIVE_FIXTURE").unwrap_or_else(|_| "all".to_owned()),
+    )
+}
+
+fn parse_fixture_filter(value: &str) -> FixtureFilter {
+    match value {
+        "all" => FixtureFilter::All,
+        "staged-prepacked-quotient" => FixtureFilter::StagedPrepackedQuotient,
+        value => panic!("unsupported STWO_STAGE4_NATIVE_FIXTURE={value:?}"),
+    }
+}
+
+#[test]
+fn stage4_fixture_filter_is_exact() {
+    assert_eq!(parse_fixture_filter("all"), FixtureFilter::All);
+    assert_eq!(
+        parse_fixture_filter("staged-prepacked-quotient"),
+        FixtureFilter::StagedPrepackedQuotient
+    );
+    assert!(std::panic::catch_unwind(|| parse_fixture_filter("quotient")).is_err());
 }
 
 #[cfg(stwo_cuda_link)]

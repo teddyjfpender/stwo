@@ -29,6 +29,7 @@ pub struct FixtureReceipt {
 #[derive(Debug, Serialize)]
 pub struct AdmissionReceipt {
     pub schema: &'static str,
+    pub fixture_filter: &'static str,
     pub run_id: String,
     pub unix_timestamp: u64,
     pub passed: bool,
@@ -54,11 +55,28 @@ pub struct PerformanceReceipt {
     pub parameters: BTreeMap<String, u64>,
     pub arena_bytes: BTreeMap<String, usize>,
     pub traffic_bytes: BTreeMap<String, u64>,
+    pub loaded_functions: Vec<LoadedFunctionReceipt>,
     pub baseline_label: String,
     pub candidate_label: String,
     pub baseline: TimingStats,
     pub candidate: TimingStats,
     pub speedup: f64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct LoadedFunctionReceipt {
+    pub role: &'static str,
+    pub symbol: &'static str,
+    pub launch_threads: u32,
+    pub dynamic_shared_bytes: u64,
+    pub abi_version: u32,
+    pub max_threads_per_block: u32,
+    pub registers_per_thread: u32,
+    pub binary_version: u32,
+    pub ptx_version: u32,
+    pub reserved: u32,
+    pub local_bytes: u64,
+    pub static_shared_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -185,6 +203,7 @@ pub fn hash_hashes(hashes: &[Blake2sHash]) -> String {
 }
 
 pub fn receipt(
+    fixture_filter: &'static str,
     fixtures: Vec<FixtureReceipt>,
     performance_requested: bool,
     performance_failure: Option<String>,
@@ -245,6 +264,7 @@ pub fn receipt(
     }
     Ok(AdmissionReceipt {
         schema: "stwo.replacement-stage4-native.v1",
+        fixture_filter,
         run_id: format!(
             "{unix_timestamp}-{}-{}",
             std::process::id(),
@@ -297,13 +317,13 @@ where
 
 /// Paired CUDA-event timings in alternating `AB, BA` order.
 ///
+/// Both variants are deliberately bound to one context stream.
 /// `*_check` runs only after the stop event has completed, so status fences
 /// attest every replay without being reported as kernel time.
 #[cfg(stwo_cuda_link)]
 #[allow(clippy::too_many_arguments)]
 pub fn cuda_event_abba_timings<FA, EA, FB, EB, CA, CB>(
-    baseline_context: &CudaExecContext,
-    candidate_context: &CudaExecContext,
+    context: &CudaExecContext,
     warmups: usize,
     iterations: usize,
     mut baseline_launch: FA,
@@ -337,26 +357,26 @@ where
     for iteration in 0..iterations {
         if paired_baseline_first(iteration) {
             baseline_samples.push(checked_sample(
-                baseline_context,
+                context,
                 &baseline_events,
                 &mut baseline_launch,
                 &mut baseline_check,
             ));
             candidate_samples.push(checked_sample(
-                candidate_context,
+                context,
                 &candidate_events,
                 &mut candidate_launch,
                 &mut candidate_check,
             ));
         } else {
             candidate_samples.push(checked_sample(
-                candidate_context,
+                context,
                 &candidate_events,
                 &mut candidate_launch,
                 &mut candidate_check,
             ));
             baseline_samples.push(checked_sample(
-                baseline_context,
+                context,
                 &baseline_events,
                 &mut baseline_launch,
                 &mut baseline_check,
@@ -615,6 +635,10 @@ fn source_hash() -> Result<String, String> {
             include_bytes!("../../src/backend/prepared_quotient_numerator/launch.rs"),
         ),
         (
+            "src/backend/prepared_quotient_numerator/prepacked.rs",
+            include_bytes!("../../src/backend/prepared_quotient_numerator/prepacked.rs"),
+        ),
+        (
             "src/backend/quotient_numerator_staged_single_write.rs",
             include_bytes!("../../src/backend/quotient_numerator_staged_single_write.rs"),
         ),
@@ -635,6 +659,10 @@ fn source_hash() -> Result<String, String> {
             include_bytes!(
                 "../../../backend-cuda-kernels/cuda/quotient_numerator_single_write.cuh"
             ),
+        ),
+        (
+            "../backend-cuda-kernels/cuda/resource_attestation.cuh",
+            include_bytes!("../../../backend-cuda-kernels/cuda/resource_attestation.cuh"),
         ),
         (
             "../backend-cuda-kernels/src/raw.rs",
@@ -659,6 +687,14 @@ fn source_hash() -> Result<String, String> {
         (
             "tests/support/replacement_stage4_quotient.rs",
             include_bytes!("replacement_stage4_quotient.rs"),
+        ),
+        (
+            "tests/support/replacement_stage4_quotient_prepacked.rs",
+            include_bytes!("replacement_stage4_quotient_prepacked.rs"),
+        ),
+        (
+            "tests/support/replacement_stage4_quotient_resources.rs",
+            include_bytes!("replacement_stage4_quotient_resources.rs"),
         ),
     ];
     let mut hasher = blake3::Hasher::new();

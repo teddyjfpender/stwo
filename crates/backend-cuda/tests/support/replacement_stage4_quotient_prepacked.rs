@@ -19,11 +19,15 @@ use stwo_backend_cuda::{
 
 use super::quotient_numerator_oracle::{expected_group, OracleTerm};
 #[cfg(stwo_cuda_link)]
-use super::replacement_stage4_common::{cuda_event_abba_timings, PerformanceReceipt};
+use super::replacement_stage4_common::{
+    cuda_event_abba_timings, LoadedFunctionReceipt, PerformanceReceipt,
+};
 use super::replacement_stage4_common::{
     fill, hash_words, read_words, upload_words, FixtureReceipt,
 };
 use super::replacement_stage4_quotient as quotient;
+#[cfg(stwo_cuda_link)]
+use super::replacement_stage4_quotient_resources::loaded_function_receipts;
 
 const OVERFLOW_WORDS: usize = 128;
 const STALE_OUTPUT_BYTE: u8 = 0x5a;
@@ -234,7 +238,11 @@ pub fn run() -> FixtureReceipt {
 }
 
 #[cfg(stwo_cuda_link)]
-pub fn benchmark(lifting_log_size: u32, warmups: usize, iterations: usize) -> PerformanceReceipt {
+pub fn benchmark(
+    lifting_log_size: u32,
+    warmups: usize,
+    iterations: usize,
+) -> Vec<PerformanceReceipt> {
     let config = config(lifting_log_size);
     let points = points();
     let topology = dense_topology(quotient::scaled_topology(points, lifting_log_size), points);
@@ -255,109 +263,118 @@ pub fn benchmark(lifting_log_size: u32, warmups: usize, iterations: usize) -> Pe
     let layout = quotient_numerator_prepacked_term_layout(&plan).unwrap();
     assert!(layout.term_count >= 4 * layout.group_count + 1);
     let slots = quotient::workspace_slots(&requirements);
-    let (baseline_arena, baseline_bytes) =
-        quotient::make_arena(&requirements, &slots, source_words, overflow_words);
-    let (candidate_arena, candidate_bytes) =
+    let (arena, arena_bytes) =
         quotient::make_arena(&requirements, &slots, source_words, overflow_words);
     let values = values();
     let sources = quotient::source_set_for_words(0x1319_8a2e, source_words);
     let twiddles = quotient::required_forward_twiddle_words(config, &requirements);
-    initialize(
-        [&baseline_arena, &candidate_arena],
-        points,
-        &values,
-        &twiddles,
-        &sources,
-    );
-    upload_alpha(
-        [&baseline_arena, &candidate_arena],
-        SecureField::from_u32_unchecked(73, 79, 83, 89),
-    );
+    initialize([&arena], points, &values, &twiddles, &sources);
+    upload_alpha([&arena], SecureField::from_u32_unchecked(73, 79, 83, 89));
 
-    let baseline_destinations = quotient::destinations(&baseline_arena, &requirements);
-    let candidate_destinations = quotient::destinations(&candidate_arena, &requirements);
-    let baseline = prepare_staged(
-        &baseline_arena,
-        config,
-        &slots,
-        &quotient::columns(&baseline_arena, &topology),
-        &baseline_destinations,
-    );
-    let candidate = prepare_prepacked(
-        &candidate_arena,
-        config,
-        &slots,
-        &quotient::columns(&candidate_arena, &topology),
-        &candidate_destinations,
-    );
-    let capture = baseline_arena.context().capture().unwrap();
-    baseline.launch().unwrap();
-    let baseline_graph = capture.finish().unwrap();
-    let capture = candidate_arena.context().capture().unwrap();
-    candidate.launch().unwrap();
-    let candidate_graph = capture.finish().unwrap();
-    let status_d2h_before = candidate_arena.context().telemetry().d2h_bytes;
-    let (baseline_timing, candidate_timing) = cuda_event_abba_timings(
-        baseline_arena.context(),
-        candidate_arena.context(),
+    let destinations = quotient::destinations(&arena, &requirements);
+    let columns = quotient::columns(&arena, &topology);
+    let baseline = prepare_staged(&arena, config, &slots, &columns, &destinations);
+    let candidate = prepare_prepacked(&arena, config, &slots, &columns, &destinations);
+    let loaded_functions = loaded_function_receipts();
+    let status_observations = warmups.checked_add(iterations).unwrap();
+    let expected_fence_bytes = (status_observations * core::mem::size_of::<u32>()) as u64;
+
+    let eager_d2h_before = arena.context().telemetry().d2h_bytes;
+    let eager = cuda_event_abba_timings(
+        arena.context(),
         warmups,
         iterations,
-        || baseline_graph.launch(baseline_arena.context()),
-        || candidate_graph.launch(candidate_arena.context()),
-        || baseline_arena.context().sync().unwrap(),
+        || baseline.launch(),
+        || candidate.launch(),
+        || arena.context().sync().unwrap(),
         || candidate.observe_prepacked_status().unwrap(),
     );
-    let status_observations = warmups.checked_add(iterations).unwrap();
     assert_eq!(
-        candidate_arena.context().telemetry().d2h_bytes - status_d2h_before,
-        (status_observations * core::mem::size_of::<u32>()) as u64
+        arena.context().telemetry().d2h_bytes - eager_d2h_before,
+        expected_fence_bytes
     );
-    assert_eq!(
-        quotient::raw_snapshot(&baseline_arena, &requirements, &baseline_destinations),
-        quotient::raw_snapshot(&candidate_arena, &requirements, &candidate_destinations)
-    );
-    quotient::assert_preserved(&baseline_arena, &sources);
-    quotient::assert_preserved(&candidate_arena, &sources);
 
-    PerformanceReceipt {
-        name: format!("staged-prepacked-quotient-log{lifting_log_size}"),
-        parameters: [
-            ("lifting_log_size".to_owned(), u64::from(lifting_log_size)),
-            ("groups".to_owned(), requirements.groups.len() as u64),
-            ("terms".to_owned(), requirements.term_count as u64),
-            ("packed_output_rows".to_owned(), plan.packed_output_rows()),
-            ("prepacked_used_words".to_owned(), layout.used_words as u64),
-            (
-                "candidate_status_observations".to_owned(),
-                status_observations as u64,
-            ),
-        ]
-        .into_iter()
-        .collect(),
-        arena_bytes: [
-            ("staged".to_owned(), baseline_bytes),
-            ("prepacked".to_owned(), candidate_bytes),
-        ]
-        .into_iter()
-        .collect(),
-        traffic_bytes: [
-            (
-                "prepacked_record_bytes".to_owned(),
-                (layout.used_words * core::mem::size_of::<u32>()) as u64,
-            ),
-            (
-                "candidate_status_fence_bytes_per_replay".to_owned(),
-                core::mem::size_of::<u32>() as u64,
-            ),
-        ]
-        .into_iter()
-        .collect(),
-        baseline_label: "staged-packed-single-write-cuda-graph-checked-abba".to_owned(),
-        candidate_label: "staged-prepacked-single-write-cuda-graph-checked-abba".to_owned(),
-        baseline: baseline_timing,
-        candidate: candidate_timing,
-        speedup: baseline_timing.median_ms / candidate_timing.median_ms,
-    }
+    let capture = arena.context().capture().unwrap();
+    baseline.launch().unwrap();
+    let baseline_graph = capture.finish().unwrap();
+    let capture = arena.context().capture().unwrap();
+    candidate.launch().unwrap();
+    let candidate_graph = capture.finish().unwrap();
+    let captured_d2h_before = arena.context().telemetry().d2h_bytes;
+    let captured = cuda_event_abba_timings(
+        arena.context(),
+        warmups,
+        iterations,
+        || baseline_graph.launch(arena.context()),
+        || candidate_graph.launch(arena.context()),
+        || arena.context().sync().unwrap(),
+        || candidate.observe_prepacked_status().unwrap(),
+    );
+    assert_eq!(
+        arena.context().telemetry().d2h_bytes - captured_d2h_before,
+        expected_fence_bytes
+    );
+
+    baseline.launch().unwrap();
+    arena.context().sync().unwrap();
+    let baseline_output = quotient::raw_snapshot(&arena, &requirements, &destinations);
+    candidate.launch().unwrap();
+    candidate.observe_prepacked_status().unwrap();
+    let candidate_output = quotient::raw_snapshot(&arena, &requirements, &destinations);
+    assert_eq!(baseline_output, candidate_output);
+    quotient::assert_preserved(&arena, &sources);
+
+    let receipt = |mode: &str,
+                   (baseline_timing, candidate_timing),
+                   loaded_functions: Vec<LoadedFunctionReceipt>| {
+        PerformanceReceipt {
+            name: format!("staged-prepacked-quotient-{mode}-log{lifting_log_size}"),
+            parameters: [
+                ("lifting_log_size".to_owned(), u64::from(lifting_log_size)),
+                ("groups".to_owned(), requirements.groups.len() as u64),
+                ("terms".to_owned(), requirements.term_count as u64),
+                ("packed_output_rows".to_owned(), plan.packed_output_rows()),
+                ("prepacked_used_words".to_owned(), layout.used_words as u64),
+                (
+                    "candidate_status_observations".to_owned(),
+                    status_observations as u64,
+                ),
+                ("stream_count".to_owned(), 1),
+                ("source_buffer_sets".to_owned(), 1),
+            ]
+            .into_iter()
+            .collect(),
+            arena_bytes: [("shared_single_stream".to_owned(), arena_bytes)]
+                .into_iter()
+                .collect(),
+            traffic_bytes: [
+                (
+                    "prepacked_record_bytes".to_owned(),
+                    (layout.used_words * core::mem::size_of::<u32>()) as u64,
+                ),
+                (
+                    "candidate_status_fence_d2h_bytes_per_replay_outside_kernel_time".to_owned(),
+                    core::mem::size_of::<u32>() as u64,
+                ),
+                (
+                    "candidate_status_fence_d2h_bytes_total_outside_kernel_time".to_owned(),
+                    expected_fence_bytes,
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            loaded_functions,
+            baseline_label: format!("staged-packed-single-write-{mode}-checked-abba"),
+            candidate_label: format!("staged-prepacked-single-write-{mode}-checked-abba"),
+            baseline: baseline_timing,
+            candidate: candidate_timing,
+            speedup: baseline_timing.median_ms / candidate_timing.median_ms,
+        }
+    };
+    vec![
+        receipt("eager", eager, loaded_functions.clone()),
+        receipt("captured", captured, loaded_functions),
+    ]
 }
 
 fn config(lifting_log_size: u32) -> QuotientNumeratorWorkspaceConfig {
@@ -532,8 +549,8 @@ fn dense_fixture_matches_staged_term_manifest_and_fits_dead_extent() {
     }
 }
 
-fn initialize(
-    arenas: [&DeviceArena; 2],
+fn initialize<const N: usize>(
+    arenas: [&DeviceArena; N],
     points: [CirclePoint<SecureField>; 4],
     values: &[SecureField; 5],
     twiddles: &[u32],
@@ -557,7 +574,7 @@ fn initialize(
     }
 }
 
-fn upload_alpha(arenas: [&DeviceArena; 2], alpha: SecureField) {
+fn upload_alpha<const N: usize>(arenas: [&DeviceArena; N], alpha: SecureField) {
     for arena in arenas {
         upload_words(
             arena,

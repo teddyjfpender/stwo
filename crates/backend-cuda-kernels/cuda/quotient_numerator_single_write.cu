@@ -1,5 +1,6 @@
 #include "quotient_numerator_single_write.cuh"
 #include "m31_fast32.cuh"
+#include "resource_attestation.cuh"
 
 #include <cstdint>
 #include <cuda_runtime.h>
@@ -658,4 +659,26 @@ extern "C" int stwo_accumulate_quotient_numerator_prepacked_single_write_on(
             packed_output_rows, prepacked_storage, group_log_sizes, outputs_0,
             outputs_1, outputs_2, outputs_3);
     return cudaGetLastError();
+}
+
+extern "C" int stwo_quotient_numerator_single_write_function_attributes(
+        uint32_t role,
+        StwoCudaFunctionAttributes *out
+) {
+    switch (role) {
+    case STWO_QUOTIENT_NUMERATOR_STAGED_PACKED:
+        return stwo_cuda_function_attributes(
+            stwo_quotient_numerator_packed_single_write_kernel, out);
+    case STWO_QUOTIENT_NUMERATOR_PREPACKED_PREPARE:
+        return stwo_cuda_function_attributes(
+            stwo_prepare_quotient_numerator_prepacked_terms_kernel, out);
+    case STWO_QUOTIENT_NUMERATOR_PREPACKED_VALIDATE:
+        return stwo_cuda_function_attributes(
+            stwo_validate_quotient_numerator_prepacked_terms_kernel, out);
+    case STWO_QUOTIENT_NUMERATOR_PREPACKED_HOT:
+        return stwo_cuda_function_attributes(
+            stwo_quotient_numerator_prepacked_single_write_kernel, out);
+    default:
+        return cudaErrorInvalidValue;
+    }
 }

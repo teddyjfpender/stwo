@@ -368,11 +368,20 @@ mod tests {
         ] {
             assert!(status_abi.contains(&format!("{name} = {value},")));
         }
+        for (name, value) in [
+            ("STWO_QUOTIENT_NUMERATOR_STAGED_PACKED", 0),
+            ("STWO_QUOTIENT_NUMERATOR_PREPACKED_PREPARE", 1),
+            ("STWO_QUOTIENT_NUMERATOR_PREPACKED_VALIDATE", 2),
+            ("STWO_QUOTIENT_NUMERATOR_PREPACKED_HOT", 3),
+        ] {
+            assert!(status_abi.contains(&format!("{name} = {value},")));
+        }
         let candidate = include_str!("../cuda/quotient_numerator_single_write.cu");
         assert!(candidate.contains("constexpr uint32_t PREPACKED_STATUS_WORDS = 1;"));
         assert!(candidate.contains("const cudaError_t reset = cudaMemsetAsync("));
         assert!(candidate.contains("while (current == 0 || requested < current)"));
         assert!(candidate.contains("if (atomicCAS(status, 0, 0) != 0)"));
+        assert!(candidate.contains("stwo_quotient_numerator_single_write_function_attributes"));
         let validation_launch = candidate
             .find("stwo_validate_quotient_numerator_prepacked_terms_kernel<<<")
             .unwrap();
