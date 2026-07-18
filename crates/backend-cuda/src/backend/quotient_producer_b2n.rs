@@ -930,10 +930,21 @@ mod tests {
 
     #[test]
     fn scalar_oracle_matches_the_independent_cpu_inverse_transform() {
-        let config = QuotientWorkspaceConfig {
-            lifting_log_size: 8,
-            log_blowup_factor: 1,
-        };
+        for config in [
+            QuotientWorkspaceConfig {
+                lifting_log_size: 8,
+                log_blowup_factor: 1,
+            },
+            QuotientWorkspaceConfig {
+                lifting_log_size: 9,
+                log_blowup_factor: 2,
+            },
+        ] {
+            assert_scalar_oracle_matches_cpu(config);
+        }
+    }
+
+    fn assert_scalar_oracle_matches_cpu(config: QuotientWorkspaceConfig) {
         let constants = [
             QuotientSampleConstants {
                 sample_point: SECURE_FIELD_CIRCLE_GEN.mul(3),
