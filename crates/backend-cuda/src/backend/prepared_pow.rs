@@ -336,6 +336,10 @@ impl<'a> PreparedBlake2sPowGraph<'a> {
         self.transcript_state
     }
 
+    pub const fn pow_bits(&self) -> u32 {
+        self.pow_bits
+    }
+
     pub fn nonce_destination(&self) -> ArenaSlice {
         self.transcript_nonce
     }
@@ -445,6 +449,23 @@ impl<'a> PreparedBlake2sPowGraph<'a> {
         };
         check_cuda("prepared_blake2s_pow_rank_tile", code)?;
         Ok(())
+    }
+
+    /// Execute one worker request with a single required completion fence.
+    pub fn execute_rank_tile(
+        &self,
+        state: &[u32; BLAKE2S_TRANSCRIPT_STATE_WORDS],
+        tile: Blake2sPowRankTile,
+    ) -> Result<u64, PreparedBlake2sPowError> {
+        unsafe {
+            self.arena.context().memcpy_h2d_async(
+                self.transcript_state.as_void_ptr(),
+                state.as_ptr().cast(),
+                core::mem::size_of_val(state),
+            )?;
+        }
+        self.launch_rank_tile(tile)?;
+        self.read_rank_result()
     }
 
     fn reset_best_nonce(&self) -> Result<(), PreparedBlake2sPowError> {
