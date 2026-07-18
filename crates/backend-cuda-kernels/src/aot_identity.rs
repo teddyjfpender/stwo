@@ -132,7 +132,13 @@ pub(crate) fn module_globals_for_source(
     if has_columns != has_rows {
         return Err("generated witness source has a partial Pedersen-global contract");
     }
-    match (schema, has_columns) {
+    // Every fp256 witness embeds the guarded support text; this exact emitter
+    // marker decides whether those globals survive preprocessing into the cubin.
+    let needs_pedersen = contains_bytes(source, b"#define STWO_WIT_NEEDS_PEDERSEN 1\n");
+    if needs_pedersen && !has_columns {
+        return Err("generated witness source enables missing Pedersen globals");
+    }
+    match (schema, needs_pedersen) {
         (Some(AotKernelAbiSchema::RecordedWitnessV1), true) => {
             Ok(AotKernelModuleGlobals::WitnessPedersenV1)
         }
@@ -769,9 +775,15 @@ mod tests {
     fn generated_source_global_contract_is_fail_closed() {
         let globals = b"__device__ m31* g_stwo_wit_pedersen_cols[56];\n\
               __device__ unsigned g_stwo_wit_pedersen_n_rows;";
+        let mut active_globals = b"#define STWO_WIT_NEEDS_PEDERSEN 1\n".to_vec();
+        active_globals.extend_from_slice(globals);
+        assert_eq!(
+            module_globals_for_source(Some(AotKernelAbiSchema::RecordedWitnessV1), &active_globals),
+            Ok(AotKernelModuleGlobals::WitnessPedersenV1)
+        );
         assert_eq!(
             module_globals_for_source(Some(AotKernelAbiSchema::RecordedWitnessV1), globals),
-            Ok(AotKernelModuleGlobals::WitnessPedersenV1)
+            Ok(AotKernelModuleGlobals::None)
         );
         assert_eq!(
             module_globals_for_source(
@@ -785,10 +797,16 @@ mod tests {
             b"g_stwo_wit_pedersen_cols"
         )
         .is_err());
-        assert!(
-            module_globals_for_source(Some(AotKernelAbiSchema::OrdinaryConstraintV1), globals)
-                .is_err()
-        );
+        assert!(module_globals_for_source(
+            Some(AotKernelAbiSchema::RecordedWitnessV1),
+            b"#define STWO_WIT_NEEDS_PEDERSEN 1\n"
+        )
+        .is_err());
+        assert!(module_globals_for_source(
+            Some(AotKernelAbiSchema::OrdinaryConstraintV1),
+            &active_globals
+        )
+        .is_err());
         assert_eq!(
             module_globals_for_source(None, globals),
             Ok(AotKernelModuleGlobals::Unspecified)
