@@ -11,6 +11,7 @@ use super::super::prepared_witness_input::static_build::{
 };
 use super::*;
 
+pub(super) mod challenge;
 mod compiler;
 mod effects;
 mod identity;

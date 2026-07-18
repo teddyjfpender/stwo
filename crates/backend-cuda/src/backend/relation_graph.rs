@@ -17,6 +17,7 @@ use super::exec_context::{
 };
 
 mod authority;
+pub use authority::challenge::*;
 pub use authority::*;
 
 const WORD_BYTES: usize = core::mem::size_of::<u32>();
