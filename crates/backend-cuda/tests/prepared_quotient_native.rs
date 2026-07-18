@@ -425,8 +425,8 @@ fn quotient_eager_and_capture_match_cpu_constants_partials_and_fri_input() {
 #[ignore = "requires exact log23 native CUDA execution"]
 fn quotient_producer_b2n_exact_sn2_eager_and_graph_match_fallback() {
     let config = QuotientWorkspaceConfig {
-        lifting_log_size: 25,
-        log_blowup_factor: 2,
+        lifting_log_size: 24,
+        log_blowup_factor: 1,
     };
     let logs = (0..19)
         .map(|source| [10, 9, 7][source % 3])

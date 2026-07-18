@@ -39,7 +39,7 @@ pub struct QuotientProducerB2nSchedule {
 
 impl QuotientProducerB2nSchedule {
     pub const fn is_exact(self) -> bool {
-        self.lifting_log_size == 25
+        (self.lifting_log_size == 24 || self.lifting_log_size == 25)
             && self.subdomain_log_size == 23
             && self.sample_count > 0
             && self.producer_stages == QUOTIENT_PRODUCER_B2N_FIRST_STAGES
@@ -243,13 +243,14 @@ impl QuotientProducerB2nProgram {
         config: QuotientWorkspaceConfig,
         partial_log_sizes: &[u32],
     ) -> Result<Self, QuotientProducerB2nError> {
-        if config.lifting_log_size != 25 || config.log_blowup_factor != 2 {
-            return Err(QuotientProducerB2nError::UnsupportedShape(config));
-        }
-        validate_sources(23, partial_log_sizes)?;
+        let subdomain_log_size = match (config.lifting_log_size, config.log_blowup_factor) {
+            (24, 1) | (25, 2) => 23,
+            _ => return Err(QuotientProducerB2nError::UnsupportedShape(config)),
+        };
+        validate_sources(subdomain_log_size, partial_log_sizes)?;
         let schedule = QuotientProducerB2nSchedule {
-            lifting_log_size: 25,
-            subdomain_log_size: 23,
+            lifting_log_size: config.lifting_log_size,
+            subdomain_log_size,
             sample_count: partial_log_sizes.len(),
             producer_stages: QUOTIENT_PRODUCER_B2N_FIRST_STAGES,
             continuation_intervals: [8, 8],
@@ -646,19 +647,45 @@ mod tests {
     use stwo::prover::poly::BitReversedOrder;
 
     use super::*;
+    use crate::backend::prepared_quotient::quotient_workspace_requirements;
 
     #[test]
     fn exact_sn2_receipt_removes_twenty_one_launches_and_5_637_gb() {
-        let program = QuotientProducerB2nProgram::compile(
+        let configs = [
+            QuotientWorkspaceConfig {
+                lifting_log_size: 24,
+                log_blowup_factor: 1,
+            },
             QuotientWorkspaceConfig {
                 lifting_log_size: 25,
                 log_blowup_factor: 2,
             },
-            &[23; 19],
-        )
-        .unwrap();
-        let receipt = program.receipt();
+        ];
+        let requirements =
+            configs.map(|config| quotient_workspace_requirements(config, &[23; 19]).unwrap());
+        assert_eq!(requirements[0].subdomain_log_size, 23);
+        assert_ne!(
+            requirements[0].half_coset_initial_index,
+            requirements[1].half_coset_initial_index
+        );
+        assert_eq!(
+            requirements[0].half_coset_step_size,
+            requirements[1].half_coset_step_size
+        );
+        assert_eq!(
+            requirements[0].inverse_twiddle_words,
+            requirements[1].inverse_twiddle_words
+        );
+
+        let programs =
+            configs.map(|config| QuotientProducerB2nProgram::compile(config, &[23; 19]).unwrap());
+        let receipt = programs[0].receipt();
         assert!(receipt.schedule.is_exact());
+        assert_eq!(receipt.schedule.lifting_log_size, 24);
+        assert_eq!(receipt.schedule.subdomain_log_size, 23);
+        assert_eq!(programs[1].receipt().schedule.lifting_log_size, 25);
+        assert_eq!(programs[1].receipt().traffic, receipt.traffic);
+        assert_eq!(programs[1].receipt().resources, receipt.resources);
         assert_eq!(receipt.traffic.coordinate_image_bytes, 134_217_728);
         assert_eq!(receipt.traffic.denominator_factors, 159_383_552);
         assert_eq!(receipt.traffic.batch_inverse_calls, 25_165_824);
@@ -904,8 +931,8 @@ mod tests {
     #[test]
     fn scalar_oracle_matches_the_independent_cpu_inverse_transform() {
         let config = QuotientWorkspaceConfig {
-            lifting_log_size: 9,
-            log_blowup_factor: 2,
+            lifting_log_size: 8,
+            log_blowup_factor: 1,
         };
         let constants = [
             QuotientSampleConstants {
