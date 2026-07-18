@@ -1153,6 +1153,15 @@ pub struct PreparedRelationOutput {
     pub claimed_sum: ArenaSlice,
 }
 
+impl PreparedRelationOutput {
+    /// Number of coordinate pointers in the output table consumed by kernels.
+    ///
+    /// This is four times the logical LogUp column count for QM31 outputs.
+    fn n_coordinate_pointers(&self) -> Result<u32, RelationGraphError> {
+        u32::try_from(self.coordinates.len()).map_err(|_| RelationGraphError::SizeOverflow)
+    }
+}
+
 struct PreparedInstance {
     output: PreparedRelationOutput,
     descriptor_ptr: *const u32,
@@ -1661,7 +1670,7 @@ impl<'a> PreparedRelationGraph<'a> {
                     self.n_alpha_powers()?,
                     self.z.as_u32_ptr().cast_const(),
                     instance.output_pointers.as_u32_ptr().cast_const().cast(),
-                    instance.output.columns,
+                    instance.output.n_coordinate_pointers()?,
                     stream,
                 )
             })?;
@@ -2216,6 +2225,22 @@ mod tests {
             requirements.instances[0].claimed_sum_words,
             SECURE_FIELD_WORDS
         );
+    }
+
+    #[test]
+    fn blake_g_launch_counts_coordinate_pointers_not_logical_columns() {
+        let slice = ArenaSlice::dangling_for_test(1, 8);
+        let output = PreparedRelationOutput {
+            batch_index: 0,
+            instance_index: 0,
+            rows: 8,
+            columns: BLAKE_G_LOGUP_COLUMNS as u32,
+            coordinates: vec![slice; BLAKE_G_LOGUP_COLUMNS * SECURE_FIELD_WORDS],
+            claimed_sum: slice,
+        };
+
+        assert_eq!(output.columns, 9);
+        assert_eq!(output.n_coordinate_pointers().unwrap(), 36);
     }
 
     #[test]
