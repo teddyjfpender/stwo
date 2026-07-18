@@ -21,9 +21,10 @@ pub use authority::{
     WitnessInputGatherAbi, WitnessInputGatherAbiAccess, WitnessInputGatherAbiArgument,
     WitnessInputGatherAbiArgumentKind, WitnessInputGatherAuthorityError,
     WitnessInputGatherContract, WitnessInputGatherDescriptorField, WitnessInputGatherEffectAbi,
-    WitnessInputGatherEffectGeometry, WitnessInputGatherOutputEffect,
-    WitnessInputGatherPackedEdgeEffect, WitnessInputGatherRowDomain,
-    WitnessInputGatherWrapperLaunch, WITNESS_INPUT_GATHER_DESCRIPTOR_ORDER,
+    WitnessInputGatherEffectGeometry, WitnessInputGatherLinkedContract,
+    WitnessInputGatherOutputEffect, WitnessInputGatherPackedEdgeEffect,
+    WitnessInputGatherRowDomain, WitnessInputGatherWrapperLaunch,
+    WITNESS_INPUT_GATHER_DESCRIPTOR_ORDER,
 };
 pub use compact_authority::{
     WitnessInputCompactAbi, WitnessInputCompactAbiAccess, WitnessInputCompactAbiArgument,

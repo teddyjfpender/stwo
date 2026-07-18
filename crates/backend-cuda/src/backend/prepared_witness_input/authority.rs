@@ -1,6 +1,10 @@
 //! Address-free source, ABI, effect, descriptor, and launch authority for the
 //! prepared multi-producer witness-input gather.
 
+mod linked;
+
+pub use linked::WitnessInputGatherLinkedContract;
+
 use super::{
     witness_input_gather_requirements, PreparedWitnessInputGatherError,
     WitnessInputGatherRequirements, WITNESS_INPUT_GATHER_DESCRIPTOR_WORDS,
@@ -10,6 +14,7 @@ use super::{
 const ZERO_IDENTITY: [u8; 32] = [0; 32];
 const BINDER_SOURCE: &[u8] = include_bytes!("../prepared_witness_input.rs");
 const AUTHORITY_SOURCE: &[u8] = include_bytes!("authority.rs");
+const LINKED_SOURCE: &[u8] = include_bytes!("authority/linked.rs");
 const WRAPPER_SOURCE: &[u8] =
     include_bytes!("../../../../backend-cuda-kernels/cuda/witness_edge_gather.cu");
 
@@ -197,6 +202,7 @@ impl WitnessInputGatherContract {
             wrapper_source_identity,
             BINDER_SOURCE,
             AUTHORITY_SOURCE,
+            LINKED_SOURCE,
         );
         if [
             static_source_identity,
@@ -320,6 +326,9 @@ pub enum WitnessInputGatherAuthorityError {
     MissingStaticSourceIdentity,
     InvalidCanonicalRequirements,
     SizeOverflow,
+    StaticBuildUnavailable,
+    StaticBuildMismatch,
+    UnsupportedTargetSm(u32),
 }
 
 impl core::fmt::Display for WitnessInputGatherAuthorityError {
@@ -667,6 +676,7 @@ fn source_identity_from(
     wrapper_source: [u8; 32],
     binder: &[u8],
     authority: &[u8],
+    linked: &[u8],
 ) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(SOURCE_DOMAIN);
@@ -674,6 +684,7 @@ fn source_identity_from(
     hasher.update(&wrapper_source);
     hash_bytes(&mut hasher, binder);
     hash_bytes(&mut hasher, authority);
+    hash_bytes(&mut hasher, linked);
     *hasher.finalize().as_bytes()
 }
 

@@ -2,6 +2,9 @@ use core::ffi::c_void;
 
 use super::super::WitnessInputGatherEdge;
 use super::*;
+use crate::backend::prepared_witness_input::static_build::{
+    binding_for_test, validate_binding_for_test, StaticBuildBindError, StaticBuildBinding,
+};
 
 fn edges() -> [WitnessInputGatherEdge; 2] {
     [
@@ -245,6 +248,7 @@ fn source_closure_seals_exact_wrapper_kernel_descriptor_and_stream_launch() {
         wrapper_source,
         BINDER_SOURCE,
         AUTHORITY_SOURCE,
+        LINKED_SOURCE,
     );
     let mut changed_static = static_source;
     changed_static[0] ^= 1;
@@ -255,6 +259,7 @@ fn source_closure_seals_exact_wrapper_kernel_descriptor_and_stream_launch() {
             wrapper_source,
             BINDER_SOURCE,
             AUTHORITY_SOURCE,
+            LINKED_SOURCE,
         )
     );
     let mut changed_wrapper = wrapper_source;
@@ -266,14 +271,25 @@ fn source_closure_seals_exact_wrapper_kernel_descriptor_and_stream_launch() {
             changed_wrapper,
             BINDER_SOURCE,
             AUTHORITY_SOURCE,
+            LINKED_SOURCE,
         )
     );
-    for changed_index in 0..2 {
-        let mut sources = [BINDER_SOURCE.to_vec(), AUTHORITY_SOURCE.to_vec()];
+    for changed_index in 0..3 {
+        let mut sources = [
+            BINDER_SOURCE.to_vec(),
+            AUTHORITY_SOURCE.to_vec(),
+            LINKED_SOURCE.to_vec(),
+        ];
         sources[changed_index][0] ^= 1;
         assert_ne!(
             baseline,
-            source_identity_from(static_source, wrapper_source, &sources[0], &sources[1]),
+            source_identity_from(
+                static_source,
+                wrapper_source,
+                &sources[0],
+                &sources[1],
+                &sources[2],
+            ),
             "source {changed_index} was not sealed",
         );
     }
@@ -281,6 +297,143 @@ fn source_closure_seals_exact_wrapper_kernel_descriptor_and_stream_launch() {
         contract().wrapper_source_identity(),
         digest(WRAPPER_SOURCE_DOMAIN, source.as_bytes())
     );
+}
+
+#[test]
+fn linked_build_authority_seals_contract_module_source_target_and_sm() {
+    let semantic = contract();
+    let binding = binding_for_test(
+        linked::STATIC_BUILD_DOMAIN,
+        semantic.identity(),
+        [0x41; 32],
+        [0x41; 32],
+        &[86, 89],
+        89,
+    )
+    .unwrap();
+    validate_binding_for_test(
+        &binding,
+        linked::STATIC_BUILD_DOMAIN,
+        semantic.identity(),
+        [0x41; 32],
+        [0x41; 32],
+        &[86, 89],
+        89,
+    )
+    .unwrap();
+    let linked = linked::linked_contract(semantic.identity(), binding);
+    assert_eq!(linked.contract_identity(), semantic.identity());
+    assert_eq!(linked.module_build_identity(), [0x41; 32]);
+    assert_ne!(linked.static_build_source_identity(), ZERO_IDENTITY);
+    assert_ne!(linked.static_build_identity(), ZERO_IDENTITY);
+    assert_eq!(linked.target_sm(), 89);
+    assert_ne!(linked.sm_identity(), ZERO_IDENTITY);
+    assert_ne!(linked.identity(), ZERO_IDENTITY);
+
+    let changed_contract = linked::linked_contract([0x77; 32], binding);
+    assert_ne!(linked.identity(), changed_contract.identity());
+
+    let changed_build = binding_for_test(
+        linked::STATIC_BUILD_DOMAIN,
+        semantic.identity(),
+        [0x42; 32],
+        [0x42; 32],
+        &[86, 89],
+        89,
+    )
+    .unwrap();
+    assert_ne!(
+        linked.identity(),
+        linked::linked_contract(semantic.identity(), changed_build).identity()
+    );
+
+    let changed_sm = binding_for_test(
+        linked::STATIC_BUILD_DOMAIN,
+        semantic.identity(),
+        [0x41; 32],
+        [0x41; 32],
+        &[86, 89],
+        86,
+    )
+    .unwrap();
+    assert_ne!(
+        linked.identity(),
+        linked::linked_contract(semantic.identity(), changed_sm).identity()
+    );
+
+    let mutations: [fn(&mut StaticBuildBinding); 5] = [
+        |changed| changed.module_build_identity[0] ^= 1,
+        |changed| changed.static_build_source_identity[0] ^= 1,
+        |changed| changed.target_sm ^= 1,
+        |changed| changed.sm_identity[0] ^= 1,
+        |changed| changed.identity[0] ^= 1,
+    ];
+    for mutate in mutations {
+        let mut changed = binding;
+        mutate(&mut changed);
+        assert_eq!(
+            validate_binding_for_test(
+                &changed,
+                linked::STATIC_BUILD_DOMAIN,
+                semantic.identity(),
+                [0x41; 32],
+                [0x41; 32],
+                &[86, 89],
+                89,
+            ),
+            Err(StaticBuildBindError::InconsistentBuildMetadata)
+        );
+        assert_ne!(
+            linked.identity(),
+            linked::linked_contract(semantic.identity(), changed).identity()
+        );
+    }
+
+    assert_eq!(
+        binding_for_test(
+            linked::STATIC_BUILD_DOMAIN,
+            semantic.identity(),
+            [0x41; 32],
+            [0x41; 32],
+            &[86, 89],
+            90,
+        ),
+        Err(StaticBuildBindError::UnsupportedTargetSm(90))
+    );
+    assert_eq!(
+        binding_for_test(
+            linked::STATIC_BUILD_DOMAIN,
+            semantic.identity(),
+            [0x41; 32],
+            [0x42; 32],
+            &[86, 89],
+            89,
+        ),
+        Err(StaticBuildBindError::InconsistentBuildMetadata)
+    );
+    assert_eq!(
+        binding_for_test(
+            linked::STATIC_BUILD_DOMAIN,
+            semantic.identity(),
+            [0x41; 32],
+            [0x41; 32],
+            &[89, 86],
+            89,
+        ),
+        Err(StaticBuildBindError::InconsistentBuildMetadata)
+    );
+
+    if stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
+        let target = stwo_backend_cuda_kernels::static_cuda_module_target_sms()[0];
+        semantic
+            .bind_static_build(target)
+            .unwrap()
+            .unwrap()
+            .validate(&semantic)
+            .unwrap();
+    } else {
+        assert_eq!(semantic.bind_static_build(89).unwrap(), None);
+    }
 }
 
 #[test]
