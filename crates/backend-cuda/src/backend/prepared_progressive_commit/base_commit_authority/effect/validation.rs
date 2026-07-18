@@ -209,8 +209,10 @@ fn source_table_matches(table: &BaseCommitInstalledAccess, pointers: usize) -> b
         BaseCommitInstalledAccess {
             kind: BaseCommitAccessKind::Read,
             role: BaseCommitDependencyRole::BatchSourcePointerTable { .. },
-            range: BaseCommitDependencyRange::Whole { words },
-        } if *words == expected_words && pointers != 0
+            range: BaseCommitDependencyRange::Slice { first_word, words },
+        } if *words == expected_words
+            && *first_word % POINTER_WORDS == 0
+            && pointers != 0
     )
 }
 
@@ -223,8 +225,10 @@ fn retained_table_matches(table: &BaseCommitInstalledAccess, pointers: usize) ->
         BaseCommitInstalledAccess {
             kind: BaseCommitAccessKind::Read,
             role: BaseCommitDependencyRole::BatchRetainedPointerTable { .. },
-            range: BaseCommitDependencyRange::Whole { words },
-        } if *words == expected_words && pointers != 0
+            range: BaseCommitDependencyRange::Slice { first_word, words },
+        } if *words == expected_words
+            && *first_word % POINTER_WORDS == 0
+            && pointers != 0
     )
 }
 

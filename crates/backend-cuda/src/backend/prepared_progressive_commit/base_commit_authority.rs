@@ -36,8 +36,8 @@ const STATE_WORDS: usize = PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES / core::mem::s
 const ZERO_IDENTITY: [u8; 32] = [0; 32];
 const SOURCE_DOMAIN: &[u8] = b"stwo-cuda-base-commit-source-v1\0";
 const ABI_DOMAIN: &[u8] = b"stwo-cuda-base-commit-abi-v1\0";
-const EFFECT_DOMAIN: &[u8] = b"stwo-cuda-base-commit-effect-v1\0";
-const LAUNCH_DOMAIN: &[u8] = b"stwo-cuda-base-commit-launch-v2\0";
+const EFFECT_DOMAIN: &[u8] = b"stwo-cuda-base-commit-effect-v2\0";
+const LAUNCH_DOMAIN: &[u8] = b"stwo-cuda-base-commit-launch-v3\0";
 const OPERATION_DOMAIN: &[u8] = b"stwo-cuda-base-commit-operation-v1\0";
 const PROGRAM_DOMAIN: &[u8] = b"stwo-cuda-base-commit-program-v1\0";
 const STATIC_BUILD_DOMAIN: &[u8] = b"stwo-cuda-base-commit-static-build-v1\0";
@@ -51,6 +51,8 @@ const EFFECT_VALIDATION_SOURCE: &[u8] =
     include_bytes!("base_commit_authority/effect/validation.rs");
 const ENCODING_AUTHORITY_SOURCE: &[u8] = include_bytes!("base_commit_authority/encoding.rs");
 const EXECUTION_AUTHORITY_SOURCE: &[u8] = include_bytes!("base_commit_authority/execution.rs");
+const EXECUTION_ARGUMENTS_SOURCE: &[u8] =
+    include_bytes!("base_commit_authority/execution/arguments.rs");
 const INVOCATION_AUTHORITY_SOURCE: &[u8] = include_bytes!("base_commit_authority/invocation.rs");
 const COMMIT_SOURCE: &[u8] = include_bytes!("program.rs");
 const DIRECT_SOURCE: &[u8] = include_bytes!("direct_retained_b2n.rs");
@@ -189,6 +191,31 @@ pub enum BaseCommitOperationKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BaseCommitExecutionBuffer {
+    /// Byte offset from the pointer passed at this sealed wrapper ABI ordinal.
+    WrapperArgument { ordinal: u8, byte_offset: u64 },
+    /// Byte offset from the first word of the installed suffix sealed by the effect.
+    DependencySuffix {
+        role: BaseCommitDependencyRole,
+        byte_offset: u64,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BaseCommitKernelArgumentValue {
+    Buffer(BaseCommitExecutionBuffer),
+    U32(u32),
+    M31(u32),
+    Null,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BaseCommitKernelArgument {
+    pub name: &'static str,
+    pub value: BaseCommitKernelArgumentValue,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BaseCommitKernelLaunch {
     pub symbol: &'static str,
     pub grid: [u32; 3],
@@ -196,12 +223,19 @@ pub struct BaseCommitKernelLaunch {
     pub cluster: Option<[u32; 3]>,
     pub dynamic_shared_bytes: u32,
     pub cooperative: bool,
+    /// Raw kernel arguments in launch order, excluding CUDA's execution stream.
+    pub arguments: Vec<BaseCommitKernelArgument>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BaseCommitExecutionStep {
     KernelLaunch(BaseCommitKernelLaunch),
-    DeviceCopyD2D { bytes: u64 },
+    DeviceCopyD2D {
+        /// Exact source and destination are relative to sealed wrapper arguments.
+        source: BaseCommitExecutionBuffer,
+        destination: BaseCommitExecutionBuffer,
+        bytes: u64,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

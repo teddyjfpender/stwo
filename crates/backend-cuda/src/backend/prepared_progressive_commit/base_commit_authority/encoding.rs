@@ -34,7 +34,7 @@ pub(super) fn source_identity_from_parts(
     Ok(*hasher.finalize().as_bytes())
 }
 
-pub(super) fn authority_sources() -> [&'static [u8]; 20] {
+pub(super) fn authority_sources() -> [&'static [u8]; 21] {
     [
         AUTHORITY_SOURCE,
         ABI_AUTHORITY_SOURCE,
@@ -43,6 +43,7 @@ pub(super) fn authority_sources() -> [&'static [u8]; 20] {
         EFFECT_VALIDATION_SOURCE,
         ENCODING_AUTHORITY_SOURCE,
         EXECUTION_AUTHORITY_SOURCE,
+        EXECUTION_ARGUMENTS_SOURCE,
         INVOCATION_AUTHORITY_SOURCE,
         COMMIT_SOURCE,
         DIRECT_SOURCE,
@@ -116,14 +117,80 @@ pub(super) fn launch_identity(
                 }
                 hash_u32(&mut hasher, launch.dynamic_shared_bytes);
                 hasher.update(&[u8::from(launch.cooperative)]);
+                hash_size(&mut hasher, launch.arguments.len());
+                for argument in &launch.arguments {
+                    hash_bytes(&mut hasher, argument.name.as_bytes());
+                    match argument.value {
+                        BaseCommitKernelArgumentValue::Buffer(buffer) => {
+                            hasher.update(&[1]);
+                            hash_execution_buffer(&mut hasher, buffer);
+                        }
+                        BaseCommitKernelArgumentValue::U32(value) => {
+                            hasher.update(&[2]);
+                            hash_u32(&mut hasher, value);
+                        }
+                        BaseCommitKernelArgumentValue::M31(value) => {
+                            hasher.update(&[3]);
+                            hash_u32(&mut hasher, value);
+                        }
+                        BaseCommitKernelArgumentValue::Null => {
+                            hasher.update(&[4]);
+                        }
+                    }
+                }
             }
-            BaseCommitExecutionStep::DeviceCopyD2D { bytes } => {
+            BaseCommitExecutionStep::DeviceCopyD2D {
+                source,
+                destination,
+                bytes,
+            } => {
                 hasher.update(&[1]);
+                hash_execution_buffer(&mut hasher, *source);
+                hash_execution_buffer(&mut hasher, *destination);
                 hasher.update(&bytes.to_le_bytes());
             }
         }
     }
     Ok(*hasher.finalize().as_bytes())
+}
+
+fn hash_execution_buffer(hasher: &mut blake3::Hasher, buffer: BaseCommitExecutionBuffer) {
+    match buffer {
+        BaseCommitExecutionBuffer::WrapperArgument {
+            ordinal,
+            byte_offset,
+        } => {
+            hasher.update(&[1, ordinal]);
+            hasher.update(&byte_offset.to_le_bytes());
+        }
+        BaseCommitExecutionBuffer::DependencySuffix { role, byte_offset } => {
+            hasher.update(&[2]);
+            hash_dependency_role(hasher, role);
+            hasher.update(&byte_offset.to_le_bytes());
+        }
+    }
+}
+
+fn hash_dependency_role(hasher: &mut blake3::Hasher, role: BaseCommitDependencyRole) {
+    match role {
+        BaseCommitDependencyRole::BatchSourcePointerTable { batch_index } => {
+            hasher.update(&[1]);
+            hash_u32(hasher, batch_index);
+        }
+        BaseCommitDependencyRole::BatchRetainedPointerTable { batch_index } => {
+            hasher.update(&[2]);
+            hash_u32(hasher, batch_index);
+        }
+        BaseCommitDependencyRole::InverseTwiddles => {
+            hasher.update(&[3]);
+        }
+        BaseCommitDependencyRole::ForwardTwiddles => {
+            hasher.update(&[4]);
+        }
+        BaseCommitDependencyRole::InPlaceScratch => {
+            hasher.update(&[5]);
+        }
+    }
 }
 
 pub(super) fn operation_identity(

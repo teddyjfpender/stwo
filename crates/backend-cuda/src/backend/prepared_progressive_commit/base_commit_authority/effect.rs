@@ -37,6 +37,7 @@ pub enum BaseCommitDependencyRole {
 pub enum BaseCommitDependencyRange {
     Whole { words: usize },
     Suffix { words: usize },
+    Slice { first_word: usize, words: usize },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -118,6 +119,7 @@ impl BaseCommitEffect {
 
 pub(super) fn direct_b2n_effect(
     batch_index: u32,
+    segment_offset: u32,
     canonical: &[u32],
     source_log: u32,
     retained_log: u32,
@@ -143,17 +145,17 @@ pub(super) fn direct_b2n_effect(
         reads.push(source);
         writes.push(destination);
     }
-    let table_words = pointer_words(canonical.len())?;
+    let table_range = pointer_table_range(segment_offset, canonical.len())?;
     builder.pointer_table(
         0,
         BaseCommitDependencyRole::BatchSourcePointerTable { batch_index },
-        table_words,
+        table_range,
         reads,
     );
     builder.pointer_table(
         1,
         BaseCommitDependencyRole::BatchRetainedPointerTable { batch_index },
-        table_words,
+        table_range,
         writes,
     );
     builder.installed(
@@ -172,6 +174,7 @@ pub(super) fn direct_b2n_effect(
 
 pub(super) fn direct_n2b_effect(
     batch_index: u32,
+    segment_offset: u32,
     canonical: &[u32],
     retained_log: u32,
 ) -> Result<BaseCommitEffect, BaseCommitAuthorityError> {
@@ -197,7 +200,7 @@ pub(super) fn direct_n2b_effect(
     builder.pointer_table(
         0,
         BaseCommitDependencyRole::BatchRetainedPointerTable { batch_index },
-        pointer_words(canonical.len())?,
+        pointer_table_range(segment_offset, canonical.len())?,
         values,
     );
     builder.installed(
@@ -227,6 +230,7 @@ pub(super) fn state_init_effect(
 
 pub(super) fn state_absorb_effect(
     batch_index: u32,
+    segment_offset: u32,
     log_size: u32,
     source: BaseCommitValueRole,
     destination: BaseCommitValueRole,
@@ -251,7 +255,7 @@ pub(super) fn state_absorb_effect(
     builder.pointer_table(
         3,
         BaseCommitDependencyRole::BatchRetainedPointerTable { batch_index },
-        pointer_words(canonical.len())?,
+        pointer_table_range(segment_offset, canonical.len())?,
         evaluation_reads,
     );
     builder.values(4, vec![state_read, state_write]);
@@ -411,7 +415,7 @@ impl EffectBuilder {
         &mut self,
         argument_ordinal: u8,
         role: BaseCommitDependencyRole,
-        words: usize,
+        range: BaseCommitDependencyRange,
         access_indices: Vec<u32>,
     ) {
         self.pointer_bindings.push(BaseCommitPointerBinding {
@@ -420,7 +424,7 @@ impl EffectBuilder {
                 table: BaseCommitInstalledAccess {
                     kind: BaseCommitAccessKind::Read,
                     role,
-                    range: BaseCommitDependencyRange::Whole { words },
+                    range,
                 },
                 access_indices,
             },
@@ -542,6 +546,11 @@ fn hash_installed_access(hasher: &mut blake3::Hasher, access: BaseCommitInstalle
             hasher.update(&[2]);
             hash_size(hasher, words);
         }
+        BaseCommitDependencyRange::Slice { first_word, words } => {
+            hasher.update(&[3]);
+            hash_size(hasher, first_word);
+            hash_size(hasher, words);
+        }
     }
 }
 
@@ -576,6 +585,20 @@ fn pointer_words(columns: usize) -> Result<usize, BaseCommitAuthorityError> {
         .checked_mul(POINTER_WORDS)
         .filter(|&words| words != 0)
         .ok_or(BaseCommitAuthorityError::SizeOverflow)
+}
+
+fn pointer_table_range(
+    segment_offset: u32,
+    columns: usize,
+) -> Result<BaseCommitDependencyRange, BaseCommitAuthorityError> {
+    let first_word = usize::try_from(segment_offset)
+        .ok()
+        .and_then(|offset| offset.checked_mul(POINTER_WORDS))
+        .ok_or(BaseCommitAuthorityError::SizeOverflow)?;
+    Ok(BaseCommitDependencyRange::Slice {
+        first_word,
+        words: pointer_words(columns)?,
+    })
 }
 
 fn transform_twiddle_words(log_size: u32) -> Result<usize, BaseCommitAuthorityError> {

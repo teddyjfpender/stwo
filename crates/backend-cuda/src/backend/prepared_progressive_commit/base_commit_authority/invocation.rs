@@ -2,12 +2,13 @@
 
 use super::*;
 
-const INVOCATION_DOMAIN: &[u8] = b"stwo-cuda-base-commit-invocation-v1\0";
+const INVOCATION_DOMAIN: &[u8] = b"stwo-cuda-base-commit-invocation-v2\0";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BaseCommitInvocationValue {
     PointerEffect {
         binding_index: u32,
+        installed_range: Option<BaseCommitDependencyRange>,
     },
     U32(u32),
     Unsigned(u32),
@@ -55,16 +56,23 @@ pub(super) fn compile_invocation(
         .iter()
         .map(|argument| {
             let value = if argument.kind.is_pointer_bearing() {
-                let binding_index = effect
+                let (binding_index, binding) = effect
                     .pointer_bindings
                     .iter()
                     .position(|binding| binding.argument_ordinal == argument.ordinal)
-                    .and_then(|index| u32::try_from(index).ok())
+                    .and_then(|index| {
+                        u32::try_from(index)
+                            .ok()
+                            .map(|binding_index| (binding_index, &effect.pointer_bindings[index]))
+                    })
                     .ok_or(BaseCommitAuthorityError::InvalidInvocation)?;
                 if argument.kind == BaseCommitAbiArgumentKind::CudaStream {
                     BaseCommitInvocationValue::ExecutionStream
                 } else {
-                    BaseCommitInvocationValue::PointerEffect { binding_index }
+                    BaseCommitInvocationValue::PointerEffect {
+                        binding_index,
+                        installed_range: target_installed_range(&binding.target),
+                    }
                 }
             } else {
                 scalar_value(abi, argument.ordinal, operation)?
@@ -219,13 +227,19 @@ fn validate_argument_types(
             return Err(BaseCommitAuthorityError::InvalidInvocation);
         }
         let valid = match argument.value {
-            BaseCommitInvocationValue::PointerEffect { binding_index } => {
+            BaseCommitInvocationValue::PointerEffect {
+                binding_index,
+                installed_range: expected_range,
+            } => {
                 expected.kind.is_pointer_bearing()
                     && expected.kind != BaseCommitAbiArgumentKind::CudaStream
                     && effect
                         .pointer_bindings
                         .get(binding_index as usize)
-                        .is_some_and(|binding| binding.argument_ordinal == argument.ordinal)
+                        .is_some_and(|binding| {
+                            binding.argument_ordinal == argument.ordinal
+                                && target_installed_range(&binding.target) == expected_range
+                        })
             }
             BaseCommitInvocationValue::U32(_) => expected.kind == BaseCommitAbiArgumentKind::U32,
             BaseCommitInvocationValue::Unsigned(_) => {
@@ -264,9 +278,13 @@ fn invocation_identity(abi: BaseCommitAbi, arguments: &[BaseCommitInvocationArgu
         hasher.update(&(argument.name.len() as u64).to_le_bytes());
         hasher.update(argument.name.as_bytes());
         match argument.value {
-            BaseCommitInvocationValue::PointerEffect { binding_index } => {
+            BaseCommitInvocationValue::PointerEffect {
+                binding_index,
+                installed_range,
+            } => {
                 hasher.update(&[1]);
                 hasher.update(&binding_index.to_le_bytes());
+                hash_installed_range(&mut hasher, installed_range);
             }
             BaseCommitInvocationValue::U32(value) => {
                 hasher.update(&[2]);
@@ -286,6 +304,35 @@ fn invocation_identity(abi: BaseCommitAbi, arguments: &[BaseCommitInvocationArgu
         }
     }
     *hasher.finalize().as_bytes()
+}
+
+fn target_installed_range(target: &BaseCommitPointerTarget) -> Option<BaseCommitDependencyRange> {
+    match target {
+        BaseCommitPointerTarget::PointerTable { table, .. } => Some(table.range),
+        BaseCommitPointerTarget::Installed { access } => Some(access.range),
+        BaseCommitPointerTarget::Values { .. } | BaseCommitPointerTarget::ExecutionStream => None,
+    }
+}
+
+fn hash_installed_range(hasher: &mut blake3::Hasher, range: Option<BaseCommitDependencyRange>) {
+    match range {
+        None => {
+            hasher.update(&[0]);
+        }
+        Some(BaseCommitDependencyRange::Whole { words }) => {
+            hasher.update(&[1]);
+            hasher.update(&(words as u64).to_le_bytes());
+        }
+        Some(BaseCommitDependencyRange::Suffix { words }) => {
+            hasher.update(&[2]);
+            hasher.update(&(words as u64).to_le_bytes());
+        }
+        Some(BaseCommitDependencyRange::Slice { first_word, words }) => {
+            hasher.update(&[3]);
+            hasher.update(&(first_word as u64).to_le_bytes());
+            hasher.update(&(words as u64).to_le_bytes());
+        }
+    }
 }
 
 fn hash_dependency(hasher: &mut blake3::Hasher, dependency: BaseCommitDependencyRole) {

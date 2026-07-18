@@ -467,7 +467,8 @@ fn effects_cover_every_pointer_alias_scratch_and_stay_monolithic() {
                 }
                 match access.range {
                     BaseCommitDependencyRange::Whole { words } => Some(words),
-                    BaseCommitDependencyRange::Suffix { .. } => None,
+                    BaseCommitDependencyRange::Suffix { .. }
+                    | BaseCommitDependencyRange::Slice { .. } => None,
                 }
             });
         assert_eq!(scratch_words, expected_scratch_words);
@@ -485,7 +486,7 @@ fn effects_cover_every_pointer_alias_scratch_and_stay_monolithic() {
 fn pointer_tables_bind_physical_slots_to_ordered_logical_effects() {
     let pointer_words = core::mem::size_of::<usize>() / core::mem::size_of::<u32>();
     let canonical = [2, 5];
-    let mut n2b = direct_n2b_effect(7, &canonical, 9).unwrap();
+    let mut n2b = direct_n2b_effect(7, 0, &canonical, 9).unwrap();
     n2b.validate_for_abi(BaseCommitAbi::DirectN2bV1).unwrap();
     let n2b_table = n2b
         .pointer_bindings
@@ -502,7 +503,8 @@ fn pointer_tables_bind_physical_slots_to_ordered_logical_effects() {
     assert_eq!(access_indices.len(), 2 * canonical.len());
     assert_eq!(
         table.range,
-        BaseCommitDependencyRange::Whole {
+        BaseCommitDependencyRange::Slice {
+            first_word: 0,
             words: canonical.len() * pointer_words,
         }
     );
@@ -541,7 +543,7 @@ fn pointer_tables_bind_physical_slots_to_ordered_logical_effects() {
         version: 2,
         log_size: 9,
     };
-    let mut absorb = state_absorb_effect(7, 9, source, destination, &canonical).unwrap();
+    let mut absorb = state_absorb_effect(7, 0, 9, source, destination, &canonical).unwrap();
     absorb
         .validate_for_abi(BaseCommitAbi::StateAbsorbV1)
         .unwrap();

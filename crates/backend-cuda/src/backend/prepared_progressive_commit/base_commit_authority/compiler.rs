@@ -310,6 +310,7 @@ impl<'a> Compiler<'a> {
             BaseCommitAbi::DirectB2nV1,
             direct_b2n_effect(
                 batch_index,
+                segment_offset,
                 canonical_columns,
                 source_log_size,
                 retained_log_size,
@@ -325,7 +326,12 @@ impl<'a> Compiler<'a> {
                 canonical_columns: canonical_columns.to_vec(),
             },
             BaseCommitAbi::DirectN2bV1,
-            direct_n2b_effect(batch_index, canonical_columns, retained_log_size)?,
+            direct_n2b_effect(
+                batch_index,
+                segment_offset,
+                canonical_columns,
+                retained_log_size,
+            )?,
             BaseCommitPartitionAuthority::Monolithic,
         )
     }
@@ -353,6 +359,7 @@ impl<'a> Compiler<'a> {
             BaseCommitAbi::StateAbsorbV1,
             state_absorb_effect(
                 batch_index,
+                segment_offset,
                 log_size,
                 source,
                 destination,

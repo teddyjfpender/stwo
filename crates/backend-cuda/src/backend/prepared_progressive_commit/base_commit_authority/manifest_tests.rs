@@ -1,3 +1,4 @@
+use super::super::effect::direct_b2n_effect;
 use super::super::encoding::{
     launch_identity, linked_authority, operation_identity, program_identity,
 };
@@ -32,6 +33,26 @@ fn programs_for_logs(
     .unwrap();
     let direct = DirectRetainedB2nProgram::compile(TraceTreeRole::Base, &commit).unwrap();
     (commit, direct)
+}
+
+fn pointer_table_range(
+    operation: &BaseCommitOperation,
+    argument_ordinal: u8,
+) -> BaseCommitDependencyRange {
+    operation
+        .effect
+        .pointer_bindings
+        .iter()
+        .find_map(|binding| {
+            if binding.argument_ordinal != argument_ordinal {
+                return None;
+            }
+            let BaseCommitPointerTarget::PointerTable { table, .. } = binding.target else {
+                return None;
+            };
+            Some(table.range)
+        })
+        .unwrap()
 }
 
 #[test]
@@ -89,32 +110,92 @@ fn fused_leaf_and_tail_lower_to_exact_ordinary_wrapper_order() {
             ..
         }
     ));
-    assert!(authority.operations().windows(3).any(|operations| matches!(
-        operations,
-        [
-            BaseCommitOperation {
-                kind: BaseCommitOperationKind::DirectB2n {
-                    segment_offset: 16,
-                    ..
-                },
-                ..
-            },
-            BaseCommitOperation {
-                kind: BaseCommitOperationKind::DirectN2b {
-                    segment_offset: 16,
-                    ..
-                },
-                ..
-            },
-            BaseCommitOperation {
-                kind: BaseCommitOperationKind::StateAbsorb {
-                    segment_offset: 16,
-                    ..
-                },
-                ..
+    let later = authority
+        .operations()
+        .windows(3)
+        .find(|operations| {
+            matches!(
+                operations,
+                [
+                    BaseCommitOperation {
+                        kind: BaseCommitOperationKind::DirectB2n {
+                            segment_offset: 16,
+                            ..
+                        },
+                        ..
+                    },
+                    BaseCommitOperation {
+                        kind: BaseCommitOperationKind::DirectN2b {
+                            segment_offset: 16,
+                            ..
+                        },
+                        ..
+                    },
+                    BaseCommitOperation {
+                        kind: BaseCommitOperationKind::StateAbsorb {
+                            segment_offset: 16,
+                            ..
+                        },
+                        ..
+                    }
+                ]
+            )
+        })
+        .unwrap();
+    let pointer_words = core::mem::size_of::<usize>() / core::mem::size_of::<u32>();
+    for (operation, ordinal) in [
+        (&fused[0], 0),
+        (&fused[0], 1),
+        (&fused[1], 0),
+        (&fused[2], 3),
+    ] {
+        assert_eq!(
+            pointer_table_range(operation, ordinal),
+            BaseCommitDependencyRange::Slice {
+                first_word: 0,
+                words: 16 * pointer_words,
             }
-        ]
-    )));
+        );
+    }
+    for (operation, ordinal) in [
+        (&later[0], 0),
+        (&later[0], 1),
+        (&later[1], 0),
+        (&later[2], 3),
+    ] {
+        assert_eq!(
+            pointer_table_range(operation, ordinal),
+            BaseCommitDependencyRange::Slice {
+                first_word: 16 * pointer_words,
+                words: pointer_words,
+            }
+        );
+    }
+    assert_ne!(fused[0].invocation.identity, later[0].invocation.identity);
+    let BaseCommitOperationKind::DirectB2n {
+        batch_index,
+        source_log_size,
+        retained_log_size,
+        canonical_columns,
+        ..
+    } = &later[0].kind
+    else {
+        unreachable!()
+    };
+    let wrong_offset_effect = direct_b2n_effect(
+        *batch_index,
+        0,
+        canonical_columns,
+        *source_log_size,
+        *retained_log_size,
+    )
+    .unwrap();
+    assert_eq!(
+        later[0]
+            .invocation
+            .validate(later[0].abi, &later[0].kind, &wrong_offset_effect),
+        Err(BaseCommitAuthorityError::InvalidInvocation)
+    );
     assert!(matches!(
         authority.operations()[authority.operations().len() - 2..],
         [
@@ -147,32 +228,73 @@ fn execution_manifest_seals_exact_kernel_geometry_copy_bytes_and_order() {
     })
     .unwrap();
     assert_eq!(
-        b2n,
+        b2n.iter()
+            .map(|step| match step {
+                BaseCommitExecutionStep::KernelLaunch(launch) => {
+                    (launch.symbol, launch.grid, launch.block)
+                }
+                BaseCommitExecutionStep::DeviceCopyD2D { .. } => unreachable!(),
+            })
+            .collect::<Vec<_>>(),
         vec![
-            BaseCommitExecutionStep::KernelLaunch(BaseCommitKernelLaunch {
-                symbol: "b2n_init_warp_batch<3>",
-                grid: [16_384, 54, 1],
-                block: [32, 4, 1],
-                cluster: None,
-                dynamic_shared_bytes: 0,
-                cooperative: false,
-            }),
-            BaseCommitExecutionStep::KernelLaunch(BaseCommitKernelLaunch {
-                symbol: "b2n_noinit_block_batch<4,false>",
-                grid: [8, 256, 54],
-                block: [32, 16, 1],
-                cluster: None,
-                dynamic_shared_bytes: 0,
-                cooperative: false,
-            }),
-            BaseCommitExecutionStep::KernelLaunch(BaseCommitKernelLaunch {
-                symbol: "b2n_noinit_block_batch<4,true>",
-                grid: [2_048, 1, 54],
-                block: [32, 16, 1],
-                cluster: None,
-                dynamic_shared_bytes: 0,
-                cooperative: false,
-            }),
+            ("b2n_init_warp_batch<3>", [16_384, 54, 1], [32, 4, 1]),
+            ("b2n_noinit_block_batch<4,false>", [8, 256, 54], [32, 16, 1]),
+            (
+                "b2n_noinit_block_batch<4,true>",
+                [2_048, 1, 54],
+                [32, 16, 1]
+            ),
+        ]
+    );
+    let BaseCommitExecutionStep::KernelLaunch(first_b2n) = &b2n[0] else {
+        unreachable!()
+    };
+    assert_eq!(
+        first_b2n.arguments,
+        vec![
+            BaseCommitKernelArgument {
+                name: "input",
+                value: BaseCommitKernelArgumentValue::Buffer(
+                    BaseCommitExecutionBuffer::WrapperArgument {
+                        ordinal: 0,
+                        byte_offset: 0,
+                    }
+                ),
+            },
+            BaseCommitKernelArgument {
+                name: "output",
+                value: BaseCommitKernelArgumentValue::Buffer(
+                    BaseCommitExecutionBuffer::WrapperArgument {
+                        ordinal: 1,
+                        byte_offset: 0,
+                    }
+                ),
+            },
+            BaseCommitKernelArgument {
+                name: "log_n",
+                value: BaseCommitKernelArgumentValue::U32(24),
+            },
+            BaseCommitKernelArgument {
+                name: "num_poly",
+                value: BaseCommitKernelArgumentValue::U32(54),
+            },
+            BaseCommitKernelArgument {
+                name: "min_stage",
+                value: BaseCommitKernelArgumentValue::U32(1),
+            },
+            BaseCommitKernelArgument {
+                name: "max_stage",
+                value: BaseCommitKernelArgumentValue::U32(8),
+            },
+            BaseCommitKernelArgument {
+                name: "g_twiddles",
+                value: BaseCommitKernelArgumentValue::Buffer(
+                    BaseCommitExecutionBuffer::DependencySuffix {
+                        role: BaseCommitDependencyRole::InverseTwiddles,
+                        byte_offset: 0,
+                    }
+                ),
+            },
         ]
     );
 
@@ -223,6 +345,59 @@ fn execution_manifest_seals_exact_kernel_geometry_copy_bytes_and_order() {
             .collect::<Vec<_>>(),
         [[16, 65_535, 1], [4, 1, 65_535], [16, 1, 1], [4, 1, 1]]
     );
+    let BaseCommitExecutionStep::KernelLaunch(second_chunk) = &tiled[2] else {
+        unreachable!()
+    };
+    assert!(second_chunk.arguments.iter().any(|argument| {
+        matches!(
+            argument,
+            BaseCommitKernelArgument {
+                name: "input",
+                value: BaseCommitKernelArgumentValue::Buffer(
+                    BaseCommitExecutionBuffer::WrapperArgument {
+                        ordinal: 0,
+                        byte_offset,
+                    }
+                ),
+            } if *byte_offset == 65_535 * core::mem::size_of::<usize>() as u64
+        )
+    }));
+
+    let tiled_n2b = execution_manifest(&BaseCommitOperationKind::DirectN2b {
+        batch_index: 18,
+        segment_offset: 0,
+        source_log_size: 12,
+        retained_log_size: 13,
+        canonical_columns: (0..65_536).collect(),
+    })
+    .unwrap();
+    assert_eq!(
+        tiled_n2b
+            .iter()
+            .map(|step| match step {
+                BaseCommitExecutionStep::KernelLaunch(launch) => launch.grid,
+                BaseCommitExecutionStep::DeviceCopyD2D { .. } => unreachable!(),
+            })
+            .collect::<Vec<_>>(),
+        [[4, 2, 65_535], [16, 65_535, 1], [4, 2, 1], [16, 1, 1]]
+    );
+    let BaseCommitExecutionStep::KernelLaunch(second_n2b_chunk) = &tiled_n2b[2] else {
+        unreachable!()
+    };
+    assert!(second_n2b_chunk.arguments.iter().any(|argument| {
+        matches!(
+            argument,
+            BaseCommitKernelArgument {
+                name: "input",
+                value: BaseCommitKernelArgumentValue::Buffer(
+                    BaseCommitExecutionBuffer::WrapperArgument {
+                        ordinal: 0,
+                        byte_offset,
+                    }
+                ),
+            } if *byte_offset == 65_535 * core::mem::size_of::<usize>() as u64
+        )
+    }));
 
     let (commit, direct) = programs(ProgressiveNttLeafFusionMode::Separate, false, 0);
     let authority = BaseCommitProgramAuthority::compile(&commit, &direct).unwrap();
@@ -232,20 +407,51 @@ fn execution_manifest_seals_exact_kernel_geometry_copy_bytes_and_order() {
             .iter()
             .enumerate()
             .filter_map(|(index, step)| match step {
-                BaseCommitExecutionStep::DeviceCopyD2D { bytes } => Some((index, *bytes)),
+                BaseCommitExecutionStep::DeviceCopyD2D {
+                    source,
+                    destination,
+                    bytes,
+                } => Some((index, *source, *destination, *bytes)),
                 _ => None,
             })
             .collect::<Vec<_>>();
         let expected = match operation.kind {
-            BaseCommitOperationKind::StateExpandInPlace { .. } => {
-                vec![(0, 2 * PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES as u64)]
-            }
-            BaseCommitOperationKind::StateFinalizeInPlace { .. } => {
-                vec![(0, PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES as u64)]
-            }
-            BaseCommitOperationKind::MerkleLayerInPlace { .. } => {
-                vec![(0, (2 * core::mem::size_of::<Blake2sHash>()) as u64)]
-            }
+            BaseCommitOperationKind::StateExpandInPlace { .. } => vec![(
+                0,
+                BaseCommitExecutionBuffer::WrapperArgument {
+                    ordinal: 2,
+                    byte_offset: 0,
+                },
+                BaseCommitExecutionBuffer::WrapperArgument {
+                    ordinal: 3,
+                    byte_offset: 0,
+                },
+                2 * PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES as u64,
+            )],
+            BaseCommitOperationKind::StateFinalizeInPlace { .. } => vec![(
+                0,
+                BaseCommitExecutionBuffer::WrapperArgument {
+                    ordinal: 2,
+                    byte_offset: 0,
+                },
+                BaseCommitExecutionBuffer::WrapperArgument {
+                    ordinal: 3,
+                    byte_offset: 0,
+                },
+                PROGRESSIVE_BLAKE2S_STATE_STRIDE_BYTES as u64,
+            )],
+            BaseCommitOperationKind::MerkleLayerInPlace { .. } => vec![(
+                0,
+                BaseCommitExecutionBuffer::WrapperArgument {
+                    ordinal: 1,
+                    byte_offset: 0,
+                },
+                BaseCommitExecutionBuffer::WrapperArgument {
+                    ordinal: 2,
+                    byte_offset: 0,
+                },
+                (2 * core::mem::size_of::<Blake2sHash>()) as u64,
+            )],
             _ => vec![],
         };
         assert_eq!(copies, expected, "{:?}", operation.kind);
@@ -270,10 +476,19 @@ fn execution_mutations_change_operation_program_and_linked_identities() {
     let baseline = operation.launch_identity;
 
     let mut copy_bytes = operation.execution.clone();
-    let BaseCommitExecutionStep::DeviceCopyD2D { bytes } = &mut copy_bytes[0] else {
+    let BaseCommitExecutionStep::DeviceCopyD2D { bytes, .. } = &mut copy_bytes[0] else {
         unreachable!()
     };
     *bytes += 4;
+
+    let mut copy_endpoint = operation.execution.clone();
+    let BaseCommitExecutionStep::DeviceCopyD2D { source, .. } = &mut copy_endpoint[0] else {
+        unreachable!()
+    };
+    *source = BaseCommitExecutionBuffer::WrapperArgument {
+        ordinal: 1,
+        byte_offset: 0,
+    };
 
     let mut reordered = operation.execution.clone();
     reordered.swap(0, 1);
@@ -290,7 +505,7 @@ fn execution_mutations_change_operation_program_and_linked_identities() {
     };
     launch.symbol = "wrong_kernel";
 
-    for changed in [&copy_bytes, &reordered, &geometry, &symbol] {
+    for changed in [&copy_bytes, &copy_endpoint, &reordered, &geometry, &symbol] {
         assert_ne!(
             launch_identity(operation.abi, &operation.kind, changed).unwrap(),
             baseline
@@ -338,6 +553,40 @@ fn execution_mutations_change_operation_program_and_linked_identities() {
     assert_ne!(
         linked_authority(authority.identity(), binding).identity(),
         linked_authority(changed_program, binding).identity()
+    );
+
+    let stage_index = authority
+        .operations()
+        .iter()
+        .position(|operation| matches!(operation.kind, BaseCommitOperationKind::DirectB2n { .. }))
+        .unwrap();
+    let stage_operation = &authority.operations()[stage_index];
+    let mut changed_stage = stage_operation.execution.clone();
+    let argument = changed_stage
+        .iter_mut()
+        .find_map(|step| {
+            let BaseCommitExecutionStep::KernelLaunch(launch) = step else {
+                return None;
+            };
+            launch
+                .arguments
+                .iter_mut()
+                .find(|argument| argument.name == "stage")
+        })
+        .unwrap();
+    let BaseCommitKernelArgumentValue::U32(stage) = &mut argument.value else {
+        unreachable!()
+    };
+    *stage += 1;
+    assert_ne!(
+        launch_identity(stage_operation.abi, &stage_operation.kind, &changed_stage).unwrap(),
+        stage_operation.launch_identity
+    );
+    let mut mutated = authority.clone();
+    mutated.operations[stage_index].execution = changed_stage;
+    assert_eq!(
+        mutated.validate(),
+        Err(BaseCommitAuthorityError::ProgramMismatch)
     );
 }
 
@@ -404,7 +653,7 @@ fn generated_live_sn2_base_histogram_admits_fused16_and_tail12() {
                         && !launch.grid.contains(&0)
                         && !launch.block.contains(&0)
                 }
-                BaseCommitExecutionStep::DeviceCopyD2D { bytes } => *bytes != 0,
+                BaseCommitExecutionStep::DeviceCopyD2D { bytes, .. } => *bytes != 0,
             })
     }));
 }
