@@ -2,8 +2,8 @@
 //!
 //! The reference is the production predecessor: full B2N, eight coefficient
 //! half copies, ordinary compact LDE, leaf hashing, and Merkle. The candidate
-//! uses the qualified terminal split at log 24 and the fused split at log 25,
-//! followed directly by compact hashing of its evaluations.
+//! uses the qualified fused split at log 24 and 25, followed directly by compact
+//! hashing of its evaluations.
 //! gpu-lab-cohesion-review: one native gate must bind both graph lifetimes and compare every
 //! boundary. Run on a >=16 GiB CUDA device with:
 //!
@@ -434,49 +434,12 @@ fn compare_pair(
 
 fn verify(arena: &DeviceArena, log_size: u32, prepared: &PreparedCase<'_>) -> WordDigest {
     let rows = 1usize << log_size;
-    let half = rows / 2;
     let mut digest = WordDigest { sum: 0, mixed: 0 };
-    for coordinate in 0..COMPOSITION_SOURCE_COORDINATES {
-        compare_pair(
-            arena,
-            exact(
-                arena,
-                ArenaSlotId(BASELINE_SOURCE_BASE + coordinate as u32),
-                rows,
-            ),
-            exact(
-                arena,
-                ArenaSlotId(CANDIDATE_SOURCE_BASE + coordinate as u32),
-                rows,
-            ),
-            &format!("source {coordinate}"),
-            &mut digest,
-            coordinate * rows,
-            true,
-        );
-    }
+    // Retained evaluations are the first common semantic boundary. The
+    // predecessor materializes terminal coefficients in its source and copy
+    // slabs; the fused candidate intentionally keeps them in registers/shared
+    // memory, so those internal postimages are not equivalent representations.
     for column in 0..COMPOSITION_RETAINED_COLUMNS {
-        let half_index = column / COMPOSITION_SOURCE_COORDINATES;
-        let coordinate = column % COMPOSITION_SOURCE_COORDINATES;
-        compare_pair(
-            arena,
-            exact(
-                arena,
-                ArenaSlotId(BASELINE_COEFFICIENT_BASE + column as u32),
-                half,
-            ),
-            exact(
-                arena,
-                ArenaSlotId(CANDIDATE_SOURCE_BASE + coordinate as u32),
-                rows,
-            )
-            .checked_subslice(half_index * half, half)
-            .unwrap(),
-            &format!("coefficient {column}"),
-            &mut digest,
-            (4 + column) * rows,
-            true,
-        );
         compare_pair(
             arena,
             exact(
@@ -544,7 +507,7 @@ fn verify(arena: &DeviceArena, log_size: u32, prepared: &PreparedCase<'_>) -> Wo
             .read_root_at_transcript_boundary()
             .unwrap()
     );
-    assert_guards(arena, rows, half);
+    assert_guards(arena, rows, rows / 2);
     digest
 }
 
@@ -745,14 +708,14 @@ fn fused_split_precomputed_commit_matches_legacy_pipeline_exactly() {
     eprintln!(
         "STWO_COMPOSITION_SPLIT_COMMIT_NATIVE_RECEIPT_JSON={}",
         serde_json::json!({
-            "schema": "stwo.composition-split-commit-native.v1",
+            "schema": "stwo.composition-split-commit-native.v2",
             "passed": true,
             "baseline": "b2n-plus-eight-d2d-plus-ordinary-compact-commit",
             "candidate": "qualified-split-plus-precomputed-compact-commit",
+            "semantic_equivalence_boundary": "retained-evaluations",
+            "candidate_terminal_coefficients_materialized": false,
             "log24_candidate_launch_mode": "FusedFirstForward",
             "log25_candidate_launch_mode": "FusedFirstForward",
-            "source_postimages_equal": true,
-            "coefficient_halves_equal": true,
             "retained_evaluations_equal": true,
             "leaf_hashes_equal": true,
             "retained_merkle_layers_equal": true,
