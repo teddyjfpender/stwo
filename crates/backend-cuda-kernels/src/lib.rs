@@ -330,6 +330,56 @@ mod tests {
             raw::stwo_accumulate_quotient_numerator_packed_single_write_on as usize,
             0
         );
+        assert_ne!(
+            raw::stwo_prepare_quotient_numerator_prepacked_terms_on as usize,
+            0
+        );
+        assert_ne!(
+            raw::stwo_accumulate_quotient_numerator_prepacked_single_write_on as usize,
+            0
+        );
+        let status_abi = include_str!("../cuda/quotient_numerator_single_write.cuh");
+        for (name, value) in [
+            ("STWO_QUOTIENT_PREPACKED_SUCCESS", 0),
+            (
+                "STWO_QUOTIENT_PREPACKED_PREPARE_GROUP_OFFSETS_NOT_CANONICAL",
+                1,
+            ),
+            ("STWO_QUOTIENT_PREPACKED_PREPARE_SOURCE_OUT_OF_BOUNDS", 2),
+            ("STWO_QUOTIENT_PREPACKED_PREPARE_TERM_OUT_OF_BOUNDS", 3),
+            (
+                "STWO_QUOTIENT_PREPACKED_PREPARE_SOURCE_LOG_OUT_OF_BOUNDS",
+                4,
+            ),
+            ("STWO_QUOTIENT_PREPACKED_PREPARE_NULL_SOURCE", 5),
+            (
+                "STWO_QUOTIENT_PREPACKED_PREPARE_GROUP_RANGE_OUT_OF_BOUNDS",
+                6,
+            ),
+            (
+                "STWO_QUOTIENT_PREPACKED_PREPARE_GROUP_TERM_OUT_OF_BOUNDS",
+                7,
+            ),
+            ("STWO_QUOTIENT_PREPACKED_HOT_ROW_OFFSETS_NOT_CANONICAL", 8),
+            ("STWO_QUOTIENT_PREPACKED_HOT_GROUP_ROW_SHAPE_INVALID", 9),
+            ("STWO_QUOTIENT_PREPACKED_HOT_GROUP_TERM_RANGE_INVALID", 10),
+            ("STWO_QUOTIENT_PREPACKED_HOT_SOURCE_LOG_OUT_OF_BOUNDS", 11),
+            ("STWO_QUOTIENT_PREPACKED_HOT_NULL_SOURCE", 12),
+        ] {
+            assert!(status_abi.contains(&format!("{name} = {value},")));
+        }
+        let candidate = include_str!("../cuda/quotient_numerator_single_write.cu");
+        assert!(candidate.contains("constexpr uint32_t PREPACKED_STATUS_WORDS = 1;"));
+        assert!(candidate.contains("const cudaError_t reset = cudaMemsetAsync("));
+        assert!(candidate.contains("while (current == 0 || requested < current)"));
+        assert!(candidate.contains("if (atomicCAS(status, 0, 0) != 0)"));
+        let validation_launch = candidate
+            .find("stwo_validate_quotient_numerator_prepacked_terms_kernel<<<")
+            .unwrap();
+        let hot_launch = candidate
+            .find("stwo_quotient_numerator_prepacked_single_write_kernel<<<")
+            .unwrap();
+        assert!(validation_launch < hot_launch);
         assert_ne!(raw::stwo_ntt_b2n_columns_on as usize, 0);
         assert_ne!(raw::stwo_ntt_b2n_columns_after_first_seven_on as usize, 0);
         assert_ne!(

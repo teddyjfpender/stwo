@@ -321,6 +321,14 @@ pub use backend::proof_assembly::{
     assemble_blake2s_stark_proof, Blake2sFriAssemblyShape, Blake2sProofAssemblyError,
     Blake2sProofAssemblyInput, Blake2sProofAssemblyShape, Blake2sTraceAssemblyShape,
 };
+pub use backend::quotient_numerator_prepacked_terms::{
+    quotient_numerator_prepacked_row_oracle, quotient_numerator_prepacked_term_layout,
+    quotient_numerator_prepacked_term_oracle, QuotientNumeratorLineCoefficientsWords,
+    QuotientNumeratorPrepackedStatusCode, QuotientNumeratorPrepackedTerm,
+    QuotientNumeratorPrepackedTermError, QuotientNumeratorPrepackedTermLayout,
+    QuotientNumeratorPrepackedTermOracle, QUOTIENT_NUMERATOR_PREPACKED_GROUP_WORDS,
+    QUOTIENT_NUMERATOR_PREPACKED_STATUS_WORDS, QUOTIENT_NUMERATOR_PREPACKED_TERM_WORDS,
+};
 pub use backend::quotient_numerator_single_write::{
     quotient_numerator_hybrid_plan, quotient_numerator_single_write_plan,
     quotient_numerator_single_write_report, QuotientNumeratorHybridBatch,

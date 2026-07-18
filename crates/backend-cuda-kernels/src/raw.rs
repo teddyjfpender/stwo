@@ -1675,6 +1675,35 @@ extern "C" {
         stream: *mut c_void,
     ) -> i32;
 
+    pub fn stwo_prepare_quotient_numerator_prepacked_terms_on(
+        group_term_offsets: *const u32,
+        term_descriptors: *const u32,
+        group_count: u32,
+        term_count: u32,
+        source_evaluations: *const *const u32,
+        source_count: u32,
+        line_coefficients: *const CudaSecureField,
+        prepacked_storage: *mut u32,
+        prepacked_storage_words: u64,
+        stream: *mut c_void,
+    ) -> i32;
+
+    pub fn stwo_accumulate_quotient_numerator_prepacked_single_write_on(
+        group_row_offsets: *const u64,
+        group_term_offsets: *const u32,
+        group_count: u32,
+        term_count: u32,
+        packed_output_rows: u64,
+        prepacked_storage: *mut u32,
+        prepacked_storage_words: u64,
+        group_log_sizes: *const u32,
+        outputs_0: *const *mut u32,
+        outputs_1: *const *mut u32,
+        outputs_2: *const *mut u32,
+        outputs_3: *const *mut u32,
+        stream: *mut c_void,
+    ) -> i32;
+
     /// Allocation-free coefficient-form OODS evaluation on an explicit proof stream.
     pub fn stwo_oods_derive_points_on(
         oods_parameter: *const CudaSecureField,
