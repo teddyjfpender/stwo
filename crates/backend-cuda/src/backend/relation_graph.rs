@@ -130,6 +130,11 @@ pub fn relation_batch_one_read_eligible(batch: &RelationBatchProgram) -> bool {
         && relation_batch_max_tuple_words(batch) <= RELATION_FUSED_MAX_TUPLE_WORDS
 }
 
+fn relation_batch_prefers_one_read(batch: &RelationBatchProgram) -> bool {
+    relation_batch_max_tuple_words(batch) > RELATION_FUSED_NARROW_MAX_TUPLE_WORDS
+        && relation_batch_one_read_eligible(batch)
+}
+
 /// Static fused-lane eligibility of every instance of `batch`. Tuples of at
 /// most 32 words use suffix/recompute through 1024 columns. Wider tuples use
 /// one-read only when they fit its 512-fraction tile and 126-word audited
@@ -138,7 +143,7 @@ pub fn relation_batch_fused_eligible(batch: &RelationBatchProgram) -> bool {
     if batch.columns.len() > RELATION_FUSED_MAX_COLUMNS {
         return false;
     }
-    relation_batch_one_read_eligible(batch)
+    relation_batch_prefers_one_read(batch)
         || relation_batch_max_tuple_words(batch) <= RELATION_FUSED_NARROW_MAX_TUPLE_WORDS
 }
 
@@ -2497,6 +2502,8 @@ mod tests {
         assert!(relation_batch_fused_eligible(&program.batches[1]));
         assert!(relation_batch_one_read_eligible(&program.batches[0]));
         assert!(relation_batch_one_read_eligible(&program.batches[1]));
+        assert!(!relation_batch_prefers_one_read(&program.batches[0]));
+        assert!(!relation_batch_prefers_one_read(&program.batches[1]));
 
         // One use wider than the tuple-word cap routes the batch to the
         // 3-stage lane.
@@ -2504,9 +2511,11 @@ mod tests {
         wide.columns[0].uses[0].tuple_words = RELATION_FUSED_MAX_TUPLE_WORDS + 1;
         assert!(!relation_batch_fused_eligible(&wide));
         assert!(!relation_batch_one_read_eligible(&wide));
+        assert!(!relation_batch_prefers_one_read(&wide));
         wide.columns[0].uses[0].tuple_words = RELATION_FUSED_MAX_TUPLE_WORDS;
         assert!(relation_batch_fused_eligible(&wide));
         assert!(relation_batch_one_read_eligible(&wide));
+        assert!(relation_batch_prefers_one_read(&wide));
 
         // Every generated wide Cairo tuple is explicitly inside the one-read
         // lane, while the original <=32-word lane remains independently
@@ -2515,11 +2524,13 @@ mod tests {
             wide.columns[0].uses[0].tuple_words = width;
             assert!(relation_batch_fused_eligible(&wide), "width {width}");
             assert!(relation_batch_one_read_eligible(&wide), "width {width}");
+            assert!(relation_batch_prefers_one_read(&wide), "width {width}");
         }
         let column = wide.columns[0].clone();
         wide.columns = vec![column.clone(); RELATION_FUSED_ONE_READ_MAX_COLUMNS];
         assert!(relation_batch_fused_eligible(&wide));
         assert!(relation_batch_one_read_eligible(&wide));
+        assert!(relation_batch_prefers_one_read(&wide));
 
         wide.columns.push(column.clone());
         assert!(
@@ -2527,6 +2538,7 @@ mod tests {
             "a wide row must fit the 512-fraction shared tile"
         );
         assert!(!relation_batch_one_read_eligible(&wide));
+        assert!(!relation_batch_prefers_one_read(&wide));
         for relation_use in &mut wide.columns[0].uses {
             relation_use.tuple_words = RELATION_FUSED_NARROW_MAX_TUPLE_WORDS;
         }
@@ -2549,14 +2561,17 @@ mod tests {
         }
         assert!(relation_batch_fused_eligible(&wide));
         assert!(!relation_batch_one_read_eligible(&wide));
+        assert!(!relation_batch_prefers_one_read(&wide));
 
         // A pathological chain length also fails closed.
         let mut long = program.batches[0].clone();
         let column = long.columns[0].clone();
         long.columns = vec![column; RELATION_FUSED_MAX_COLUMNS + 1];
         assert!(!relation_batch_fused_eligible(&long));
+        assert!(!relation_batch_prefers_one_read(&long));
         long.columns.pop();
         assert!(relation_batch_fused_eligible(&long));
+        assert!(!relation_batch_prefers_one_read(&long));
     }
 
     #[test]

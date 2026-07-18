@@ -637,7 +637,7 @@ fn run_eager_capture_and_mutated_replay(
             .map(relation_batch_one_read_eligible)
             .collect::<Vec<_>>(),
         vec![true, true, true, true, false, false],
-        "one-read and 513-column fallback classification drifted"
+        "one-read admissibility and 513-column fallback classification drifted"
     );
     let scan_probe = (1..=512)
         .map(SecureField::from)
