@@ -27,6 +27,7 @@ use super::progressive_ntt_leaf_fusion::{
     ProgressiveNttLeafFusionMode, ProgressiveNttLeafFusionTelemetry,
 };
 
+mod base_commit_authority;
 mod composition_split;
 mod direct_compact_domain_binding;
 mod direct_compact_terminal_fused;
@@ -47,6 +48,17 @@ mod program_binding;
 mod program_oracle;
 mod shape_wide;
 
+pub use base_commit_authority::{
+    BaseCommitAbi, BaseCommitAbiAccess, BaseCommitAbiArgument, BaseCommitAbiArgumentKind,
+    BaseCommitAccess, BaseCommitAccessKind, BaseCommitAliasAuthority, BaseCommitAliasDiscipline,
+    BaseCommitAliasRequirement, BaseCommitAuthorityError, BaseCommitDependencyRange,
+    BaseCommitDependencyRole, BaseCommitEffect, BaseCommitInstalledAccess, BaseCommitInvocation,
+    BaseCommitInvocationArgument, BaseCommitInvocationValue, BaseCommitLayout,
+    BaseCommitLinkedAuthority, BaseCommitOperation, BaseCommitOperationKind,
+    BaseCommitPartitionAuthority, BaseCommitPointerBinding, BaseCommitPointerTarget,
+    BaseCommitProgramAuthority, BaseCommitRetainedEvaluation, BaseCommitRetainedLayer,
+    BaseCommitValueRole,
+};
 pub use composition_split::{
     CompositionSplitColumns, CompositionSplitError, CompositionSplitLaunchMode,
     CompositionSplitOracle, CompositionSplitPointerSlots, CompositionSplitProgram,
