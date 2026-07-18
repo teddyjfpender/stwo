@@ -366,6 +366,7 @@ pub fn quotient_numerator_prepacked_row_oracle(
 
 /// Domain-separated identity of every address-free staged-plan field consumed
 /// by the prepacked runtime.
+#[doc(hidden)]
 pub fn quotient_numerator_prepacked_plan_identity(
     plan: &QuotientNumeratorStagedSingleWritePlan,
 ) -> Result<[u8; 32], QuotientNumeratorPrepackedTermError> {

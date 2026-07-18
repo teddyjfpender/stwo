@@ -224,7 +224,7 @@ pub fn run() -> FixtureReceipt {
     }
 }
 
-fn required_forward_twiddle_words(
+pub(super) fn required_forward_twiddle_words(
     config: QuotientNumeratorWorkspaceConfig,
     requirements: &QuotientNumeratorWorkspaceRequirements,
 ) -> Vec<u32> {
@@ -317,7 +317,9 @@ pub fn benchmark(lifting_log_size: u32, warmups: usize, iterations: usize) -> Pe
     super::replacement_stage4_bench::benchmark_quotient(lifting_log_size, warmups, iterations)
 }
 
-fn topology(points: [CirclePoint<SecureField>; 4]) -> Vec<QuotientNumeratorColumnTopology> {
+pub(super) fn topology(
+    points: [CirclePoint<SecureField>; 4],
+) -> Vec<QuotientNumeratorColumnTopology> {
     let sample = |input_index, shape_point| QuotientOodsSample {
         input_index,
         shape_point,
@@ -495,7 +497,7 @@ pub(super) fn destinations(
         .collect()
 }
 
-fn source_set(seed: u32) -> [Vec<u32>; 4] {
+pub(super) fn source_set(seed: u32) -> [Vec<u32>; 4] {
     source_set_for_words(seed, [1 << 3, 1 << 5, 1 << 5, 1 << 3])
 }
 
@@ -511,7 +513,10 @@ pub(super) fn source_set_for_words(seed: u32, source_words: [usize; 4]) -> [Vec<
     })
 }
 
-fn evaluations(config: QuotientNumeratorWorkspaceConfig, sources: &[Vec<u32>; 4]) -> [Vec<u32>; 4] {
+pub(super) fn evaluations(
+    config: QuotientNumeratorWorkspaceConfig,
+    sources: &[Vec<u32>; 4],
+) -> [Vec<u32>; 4] {
     let full_twiddles = CpuBackend::precompute_twiddles(
         CanonicCoset::new(config.lifting_log_size)
             .circle_domain()
@@ -597,7 +602,7 @@ fn oracle_terms<'a>(
     ]
 }
 
-fn snapshot(
+pub(super) fn snapshot(
     arena: &DeviceArena,
     requirements: &QuotientNumeratorWorkspaceRequirements,
     destinations: &[QuotientNumeratorDestination],

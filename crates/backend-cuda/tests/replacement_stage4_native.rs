@@ -15,6 +15,8 @@ mod replacement_stage4_common;
 mod replacement_stage4_mode_a;
 #[path = "support/replacement_stage4_quotient.rs"]
 mod replacement_stage4_quotient;
+#[path = "support/replacement_stage4_quotient_prepacked.rs"]
+mod replacement_stage4_quotient_prepacked;
 
 #[test]
 #[cfg_attr(not(stwo_cuda_link), ignore = "requires a native CUDA-linked backend")]
@@ -29,6 +31,7 @@ fn replacement_stage4_native_bytes_match() {
         memory_before.set(stwo_backend_cuda::gpu_memory_info());
         let fixtures = vec![
             replacement_stage4_quotient::run(),
+            replacement_stage4_quotient_prepacked::run(),
             replacement_stage4_mode_a::run(),
         ];
         let performance_requested = std::env::var_os("STWO_STAGE4_NATIVE_PERF").is_some();
@@ -87,9 +90,12 @@ fn run_performance() -> Vec<replacement_stage4_common::PerformanceReceipt> {
     assert!(logs.iter().all(|log| (4..=20).contains(log)));
     let warmups = env_usize("STWO_STAGE4_NATIVE_PERF_WARMUPS", 5, 1);
     let iterations = env_usize("STWO_STAGE4_NATIVE_PERF_ITERATIONS", 30, 2);
-    let mut output = Vec::with_capacity(2 * logs.len());
+    let mut output = Vec::with_capacity(3 * logs.len());
     for log in logs {
         output.push(replacement_stage4_quotient::benchmark(
+            log, warmups, iterations,
+        ));
+        output.push(replacement_stage4_quotient_prepacked::benchmark(
             log, warmups, iterations,
         ));
         output.push(replacement_stage4_bench::benchmark_mode_a(

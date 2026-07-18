@@ -203,3 +203,31 @@ impl PreparedQuotientNumeratorGraph<'_> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn prepacked_schedule_reuses_term_points_only_after_finalize() {
+        let source = include_str!("launch.rs");
+        let finalized = source
+            .find("check_cuda(\"prepared_quotient_numerator_groups\", code)")
+            .unwrap();
+        let branch_start = source
+            .find("PreparedNumeratorSchedule::StagedPrepackedSingleWrite")
+            .unwrap();
+        let branch_end = source[branch_start..]
+            .find("PreparedNumeratorSchedule::LegacyBatches")
+            .map(|offset| branch_start + offset)
+            .unwrap();
+        let branch = &source[branch_start..branch_end];
+        let prepare = branch.find("self.prepare_prepacked_terms(stream)").unwrap();
+        let lde = branch.find("self.launch_all_staged_ldes(stream)").unwrap();
+        let hot = branch
+            .find("self.launch_prepacked_single_write(packed_output_rows, stream)")
+            .unwrap();
+
+        assert!(finalized < branch_start);
+        assert!(prepare < lde);
+        assert!(lde < hot);
+    }
+}

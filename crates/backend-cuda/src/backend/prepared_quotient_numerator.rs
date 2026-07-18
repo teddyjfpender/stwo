@@ -13,6 +13,7 @@
 mod bindings;
 mod launch;
 mod plan;
+mod prepacked;
 mod single_write;
 
 use core::ffi::c_void;
@@ -310,6 +311,7 @@ pub enum PreparedNumeratorSchedule {
     StagedPackedSingleWrite {
         packed_output_rows: u64,
     },
+    #[doc(hidden)]
     StagedPrepackedSingleWrite {
         packed_output_rows: u64,
     },
@@ -320,6 +322,7 @@ pub enum PreparedNumeratorSchedule {
 }
 
 /// Setup receipt for the dormant prepacked quotient schedule.
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PreparedPrepackedQuotientNumeratorReceipt {
     pub plan_identity: [u8; 32],
@@ -731,6 +734,7 @@ impl<'a> PreparedQuotientNumeratorGraph<'a> {
 
     /// Exact staged-plan identity and dead-extent binding, if the test-only
     /// prepacked schedule was selected.
+    #[doc(hidden)]
     pub fn prepacked_receipt(&self) -> Option<PreparedPrepackedQuotientNumeratorReceipt> {
         self.prepacked.map(|binding| binding.receipt)
     }
