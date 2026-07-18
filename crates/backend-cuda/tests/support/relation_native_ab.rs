@@ -6,6 +6,13 @@ use serde::Serialize;
 
 use super::*;
 
+// Last qualified adaptive sm_90/H100 function envelope. CUDA resource
+// allocation is architecture-specific; other SMs must first report facts.
+const QUALIFIED_RESOURCE_SM: u32 = 90;
+const QUALIFIED_MAX_REGISTERS_PER_THREAD: u32 = 82;
+const QUALIFIED_MAX_LOCAL_BYTES: u64 = 32;
+const QUALIFIED_MAX_STATIC_SHARED_BYTES: u64 = 4;
+
 pub fn run(
     arena: &DeviceArena,
     prepared: &PreparedRelationGraph<'_>,
@@ -135,6 +142,17 @@ pub fn run(
         RelationFusedTestStrategy::AllOneReadBaseline,
     )
     .unwrap();
+    let zero_denominator_batch = &program.batches[ZERO_DENOMINATOR_DIFFERENTIAL_BATCH];
+    let zero_denominator_max_tuple_words = max_tuple_words(zero_denominator_batch);
+    let zero_denominator_selector_differential =
+        relation_batch_fused_eligible(zero_denominator_batch)
+            && zero_denominator_batch.columns.len() <= 512
+            && zero_denominator_max_tuple_words <= 32;
+    assert!(
+        zero_denominator_selector_differential,
+        "zero-denominator fixture must take one-read in the baseline and \
+         suffix/recompute in the adaptive selector"
+    );
     let adaptive_zero_denominator_fail_closed = zero_denominator_is_fail_closed(false);
     let baseline_zero_denominator_fail_closed = zero_denominator_is_fail_closed(true);
     let invalid_input_guards = raw_guards_reject_invalid_inputs();
@@ -150,9 +168,26 @@ pub fn run(
                 && resources.ptx_version <= resources.binary_version
                 && target_sms.contains(&resources.binary_version)
         });
-    let adaptive_resource_gate = adaptive_resources.registers_per_thread <= 82
-        && adaptive_resources.local_bytes <= 32
-        && adaptive_resources.static_shared_bytes <= 4;
+    let adaptive_within_qualified_envelope = adaptive_resources.registers_per_thread
+        <= QUALIFIED_MAX_REGISTERS_PER_THREAD
+        && adaptive_resources.local_bytes <= QUALIFIED_MAX_LOCAL_BYTES
+        && adaptive_resources.static_shared_bytes <= QUALIFIED_MAX_STATIC_SHARED_BYTES;
+    let adaptive_resource_ceiling_enforced =
+        adaptive_resources.binary_version == QUALIFIED_RESOURCE_SM;
+    let adaptive_resource_gate =
+        !adaptive_resource_ceiling_enforced || adaptive_within_qualified_envelope;
+    let adaptive_resource_policy = match adaptive_resources.binary_version {
+        QUALIFIED_RESOURCE_SM => "qualified_sm_90_envelope",
+        86 => "first_characterization_report_only",
+        _ => "unqualified_architecture_report_only",
+    };
+    let adaptive_resource_limits = adaptive_resource_ceiling_enforced.then(|| {
+        serde_json::json!({
+            "registers_per_thread": QUALIFIED_MAX_REGISTERS_PER_THREAD,
+            "local_bytes": QUALIFIED_MAX_LOCAL_BYTES,
+            "static_shared_bytes": QUALIFIED_MAX_STATIC_SHARED_BYTES,
+        })
+    });
     let git_commit = std::env::var("STWO_PARITY_REF_STWO_HEAD")
         .expect("STWO_PARITY_REF_STWO_HEAD must seal the tested source");
     assert!(
@@ -171,23 +206,25 @@ pub fn run(
         "adaptive_captured_mutation_bytes": true,
         "baseline_captured_mutation_bytes": true,
         "compact_mode_guard": true,
+        "zero_denominator_selector_differential": zero_denominator_selector_differential,
         "adaptive_zero_denominator_fail_closed": adaptive_zero_denominator_fail_closed,
         "baseline_zero_denominator_fail_closed": baseline_zero_denominator_fail_closed,
         "invalid_input_guards": invalid_input_guards,
         "loaded_resource_abi": resource_abi_valid,
-        "adaptive_resource_gate": adaptive_resource_gate,
+        "adaptive_resource_policy_admitted": adaptive_resource_gate,
         "eager_positive_median_speedup": eager.candidate_speedup > 1.0,
         "captured_positive_median_speedup": captured.candidate_speedup > 1.0,
     });
     let passed = resource_abi_valid
         && adaptive_resource_gate
+        && zero_denominator_selector_differential
         && adaptive_zero_denominator_fail_closed
         && baseline_zero_denominator_fail_closed
         && invalid_input_guards
         && eager.candidate_speedup > 1.0
         && captured.candidate_speedup > 1.0;
     let receipt = serde_json::json!({
-        "schema": "stwo.prepared-relation.same-binary-ab.v1",
+        "schema": "stwo.prepared-relation.same-binary-ab.v2",
         "passed": passed,
         "git_commit": git_commit,
         "fixture": "prepared_relation_native.cairo_program",
@@ -197,6 +234,19 @@ pub fn run(
         "selector_fixture": {
             "adaptive_lane_change_batches": adaptive_lane_changes,
             "shared_one_read_batches": shared_one_read_lane,
+        },
+        "zero_denominator_fixture": {
+            "batch_index": ZERO_DENOMINATOR_DIFFERENTIAL_BATCH,
+            "instance_index": ZERO_DENOMINATOR_DIFFERENTIAL_INSTANCE,
+            "column_index": ZERO_DENOMINATOR_DIFFERENTIAL_COLUMN,
+            "source_index": ZERO_DENOMINATOR_DIFFERENTIAL_SOURCE,
+            "columns": zero_denominator_batch.columns.len(),
+            "max_tuple_words": zero_denominator_max_tuple_words,
+            "poisoned_use_tuple_words": zero_denominator_batch.columns
+                [ZERO_DENOMINATOR_DIFFERENTIAL_COLUMN].uses[0].tuple_words,
+            "tuple_class": "at_most_32_words",
+            "baseline_lane": "one_read",
+            "adaptive_lane": "suffix_recompute",
         },
         "ordering": "alternating_baseline_candidate_then_candidate_baseline",
         "percentiles": "sorted_linear_index",
@@ -214,6 +264,14 @@ pub fn run(
         "loaded_functions": {
             "adaptive_relation_fused_kernel": resource_json(adaptive_resources),
             "all_one_read_test_kernel": resource_json(baseline_resources),
+        },
+        "adaptive_resource_policy": {
+            "mode": adaptive_resource_policy,
+            "binary_version": adaptive_resources.binary_version,
+            "ceiling_enforced": adaptive_resource_ceiling_enforced,
+            "limits": adaptive_resource_limits,
+            "within_qualified_envelope": adaptive_resource_ceiling_enforced
+                .then_some(adaptive_within_qualified_envelope),
         },
         "eager": eager,
         "captured": captured,

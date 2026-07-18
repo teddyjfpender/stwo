@@ -29,6 +29,10 @@ const SECURE_WORDS: usize = 4;
 const LARGE_MEMORY_VALUE_ID_BASE: u32 = 0x4000_0000;
 const WIDE_TUPLE_WORDS: u32 = 33;
 const NARROW_FALLBACK_COLUMNS: usize = 513;
+const ZERO_DENOMINATOR_DIFFERENTIAL_BATCH: usize = 0;
+const ZERO_DENOMINATOR_DIFFERENTIAL_INSTANCE: usize = 0;
+const ZERO_DENOMINATOR_DIFFERENTIAL_COLUMN: usize = 0;
+const ZERO_DENOMINATOR_DIFFERENTIAL_SOURCE: usize = 0;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct InstanceSnapshot {
@@ -930,17 +934,30 @@ fn run_eager_capture_and_mutated_replay(
 
     if poison_zero_denominator {
         assert_eq!(mode, RelationLaunchMode::Fused);
-        // Force the one-read wide instance's first denominator to zero, then
-        // replay the captured graph. The device trap must surface as a stream
-        // error; silently returning a zero inverse would leave stale committed
-        // output and violate the fail-closed LogUp contract.
-        let wide_batch = &program.batches[3];
-        let wide_use = wide_batch.columns[0].uses[0];
-        let wide_sources = &second_sources[4];
+        // Force a selector-changing narrow batch's first denominator to zero.
+        // The historical baseline must trap in one-read while the adaptive
+        // candidate must trap in suffix/recompute on the identical fixture.
+        let batch = &program.batches[ZERO_DENOMINATOR_DIFFERENTIAL_BATCH];
+        let relation_use = batch.columns[ZERO_DENOMINATOR_DIFFERENTIAL_COLUMN].uses[0];
+        let RelationRowExtent::Exact {
+            padded_rows,
+            source_offset_rows,
+            ..
+        } = batch.instances[ZERO_DENOMINATOR_DIFFERENTIAL_INSTANCE]
+        else {
+            panic!("zero-denominator differential requires an exact row extent")
+        };
+        let sources = &second_sources[ZERO_DENOMINATOR_DIFFERENTIAL_SOURCE];
         let mut zero_z = SecureField::zero();
-        for word in 0..wide_use.tuple_words {
-            zero_z += SecureField::from(tuple_word(wide_sources, 16, 0, 0, wide_use, word))
-                * second_alphas[word as usize];
+        for word in 0..relation_use.tuple_words {
+            zero_z += SecureField::from(tuple_word(
+                sources,
+                padded_rows,
+                0,
+                source_offset_rows,
+                relation_use,
+                word,
+            )) * second_alphas[word as usize];
         }
         prepared
             .upload_challenges_at_transcript_boundary(RelationChallenges {
@@ -951,7 +968,7 @@ fn run_eager_capture_and_mutated_replay(
         graph.launch(arena.context()).unwrap();
         assert!(
             arena.context().sync().is_err(),
-            "a zero wide-lane denominator must poison the captured launch"
+            "a zero denominator must poison the selected relation lane"
         );
         // CUDA documents an illegal-instruction trap as context-fatal. This
         // oracle already runs in an isolated child process; exit successfully
