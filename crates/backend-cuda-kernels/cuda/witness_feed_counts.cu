@@ -27,6 +27,24 @@
 #define WFC_MAX_WORDS 5u
 #define WFC_NO_LUT 0xFFFFFFFFu
 
+// Collapse identical counter destinations within a warp before touching
+// global memory. Every participating lane contributes exactly +1; replacing
+// N atomicAdd(+1) operations with one atomicAdd(+N) preserves the exact
+// wrapping-u32 sum. The fallback keeps pre-Volta builds semantically intact.
+static __device__ __forceinline__ void wfc_atomic_increment(uint32_t *counter) {
+#if __CUDA_ARCH__ >= 700
+    const uint32_t active = __activemask();
+    const uint32_t peers = __match_any_sync(
+        active, reinterpret_cast<unsigned long long>(counter));
+    const uint32_t leader = (uint32_t)(__ffs(peers) - 1);
+    if ((threadIdx.x & 31u) == leader) {
+        atomicAdd(counter, (uint32_t)__popc(peers));
+    }
+#else
+    atomicAdd(counter, 1u);
+#endif
+}
+
 __global__ void witness_feed_counts_kernel(
     const uint32_t *sub_words,
     uint32_t column_length,
@@ -62,12 +80,14 @@ __global__ void witness_feed_counts_kernel(
             uint32_t val = v & 0x3FFFFFFFu;
             if (tag == 1u) {
                 if (val < table_size) {
-                    atomicAdd(&counts[e[10]][(size_t)rel_index * table_size + val], 1u);
+                    wfc_atomic_increment(
+                        &counts[e[10]][(size_t)rel_index * table_size + val]);
                 }
             } else if (tag == 0u) {
                 uint32_t small_size = e[12];
                 if (val < small_size) {
-                    atomicAdd(&counts[e[13]][(size_t)rel_index * small_size + val], 1u);
+                    wfc_atomic_increment(
+                        &counts[e[13]][(size_t)rel_index * small_size + val]);
                 }
             }
             continue;
@@ -89,7 +109,8 @@ __global__ void witness_feed_counts_kernel(
             uint32_t key = (a << bits) | b;
             uint32_t idx = luts[lut_index][key];
             if (idx < table_size) {
-                atomicAdd(&counts[e[10]][(size_t)rel_index * table_size + idx], 1u);
+                wfc_atomic_increment(
+                    &counts[e[10]][(size_t)rel_index * table_size + idx]);
             }
             continue;
         }
@@ -113,7 +134,8 @@ __global__ void witness_feed_counts_kernel(
             // skip (never spill into a neighboring column) exactly like every
             // other arm's `idx < table_size` check.
             if (table_row < table_size) {
-                atomicAdd(&counts[e[10]][(size_t)column * table_size + table_row], 1u);
+                wfc_atomic_increment(
+                    &counts[e[10]][(size_t)column * table_size + table_row]);
             }
             continue;
         }
@@ -136,7 +158,8 @@ __global__ void witness_feed_counts_kernel(
         uint32_t k = (uint32_t)keyed;
         uint32_t idx = (lut_index == WFC_NO_LUT) ? k : luts[lut_index][k];
         if (idx < table_size) {
-            atomicAdd(&counts[e[10]][(size_t)rel_index * table_size + idx], 1u);
+            wfc_atomic_increment(
+                &counts[e[10]][(size_t)rel_index * table_size + idx]);
         }
     }
 }
