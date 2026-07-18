@@ -16,6 +16,9 @@ use super::exec_context::{
     check_cuda, ArenaError, ArenaSlice, ArenaSlotId, CudaRuntimeError, DeviceArena,
 };
 
+mod authority;
+pub use authority::*;
+
 const WORD_BYTES: usize = core::mem::size_of::<u32>();
 const POINTER_WORDS: usize = core::mem::size_of::<*const u32>().div_ceil(WORD_BYTES);
 const DESCRIPTOR_WORDS: usize = 16;
@@ -814,6 +817,69 @@ fn scan_descriptor_words(total_row_blocks: usize) -> Result<usize, RelationGraph
         .ok_or(RelationGraphError::SizeOverflow)
 }
 
+fn relation_instance_geometry(
+    pair_first: u32,
+    inverse_first: u32,
+    row_first: u32,
+    rows: u32,
+    columns: u32,
+    n_real_rows: u32,
+    source_offset_rows: u32,
+) -> Result<([u32; INSTANCE_GEOMETRY_WORDS], u32, u32, u32), RelationGraphError> {
+    let values = rows
+        .checked_mul(columns)
+        .ok_or(RelationGraphError::SizeOverflow)?;
+    let inverse_blocks = if rows as usize >= FRACTION_INVERSE_BLOCK_VALUES {
+        values / FRACTION_INVERSE_BLOCK_VALUES as u32
+    } else {
+        values.div_ceil(FRACTION_INVERSE_BLOCK_VALUES as u32)
+    };
+    let row_blocks = rows.div_ceil(REDUCTION_BLOCK as u32);
+    let pair_blocks = row_blocks
+        .checked_mul(columns)
+        .ok_or(RelationGraphError::SizeOverflow)?;
+    let geometry = [
+        pair_first,
+        pair_blocks,
+        inverse_first,
+        inverse_blocks,
+        row_first,
+        row_blocks,
+        rows,
+        columns,
+        n_real_rows,
+        source_offset_rows,
+        M31::from_u32_unchecked(rows).inverse().0,
+    ];
+    Ok((
+        geometry,
+        pair_first
+            .checked_add(pair_blocks)
+            .ok_or(RelationGraphError::SizeOverflow)?,
+        inverse_first
+            .checked_add(inverse_blocks)
+            .ok_or(RelationGraphError::SizeOverflow)?,
+        row_first
+            .checked_add(row_blocks)
+            .ok_or(RelationGraphError::SizeOverflow)?,
+    ))
+}
+
+fn relation_source_word_extents(
+    layout: RelationSourceLayout,
+    rows: u32,
+) -> Result<Vec<usize>, RelationGraphError> {
+    let rows = usize::try_from(rows).map_err(|_| RelationGraphError::SizeOverflow)?;
+    let pointers = layout.pointer_count()?;
+    match layout {
+        RelationSourceLayout::LookupWords { words } => Ok(vec![usize::try_from(words)
+            .map_err(|_| RelationGraphError::SizeOverflow)?
+            .checked_mul(rows)
+            .ok_or(RelationGraphError::SizeOverflow)?]),
+        _ => Ok(vec![rows; pointers]),
+    }
+}
+
 fn validate_extent(
     layout: RelationSourceLayout,
     extent: RelationRowExtent,
@@ -1389,43 +1455,19 @@ impl<'a> PreparedRelationGraph<'a> {
             let mut inverse_first = 0u32;
             let mut row_first = 0u32;
             for instance in &prepared {
-                let rows = instance.output.rows;
-                let columns = instance.output.columns;
-                let values = rows
-                    .checked_mul(columns)
-                    .ok_or(RelationGraphError::SizeOverflow)?;
-                let inverse_blocks = if rows as usize >= FRACTION_INVERSE_BLOCK_VALUES {
-                    values / FRACTION_INVERSE_BLOCK_VALUES as u32
-                } else {
-                    values.div_ceil(FRACTION_INVERSE_BLOCK_VALUES as u32)
-                };
-                let row_blocks = rows.div_ceil(REDUCTION_BLOCK as u32);
-                let pair_count = row_blocks
-                    .checked_mul(columns)
-                    .ok_or(RelationGraphError::SizeOverflow)?;
-                let inverse_rows = M31::from_u32_unchecked(rows).inverse().0;
-                geometry.extend([
+                let (record, next_pair, next_inverse, next_row) = relation_instance_geometry(
                     pair_first,
-                    pair_count,
                     inverse_first,
-                    inverse_blocks,
                     row_first,
-                    row_blocks,
-                    rows,
-                    columns,
+                    instance.output.rows,
+                    instance.output.columns,
                     instance.n_real_rows,
                     instance.source_offset_rows,
-                    inverse_rows,
-                ]);
-                pair_first = pair_first
-                    .checked_add(pair_count)
-                    .ok_or(RelationGraphError::SizeOverflow)?;
-                inverse_first = inverse_first
-                    .checked_add(inverse_blocks)
-                    .ok_or(RelationGraphError::SizeOverflow)?;
-                row_first = row_first
-                    .checked_add(row_blocks)
-                    .ok_or(RelationGraphError::SizeOverflow)?;
+                )?;
+                geometry.extend(record);
+                pair_first = next_pair;
+                inverse_first = next_inverse;
+                row_first = next_row;
             }
             if pair_first != requirements.pair_blocks
                 || inverse_first != requirements.fraction_inverse_blocks
@@ -1874,37 +1916,22 @@ fn validate_sources(
     rows: u32,
     context_token: core::ptr::NonNull<c_void>,
 ) -> Result<(), RelationGraphError> {
-    let rows = usize::try_from(rows).map_err(|_| RelationGraphError::SizeOverflow)?;
     for source in &sources.columns {
         if source.context_token() != context_token {
             return Err(RelationGraphError::ContextMismatch(source.id()));
         }
     }
-    match layout {
-        RelationSourceLayout::LookupWords { words } => {
-            let required_words = usize::try_from(words)
-                .map_err(|_| RelationGraphError::SizeOverflow)?
-                .checked_mul(rows)
-                .ok_or(RelationGraphError::SizeOverflow)?;
-            let source = sources.columns[0];
-            if source.len_words() < required_words {
-                return Err(RelationGraphError::SourceTooSmall {
-                    slot: source.id(),
-                    required_words,
-                    actual_words: source.len_words(),
-                });
-            }
-        }
-        _ => {
-            for source in &sources.columns {
-                if source.len_words() < rows {
-                    return Err(RelationGraphError::SourceTooSmall {
-                        slot: source.id(),
-                        required_words: rows,
-                        actual_words: source.len_words(),
-                    });
-                }
-            }
+    for (source, required_words) in sources
+        .columns
+        .iter()
+        .zip(relation_source_word_extents(layout, rows)?)
+    {
+        if source.len_words() < required_words {
+            return Err(RelationGraphError::SourceTooSmall {
+                slot: source.id(),
+                required_words,
+                actual_words: source.len_words(),
+            });
         }
     }
     Ok(())
