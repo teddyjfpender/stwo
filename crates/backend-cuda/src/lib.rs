@@ -225,10 +225,11 @@ pub use backend::prepared_quotient::{
 };
 pub use backend::prepared_quotient_numerator::{
     quotient_numerator_workspace_requirements, PreparedNumeratorSchedule,
-    PreparedQuotientNumeratorError, PreparedQuotientNumeratorGraph,
-    QuotientNumeratorArenaSlotRequirement, QuotientNumeratorBatchRequirements,
-    QuotientNumeratorColumn, QuotientNumeratorColumnSource, QuotientNumeratorColumnTopology,
-    QuotientNumeratorDestination, QuotientNumeratorGroupRequirements, QuotientNumeratorSourceKind,
+    PreparedPrepackedQuotientNumeratorReceipt, PreparedQuotientNumeratorError,
+    PreparedQuotientNumeratorGraph, QuotientNumeratorArenaSlotRequirement,
+    QuotientNumeratorBatchRequirements, QuotientNumeratorColumn, QuotientNumeratorColumnSource,
+    QuotientNumeratorColumnTopology, QuotientNumeratorDestination,
+    QuotientNumeratorGroupRequirements, QuotientNumeratorSourceKind,
     QuotientNumeratorWorkspaceConfig, QuotientNumeratorWorkspaceRequirements,
     QuotientNumeratorWorkspaceSlots, QuotientOodsSample,
     QUOTIENT_NUMERATOR_POINTER_ALIGNMENT_WORDS,
@@ -322,12 +323,13 @@ pub use backend::proof_assembly::{
     Blake2sProofAssemblyInput, Blake2sProofAssemblyShape, Blake2sTraceAssemblyShape,
 };
 pub use backend::quotient_numerator_prepacked_terms::{
-    quotient_numerator_prepacked_row_oracle, quotient_numerator_prepacked_term_layout,
-    quotient_numerator_prepacked_term_oracle, QuotientNumeratorLineCoefficientsWords,
-    QuotientNumeratorPrepackedStatusCode, QuotientNumeratorPrepackedTerm,
-    QuotientNumeratorPrepackedTermError, QuotientNumeratorPrepackedTermLayout,
-    QuotientNumeratorPrepackedTermOracle, QUOTIENT_NUMERATOR_PREPACKED_GROUP_WORDS,
-    QUOTIENT_NUMERATOR_PREPACKED_STATUS_WORDS, QUOTIENT_NUMERATOR_PREPACKED_TERM_WORDS,
+    quotient_numerator_prepacked_plan_identity, quotient_numerator_prepacked_row_oracle,
+    quotient_numerator_prepacked_term_layout, quotient_numerator_prepacked_term_oracle,
+    QuotientNumeratorLineCoefficientsWords, QuotientNumeratorPrepackedStatusCode,
+    QuotientNumeratorPrepackedTerm, QuotientNumeratorPrepackedTermError,
+    QuotientNumeratorPrepackedTermLayout, QuotientNumeratorPrepackedTermOracle,
+    QUOTIENT_NUMERATOR_PREPACKED_GROUP_WORDS, QUOTIENT_NUMERATOR_PREPACKED_STATUS_WORDS,
+    QUOTIENT_NUMERATOR_PREPACKED_TERM_WORDS,
 };
 pub use backend::quotient_numerator_single_write::{
     quotient_numerator_hybrid_plan, quotient_numerator_single_write_plan,

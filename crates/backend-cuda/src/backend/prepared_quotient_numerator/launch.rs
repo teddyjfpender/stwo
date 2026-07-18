@@ -73,6 +73,15 @@ impl PreparedQuotientNumeratorGraph<'_> {
                 self.launch_packed_single_write(packed_output_rows, stream)?;
                 return Ok(());
             }
+            PreparedNumeratorSchedule::StagedPrepackedSingleWrite { packed_output_rows } => {
+                // `groups` is the last term_points reader. Repack that exact
+                // owner immediately, then materialize staged sources before
+                // the validated hot consumer.
+                self.prepare_prepacked_terms(stream)?;
+                self.launch_all_staged_ldes(stream)?;
+                self.launch_prepacked_single_write(packed_output_rows, stream)?;
+                return Ok(());
+            }
             PreparedNumeratorSchedule::LegacyBatches => {}
         }
         if matches!(self.schedule, PreparedNumeratorSchedule::LegacyBatches) {

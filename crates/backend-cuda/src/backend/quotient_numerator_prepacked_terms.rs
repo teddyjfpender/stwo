@@ -211,7 +211,7 @@ pub fn quotient_numerator_prepacked_term_oracle(
     coefficients: &[QuotientNumeratorLineCoefficientsWords],
 ) -> Result<QuotientNumeratorPrepackedTermOracle, QuotientNumeratorPrepackedTermError> {
     let layout = quotient_numerator_prepacked_term_layout(plan)?;
-    let plan_identity = prepacked_plan_identity(plan)?;
+    let plan_identity = quotient_numerator_prepacked_plan_identity(plan)?;
     if coefficients.len() != layout.term_count {
         return Err(
             QuotientNumeratorPrepackedTermError::LineCoefficientCountMismatch {
@@ -310,7 +310,7 @@ pub fn quotient_numerator_prepacked_row_oracle(
             "packed layout differs from the staged plan",
         ));
     }
-    if packed.plan_identity != prepacked_plan_identity(plan)? {
+    if packed.plan_identity != quotient_numerator_prepacked_plan_identity(plan)? {
         return Err(QuotientNumeratorPrepackedTermError::DescriptorInvariant(
             "packed plan identity differs from the staged plan",
         ));
@@ -364,7 +364,9 @@ pub fn quotient_numerator_prepacked_row_oracle(
     Ok(numerator)
 }
 
-fn prepacked_plan_identity(
+/// Domain-separated identity of every address-free staged-plan field consumed
+/// by the prepacked runtime.
+pub fn quotient_numerator_prepacked_plan_identity(
     plan: &QuotientNumeratorStagedSingleWritePlan,
 ) -> Result<[u8; 32], QuotientNumeratorPrepackedTermError> {
     let mut identity = blake3::Hasher::new();

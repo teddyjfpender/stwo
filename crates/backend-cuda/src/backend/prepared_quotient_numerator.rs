@@ -27,6 +27,7 @@ use super::exec_context::{
     check_cuda, ArenaError, ArenaSlice, ArenaSlotId, CudaRuntimeError, DeviceArena,
 };
 use super::prepared_quotient::{QuotientNumeratorSource, QuotientSampleConstants};
+use super::quotient_numerator_prepacked_terms::QuotientNumeratorPrepackedTermError;
 
 const WORD_BYTES: usize = core::mem::size_of::<u32>();
 const SECURE_WORDS: usize = 4;
@@ -250,6 +251,9 @@ pub enum PreparedQuotientNumeratorError {
         required_words: usize,
         actual_words: usize,
     },
+    PrepackedLayout(QuotientNumeratorPrepackedTermError),
+    PrepackedScheduleInvariant(&'static str),
+    PrepackedDeviceStatus(u32),
     SizeOverflow,
     Arena(ArenaError),
     Cuda(CudaRuntimeError),
@@ -278,6 +282,12 @@ impl From<CudaRuntimeError> for PreparedQuotientNumeratorError {
     }
 }
 
+impl From<QuotientNumeratorPrepackedTermError> for PreparedQuotientNumeratorError {
+    fn from(value: QuotientNumeratorPrepackedTermError) -> Self {
+        Self::PrepackedLayout(value)
+    }
+}
+
 pub(super) use plan::build_plan;
 pub use plan::quotient_numerator_workspace_requirements;
 #[cfg(test)]
@@ -300,10 +310,22 @@ pub enum PreparedNumeratorSchedule {
     StagedPackedSingleWrite {
         packed_output_rows: u64,
     },
+    StagedPrepackedSingleWrite {
+        packed_output_rows: u64,
+    },
     HybridCandidate {
         eligible_groups: usize,
         legacy_groups: usize,
     },
+}
+
+/// Setup receipt for the dormant prepacked quotient schedule.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PreparedPrepackedQuotientNumeratorReceipt {
+    pub plan_identity: [u8; 32],
+    pub source_count: u32,
+    pub used_words: u64,
+    pub status_offset_words: usize,
 }
 
 use self::bindings::{
@@ -339,6 +361,12 @@ pub struct PreparedQuotientNumeratorGraph<'a> {
     lde_tile: Option<ArenaSlice>,
     batches: Vec<PreparedBatch>,
     schedule: PreparedNumeratorSchedule,
+    prepacked: Option<PreparedPrepackedBinding>,
+}
+
+#[derive(Clone, Copy)]
+struct PreparedPrepackedBinding {
+    receipt: PreparedPrepackedQuotientNumeratorReceipt,
 }
 
 impl<'a> PreparedQuotientNumeratorGraph<'a> {
@@ -684,6 +712,7 @@ impl<'a> PreparedQuotientNumeratorGraph<'a> {
             lde_tile,
             batches: prepared_batches,
             schedule: PreparedNumeratorSchedule::LegacyBatches,
+            prepacked: None,
         })
     }
 
@@ -698,6 +727,12 @@ impl<'a> PreparedQuotientNumeratorGraph<'a> {
     /// Actual schedule selected by the constructor; launch cannot change it.
     pub fn schedule(&self) -> PreparedNumeratorSchedule {
         self.schedule
+    }
+
+    /// Exact staged-plan identity and dead-extent binding, if the test-only
+    /// prepacked schedule was selected.
+    pub fn prepacked_receipt(&self) -> Option<PreparedPrepackedQuotientNumeratorReceipt> {
+        self.prepacked.map(|binding| binding.receipt)
     }
 
     /// Setup-only adapter for [`super::prepared_quotient::PreparedQuotientGraph::prepare`].
