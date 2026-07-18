@@ -292,19 +292,159 @@ where
         launch().unwrap();
         samples.push(events.finish_ms(context) as f64);
     }
+    timing_stats(warmups, samples)
+}
+
+/// Paired CUDA-event timings in alternating `AB, BA` order.
+///
+/// `*_check` runs only after the stop event has completed, so status fences
+/// attest every replay without being reported as kernel time.
+#[cfg(stwo_cuda_link)]
+#[allow(clippy::too_many_arguments)]
+pub fn cuda_event_abba_timings<FA, EA, FB, EB, CA, CB>(
+    baseline_context: &CudaExecContext,
+    candidate_context: &CudaExecContext,
+    warmups: usize,
+    iterations: usize,
+    mut baseline_launch: FA,
+    mut candidate_launch: FB,
+    mut baseline_check: CA,
+    mut candidate_check: CB,
+) -> (TimingStats, TimingStats)
+where
+    FA: FnMut() -> Result<(), EA>,
+    EA: core::fmt::Debug,
+    FB: FnMut() -> Result<(), EB>,
+    EB: core::fmt::Debug,
+    CA: FnMut(),
+    CB: FnMut(),
+{
+    assert!(iterations >= 2);
+    for iteration in 0..warmups {
+        if paired_baseline_first(iteration) {
+            checked_launch(&mut baseline_launch, &mut baseline_check);
+            checked_launch(&mut candidate_launch, &mut candidate_check);
+        } else {
+            checked_launch(&mut candidate_launch, &mut candidate_check);
+            checked_launch(&mut baseline_launch, &mut baseline_check);
+        }
+    }
+
+    let baseline_events = CudaEvents::new();
+    let candidate_events = CudaEvents::new();
+    let mut baseline_samples = Vec::with_capacity(iterations);
+    let mut candidate_samples = Vec::with_capacity(iterations);
+    for iteration in 0..iterations {
+        if paired_baseline_first(iteration) {
+            baseline_samples.push(checked_sample(
+                baseline_context,
+                &baseline_events,
+                &mut baseline_launch,
+                &mut baseline_check,
+            ));
+            candidate_samples.push(checked_sample(
+                candidate_context,
+                &candidate_events,
+                &mut candidate_launch,
+                &mut candidate_check,
+            ));
+        } else {
+            candidate_samples.push(checked_sample(
+                candidate_context,
+                &candidate_events,
+                &mut candidate_launch,
+                &mut candidate_check,
+            ));
+            baseline_samples.push(checked_sample(
+                baseline_context,
+                &baseline_events,
+                &mut baseline_launch,
+                &mut baseline_check,
+            ));
+        }
+    }
+    (
+        timing_stats(warmups, baseline_samples),
+        timing_stats(warmups, candidate_samples),
+    )
+}
+
+#[cfg(stwo_cuda_link)]
+fn checked_launch<F, E, C>(launch: &mut F, check: &mut C)
+where
+    F: FnMut() -> Result<(), E>,
+    E: core::fmt::Debug,
+    C: FnMut(),
+{
+    launch().unwrap();
+    check();
+}
+
+#[cfg(stwo_cuda_link)]
+fn checked_sample<F, E, C>(
+    context: &CudaExecContext,
+    events: &CudaEvents,
+    launch: &mut F,
+    check: &mut C,
+) -> f64
+where
+    F: FnMut() -> Result<(), E>,
+    E: core::fmt::Debug,
+    C: FnMut(),
+{
+    events.record_start(context);
+    launch().unwrap();
+    let elapsed = events.finish_ms(context) as f64;
+    check();
+    elapsed
+}
+
+#[cfg(stwo_cuda_link)]
+fn timing_stats(warmups: usize, mut samples: Vec<f64>) -> TimingStats {
     samples.sort_by(f64::total_cmp);
     TimingStats {
         warmups,
-        iterations,
+        iterations: samples.len(),
         median_ms: percentile(&samples, 50),
         p10_ms: percentile(&samples, 10),
         p90_ms: percentile(&samples, 90),
     }
 }
 
+const fn paired_baseline_first(iteration: usize) -> bool {
+    iteration % 2 == 0
+}
+
 #[cfg(stwo_cuda_link)]
 fn percentile(samples: &[f64], percentile: usize) -> f64 {
     samples[(samples.len() - 1) * percentile / 100]
+}
+
+#[cfg(test)]
+mod timing_contract_tests {
+    use super::paired_baseline_first;
+
+    #[test]
+    fn paired_order_is_ab_ba() {
+        assert_eq!(
+            (0..6).map(paired_baseline_first).collect::<Vec<_>>(),
+            [true, false, true, false, true, false]
+        );
+    }
+
+    #[test]
+    fn checked_sample_observes_status_after_event_timing() {
+        let source = include_str!("replacement_stage4_common.rs");
+        let begin = source.find("fn checked_sample").unwrap();
+        let end = source[begin..]
+            .find("fn timing_stats")
+            .map(|offset| begin + offset)
+            .unwrap();
+        let sample = &source[begin..end];
+        assert!(
+            sample.find("events.finish_ms(context)").unwrap() < sample.find("check();").unwrap()
+        );
+    }
 }
 
 #[cfg(stwo_cuda_link)]

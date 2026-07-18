@@ -1,19 +1,25 @@
 use std::collections::BTreeMap;
 
 use stwo::core::circle::{CirclePoint, SECURE_FIELD_CIRCLE_GEN};
+use stwo::core::constraints::complex_conjugate_line_coeffs;
 use stwo::core::fields::qm31::SecureField;
+use stwo::core::fields::FieldExpOps;
+use stwo::core::pcs::quotients::PointSample;
 use stwo_backend_cuda::{
-    quotient_numerator_prepacked_plan_identity, quotient_numerator_prepacked_term_layout,
+    quotient_numerator_prepacked_plan_identity, quotient_numerator_prepacked_row_oracle,
+    quotient_numerator_prepacked_term_layout, quotient_numerator_prepacked_term_oracle,
     quotient_numerator_staged_single_write_plan_with_overflow_capacities,
     quotient_numerator_workspace_requirements, DeviceArena, PreparedNumeratorSchedule,
     PreparedQuotientNumeratorError, PreparedQuotientNumeratorGraph, QuotientNumeratorColumn,
-    QuotientNumeratorDestination, QuotientNumeratorPrepackedStatusCode,
+    QuotientNumeratorColumnTopology, QuotientNumeratorDestination,
+    QuotientNumeratorLineCoefficientsWords, QuotientNumeratorPrepackedStatusCode,
     QuotientNumeratorWorkspaceConfig, QuotientNumeratorWorkspaceRequirements,
-    QuotientNumeratorWorkspaceSlots,
+    QuotientNumeratorWorkspaceSlots, QuotientOodsSample,
 };
 
+use super::quotient_numerator_oracle::{expected_group, OracleTerm};
 #[cfg(stwo_cuda_link)]
-use super::replacement_stage4_common::{cuda_event_timings, PerformanceReceipt};
+use super::replacement_stage4_common::{cuda_event_abba_timings, PerformanceReceipt};
 use super::replacement_stage4_common::{
     fill, hash_words, read_words, upload_words, FixtureReceipt,
 };
@@ -25,7 +31,7 @@ const STALE_OUTPUT_BYTE: u8 = 0x5a;
 pub fn run() -> FixtureReceipt {
     let config = config(10);
     let points = points();
-    let topology = quotient::topology(points);
+    let topology = dense_topology(quotient::topology(points), points);
     let requirements = quotient_numerator_workspace_requirements(config, &topology).unwrap();
     let plan = quotient_numerator_staged_single_write_plan_with_overflow_capacities(
         config,
@@ -84,6 +90,7 @@ pub fn run() -> FixtureReceipt {
     assert_eq!(receipt.source_count as usize, plan.sources().len());
     assert_eq!(receipt.used_words as usize, layout.used_words);
     assert_eq!(receipt.status_offset_words, layout.status_offset_words);
+    assert!(layout.term_count >= 4 * layout.group_count + 1);
     assert!(layout.used_words <= requirements.term_point_words);
 
     let eager_alpha = SecureField::from_u32_unchecked(73, 79, 83, 89);
@@ -96,21 +103,24 @@ pub fn run() -> FixtureReceipt {
         candidate_arena.context().telemetry().d2h_bytes - d2h_before,
         core::mem::size_of::<u32>() as u64
     );
-    let eager_baseline = quotient::snapshot(
+    let eager_evaluations = quotient::evaluations(config, &eager_sources);
+    let eager_baseline = dense_snapshot(
         &baseline_arena,
         &requirements,
         &baseline_destinations,
+        &topology,
         &values,
         eager_alpha,
-        &quotient::evaluations(config, &eager_sources),
+        &eager_evaluations,
     );
-    let eager_candidate = quotient::snapshot(
+    let eager_candidate = dense_snapshot(
         &candidate_arena,
         &requirements,
         &candidate_destinations,
+        &topology,
         &values,
         eager_alpha,
-        &quotient::evaluations(config, &eager_sources),
+        &eager_evaluations,
     );
     assert_eq!(eager_candidate, eager_baseline);
 
@@ -129,21 +139,24 @@ pub fn run() -> FixtureReceipt {
     baseline_graph.launch(baseline_arena.context()).unwrap();
     candidate_graph.launch(candidate_arena.context()).unwrap();
     candidate.observe_prepacked_status().unwrap();
-    let replay_baseline = quotient::snapshot(
+    let replay_evaluations = quotient::evaluations(config, &replay_sources);
+    let replay_baseline = dense_snapshot(
         &baseline_arena,
         &requirements,
         &baseline_destinations,
+        &topology,
         &values,
         replay_alpha,
-        &quotient::evaluations(config, &replay_sources),
+        &replay_evaluations,
     );
-    let replay_candidate = quotient::snapshot(
+    let replay_candidate = dense_snapshot(
         &candidate_arena,
         &requirements,
         &candidate_destinations,
+        &topology,
         &values,
         replay_alpha,
-        &quotient::evaluations(config, &replay_sources),
+        &replay_evaluations,
     );
     assert_eq!(replay_candidate, replay_baseline);
     assert_ne!(eager_candidate, replay_candidate);
@@ -175,13 +188,14 @@ pub fn run() -> FixtureReceipt {
     candidate_arena.context().sync().unwrap();
     candidate_graph.launch(candidate_arena.context()).unwrap();
     candidate.observe_prepacked_status().unwrap();
-    let recovered = quotient::snapshot(
+    let recovered = dense_snapshot(
         &candidate_arena,
         &requirements,
         &candidate_destinations,
+        &topology,
         &values,
         replay_alpha,
-        &quotient::evaluations(config, &replay_sources),
+        &replay_evaluations,
     );
     assert_eq!(recovered, replay_baseline);
     quotient::assert_preserved(&baseline_arena, &replay_sources);
@@ -196,6 +210,7 @@ pub fn run() -> FixtureReceipt {
     .collect::<BTreeMap<_, _>>();
     let checks = [
         ("exact_plan_receipt", true),
+        ("dense_native_independent_cpu_oracle", true),
         ("eager_staged_prepacked_identity", true),
         ("captured_replay_status_reset", true),
         ("invalid_descriptor_rejects_stale_output", true),
@@ -222,7 +237,7 @@ pub fn run() -> FixtureReceipt {
 pub fn benchmark(lifting_log_size: u32, warmups: usize, iterations: usize) -> PerformanceReceipt {
     let config = config(lifting_log_size);
     let points = points();
-    let topology = quotient::scaled_topology(points, lifting_log_size);
+    let topology = dense_topology(quotient::scaled_topology(points, lifting_log_size), points);
     let source_words = [
         1usize << (lifting_log_size - 3),
         1usize << (lifting_log_size - 1),
@@ -238,6 +253,7 @@ pub fn benchmark(lifting_log_size: u32, warmups: usize, iterations: usize) -> Pe
     )
     .unwrap();
     let layout = quotient_numerator_prepacked_term_layout(&plan).unwrap();
+    assert!(layout.term_count >= 4 * layout.group_count + 1);
     let slots = quotient::workspace_slots(&requirements);
     let (baseline_arena, baseline_bytes) =
         quotient::make_arena(&requirements, &slots, source_words, overflow_words);
@@ -280,17 +296,22 @@ pub fn benchmark(lifting_log_size: u32, warmups: usize, iterations: usize) -> Pe
     let capture = candidate_arena.context().capture().unwrap();
     candidate.launch().unwrap();
     let candidate_graph = capture.finish().unwrap();
-    candidate_graph.launch(candidate_arena.context()).unwrap();
-    candidate.observe_prepacked_status().unwrap();
-
-    let baseline_timing = cuda_event_timings(baseline_arena.context(), warmups, iterations, || {
-        baseline_graph.launch(baseline_arena.context())
-    });
-    let candidate_timing =
-        cuda_event_timings(candidate_arena.context(), warmups, iterations, || {
-            candidate_graph.launch(candidate_arena.context())
-        });
-    candidate.observe_prepacked_status().unwrap();
+    let status_d2h_before = candidate_arena.context().telemetry().d2h_bytes;
+    let (baseline_timing, candidate_timing) = cuda_event_abba_timings(
+        baseline_arena.context(),
+        candidate_arena.context(),
+        warmups,
+        iterations,
+        || baseline_graph.launch(baseline_arena.context()),
+        || candidate_graph.launch(candidate_arena.context()),
+        || baseline_arena.context().sync().unwrap(),
+        || candidate.observe_prepacked_status().unwrap(),
+    );
+    let status_observations = warmups.checked_add(iterations).unwrap();
+    assert_eq!(
+        candidate_arena.context().telemetry().d2h_bytes - status_d2h_before,
+        (status_observations * core::mem::size_of::<u32>()) as u64
+    );
     assert_eq!(
         quotient::raw_snapshot(&baseline_arena, &requirements, &baseline_destinations),
         quotient::raw_snapshot(&candidate_arena, &requirements, &candidate_destinations)
@@ -306,6 +327,10 @@ pub fn benchmark(lifting_log_size: u32, warmups: usize, iterations: usize) -> Pe
             ("terms".to_owned(), requirements.term_count as u64),
             ("packed_output_rows".to_owned(), plan.packed_output_rows()),
             ("prepacked_used_words".to_owned(), layout.used_words as u64),
+            (
+                "candidate_status_observations".to_owned(),
+                status_observations as u64,
+            ),
         ]
         .into_iter()
         .collect(),
@@ -315,14 +340,20 @@ pub fn benchmark(lifting_log_size: u32, warmups: usize, iterations: usize) -> Pe
         ]
         .into_iter()
         .collect(),
-        traffic_bytes: [(
-            "prepacked_record_bytes".to_owned(),
-            (layout.used_words * core::mem::size_of::<u32>()) as u64,
-        )]
+        traffic_bytes: [
+            (
+                "prepacked_record_bytes".to_owned(),
+                (layout.used_words * core::mem::size_of::<u32>()) as u64,
+            ),
+            (
+                "candidate_status_fence_bytes_per_replay".to_owned(),
+                core::mem::size_of::<u32>() as u64,
+            ),
+        ]
         .into_iter()
         .collect(),
-        baseline_label: "staged-packed-single-write-cuda-graph".to_owned(),
-        candidate_label: "staged-prepacked-single-write-cuda-graph".to_owned(),
+        baseline_label: "staged-packed-single-write-cuda-graph-checked-abba".to_owned(),
+        candidate_label: "staged-prepacked-single-write-cuda-graph-checked-abba".to_owned(),
         baseline: baseline_timing,
         candidate: candidate_timing,
         speedup: baseline_timing.median_ms / candidate_timing.median_ms,
@@ -354,6 +385,151 @@ fn values() -> [SecureField; 5] {
         SecureField::from_u32_unchecked(41, 43, 47, 53),
         SecureField::from_u32_unchecked(59, 61, 67, 71),
     ]
+}
+
+fn dense_topology(
+    mut topology: Vec<QuotientNumeratorColumnTopology>,
+    points: [CirclePoint<SecureField>; 4],
+) -> Vec<QuotientNumeratorColumnTopology> {
+    assert_eq!(topology.len(), 4);
+    let sample = |input_index, shape_point| QuotientOodsSample {
+        input_index,
+        shape_point,
+    };
+    topology[0].samples = vec![
+        sample(0, points[0]),
+        sample(1, points[1]),
+        sample(0, points[0]),
+        sample(1, points[1]),
+        sample(0, points[0]),
+    ];
+    topology[1].samples = vec![sample(2, points[0]); 5];
+    topology[2].samples = vec![sample(3, points[2]); 5];
+    topology[3].samples = vec![sample(4, points[3]); 5];
+    assert!(topology.iter().all(|column| column.samples.len() != 2));
+    topology
+}
+
+fn dense_snapshot(
+    arena: &DeviceArena,
+    requirements: &QuotientNumeratorWorkspaceRequirements,
+    destinations: &[QuotientNumeratorDestination],
+    topology: &[QuotientNumeratorColumnTopology],
+    values: &[SecureField; 5],
+    alpha: SecureField,
+    sources: &[Vec<u32>; 4],
+) -> Vec<u32> {
+    let terms = dense_oracle_terms(topology, values, sources);
+    assert_eq!(terms.len(), requirements.term_count);
+    quotient::snapshot_from_terms(arena, requirements, destinations, alpha, &terms)
+}
+
+fn dense_oracle_terms<'a>(
+    topology: &[QuotientNumeratorColumnTopology],
+    values: &[SecureField; 5],
+    sources: &'a [Vec<u32>; 4],
+) -> Vec<OracleTerm<'a>> {
+    let mut exponent = 0;
+    let mut terms = Vec::with_capacity(topology.iter().map(|column| column.samples.len()).sum());
+    for (column, shape) in topology.iter().enumerate() {
+        for sample in &shape.samples {
+            terms.push(OracleTerm {
+                exponent,
+                source_log: shape.coefficient_log_size,
+                value: values[sample.input_index as usize],
+                point: sample.shape_point,
+                source: &sources[column],
+            });
+            exponent += 1;
+        }
+    }
+    terms
+}
+
+#[test]
+fn dense_fixture_matches_staged_term_manifest_and_fits_dead_extent() {
+    let config = config(10);
+    let points = points();
+    let topology = dense_topology(quotient::topology(points), points);
+    let plan = quotient_numerator_staged_single_write_plan_with_overflow_capacities(
+        config,
+        &topology,
+        &[OVERFLOW_WORDS],
+    )
+    .unwrap();
+    let layout = quotient_numerator_prepacked_term_layout(&plan).unwrap();
+    let sources = quotient::evaluations(config, &quotient::source_set(0x1234_5678));
+    let values = values();
+    let terms = dense_oracle_terms(&topology, &values, &sources);
+    let mut descriptor_terms = plan
+        .term_descriptors()
+        .chunks_exact(3)
+        .map(|descriptor| descriptor[1] as usize)
+        .collect::<Vec<_>>();
+    descriptor_terms.sort_unstable();
+
+    assert_eq!(
+        topology
+            .iter()
+            .map(|column| column.samples.len())
+            .sum::<usize>(),
+        20
+    );
+    assert_eq!(plan.requirements().term_count, 20);
+    assert_eq!(plan.requirements().groups.len(), 4);
+    assert_eq!(
+        terms.iter().map(|term| term.exponent).collect::<Vec<_>>(),
+        (0..20).collect::<Vec<_>>()
+    );
+    assert_eq!(descriptor_terms, (0..20).collect::<Vec<_>>());
+    assert_eq!(layout.used_words, 157);
+    assert_eq!(layout.term_point_capacity_words, 160);
+    assert_eq!(layout.spare_words(), 3);
+
+    let alpha = SecureField::from_u32_unchecked(73, 79, 83, 89);
+    let coefficients = terms
+        .iter()
+        .map(|term| {
+            let (_, b, c) = complex_conjugate_line_coeffs(
+                &PointSample {
+                    point: term.point,
+                    value: term.value,
+                },
+                alpha.pow(term.exponent as u128),
+            );
+            QuotientNumeratorLineCoefficientsWords {
+                b: b.to_m31_array().map(|word| word.0),
+                c: c.to_m31_array().map(|word| word.0),
+            }
+        })
+        .collect::<Vec<_>>();
+    let packed = quotient_numerator_prepacked_term_oracle(&plan, &coefficients).unwrap();
+    let staged_sources = plan
+        .sources()
+        .iter()
+        .map(|source| sources[source.column()].clone())
+        .collect::<Vec<_>>();
+    for (group, requirements) in plan.requirements().groups.iter().enumerate() {
+        let (_, expected) = expected_group(
+            requirements.shape_point,
+            requirements.log_size,
+            alpha,
+            &terms,
+        );
+        for row in 0..requirements.value_words {
+            assert_eq!(
+                quotient_numerator_prepacked_row_oracle(
+                    &plan,
+                    &packed,
+                    &staged_sources,
+                    group,
+                    row,
+                )
+                .unwrap(),
+                std::array::from_fn(|coordinate| expected[coordinate][row])
+            );
+        }
+    }
 }
 
 fn initialize(

@@ -610,6 +610,23 @@ pub(super) fn snapshot(
     alpha: SecureField,
     sources: &[Vec<u32>; 4],
 ) -> Vec<u32> {
+    let points = [
+        SECURE_FIELD_CIRCLE_GEN.mul(3),
+        SECURE_FIELD_CIRCLE_GEN.mul(5),
+        SECURE_FIELD_CIRCLE_GEN.mul(7),
+        SECURE_FIELD_CIRCLE_GEN.mul(11),
+    ];
+    let terms = oracle_terms(requirements.config, points, values, sources);
+    snapshot_from_terms(arena, requirements, destinations, alpha, terms.as_slice())
+}
+
+pub(super) fn snapshot_from_terms(
+    arena: &DeviceArena,
+    requirements: &QuotientNumeratorWorkspaceRequirements,
+    destinations: &[QuotientNumeratorDestination],
+    alpha: SecureField,
+    terms: &[OracleTerm<'_>],
+) -> Vec<u32> {
     let point_output = read_words(
         arena,
         arena.bind(SAMPLE_POINTS).unwrap(),
@@ -620,13 +637,6 @@ pub(super) fn snapshot(
         arena.bind(FIRST_TERMS).unwrap(),
         4 * requirements.groups.len(),
     );
-    let points = [
-        SECURE_FIELD_CIRCLE_GEN.mul(3),
-        SECURE_FIELD_CIRCLE_GEN.mul(5),
-        SECURE_FIELD_CIRCLE_GEN.mul(7),
-        SECURE_FIELD_CIRCLE_GEN.mul(11),
-    ];
-    let terms = oracle_terms(requirements.config, points, values, sources);
     let mut result = Vec::new();
     result.extend_from_slice(&point_output);
     result.extend_from_slice(&first_output);
