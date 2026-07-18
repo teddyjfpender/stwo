@@ -10,6 +10,7 @@ use core::ptr::NonNull;
 use std::ffi::CString;
 
 use stwo_backend_cuda_kernels::raw::{
+    CudaFunctionAttributes as NativeFunctionResources,
     CudaInstalledAotFunctionReceipt as NativeReceipt, CUDA_INSTALLED_AOT_BORROWED_PUBLISHED,
     CUDA_INSTALLED_AOT_FUNCTION_ABI_VERSION,
 };
@@ -75,6 +76,17 @@ pub enum InstalledAotFunctionOwnership {
     BorrowedPublished,
 }
 
+/// Resources reported by CUDA for the exact loaded function in this receipt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InstalledAotFunctionResources {
+    pub max_threads_per_block: u32,
+    pub registers_per_thread: u32,
+    pub binary_version: u32,
+    pub ptx_version: u32,
+    pub local_bytes: u64,
+    pub static_shared_bytes: u64,
+}
+
 /// Semantic and process-local receipt for one installed function.
 ///
 /// Pointer-shaped tokens are equality facts for this process only. They never
@@ -101,6 +113,7 @@ pub struct InstalledAotFunctionReceipt {
     module_token: u64,
     function_token: u64,
     stream_token: u64,
+    resources: InstalledAotFunctionResources,
     function_publication: LoadedAotFunctionPublication,
     pedersen_publication: Option<PedersenModulePublicationReceipt>,
 }
@@ -184,6 +197,10 @@ impl InstalledAotFunctionReceipt {
 
     pub const fn stream_token(&self) -> u64 {
         self.stream_token
+    }
+
+    pub const fn resources(&self) -> InstalledAotFunctionResources {
+        self.resources
     }
 
     pub const fn function_publication(&self) -> &LoadedAotFunctionPublication {
@@ -480,6 +497,7 @@ impl<'context> InstalledAotFunction<'context> {
                 module_token: native.module_token,
                 function_token: native.function_token,
                 stream_token: native.stream_token,
+                resources: native_function_resources(native.function),
                 function_publication,
                 pedersen_publication,
             },
@@ -619,6 +637,7 @@ fn validate_native_receipt(
         || native.module_token != module_token
         || native.function_token != function_token
         || native.stream_token != stream_token
+        || !native_function_resources_valid(native.function, target_sm)
     {
         return Err(InstalledAotFunctionError::NativeReceiptMismatch);
     }
@@ -632,6 +651,24 @@ fn validate_native_receipt(
         }
     }
     Ok(())
+}
+
+fn native_function_resources_valid(resources: NativeFunctionResources, target_sm: u32) -> bool {
+    resources.abi_version == 1
+        && resources.reserved == 0
+        && resources.max_threads_per_block != 0
+        && resources.binary_version == target_sm
+}
+
+fn native_function_resources(resources: NativeFunctionResources) -> InstalledAotFunctionResources {
+    InstalledAotFunctionResources {
+        max_threads_per_block: resources.max_threads_per_block,
+        registers_per_thread: resources.registers_per_thread,
+        binary_version: resources.binary_version,
+        ptx_version: resources.ptx_version,
+        local_bytes: resources.local_bytes,
+        static_shared_bytes: resources.static_shared_bytes,
+    }
 }
 
 fn check_arguments<'arguments>(

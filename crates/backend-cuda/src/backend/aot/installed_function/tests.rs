@@ -209,6 +209,16 @@ fn native_receipt_mutations_reject_wrong_sm_and_launch_facts() {
         module_token: 2,
         function_token: 3,
         stream_token: 4,
+        function: NativeFunctionResources {
+            abi_version: 1,
+            max_threads_per_block: 1_024,
+            registers_per_thread: 128,
+            binary_version: 89,
+            ptx_version: 86,
+            reserved: 0,
+            local_bytes: 0,
+            static_shared_bytes: 0,
+        },
     };
     let validate = |native: &NativeReceipt| {
         validate_native_receipt(native, 89, 8, launch, 4, 0, 1, 2, 3, None)
@@ -226,6 +236,10 @@ fn native_receipt_mutations_reject_wrong_sm_and_launch_facts() {
         |receipt: &mut NativeReceipt| receipt.module_token = 0,
         |receipt: &mut NativeReceipt| receipt.function_token = 0,
         |receipt: &mut NativeReceipt| receipt.stream_token = 0,
+        |receipt: &mut NativeReceipt| receipt.function.abi_version = 0,
+        |receipt: &mut NativeReceipt| receipt.function.max_threads_per_block = 0,
+        |receipt: &mut NativeReceipt| receipt.function.binary_version = 90,
+        |receipt: &mut NativeReceipt| receipt.function.reserved = 1,
     ] {
         let mut changed = baseline;
         mutate(&mut changed);
@@ -234,6 +248,31 @@ fn native_receipt_mutations_reject_wrong_sm_and_launch_facts() {
             Err(InstalledAotFunctionError::NativeReceiptMismatch)
         );
     }
+}
+
+#[test]
+fn native_function_resources_are_preserved_exactly() {
+    let raw = NativeFunctionResources {
+        abi_version: 1,
+        max_threads_per_block: 768,
+        registers_per_thread: 97,
+        binary_version: 89,
+        ptx_version: 86,
+        reserved: 0,
+        local_bytes: 24,
+        static_shared_bytes: 48,
+    };
+    assert_eq!(
+        native_function_resources(raw),
+        InstalledAotFunctionResources {
+            max_threads_per_block: 768,
+            registers_per_thread: 97,
+            binary_version: 89,
+            ptx_version: 86,
+            local_bytes: 24,
+            static_shared_bytes: 48,
+        }
+    );
 }
 
 #[test]

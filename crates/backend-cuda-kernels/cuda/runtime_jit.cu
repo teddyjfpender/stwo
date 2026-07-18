@@ -50,6 +50,8 @@
 #include <cstdlib>
 #include <chrono>
 
+#include "resource_attestation.cuh"
+
 // pedersen_table_init.cu exports (same archive), used to fill the per-module
 // witness-deduce table globals. `m31` there is a typedef for uint32_t, so the
 // unsigned* ABI here is identical. MUST be declared at global scope: inside the
@@ -133,7 +135,7 @@ struct StwoCudaJitAotStats {
     uint64_t strict_rejections;
 };
 
-constexpr uint32_t kInstalledAotFunctionAbiVersion = 1;
+constexpr uint32_t kInstalledAotFunctionAbiVersion = 2;
 constexpr uint32_t kInstalledAotBorrowedPublished = 2;
 constexpr uint32_t kAotFunctionPublicationAbiVersion = 1;
 constexpr uint32_t kAotFunctionPublicationAot = 1;
@@ -174,11 +176,14 @@ struct StwoCudaInstalledAotFunctionReceipt {
     uint64_t module_token;
     uint64_t function_token;
     uint64_t stream_token;
+    StwoCudaFunctionAttributes function;
 };
-static_assert(sizeof(StwoCudaInstalledAotFunctionReceipt) == 88,
+static_assert(sizeof(StwoCudaInstalledAotFunctionReceipt) == 128,
               "installed AOT receipt ABI size");
 static_assert(offsetof(StwoCudaInstalledAotFunctionReceipt, context_token) == 56,
               "installed AOT context-token offset");
+static_assert(offsetof(StwoCudaInstalledAotFunctionReceipt, function) == 88,
+              "installed AOT function-resource offset");
 
 struct InstalledAotFunction {
     void *exec_context;
@@ -1495,8 +1500,47 @@ static int validate_installed_launch_facts(
     return CUDA_SUCCESS;
 }
 
+static int query_driver_function_attributes(
+    CUfunction function,
+    StwoCudaFunctionAttributes *out
+) {
+    if (function == nullptr || out == nullptr) return CUDA_ERROR_INVALID_VALUE;
+    *out = StwoCudaFunctionAttributes{};
+    int max_threads = 0;
+    int registers = 0;
+    int binary_version = 0;
+    int ptx_version = 0;
+    int local_bytes = 0;
+    int static_shared_bytes = 0;
+    if (cuFuncGetAttribute(&max_threads, CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
+                           function) != CUDA_SUCCESS ||
+        cuFuncGetAttribute(&registers, CU_FUNC_ATTRIBUTE_NUM_REGS, function) !=
+            CUDA_SUCCESS ||
+        cuFuncGetAttribute(&binary_version, CU_FUNC_ATTRIBUTE_BINARY_VERSION,
+                           function) != CUDA_SUCCESS ||
+        cuFuncGetAttribute(&ptx_version, CU_FUNC_ATTRIBUTE_PTX_VERSION, function) !=
+            CUDA_SUCCESS ||
+        cuFuncGetAttribute(&local_bytes, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES,
+                           function) != CUDA_SUCCESS ||
+        cuFuncGetAttribute(&static_shared_bytes, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES,
+                           function) != CUDA_SUCCESS ||
+        max_threads < 0 || registers < 0 || binary_version < 0 || ptx_version < 0 ||
+        local_bytes < 0 || static_shared_bytes < 0) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    out->abi_version = 1;
+    out->max_threads_per_block = static_cast<uint32_t>(max_threads);
+    out->registers_per_thread = static_cast<uint32_t>(registers);
+    out->binary_version = static_cast<uint32_t>(binary_version);
+    out->ptx_version = static_cast<uint32_t>(ptx_version);
+    out->local_bytes = static_cast<uint64_t>(local_bytes);
+    out->static_shared_bytes = static_cast<uint64_t>(static_shared_bytes);
+    return CUDA_SUCCESS;
+}
+
 static void fill_installed_receipt(
     const InstalledAotFunction &installed,
+    const StwoCudaFunctionAttributes &function,
     uint32_t ownership,
     uint32_t device,
     uint32_t sm_major,
@@ -1525,6 +1569,7 @@ static void fill_installed_receipt(
         static_cast<uint64_t>(reinterpret_cast<uintptr_t>(installed.function));
     out->stream_token =
         static_cast<uint64_t>(reinterpret_cast<uintptr_t>(installed.stream));
+    out->function = function;
 }
 
 static int create_borrowed_published_function(
@@ -1586,6 +1631,9 @@ static int create_borrowed_published_function(
     status = validate_installed_launch_facts(static_cast<CUdevice>(device), cached.function,
                                              grid, block, dynamic_shared_bytes);
     if (status != CUDA_SUCCESS) return status;
+    StwoCudaFunctionAttributes function{};
+    status = query_driver_function_attributes(cached.function, &function);
+    if (status != CUDA_SUCCESS) return status;
     InstalledAotFunction *installed = new (std::nothrow) InstalledAotFunction{
         exec_context,
         context,
@@ -1601,7 +1649,7 @@ static int create_borrowed_published_function(
         std::string(kernel_name),
     };
     if (installed == nullptr) return CUDA_ERROR_OUT_OF_MEMORY;
-    fill_installed_receipt(*installed, kInstalledAotBorrowedPublished, device,
+    fill_installed_receipt(*installed, function, kInstalledAotBorrowedPublished, device,
                            sm_major, sm_minor, out_receipt);
     *out_handle = installed;
     return CUDA_SUCCESS;

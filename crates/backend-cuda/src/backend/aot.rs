@@ -22,7 +22,8 @@ pub use function_publication::{
 };
 pub use installed_function::{
     CheckedAotArguments, InstalledAotFunction, InstalledAotFunctionError,
-    InstalledAotFunctionOwnership, InstalledAotFunctionReceipt, InstalledAotLaunchFacts,
+    InstalledAotFunctionOwnership, InstalledAotFunctionReceipt, InstalledAotFunctionResources,
+    InstalledAotLaunchFacts,
 };
 pub use stwo_backend_cuda_kernels::aot_pack::{
     AotKernelAbiAccess, AotKernelAbiArgument, AotKernelAbiKind, AotKernelAbiSchema,

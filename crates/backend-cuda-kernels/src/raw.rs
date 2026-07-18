@@ -474,7 +474,7 @@ const _: () = assert!(core::mem::size_of::<CudaAotFunctionPublication>() == 56);
 const _: () = assert!(core::mem::align_of::<CudaAotFunctionPublication>() == 8);
 const _: () = assert!(core::mem::offset_of!(CudaAotFunctionPublication, cache_key) == 24);
 
-pub const CUDA_INSTALLED_AOT_FUNCTION_ABI_VERSION: u32 = 1;
+pub const CUDA_INSTALLED_AOT_FUNCTION_ABI_VERSION: u32 = 2;
 pub const CUDA_INSTALLED_AOT_BORROWED_PUBLISHED: u32 = 2;
 
 /// Native receipt for one context-bound installed AOT function.
@@ -501,15 +501,19 @@ pub struct CudaInstalledAotFunctionReceipt {
     pub module_token: u64,
     pub function_token: u64,
     pub stream_token: u64,
+    pub function: CudaFunctionAttributes,
 }
 
-const _: () = assert!(core::mem::size_of::<CudaInstalledAotFunctionReceipt>() == 88);
+const _: () = assert!(core::mem::size_of::<CudaInstalledAotFunctionReceipt>() == 128);
 const _: () = assert!(core::mem::align_of::<CudaInstalledAotFunctionReceipt>() == 8);
 const _: () = assert!(core::mem::offset_of!(CudaInstalledAotFunctionReceipt, context_token) == 56);
+const _: () = assert!(core::mem::offset_of!(CudaInstalledAotFunctionReceipt, function) == 88);
 
 #[cfg(test)]
 mod pedersen_publication_abi_tests {
-    use super::{CudaAotFunctionPublication, CudaPedersenModulePublication};
+    use super::{
+        CudaAotFunctionPublication, CudaInstalledAotFunctionReceipt, CudaPedersenModulePublication,
+    };
 
     #[test]
     fn pedersen_columns_require_current_device_accessible_ranges() {
@@ -555,6 +559,11 @@ mod pedersen_publication_abi_tests {
             core::mem::offset_of!(CudaAotFunctionPublication, cache_key),
             24
         );
+        assert_eq!(core::mem::size_of::<CudaInstalledAotFunctionReceipt>(), 128);
+        assert_eq!(
+            core::mem::offset_of!(CudaInstalledAotFunctionReceipt, function),
+            88
+        );
 
         let native = include_str!("../cuda/runtime_jit.cu");
         assert!(native.contains("cols_size != kColumnsBytes"));
@@ -570,6 +579,8 @@ mod pedersen_publication_abi_tests {
         assert!(native.contains("get_live_aot_function_publication"));
         assert!(native.contains("cached.module != installed->module"));
         assert!(native.contains("cuStreamGetCtx"));
+        assert!(native.contains("query_driver_function_attributes"));
+        assert!(native.contains("cuFuncGetAttribute"));
         assert!(!native.contains("create_owned_installed_function"));
         assert!(native.contains("if (!is_borrowed_pedersen_table_registered())"));
         let table_runtime = include_str!("../cuda/pedersen_table_init.cu");
