@@ -348,6 +348,23 @@ impl<'a> PreparedWitnessCasmInputStage<'a> {
             .is_current(receipt, self.ingress_binding())
     }
 
+    /// Consume the one exact current receipt.
+    ///
+    /// A mismatch fails closed by invalidating every receipt state while
+    /// retaining the burned generation.
+    pub fn consume_ingress_receipt(
+        &self,
+        receipt: WitnessCasmInputIngressReceipt,
+    ) -> Result<(), PreparedWitnessCasmInputError> {
+        self.ingress_state.consume(receipt, self.ingress_binding())
+    }
+
+    /// Invalidate pending and published admission evidence without rolling
+    /// back the generation. This does not replace the caller-owned setup fence.
+    pub fn invalidate_ingress_receipt(&self) {
+        self.ingress_state.invalidate();
+    }
+
     pub fn contract(&self) -> &WitnessCasmInputContract {
         &self.contract
     }

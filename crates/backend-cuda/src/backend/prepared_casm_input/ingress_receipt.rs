@@ -269,6 +269,24 @@ impl WitnessCasmInputIngressState {
     ) -> bool {
         self.receipt.get() == Some(*receipt) && receipt.matches(binding, self.generation.get())
     }
+
+    pub(super) fn consume(
+        &self,
+        receipt: WitnessCasmInputIngressReceipt,
+        binding: WitnessCasmInputIngressBinding,
+    ) -> Result<(), PreparedWitnessCasmInputError> {
+        let current = self.is_current(&receipt, binding);
+        self.invalidate();
+        current
+            .then_some(())
+            .ok_or(PreparedWitnessCasmInputError::InvalidIngressReceipt)
+    }
+
+    pub(super) fn invalidate(&self) {
+        self.candidate.set(None);
+        self.scatter_enqueued.set(false);
+        self.receipt.set(None);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -557,6 +575,84 @@ mod tests {
             Err(PreparedWitnessCasmInputError::InvalidIngressReceipt)
         );
         assert!(state.is_current(&second, binding));
+    }
+
+    #[test]
+    fn consume_is_exact_single_use_and_stale_mismatch_fails_closed() {
+        let binding = binding();
+        let state = WitnessCasmInputIngressState::new();
+        let first = receipt(binding, &[1, 2, 3, 4, 5, 6], 1);
+        state.begin(first);
+        let pending = state.mark_scatter_enqueued(first, binding).unwrap();
+        state.publish(pending, binding).unwrap();
+
+        state.consume(first, binding).unwrap();
+        assert_eq!(state.receipt(), None);
+        assert_eq!(
+            state.consume(first, binding),
+            Err(PreparedWitnessCasmInputError::InvalidIngressReceipt)
+        );
+        assert_eq!(state.next_generation().unwrap(), 2);
+
+        let second = receipt(binding, &[6, 5, 4, 3, 2, 1], 2);
+        state.begin(second);
+        let pending = state.mark_scatter_enqueued(second, binding).unwrap();
+        state.publish(pending, binding).unwrap();
+        assert_eq!(
+            state.consume(first, binding),
+            Err(PreparedWitnessCasmInputError::InvalidIngressReceipt)
+        );
+        assert_eq!(state.receipt(), None);
+        assert!(!state.is_current(&second, binding));
+        assert_eq!(state.next_generation().unwrap(), 3);
+
+        let third = receipt(binding, &[2, 3, 4, 5, 6, 7], 3);
+        state.begin(third);
+        let pending = state.mark_scatter_enqueued(third, binding).unwrap();
+        state.publish(pending, binding).unwrap();
+        assert!(state.is_current(&third, binding));
+    }
+
+    #[test]
+    fn invalidate_clears_partial_and_published_state_without_reusing_generations() {
+        let binding = binding();
+        let state = WitnessCasmInputIngressState::new();
+
+        let before_scatter = receipt(binding, &[1, 2, 3, 4, 5, 6], 1);
+        state.begin(before_scatter);
+        state.invalidate();
+        assert_eq!(state.ingested(), None);
+        assert_eq!(state.receipt(), None);
+        assert_eq!(
+            state.mark_scatter_enqueued(before_scatter, binding),
+            Err(PreparedWitnessCasmInputError::InvalidIngressReceipt)
+        );
+        assert_eq!(state.next_generation().unwrap(), 2);
+
+        let after_scatter = receipt(binding, &[6, 5, 4, 3, 2, 1], 2);
+        state.begin(after_scatter);
+        let pending = state.mark_scatter_enqueued(after_scatter, binding).unwrap();
+        state.invalidate();
+        assert_eq!(
+            state.publish(pending, binding),
+            Err(PreparedWitnessCasmInputError::InvalidIngressReceipt)
+        );
+        assert_eq!(state.next_generation().unwrap(), 3);
+
+        let published = receipt(binding, &[2, 3, 4, 5, 6, 7], 3);
+        state.begin(published);
+        let pending = state.mark_scatter_enqueued(published, binding).unwrap();
+        state.publish(pending, binding).unwrap();
+        state.invalidate();
+        assert_eq!(state.receipt(), None);
+        assert!(!state.is_current(&published, binding));
+        assert_eq!(state.next_generation().unwrap(), 4);
+
+        let fresh = receipt(binding, &[7, 6, 5, 4, 3, 2], 4);
+        state.begin(fresh);
+        let pending = state.mark_scatter_enqueued(fresh, binding).unwrap();
+        state.publish(pending, binding).unwrap();
+        assert!(state.is_current(&fresh, binding));
     }
 
     #[test]
