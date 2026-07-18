@@ -101,9 +101,12 @@ pub use backend::prepared_execution_tables::{
 pub use backend::prepared_fixed_table::{
     fixed_table_workspace_requirements, FixedTableArenaSlotRequirement,
     FixedTableContiguousWorkspaceSlots, FixedTableLookupSource, FixedTableMaterializationConfig,
-    FixedTableSourceColumn, FixedTableWorkspaceRequirements, FixedTableWorkspaceSlots,
-    PreparedFixedTableError, PreparedFixedTableGraph, FIXED_TABLE_LOOKUP_DESCRIPTOR_WORDS,
-    FIXED_TABLE_POINTER_ALIGNMENT_WORDS,
+    FixedTableMaterializerAbi, FixedTableMaterializerAbiAccess, FixedTableMaterializerAbiArgument,
+    FixedTableMaterializerAbiArgumentKind, FixedTableMaterializerAuthorityError,
+    FixedTableMaterializerContract, FixedTableMaterializerKernelLaunch,
+    FixedTableMaterializerLinkedContract, FixedTableSourceColumn, FixedTableWorkspaceRequirements,
+    FixedTableWorkspaceSlots, PreparedFixedTableError, PreparedFixedTableGraph,
+    FIXED_TABLE_LOOKUP_DESCRIPTOR_WORDS, FIXED_TABLE_POINTER_ALIGNMENT_WORDS,
 };
 pub use backend::prepared_fri::{
     fri_workspace_requirements, FriArenaSlotRequirement, FriFoldLaunchMode,

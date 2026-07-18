@@ -12,6 +12,15 @@ use super::exec_context::{
 };
 use super::pedersen_table::RegisteredPedersenColumn;
 
+mod authority;
+
+pub use authority::{
+    FixedTableMaterializerAbi, FixedTableMaterializerAbiAccess, FixedTableMaterializerAbiArgument,
+    FixedTableMaterializerAbiArgumentKind, FixedTableMaterializerAuthorityError,
+    FixedTableMaterializerContract, FixedTableMaterializerKernelLaunch,
+    FixedTableMaterializerLinkedContract,
+};
+
 const WORD_BYTES: usize = core::mem::size_of::<u32>();
 const POINTER_WORDS: usize = core::mem::size_of::<*mut u32>().div_ceil(WORD_BYTES);
 const M31_MODULUS: u32 = (1 << 31) - 1;
@@ -365,6 +374,7 @@ pub enum PreparedFixedTableError {
     SlotMisaligned(ArenaSlotId),
     ContextMismatch(ArenaSlotId),
     KernelLaunchFailed,
+    InvalidAuthority,
     Arena(ArenaError),
     Cuda(CudaRuntimeError),
 }
@@ -534,6 +544,7 @@ fn pointer_words(count: usize) -> Result<usize, PreparedFixedTableError> {
 
 pub struct PreparedFixedTableGraph<'a> {
     arena: &'a DeviceArena,
+    contract: FixedTableMaterializerContract,
     requirements: FixedTableWorkspaceRequirements,
     source_columns: Vec<FixedTableSourceColumn>,
     multiplicity_columns: Vec<ArenaSlice>,
@@ -561,7 +572,9 @@ impl<'a> PreparedFixedTableGraph<'a> {
         if !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
             return Err(PreparedFixedTableError::CudaUnavailable);
         }
-        let requirements = fixed_table_workspace_requirements(config)?;
+        let contract = FixedTableMaterializerContract::compile(config)
+            .map_err(|_| PreparedFixedTableError::InvalidAuthority)?;
+        let requirements = contract.requirements().clone();
         requirements.arena_slot_requirements(slots)?;
         require_count(
             "source_columns",
@@ -687,6 +700,7 @@ impl<'a> PreparedFixedTableGraph<'a> {
 
         Ok(Self {
             arena,
+            contract,
             requirements,
             source_columns: source_columns.to_vec(),
             multiplicity_columns: multiplicity_columns.to_vec(),
@@ -716,7 +730,9 @@ impl<'a> PreparedFixedTableGraph<'a> {
         if !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
             return Err(PreparedFixedTableError::CudaUnavailable);
         }
-        let requirements = fixed_table_workspace_requirements(config)?;
+        let contract = FixedTableMaterializerContract::compile(config)
+            .map_err(|_| PreparedFixedTableError::InvalidAuthority)?;
+        let requirements = contract.requirements().clone();
         requirements.arena_slot_requirements_contiguous(slots)?;
         require_count(
             "source_columns",
@@ -861,6 +877,7 @@ impl<'a> PreparedFixedTableGraph<'a> {
 
         Ok(Self {
             arena,
+            contract,
             requirements,
             source_columns: source_columns.to_vec(),
             multiplicity_columns: Vec::new(),
@@ -914,6 +931,14 @@ impl<'a> PreparedFixedTableGraph<'a> {
         &self.requirements
     }
 
+    pub fn contract(&self) -> &FixedTableMaterializerContract {
+        &self.contract
+    }
+
+    pub fn belongs_to(&self, arena: &DeviceArena) -> bool {
+        core::ptr::eq(self.arena, arena)
+    }
+
     pub fn source_columns(&self) -> &[FixedTableSourceColumn] {
         &self.source_columns
     }
@@ -926,8 +951,28 @@ impl<'a> PreparedFixedTableGraph<'a> {
         self.multiplicity_slab
     }
 
+    pub fn source_pointers(&self) -> Option<ArenaSlice> {
+        self.source_pointers
+    }
+
+    pub fn multiplicity_pointers(&self) -> ArenaSlice {
+        self.multiplicity_pointers
+    }
+
+    pub fn trace_multiplicity_columns(&self) -> ArenaSlice {
+        self.trace_multiplicity_columns
+    }
+
     pub fn trace_outputs(&self) -> &[ArenaSlice] {
         &self.trace_outputs
+    }
+
+    pub fn trace_output_pointers(&self) -> ArenaSlice {
+        self.trace_output_pointers
+    }
+
+    pub fn lookup_descriptors(&self) -> ArenaSlice {
+        self.lookup_descriptors
     }
 
     pub fn lookup_outputs(&self) -> &[ArenaSlice] {
@@ -936,6 +981,10 @@ impl<'a> PreparedFixedTableGraph<'a> {
 
     pub fn lookup_output_slab(&self) -> Option<ArenaSlice> {
         self.lookup_output_slab
+    }
+
+    pub fn lookup_output_pointers(&self) -> ArenaSlice {
+        self.lookup_output_pointers
     }
 }
 
@@ -1108,6 +1157,109 @@ fn ensure_distinct(
 mod tests {
     use super::*;
 
+    const WRAPPER_SOURCE: &str =
+        include_str!("../../../backend-cuda-kernels/cuda/fixed_table_materializer.cu");
+
+    fn mutate_materializer_entry(old: &str, new: &str) -> String {
+        let entry = WRAPPER_SOURCE
+            .find("extern \"C\" int stwo_fixed_table_materialize_on")
+            .unwrap();
+        let relative = WRAPPER_SOURCE[entry..].find(old).unwrap();
+        let start = entry + relative;
+        let mut mutation = WRAPPER_SOURCE.to_owned();
+        mutation.replace_range(start..start + old.len(), new);
+        mutation
+    }
+
+    fn materializer_entry_header() -> &'static str {
+        let start = WRAPPER_SOURCE
+            .find("extern \"C\" int stwo_fixed_table_materialize_on")
+            .unwrap();
+        let end = start + WRAPPER_SOURCE[start..].find('{').unwrap();
+        &WRAPPER_SOURCE[start..end]
+    }
+
+    #[test]
+    fn materializer_authority_requires_the_exact_wrapper_entry_abi() {
+        let abi = FixedTableMaterializerAbi::MaterializeV1;
+        assert!(abi.source_declares_entry(WRAPPER_SOURCE.as_bytes()));
+
+        let mutations = [
+            mutate_materializer_entry(
+                "extern \"C\" int stwo_fixed_table_materialize_on",
+                "extern \"C\" void stwo_fixed_table_materialize_on",
+            ),
+            mutate_materializer_entry(
+                "const uint32_t *const *source_columns_dev",
+                "uint32_t *const *source_columns_dev",
+            ),
+            mutate_materializer_entry(
+                "const uint32_t *const *multiplicity_columns_dev",
+                "const uint32_t *const *wrong_multiplicity_columns_dev",
+            ),
+            mutate_materializer_entry(
+                "const uint32_t *trace_multiplicity_columns_dev",
+                "const uint32_t **trace_multiplicity_columns_dev",
+            ),
+            mutate_materializer_entry(
+                "uint32_t *const *trace_outputs_dev",
+                "const uint32_t *const *trace_outputs_dev",
+            ),
+            mutate_materializer_entry("uint32_t n_trace_outputs", "size_t n_trace_outputs"),
+            mutate_materializer_entry(
+                "const uint32_t *lookup_descriptors_dev",
+                "uint32_t *lookup_descriptors_dev",
+            ),
+            mutate_materializer_entry(
+                "uint32_t *const *lookup_outputs_dev",
+                "uint32_t **lookup_outputs_dev",
+            ),
+            mutate_materializer_entry(
+                "uint32_t n_lookup_outputs",
+                "uint64_t n_lookup_outputs",
+            ),
+            mutate_materializer_entry("uint32_t row_count", "uint32_t rows"),
+            mutate_materializer_entry("void *stream", "cudaStream_t stream"),
+            mutate_materializer_entry(
+                "const uint32_t *const *source_columns_dev,\n    const uint32_t *const *multiplicity_columns_dev",
+                "const uint32_t *const *multiplicity_columns_dev,\n    const uint32_t *const *source_columns_dev",
+            ),
+        ];
+        for (ordinal, mutation) in mutations.iter().enumerate() {
+            assert!(
+                !abi.source_declares_entry(mutation.as_bytes()),
+                "accepted fixed-table ABI mutation {ordinal}"
+            );
+        }
+
+        let header = materializer_entry_header();
+        let mutated_definition =
+            mutate_materializer_entry("uint32_t row_count", "uint32_t wrong_row_count");
+        let comment_decoy = format!("/* {header} */\n{mutated_definition}");
+        assert!(!abi.source_declares_entry(comment_decoy.as_bytes()));
+
+        let escaped_header = header
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r");
+        let string_decoy =
+            format!("const char *decoy = \"{escaped_header}\";\n{mutated_definition}");
+        assert!(!abi.source_declares_entry(string_decoy.as_bytes()));
+
+        let prototype_decoy = format!("{header};\n{mutated_definition}");
+        assert!(!abi.source_declares_entry(prototype_decoy.as_bytes()));
+
+        let exact_prototype = format!("{header};");
+        assert!(!abi.source_declares_entry(exact_prototype.as_bytes()));
+
+        let duplicate_declaration = format!("{header};\n{WRAPPER_SOURCE}");
+        assert!(!abi.source_declares_entry(duplicate_declaration.as_bytes()));
+
+        let duplicate_definition = format!("{WRAPPER_SOURCE}\n{header} {{ return 0; }}");
+        assert!(!abi.source_declares_entry(duplicate_definition.as_bytes()));
+    }
+
     #[test]
     fn bound_slots_truncate_pooled_surplus_to_the_logical_requirement() {
         // Pooled physical slots are sized to the LARGEST epoch-disjoint
@@ -1164,6 +1316,95 @@ mod tests {
             &requirements.lookup_descriptors()[12..],
             &[3, 2, 2, 1, 4, 2, 2, 1, 5, 2, 2, 1]
         );
+    }
+
+    #[test]
+    fn all_source_kind_authority_is_deterministic_sensitive_and_exact() {
+        let config = FixedTableMaterializationConfig {
+            row_count: 16,
+            source_column_count: 1,
+            trace_multiplicity_columns: vec![1, 0],
+            multiplicity_column_count: 4,
+            lookup_sources: vec![
+                FixedTableLookupSource::Constant(7),
+                FixedTableLookupSource::SourceColumn(0),
+                FixedTableLookupSource::MultiplicityColumn(3),
+                FixedTableLookupSource::ExpandedXorA {
+                    multiplicity_column: 2,
+                    limb_bits: 2,
+                    expand_bits: 1,
+                },
+                FixedTableLookupSource::ExpandedXorB {
+                    multiplicity_column: 2,
+                    limb_bits: 2,
+                    expand_bits: 1,
+                },
+                FixedTableLookupSource::ExpandedXor {
+                    multiplicity_column: 2,
+                    limb_bits: 2,
+                    expand_bits: 1,
+                },
+            ],
+        };
+        let contract = FixedTableMaterializerContract::compile(&config).unwrap();
+        let repeated = FixedTableMaterializerContract::compile(&config).unwrap();
+        contract.validate().unwrap();
+        repeated.validate().unwrap();
+        assert_eq!(contract, repeated);
+
+        let identities = [
+            contract.source_identity(),
+            contract.config_identity(),
+            contract.abi_identity(),
+            contract.effect_identity(),
+            contract.launch_identity(),
+            contract.identity(),
+        ];
+        assert!(identities.iter().all(|identity| *identity != [0; 32]));
+        assert_eq!(identities.into_iter().collect::<BTreeSet<_>>().len(), 6);
+
+        let arguments = contract.abi().arguments();
+        assert_eq!(arguments.len(), 10);
+        assert!(arguments
+            .iter()
+            .enumerate()
+            .all(|(ordinal, argument)| argument.ordinal as usize == ordinal));
+        assert_eq!(
+            contract.launch(),
+            FixedTableMaterializerKernelLaunch {
+                grid: [1, 8, 1],
+                block: [256, 1, 1],
+                dynamic_shared_bytes: 0,
+                cooperative: false,
+                cluster: None,
+            }
+        );
+
+        let mut changed_config = config;
+        changed_config.lookup_sources[0] = FixedTableLookupSource::Constant(8);
+        let changed = FixedTableMaterializerContract::compile(&changed_config).unwrap();
+        changed.validate().unwrap();
+        assert_eq!(contract.source_identity(), changed.source_identity());
+        assert_eq!(contract.abi_identity(), changed.abi_identity());
+        assert_eq!(contract.launch_identity(), changed.launch_identity());
+        assert_ne!(contract.config_identity(), changed.config_identity());
+        assert_ne!(contract.effect_identity(), changed.effect_identity());
+        assert_ne!(contract.identity(), changed.identity());
+
+        if stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
+            let target_sm = *stwo_backend_cuda_kernels::static_cuda_module_target_sms()
+                .first()
+                .expect("built static CUDA module must name a target SM");
+            let linked = contract
+                .bind_static_build(target_sm)
+                .unwrap()
+                .expect("built static CUDA module must bind");
+            linked.validate(&contract).unwrap();
+            assert_eq!(linked.contract_identity(), contract.identity());
+            assert!(linked.validate(&changed).is_err());
+        } else {
+            assert_eq!(contract.bind_static_build(89).unwrap(), None);
+        }
     }
 
     #[test]
