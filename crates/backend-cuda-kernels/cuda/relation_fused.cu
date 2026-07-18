@@ -78,6 +78,7 @@
 #include <cuda_runtime.h>
 
 #include "relation_fused.cuh"
+#include "resource_attestation.cuh"
 
 namespace {
 
@@ -379,6 +380,47 @@ __global__ void relation_fused_kernel(
   }
 }
 
+// Test-only control for the pre-adaptive selector. It deliberately duplicates
+// the old kernel dispatch instead of adding selector control flow or arguments
+// to relation_fused_kernel. The receipt still queries both loaded functions;
+// neither source shape receives timing credit without those exact facts.
+__global__ void relation_fused_all_one_read_test_kernel(
+    const uint32_t *const *const *source_tables,
+    const uint32_t *const *descriptors, m31 *const *const *output_tables,
+    const uint32_t *geometry, uint32_t n_instances, const qm31 *alphas,
+    const qm31 *z_ptr, relation_fused_mask mask) {
+  uint32_t local_block = 0u;
+  uint32_t instance = relation_instance_for_block(
+      geometry, n_instances, blockIdx.x, RELATION_ROW_FIRST,
+      RELATION_ROW_BLOCKS, &local_block);
+  if (instance == n_instances || !relation_fused_mask_test(mask, instance)) {
+    return;
+  }
+  const uint32_t *g = geometry + instance * RELATION_GEOMETRY_WORDS;
+  uint32_t rows = g[RELATION_ROWS];
+  uint32_t block_first_row = local_block * RELATION_LAUNCH_BLOCK;
+  uint32_t columns = g[RELATION_COLUMNS];
+  uint32_t n_real = g[RELATION_REAL_ROWS];
+  uint32_t source_offset_rows = g[RELATION_SOURCE_OFFSET];
+  const uint32_t *const *sources = source_tables[instance];
+  const uint32_t *instance_descriptors = descriptors[instance];
+  m31 *const *outputs = output_tables[instance];
+  qm31 z = z_ptr[0];
+  extern __shared__ m31 shared_words[];
+  if (columns <= RELATION_FUSED_ONE_READ_FRACTIONS) {
+    relation_fused_one_read_block(
+        sources, rows, block_first_row, columns, n_real, source_offset_rows,
+        instance_descriptors, alphas, z, outputs, shared_words);
+    return;
+  }
+  uint32_t row = block_first_row + threadIdx.x;
+  if (row < rows) {
+    relation_fused_narrow_row(sources, rows, row, columns, n_real,
+                              source_offset_rows, instance_descriptors, alphas,
+                              z, outputs);
+  }
+}
+
 } // namespace
 
 extern "C" int stwo_relation_fused_on(
@@ -409,4 +451,46 @@ extern "C" int stwo_relation_fused_on(
       n_instances, reinterpret_cast<const qm31 *>(alpha_powers),
       reinterpret_cast<const qm31 *>(z), mask);
   return (int)cudaGetLastError();
+}
+
+extern "C" int stwo_relation_fused_all_one_read_test_on(
+    const uint32_t *const *const *source_tables,
+    const uint32_t *const *descriptors, uint32_t *const *const *output_tables,
+    const uint32_t *geometry, uint32_t n_instances, uint32_t total_row_blocks,
+    const uint32_t *alpha_powers, uint32_t n_alpha_powers, const uint32_t *z,
+    const uint32_t *eligible_mask_words, void *stream_raw) {
+  if (source_tables == nullptr || descriptors == nullptr ||
+      output_tables == nullptr || geometry == nullptr || n_instances == 0u ||
+      n_instances > RELATION_FUSED_MAX_INSTANCES || total_row_blocks == 0u ||
+      total_row_blocks > 0x7fffffffu || alpha_powers == nullptr ||
+      n_alpha_powers == 0u || z == nullptr || eligible_mask_words == nullptr ||
+      stream_raw == nullptr) {
+    return (int)cudaErrorInvalidValue;
+  }
+  relation_fused_mask mask;
+  for (uint32_t word = 0; word < RELATION_FUSED_MASK_WORDS; ++word) {
+    mask.bits[word] = eligible_mask_words[word];
+  }
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_raw);
+  relation_fused_all_one_read_test_kernel
+      <<<total_row_blocks, RELATION_LAUNCH_BLOCK,
+         RELATION_FUSED_ONE_READ_SHARED_BYTES, stream>>>(
+          source_tables, descriptors,
+          reinterpret_cast<m31 *const *const *>(output_tables), geometry,
+          n_instances, reinterpret_cast<const qm31 *>(alpha_powers),
+          reinterpret_cast<const qm31 *>(z), mask);
+  return (int)cudaGetLastError();
+}
+
+extern "C" int stwo_relation_fused_test_function_attributes(
+    uint32_t strategy, StwoCudaFunctionAttributes *out) {
+  switch (strategy) {
+  case 0u:
+    return (int)stwo_cuda_function_attributes(relation_fused_kernel, out);
+  case 1u:
+    return (int)stwo_cuda_function_attributes(
+        relation_fused_all_one_read_test_kernel, out);
+  default:
+    return (int)cudaErrorInvalidValue;
+  }
 }

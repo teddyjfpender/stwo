@@ -99,6 +99,32 @@ pub enum RelationLaunchMode {
     Fused,
 }
 
+/// Test-only selector for the same-binary adaptive relation differential.
+/// Neither variant participates in [`PreparedRelationGraph::launch`].
+#[cfg(feature = "test-only-relation-ab")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum RelationFusedTestStrategy {
+    Adaptive = 0,
+    /// Exact pre-change selector: every fused batch with at most 512 columns
+    /// takes the one-read lane, independent of tuple width.
+    AllOneReadBaseline = 1,
+}
+
+/// Exact CUDA-loaded function facts used by the relation A/B receipt.
+#[cfg(feature = "test-only-relation-ab")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RelationFusedTestFunctionResources {
+    pub abi_version: u32,
+    pub max_threads_per_block: u32,
+    pub registers_per_thread: u32,
+    pub binary_version: u32,
+    pub ptx_version: u32,
+    pub reserved: u32,
+    pub local_bytes: u64,
+    pub static_shared_bytes: u64,
+}
+
 /// Selects which tail sequence follows the pipeline body. Both tails scan
 /// exactly the same element sequence (the last interaction column in coset
 /// scan order) and produce byte-identical committed columns and claimed sums;
@@ -1585,6 +1611,72 @@ impl<'a> PreparedRelationGraph<'a> {
         }
     }
 
+    /// Launch one dormant selector strategy for a same-process native A/B.
+    /// The production [`Self::launch`] path never calls this method.
+    #[cfg(feature = "test-only-relation-ab")]
+    #[doc(hidden)]
+    pub fn launch_fused_test_strategy(
+        &self,
+        strategy: RelationFusedTestStrategy,
+        tail: RelationTailMode,
+    ) -> Result<(), RelationGraphError> {
+        validate_prepared_launch_mode(self.prepared_mode, RelationLaunchMode::Fused)?;
+        if self.instances.is_empty() {
+            return Ok(());
+        }
+        let generic_eligibility = self
+            .instances
+            .iter()
+            .map(|instance| instance.fused_eligible && !instance.blake_g_inputs)
+            .collect::<Vec<_>>();
+        let has_blake_g_inputs = self
+            .instances
+            .iter()
+            .any(|instance| instance.blake_g_inputs);
+        let fused_mask = if generic_eligibility.contains(&true) || has_blake_g_inputs {
+            fused_eligibility_mask(&generic_eligibility)
+        } else {
+            None
+        };
+        match (fused_mask, strategy) {
+            (Some(mask), RelationFusedTestStrategy::Adaptive) => self.launch_fused_body(&mask),
+            (Some(mask), RelationFusedTestStrategy::AllOneReadBaseline) => {
+                self.launch_fused_all_one_read_test_body(&mask)
+            }
+            (None, _) => self.launch_three_stage_body(),
+        }?;
+        match tail {
+            RelationTailMode::Segmented => self.launch_segmented_tail(),
+            RelationTailMode::Scan => self.launch_scan_tail(),
+        }
+    }
+
+    /// Query the exact CUDA function loaded on the current device. Static
+    /// source/module identities are reported separately by the kernel crate.
+    #[cfg(feature = "test-only-relation-ab")]
+    #[doc(hidden)]
+    pub fn fused_test_function_resources(
+        strategy: RelationFusedTestStrategy,
+    ) -> Result<RelationFusedTestFunctionResources, RelationGraphError> {
+        let mut attributes = stwo_backend_cuda_kernels::raw::CudaFunctionAttributes::default();
+        check_cuda("relation_fused_test_function_attributes", unsafe {
+            stwo_backend_cuda_kernels::raw::stwo_relation_fused_test_function_attributes(
+                strategy as u32,
+                &mut attributes,
+            )
+        })?;
+        Ok(RelationFusedTestFunctionResources {
+            abi_version: attributes.abi_version,
+            max_threads_per_block: attributes.max_threads_per_block,
+            registers_per_thread: attributes.registers_per_thread,
+            binary_version: attributes.binary_version,
+            ptx_version: attributes.ptx_version,
+            reserved: attributes.reserved,
+            local_bytes: attributes.local_bytes,
+            static_shared_bytes: attributes.static_shared_bytes,
+        })
+    }
+
     fn pointer_table(&self, index: usize) -> Result<*mut u32, RelationGraphError> {
         let offset = self
             .instances
@@ -1659,6 +1751,94 @@ impl<'a> PreparedRelationGraph<'a> {
                 )
             })?;
         }
+        for instance in self
+            .instances
+            .iter()
+            .filter(|instance| instance.blake_g_inputs)
+        {
+            check_cuda("relation_blake_g_inputs_on", unsafe {
+                stwo_backend_cuda_kernels::raw::stwo_relation_blake_g_inputs_on(
+                    instance.source_pointers.as_u32_ptr().cast_const().cast(),
+                    instance.n_source_pointers,
+                    instance.output.rows,
+                    instance.n_real_rows,
+                    self.alphas.as_u32_ptr().cast_const(),
+                    self.n_alpha_powers()?,
+                    self.z.as_u32_ptr().cast_const(),
+                    instance.output_pointers.as_u32_ptr().cast_const().cast(),
+                    instance.output.n_coordinate_pointers()?,
+                    stream,
+                )
+            })?;
+        }
+        // Statically ineligible instances keep the exact per-instance 3-stage
+        // sequence (pairs, then in-place slab inverse + fraction chain).
+        for instance in self
+            .instances
+            .iter()
+            .filter(|instance| !instance.fused_eligible && !instance.blake_g_inputs)
+        {
+            check_cuda("relation_pairs_on", unsafe {
+                stwo_backend_cuda_kernels::raw::stwo_relation_pairs_on(
+                    instance.source_pointers.as_u32_ptr().cast_const().cast(),
+                    instance.n_source_pointers,
+                    instance.output.rows,
+                    instance.n_real_rows,
+                    instance.source_offset_rows,
+                    instance.descriptor_ptr,
+                    instance.output.columns,
+                    self.alphas.as_u32_ptr().cast_const(),
+                    self.n_alpha_powers()?,
+                    self.z.as_u32_ptr().cast_const(),
+                    instance.output_pointers.as_u32_ptr().cast_const().cast(),
+                    instance.denominators.as_u32_ptr(),
+                    stream,
+                )
+            })?;
+            check_cuda("relation_fraction_chain_on", unsafe {
+                stwo_backend_cuda_kernels::raw::stwo_relation_fraction_chain_on(
+                    instance.output_pointers.as_u32_ptr().cast_const().cast(),
+                    instance.denominators.as_u32_ptr(),
+                    self.inverse_scratch.as_u32_ptr(),
+                    instance.output.rows,
+                    instance.output.columns,
+                    stream,
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "test-only-relation-ab")]
+    fn launch_fused_all_one_read_test_body(
+        &self,
+        mask: &[u32; RELATION_FUSED_MASK_WORDS],
+    ) -> Result<(), RelationGraphError> {
+        let stream = self.arena.context().stream_raw().as_ptr();
+        let geometry = self.fraction_geometry.as_u32_ptr().cast_const();
+        if mask.iter().any(|&word| word != 0) {
+            check_cuda("relation_fused_all_one_read_test_on", unsafe {
+                stwo_backend_cuda_kernels::raw::stwo_relation_fused_all_one_read_test_on(
+                    self.pointer_table(0)?.cast(),
+                    self.pointer_table(1)?.cast(),
+                    self.pointer_table(2)?.cast(),
+                    geometry,
+                    self.n_instances()?,
+                    self.fraction_chain_blocks,
+                    self.alphas.as_u32_ptr().cast_const(),
+                    self.n_alpha_powers()?,
+                    self.z.as_u32_ptr().cast_const(),
+                    mask.as_ptr(),
+                    stream,
+                )
+            })?;
+        }
+        self.launch_fused_test_fallbacks()
+    }
+
+    #[cfg(feature = "test-only-relation-ab")]
+    fn launch_fused_test_fallbacks(&self) -> Result<(), RelationGraphError> {
+        let stream = self.arena.context().stream_raw().as_ptr();
         for instance in self
             .instances
             .iter()

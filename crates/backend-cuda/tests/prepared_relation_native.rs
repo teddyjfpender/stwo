@@ -16,6 +16,14 @@ use stwo_backend_cuda::{
     RelationRowExtent, RelationSourceLayout, RelationTailMode, RelationTupleKind,
     RelationUseDescriptor, RELATION_FUSED_MAX_TUPLE_WORDS,
 };
+#[cfg(feature = "test-only-relation-ab")]
+use stwo_backend_cuda::{
+    CudaGraphExec, RelationFusedTestFunctionResources, RelationFusedTestStrategy,
+};
+
+#[cfg(feature = "test-only-relation-ab")]
+#[path = "support/relation_native_ab.rs"]
+mod relation_native_ab;
 
 const SECURE_WORDS: usize = 4;
 const LARGE_MEMORY_VALUE_ID_BASE: u32 = 0x4000_0000;
@@ -619,7 +627,25 @@ fn run_eager_capture_and_mutated_replay(
     expected_kernel_nodes: &[u64],
     implicit_launch: bool,
     poison_zero_denominator: bool,
+    same_binary_ab: bool,
 ) {
+    #[cfg(not(feature = "test-only-relation-ab"))]
+    {
+        assert!(
+            !same_binary_ab,
+            "same-binary A/B requires --features test-only-relation-ab"
+        );
+        assert_ne!(
+            std::env::var("STWO_RELATION_NATIVE_AB").as_deref(),
+            Ok("1"),
+            "STWO_RELATION_NATIVE_AB requires --features test-only-relation-ab"
+        );
+        assert_ne!(
+            std::env::var("STWO_RELATION_ALL_ONE_READ_TEST").as_deref(),
+            Ok("1"),
+            "the all-one-read baseline requires --features test-only-relation-ab"
+        );
+    }
     let program = cairo_program();
     assert_eq!(
         program
@@ -794,6 +820,12 @@ fn run_eager_capture_and_mutated_replay(
         ));
     }
     let launch = |prepared: &PreparedRelationGraph<'_>| {
+        #[cfg(feature = "test-only-relation-ab")]
+        if std::env::var("STWO_RELATION_ALL_ONE_READ_TEST").as_deref() == Ok("1") {
+            assert_eq!(mode, RelationLaunchMode::Fused);
+            return prepared
+                .launch_fused_test_strategy(RelationFusedTestStrategy::AllOneReadBaseline, tail);
+        }
         if implicit_launch {
             prepared.launch()
         } else {
@@ -877,6 +909,25 @@ fn run_eager_capture_and_mutated_replay(
     );
     assert_ne!(replayed, eager, "replay ignored mutated sources/challenges");
 
+    #[cfg(feature = "test-only-relation-ab")]
+    if same_binary_ab || std::env::var("STWO_RELATION_NATIVE_AB").as_deref() == Ok("1") {
+        assert_eq!(mode, RelationLaunchMode::Fused);
+        assert_eq!(tail, RelationTailMode::Segmented);
+        assert!(!implicit_launch);
+        assert!(!poison_zero_denominator);
+        relation_native_ab::run(
+            &arena,
+            &prepared,
+            &program,
+            &source_slots,
+            &second_sources,
+            &second_alphas,
+            second_z,
+            &graph,
+            expected_kernel_nodes,
+        );
+    }
+
     if poison_zero_denominator {
         assert_eq!(mode, RelationLaunchMode::Fused);
         // Force the one-read wide instance's first denominator to zero, then
@@ -920,6 +971,7 @@ fn eager_capture_and_mutated_replay_match_cairo_reference() {
         &[8],
         false,
         false,
+        false,
     );
 }
 
@@ -934,6 +986,26 @@ fn fused_eager_capture_and_mutated_replay_match_cairo_reference() {
         &[9],
         false,
         false,
+        false,
+    );
+}
+
+#[cfg(feature = "test-only-relation-ab")]
+#[test]
+fn fused_same_binary_selector_ab_receipt() {
+    // Direct gate:
+    // STWO_PARITY_REF_STWO_HEAD=<40hex> \
+    // STWO_RELATION_NATIVE_AB_RECEIPT=<new.json> \
+    // cargo test --release --locked -p stwo-backend-cuda \
+    // --features test-only-relation-ab --test prepared_relation_native \
+    // fused_same_binary_selector_ab_receipt -- --exact --nocapture --test-threads=1
+    run_eager_capture_and_mutated_replay(
+        RelationLaunchMode::Fused,
+        RelationTailMode::Segmented,
+        &[9],
+        false,
+        false,
+        true,
     );
 }
 
@@ -948,6 +1020,7 @@ fn scan_tail_eager_capture_and_mutated_replay_match_cairo_reference() {
         &[5],
         false,
         false,
+        false,
     );
 }
 
@@ -959,6 +1032,7 @@ fn fused_scan_tail_eager_capture_and_mutated_replay_match_cairo_reference() {
         RelationLaunchMode::Fused,
         RelationTailMode::Scan,
         &[6],
+        false,
         false,
         false,
     );
@@ -975,6 +1049,7 @@ fn compact_fused_implicit_launch_matches_cairo_reference() {
         &[6, 9],
         true,
         false,
+        false,
     );
 }
 
@@ -989,6 +1064,7 @@ fn fused_zero_denominator_child_process() {
         &[9],
         false,
         true,
+        false,
     );
 }
 

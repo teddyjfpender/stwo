@@ -252,6 +252,33 @@ pub unsafe extern "C" fn stwo_relation_fused_on(
     no_cuda_symbol("stwo_relation_fused_on")
 }
 
+#[cfg(feature = "test-only-relation-ab")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_relation_fused_all_one_read_test_on(
+    _source_tables: *const *const *const u32,
+    _descriptors: *const *const u32,
+    _output_tables: *const *const *mut u32,
+    _geometry: *const u32,
+    _n_instances: u32,
+    _total_row_blocks: u32,
+    _alpha_powers: *const u32,
+    _n_alpha_powers: u32,
+    _z: *const u32,
+    _eligible_mask: *const u32,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_relation_fused_all_one_read_test_on")
+}
+
+#[cfg(feature = "test-only-relation-ab")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_relation_fused_test_function_attributes(
+    _strategy: u32,
+    _out: *mut crate::raw::CudaFunctionAttributes,
+) -> i32 {
+    no_cuda_symbol("stwo_relation_fused_test_function_attributes")
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stwo_relation_blake_g_inputs_on(
     _sources: *const *const u32,

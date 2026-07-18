@@ -2214,6 +2214,32 @@ extern "C" {
         stream: *mut core::ffi::c_void,
     ) -> i32;
 
+    /// Test-only launch of the exact pre-adaptive `columns <= 512` selector.
+    /// It is compiled beside, but does not modify or replace, the production
+    /// fused kernel.
+    #[cfg(feature = "test-only-relation-ab")]
+    pub fn stwo_relation_fused_all_one_read_test_on(
+        source_tables: *const *const *const u32,
+        descriptors: *const *const u32,
+        output_tables: *const *const *mut u32,
+        geometry: *const u32,
+        n_instances: u32,
+        total_row_blocks: u32,
+        alpha_powers: *const u32,
+        n_alpha_powers: u32,
+        z: *const u32,
+        eligible_mask: *const u32,
+        stream: *mut core::ffi::c_void,
+    ) -> i32;
+
+    /// Loaded-function facts for the production adaptive kernel (`0`) or the
+    /// dormant pre-adaptive test baseline (`1`).
+    #[cfg(feature = "test-only-relation-ab")]
+    pub fn stwo_relation_fused_test_function_attributes(
+        strategy: u32,
+        out: *mut CudaFunctionAttributes,
+    ) -> i32;
+
     /// Isolated exact Blake-G relation body. Six raw input columns produce all
     /// 36 interaction coordinates without a flattened lookup slab.
     pub fn stwo_relation_blake_g_inputs_on(
