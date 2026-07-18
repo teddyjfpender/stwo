@@ -564,6 +564,37 @@ static bool nvrtc_accepts_dopt_off() {
     return ok;
 }
 
+// Stream-ordered allocations are not associated with a CUDA context:
+// CU_POINTER_ATTRIBUTE_CONTEXT therefore returns a null context even while the
+// allocation is valid and accessible. Prove the facts publication needs
+// directly instead: current-device accessibility and a complete u32 range.
+static bool is_current_device_u32_allocation(
+    CUdeviceptr pointer,
+    CUdevice device,
+    size_t required_bytes
+) {
+    if (pointer == 0 || pointer % alignof(uint32_t) != 0 || required_bytes == 0) {
+        return false;
+    }
+    cudaPointerAttributes attributes = {};
+    if (cudaPointerGetAttributes(
+            &attributes, reinterpret_cast<const void *>(pointer)) != cudaSuccess ||
+        attributes.type != cudaMemoryTypeDevice ||
+        attributes.device != static_cast<int>(device) ||
+        reinterpret_cast<CUdeviceptr>(attributes.devicePointer) != pointer) {
+        return false;
+    }
+    CUdeviceptr range_start = 0;
+    size_t range_bytes = 0;
+    return cuPointerGetAttribute(
+               &range_start, CU_POINTER_ATTRIBUTE_RANGE_START_ADDR, pointer) ==
+               CUDA_SUCCESS &&
+           cuPointerGetAttribute(
+               &range_bytes, CU_POINTER_ATTRIBUTE_RANGE_SIZE, pointer) ==
+               CUDA_SUCCESS &&
+           range_start == pointer && range_bytes >= required_bytes;
+}
+
 // Witness-JIT modules that embed computed EC deduces (ISA-V3 kinds 2/3,
 // `stwo_wit_deduce.cuh`) declare per-module Pedersen table globals. Device
 // globals never cross CUmodule boundaries, so publication is proved separately
@@ -672,15 +703,14 @@ static bool fill_witness_pedersen_globals(
                 kernel_name, n_rows);
         return false;
     }
+    const size_t required_column_bytes =
+        static_cast<size_t>(n_rows) * sizeof(uint32_t);
     for (size_t i = 0; i < kPointerCount; ++i) {
         CUdeviceptr pointer = static_cast<CUdeviceptr>(reinterpret_cast<uintptr_t>(ptrs[i]));
-        CUcontext pointer_context = nullptr;
-        if (pointer == 0 || pointer % alignof(uint32_t) != 0 ||
-            cuPointerGetAttribute(&pointer_context, CU_POINTER_ATTRIBUTE_CONTEXT, pointer) !=
-                CUDA_SUCCESS ||
-            pointer_context != context) {
+        if (!is_current_device_u32_allocation(
+                pointer, device, required_column_bytes)) {
             fprintf(stderr,
-                    "stwo JIT: pedersen column %zu is not a current-context u32 pointer "
+                    "stwo JIT: pedersen column %zu is not a current-device u32 allocation "
                     "for %s\n",
                     i, kernel_name);
             return false;

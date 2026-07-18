@@ -512,6 +512,21 @@ mod pedersen_publication_abi_tests {
     use super::{CudaAotFunctionPublication, CudaPedersenModulePublication};
 
     #[test]
+    fn pedersen_columns_require_current_device_accessible_ranges() {
+        let native = include_str!("../cuda/runtime_jit.cu");
+        assert!(native.contains("static bool is_current_device_u32_allocation("));
+        assert!(native.contains("attributes.type != cudaMemoryTypeDevice"));
+        assert!(native.contains("attributes.device != static_cast<int>(device)"));
+        assert!(
+            native.contains("reinterpret_cast<CUdeviceptr>(attributes.devicePointer) != pointer")
+        );
+        assert!(native.contains("CU_POINTER_ATTRIBUTE_RANGE_START_ADDR"));
+        assert!(native.contains("CU_POINTER_ATTRIBUTE_RANGE_SIZE"));
+        assert!(native.contains("range_start == pointer && range_bytes >= required_bytes"));
+        assert!(!native.contains("CU_POINTER_ATTRIBUTE_CONTEXT, pointer"));
+    }
+
+    #[test]
     fn publication_layout_and_native_contract_are_exact() {
         assert_eq!(core::mem::size_of::<CudaPedersenModulePublication>(), 544);
         assert_eq!(core::mem::align_of::<CudaPedersenModulePublication>(), 8);
