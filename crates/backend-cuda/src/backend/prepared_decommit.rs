@@ -591,8 +591,12 @@ impl DecommitWorkspaceRequirements {
         for tree in &self.trees {
             let words = match tree {
                 DecommitTreeRequirements::Trace(tree) => {
+                    let all_resident = tree
+                        .groups
+                        .iter()
+                        .all(|group| group.coefficient_pointer_words.is_none());
                     direct_trace_pack_launches = direct_trace_pack_launches
-                        .checked_add(tree.groups.len())
+                        .checked_add(if all_resident { 1 } else { tree.groups.len() })
                         .ok_or(PreparedDecommitError::SizeOverflow)?;
                     tree.column_count
                         .checked_mul(queries)
@@ -1428,6 +1432,14 @@ impl<'a> PreparedDecommitGraph<'a> {
         };
         check_cuda("decommit_prepare_trace_queries", code)?;
 
+        // Resident groups are already flattened into one canonical pointer/log
+        // table at preparation. Their planning boundaries carry no replay
+        // dependency, unlike recompute groups whose shared LDE tile must be
+        // consumed before the next group overwrites it.
+        let aggregate_resident_pack = tree
+            .groups
+            .iter()
+            .all(|group| group.coefficient_ptrs.is_none());
         let twiddles = self.lde_twiddles;
         for (group_index, group) in tree.groups.iter().enumerate() {
             if let (Some(coefficient_ptrs), Some(coefficient_sizes), Some(outputs)) = (
@@ -1462,33 +1474,39 @@ impl<'a> PreparedDecommitGraph<'a> {
 
             // Consume this group before a later recompute group reuses the same LDE
             // tile. Each launch writes directly into its disjoint final bundle range.
-            let code = unsafe {
-                stwo_backend_cuda_kernels::raw::stwo_decommit_pack_trace_group_on(
-                    u32::try_from(tree_index).map_err(|_| PreparedDecommitError::SizeOverflow)?,
-                    u32::try_from(tree.column_count)
-                        .map_err(|_| PreparedDecommitError::SizeOverflow)?,
-                    u32::try_from(group.first_column)
-                        .map_err(|_| PreparedDecommitError::SizeOverflow)?,
-                    u32::try_from(group.column_count)
-                        .map_err(|_| PreparedDecommitError::SizeOverflow)?,
-                    tree.evaluation_ptrs
-                        .as_u32_ptr()
-                        .cast::<*const u32>()
-                        .add(group.first_column),
-                    tree.evaluation_log_sizes
-                        .as_u32_ptr()
-                        .add(group.first_column),
-                    tree.leaf_log_size,
-                    self.mapped_queries.as_u32_ptr(),
-                    self.count_ptr(COUNT_MAPPED),
-                    self.requirements.config.n_queries,
-                    self.assembly.as_u32_ptr(),
-                    u32::try_from(self.requirements.assembly_words)
-                        .map_err(|_| PreparedDecommitError::SizeOverflow)?,
-                    self.stream(),
-                )
-            };
-            check_cuda("decommit_pack_trace_group", code)?;
+            if !aggregate_resident_pack || group_index == 0 {
+                let (first_column, column_count) = if aggregate_resident_pack {
+                    (0, tree.column_count)
+                } else {
+                    (group.first_column, group.column_count)
+                };
+                let code = unsafe {
+                    stwo_backend_cuda_kernels::raw::stwo_decommit_pack_trace_group_on(
+                        u32::try_from(tree_index)
+                            .map_err(|_| PreparedDecommitError::SizeOverflow)?,
+                        u32::try_from(tree.column_count)
+                            .map_err(|_| PreparedDecommitError::SizeOverflow)?,
+                        u32::try_from(first_column)
+                            .map_err(|_| PreparedDecommitError::SizeOverflow)?,
+                        u32::try_from(column_count)
+                            .map_err(|_| PreparedDecommitError::SizeOverflow)?,
+                        tree.evaluation_ptrs
+                            .as_u32_ptr()
+                            .cast::<*const u32>()
+                            .add(first_column),
+                        tree.evaluation_log_sizes.as_u32_ptr().add(first_column),
+                        tree.leaf_log_size,
+                        self.mapped_queries.as_u32_ptr(),
+                        self.count_ptr(COUNT_MAPPED),
+                        self.requirements.config.n_queries,
+                        self.assembly.as_u32_ptr(),
+                        u32::try_from(self.requirements.assembly_words)
+                            .map_err(|_| PreparedDecommitError::SizeOverflow)?,
+                        self.stream(),
+                    )
+                };
+                check_cuda("decommit_pack_trace_group", code)?;
+            }
 
             if tree.unretained_bottom_layers != 0 {
                 let final_group = group_index + 1 == tree.groups.len();
@@ -2108,7 +2126,7 @@ mod tests {
                         .direct_pack_capacity_model()
                         .unwrap()
                         .direct_trace_pack_launches,
-                    widths.len()
+                    1
                 );
             }
         }
