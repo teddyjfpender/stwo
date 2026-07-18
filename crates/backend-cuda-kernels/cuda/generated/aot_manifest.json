@@ -2231,6 +2231,16 @@
   },
   {
     "abi_schema": "composition_wave_v2",
+    "cache_key": "982c3aef19097cdd",
+    "file": "constraint_wave_log_10_982c3aef19097cdd.cu",
+    "kernel_name": "stwo_composition_wave_b4661bf86bdca12c",
+    "kind": "constraint",
+    "label": "wave_log_10",
+    "program_identity": "935e21ba6a439c7453dee99951ff3f1a5c9ba04fd08b3d82018369585488537b",
+    "semantic_hash": "b4661bf86bdca12c"
+  },
+  {
+    "abi_schema": "composition_wave_v2",
     "cache_key": "0343c0bfae90c662",
     "file": "constraint_wave_log_11_0343c0bfae90c662.cu",
     "kernel_name": "stwo_composition_wave_d75abeedeb5f43c5",
@@ -2248,6 +2258,16 @@
     "label": "wave_log_11",
     "program_identity": "09effe32072af9c515862a162380eca4bec0480754aa7fd895733fd28d315c28",
     "semantic_hash": "90ee50488cbed02f"
+  },
+  {
+    "abi_schema": "composition_wave_v2",
+    "cache_key": "f37efea602119725",
+    "file": "constraint_wave_log_11_f37efea602119725.cu",
+    "kernel_name": "stwo_composition_wave_eafeca646ed4c47d",
+    "kind": "constraint",
+    "label": "wave_log_11",
+    "program_identity": "81e3a443754443708044672220fe96763ac14b4a081da5625b3f56223239a4ad",
+    "semantic_hash": "eafeca646ed4c47d"
   },
   {
     "abi_schema": "composition_wave_v2",
@@ -2278,6 +2298,16 @@
     "label": "wave_log_12",
     "program_identity": "d29d8d42643a22cf758cc15d93a1c1299ff8f4f380baa7cf7c55f5398258848b",
     "semantic_hash": "970e0f79b9ecc6f7"
+  },
+  {
+    "abi_schema": "composition_wave_v2",
+    "cache_key": "85719ea75aeebe16",
+    "file": "constraint_wave_log_12_85719ea75aeebe16.cu",
+    "kernel_name": "stwo_composition_wave_09f3369fe7b72c55",
+    "kind": "constraint",
+    "label": "wave_log_12",
+    "program_identity": "31a5dd6283bafe34b4235f33d06ed7543db594a76b472bd45e426081ab229c59",
+    "semantic_hash": "09f3369fe7b72c55"
   },
   {
     "abi_schema": "composition_wave_v2",
@@ -2351,6 +2381,16 @@
   },
   {
     "abi_schema": "composition_wave_v2",
+    "cache_key": "9df84af1ad113a82",
+    "file": "constraint_wave_log_13_9df84af1ad113a82.cu",
+    "kernel_name": "stwo_composition_wave_4428075d6c014e25",
+    "kind": "constraint",
+    "label": "wave_log_13",
+    "program_identity": "21cf0db20a029bd0f97fcc1ba8c4856ef3216f0d6b626f1536f9645cdcffd5ba",
+    "semantic_hash": "4428075d6c014e25"
+  },
+  {
+    "abi_schema": "composition_wave_v2",
     "cache_key": "9ee2f2a172ba02c1",
     "file": "constraint_wave_log_13_9ee2f2a172ba02c1.cu",
     "kernel_name": "stwo_composition_wave_1be7f86b1cb7e342",
@@ -2368,6 +2408,16 @@
     "label": "wave_log_13",
     "program_identity": "3a4c03a5d734cff7a59c0b56051d8df83bc6064105a258b9a548bc8fabb177a9",
     "semantic_hash": "c1cb7756535c9a94"
+  },
+  {
+    "abi_schema": "composition_wave_v2",
+    "cache_key": "67eb8318de38a559",
+    "file": "constraint_wave_log_14_67eb8318de38a559.cu",
+    "kernel_name": "stwo_composition_wave_34a676ea761a8ba6",
+    "kind": "constraint",
+    "label": "wave_log_14",
+    "program_identity": "894d41980666a71a887d060e202dd13b889413bb326fa06b525e5ae37174036e",
+    "semantic_hash": "34a676ea761a8ba6"
   },
   {
     "abi_schema": "composition_wave_v2",
@@ -2411,6 +2461,16 @@
   },
   {
     "abi_schema": "composition_wave_v2",
+    "cache_key": "a9d98ef2633ba935",
+    "file": "constraint_wave_log_15_a9d98ef2633ba935.cu",
+    "kernel_name": "stwo_composition_wave_5906125e841651cd",
+    "kind": "constraint",
+    "label": "wave_log_15",
+    "program_identity": "65cf399fa97b393fdaaa679c1416a72927d423809595f85eb9cabf5aed55bce3",
+    "semantic_hash": "5906125e841651cd"
+  },
+  {
+    "abi_schema": "composition_wave_v2",
     "cache_key": "ee277d4cd2c2e3ea",
     "file": "constraint_wave_log_15_ee277d4cd2c2e3ea.cu",
     "kernel_name": "stwo_composition_wave_4a9c716bad5c7e45",
@@ -2451,6 +2511,16 @@
   },
   {
     "abi_schema": "composition_wave_v2",
+    "cache_key": "47e3877a323f0516",
+    "file": "constraint_wave_log_16_47e3877a323f0516.cu",
+    "kernel_name": "stwo_composition_wave_472666e136e5612a",
+    "kind": "constraint",
+    "label": "wave_log_16",
+    "program_identity": "db18a6dfa92c4fedcc817228bf4b6fc14f9b0dc0ca271e14c0b97ce257d90c64",
+    "semantic_hash": "472666e136e5612a"
+  },
+  {
+    "abi_schema": "composition_wave_v2",
     "cache_key": "5224de58289540c9",
     "file": "constraint_wave_log_16_5224de58289540c9.cu",
     "kernel_name": "stwo_composition_wave_d34787f9ad443deb",
@@ -2478,6 +2548,16 @@
     "label": "wave_log_17",
     "program_identity": "1740faa4b6ccbbd5ec0fde937f21c80acccc2dbdd4b5d3051dfd904a114ec8e0",
     "semantic_hash": "0d5916368f27d3af"
+  },
+  {
+    "abi_schema": "composition_wave_v2",
+    "cache_key": "5c72fefadd5a0485",
+    "file": "constraint_wave_log_17_5c72fefadd5a0485.cu",
+    "kernel_name": "stwo_composition_wave_1dd51ea57d99953d",
+    "kind": "constraint",
+    "label": "wave_log_17",
+    "program_identity": "dc114f04ef6c35aba15b5bd3991b3197ef004233d47a0147988c63bfc8a5a8c4",
+    "semantic_hash": "1dd51ea57d99953d"
   },
   {
     "abi_schema": "composition_wave_v2",
@@ -2521,6 +2601,16 @@
   },
   {
     "abi_schema": "composition_wave_v2",
+    "cache_key": "f6d9ea7b44b2f63d",
+    "file": "constraint_wave_log_18_f6d9ea7b44b2f63d.cu",
+    "kernel_name": "stwo_composition_wave_bc07595d880aa0fa",
+    "kind": "constraint",
+    "label": "wave_log_18",
+    "program_identity": "4b9d5be84bac1cd5bfeac09052daf43f17558e1ba31d2675c7f2b277d7d55476",
+    "semantic_hash": "bc07595d880aa0fa"
+  },
+  {
+    "abi_schema": "composition_wave_v2",
     "cache_key": "00230dd78ea6208e",
     "file": "constraint_wave_log_19_00230dd78ea6208e.cu",
     "kernel_name": "stwo_composition_wave_aab04d308bd7232c",
@@ -2561,6 +2651,16 @@
   },
   {
     "abi_schema": "composition_wave_v2",
+    "cache_key": "a0767f64bfa2c34a",
+    "file": "constraint_wave_log_19_a0767f64bfa2c34a.cu",
+    "kernel_name": "stwo_composition_wave_9f850c746922d9d8",
+    "kind": "constraint",
+    "label": "wave_log_19",
+    "program_identity": "af2c1ea00ed36ae4e090754c385d2891e39c3891161e5651066fed58e407e347",
+    "semantic_hash": "9f850c746922d9d8"
+  },
+  {
+    "abi_schema": "composition_wave_v2",
     "cache_key": "c5eefe107600d3fa",
     "file": "constraint_wave_log_19_c5eefe107600d3fa.cu",
     "kernel_name": "stwo_composition_wave_fa20388e573647a4",
@@ -2568,6 +2668,16 @@
     "label": "wave_log_19",
     "program_identity": "dd59604f8b28137c85946d59429e2eacd7b8c86475d93d3d797c0583d74ab569",
     "semantic_hash": "fa20388e573647a4"
+  },
+  {
+    "abi_schema": "composition_wave_v2",
+    "cache_key": "c659fe3223f1a928",
+    "file": "constraint_wave_log_20_c659fe3223f1a928.cu",
+    "kernel_name": "stwo_composition_wave_7c47621c6869ee4e",
+    "kind": "constraint",
+    "label": "wave_log_20",
+    "program_identity": "c52cf7617e10f7274bc2dbacc4bd018ca2e9a39a17987942beee9201d6ff7e05",
+    "semantic_hash": "7c47621c6869ee4e"
   },
   {
     "abi_schema": "composition_wave_v2",
@@ -2618,6 +2728,36 @@
     "label": "wave_log_21",
     "program_identity": "f7cb913a9add29d5211a74208002b6b0a3f374ecf7e9c343a7ddc1d729180ace",
     "semantic_hash": "0802298dbb462516"
+  },
+  {
+    "abi_schema": "composition_wave_v2",
+    "cache_key": "ceb9de22d182a453",
+    "file": "constraint_wave_log_21_ceb9de22d182a453.cu",
+    "kernel_name": "stwo_composition_wave_ffd22298b7d40fbe",
+    "kind": "constraint",
+    "label": "wave_log_21",
+    "program_identity": "82643db2b5f6fb72e851526fa44bb6966889ca15970feed36d1dc779c3076742",
+    "semantic_hash": "ffd22298b7d40fbe"
+  },
+  {
+    "abi_schema": "composition_wave_v2",
+    "cache_key": "b9c966e5c4e4a7a8",
+    "file": "constraint_wave_log_22_b9c966e5c4e4a7a8.cu",
+    "kernel_name": "stwo_composition_wave_15039af59bf889c9",
+    "kind": "constraint",
+    "label": "wave_log_22",
+    "program_identity": "c69e98a27cf91ca01a27ff9ddeaf111da223974f20de4ddcb195f0cc3135e189",
+    "semantic_hash": "15039af59bf889c9"
+  },
+  {
+    "abi_schema": "composition_wave_v2",
+    "cache_key": "393850386c683d3d",
+    "file": "constraint_wave_log_24_393850386c683d3d.cu",
+    "kernel_name": "stwo_composition_wave_d4383fbf67de74a8",
+    "kind": "constraint",
+    "label": "wave_log_24",
+    "program_identity": "491fa0eb652397737f36927310572a87d491957a65748804dc7af325d81443d1",
+    "semantic_hash": "d4383fbf67de74a8"
   },
   {
     "abi_schema": "composition_wave_v2",
@@ -2681,6 +2821,16 @@
   },
   {
     "abi_schema": "composition_wave_v2",
+    "cache_key": "a1a0adc456c72a20",
+    "file": "constraint_wave_log_5_a1a0adc456c72a20.cu",
+    "kernel_name": "stwo_composition_wave_f098650719fc49b8",
+    "kind": "constraint",
+    "label": "wave_log_5",
+    "program_identity": "6ee7ace0f060f0a947c33fc33d15b1a2609695aa40953f1aec8b4fbbd1808353",
+    "semantic_hash": "f098650719fc49b8"
+  },
+  {
+    "abi_schema": "composition_wave_v2",
     "cache_key": "de5f5ab3e5d0b9c6",
     "file": "constraint_wave_log_5_de5f5ab3e5d0b9c6.cu",
     "kernel_name": "stwo_composition_wave_06c7c03cedbf45cc",
@@ -2728,6 +2878,16 @@
     "label": "wave_log_7",
     "program_identity": "0746e52ea1116feabe14b8bdac7d2b9771ef0d7e98f2aedc441174b9241ee2d2",
     "semantic_hash": "71efe6146a2cda12"
+  },
+  {
+    "abi_schema": "composition_wave_v2",
+    "cache_key": "1a15e41a46649369",
+    "file": "constraint_wave_log_7_1a15e41a46649369.cu",
+    "kernel_name": "stwo_composition_wave_e14951a987a73d54",
+    "kind": "constraint",
+    "label": "wave_log_7",
+    "program_identity": "0cb72135c4522a03597b2cd75710ce3d83551bd1e1e8561aa771f8094d7e41ab",
+    "semantic_hash": "e14951a987a73d54"
   },
   {
     "abi_schema": "composition_wave_v2",
@@ -2811,6 +2971,16 @@
   },
   {
     "abi_schema": "composition_wave_v2",
+    "cache_key": "9af01993399590fd",
+    "file": "constraint_wave_log_8_9af01993399590fd.cu",
+    "kernel_name": "stwo_composition_wave_3d125db465eddf04",
+    "kind": "constraint",
+    "label": "wave_log_8",
+    "program_identity": "5731597e664e46bcfad01c115ec4cc6b6d287b3f2613ad5d05a63622447b1ddc",
+    "semantic_hash": "3d125db465eddf04"
+  },
+  {
+    "abi_schema": "composition_wave_v2",
     "cache_key": "feb2e30839fb309c",
     "file": "constraint_wave_log_8_feb2e30839fb309c.cu",
     "kernel_name": "stwo_composition_wave_434035972d9dbc0b",
@@ -2828,6 +2998,16 @@
     "label": "wave_log_9",
     "program_identity": "b7bfa6aa6ba2f305a26f0945238e44dde96b9761af667b73937d72e60d348440",
     "semantic_hash": "2a282340dafa7bda"
+  },
+  {
+    "abi_schema": "composition_wave_v2",
+    "cache_key": "34a34f3a167e083a",
+    "file": "constraint_wave_log_9_34a34f3a167e083a.cu",
+    "kernel_name": "stwo_composition_wave_8aaea495c9085d7b",
+    "kind": "constraint",
+    "label": "wave_log_9",
+    "program_identity": "56f8642bb02c4199325b26df008211c1dd78d02d9f97edf5237f935a7777f72e",
+    "semantic_hash": "8aaea495c9085d7b"
   },
   {
     "abi_schema": "composition_wave_v2",
