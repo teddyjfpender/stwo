@@ -1,11 +1,13 @@
 // Fused relation pipeline: one kernel, one proof-wide launch, replacing the
 // 3-stage `relation_pairs_global` -> `batch_inverse_secure_field_ragged` ->
 // `fraction_chain_global` sequence for every fused-eligible instance. The
-// denominator slab is never materialized. Batches of at most 512 columns use
-// a one-read shared-memory lane: every (numerator, denominator) is produced
-// once, a 512-leaf Montgomery tree inverts a bounded row tile with one root
-// inverse, and a segmented scan writes the canonical chain directly. Admitted
-// 513..1024-column batches retain the proven suffix/recompute fallback. The instance's
+// denominator slab is never materialized. Tuples of at most 32 words use the
+// proven suffix/recompute lane below. Wider tuples use a one-read shared-memory
+// lane: every (numerator, denominator) is produced once, a 512-leaf Montgomery
+// tree inverts a bounded row tile with one root inverse, and a segmented scan
+// writes the canonical chain directly. Admitted 513..1024-column batches retain
+// the suffix/recompute lane because host eligibility bounds them to 32-word
+// tuples. The instance's
 // `denominators` binding is a one-word aligned sentinel in a mode-sealed fused
 // preparation, and the proof-wide `inverse_scratch` slot stays allocated but
 // untouched. Neither is passed to or dereferenced by this kernel.
@@ -50,11 +52,11 @@
 // tuple/denominator source walk and changes one inverse per row into one inverse
 // per <=512-fraction row tile. Partial final tiles retain exactly one inverse.
 //
-// Resource gate: the last qualified sm_90 source used 80 registers/thread, a
-// 32 B stack, zero spills, and this same 24,560 B dynamic shared reservation.
-// Shape-based routing removes the old descriptor scan and shared dispatch word,
-// but its register/stack/occupancy envelope remains uncredited until a fresh
-// ptxas receipt is captured for this exact source.
+// Resource gate: the last qualified adaptive sm_90 source used 80
+// registers/thread, a 32 B stack, zero spills, this same 24,560 B dynamic
+// shared reservation, and one 4 B static dispatch word. Its
+// register/stack/occupancy envelope remains uncredited until a fresh ptxas
+// receipt is captured for this exact source.
 //
 // Byte identity with the 3-stage lane: M31/QM31 arithmetic is exact modular
 // arithmetic through the same canonical-form primitives (fields.cu), so the
@@ -112,6 +114,23 @@ __device__ __forceinline__ void relation_reject_zero_denominator(qm31 product) {
   if (relation_qm31_is_zero(product)) {
     asm volatile("trap;");
   }
+}
+
+__device__ __forceinline__ bool relation_descriptors_need_one_read(
+    const uint32_t *descriptors, uint32_t columns) {
+  for (uint32_t column = 0; column < columns; ++column) {
+    const uint32_t *descriptor =
+        descriptors + column * RELATION_DESC_WORDS;
+    if (descriptor[1u + 2u] > RELATION_FUSED_NARROW_MAX_TUPLE_WORDS) {
+      return true;
+    }
+    if (descriptor[0] == 2u &&
+        descriptor[1u + RELATION_USE_WORDS + 2u] >
+            RELATION_FUSED_NARROW_MAX_TUPLE_WORDS) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // Invert 512 shared leaves with one root inversion. Active fractions occupy
@@ -340,7 +359,13 @@ __global__ void relation_fused_kernel(
   m31 *const *outputs = output_tables[instance];
   qm31 z = z_ptr[0];
   extern __shared__ m31 shared_words[];
-  if (columns <= RELATION_FUSED_ONE_READ_FRACTIONS) {
+  __shared__ uint32_t one_read_lane;
+  if (threadIdx.x == 0u) {
+    one_read_lane =
+        relation_descriptors_need_one_read(instance_descriptors, columns);
+  }
+  __syncthreads();
+  if (one_read_lane != 0u) {
     relation_fused_one_read_block(
         sources, rows, block_first_row, columns, n_real, source_offset_rows,
         instance_descriptors, alphas, z, outputs, shared_words);

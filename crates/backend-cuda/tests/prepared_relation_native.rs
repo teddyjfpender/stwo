@@ -55,9 +55,10 @@ fn relation_use(
 fn cairo_program() -> RelationKernelProgram {
     use {RelationMultiplicityKind as Multiplicity, RelationTupleKind as Tuple};
 
-    // Exercise all body classes in one captured graph: one-read narrow and
-    // generated-Cairo-wide shapes, the 513-column suffix/recompute fallback,
-    // and a tuple beyond the audited envelope that retains the 3-stage lane.
+    // Exercise all body classes in one captured graph: <=32-word
+    // suffix/recompute, generated-Cairo-wide one-read, the 513-column
+    // suffix/recompute fallback, and a tuple beyond the audited envelope that
+    // retains the 3-stage lane.
     let wide_tuple_words = WIDE_TUPLE_WORDS;
     let fallback_tuple_words = RELATION_FUSED_MAX_TUPLE_WORDS + 1;
     let narrow_fallback_column = RelationColumnDescriptor {

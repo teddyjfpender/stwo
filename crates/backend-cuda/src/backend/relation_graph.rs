@@ -70,9 +70,8 @@ pub const RELATION_FUSED_MASK_WORDS: usize = 8;
 /// Proofs with more relation instances than mask bits fail closed to the
 /// 3-stage lane as a whole.
 pub const RELATION_FUSED_MAX_INSTANCES: usize = RELATION_FUSED_MASK_WORDS * 32;
-/// Original two-pass fused lane bound. Batches wider than the one-read column
-/// tile keep this suffix/recompute fallback only when every tuple stays at or
-/// below this audited width.
+/// Original two-pass fused lane bound. Every fused batch at or below this
+/// tuple width uses suffix/recompute; wider admitted tuples use one-read.
 const RELATION_FUSED_NARROW_MAX_TUPLE_WORDS: u32 = 32;
 /// Audited one-read wide-lane tuple bound. This covers every generated Cairo
 /// relation width (33, 36, 43, 58, 73, 87 and 126) without turning an arbitrary
@@ -123,18 +122,18 @@ fn relation_batch_max_tuple_words(batch: &RelationBatchProgram) -> u32 {
         .unwrap_or(0)
 }
 
-/// Static eligibility for the one-read shared Montgomery lane. Every
-/// numerator and denominator is evaluated once, and at least one complete row
-/// must fit its fixed 512-fraction tile.
+/// Static admissibility for the one-read shared Montgomery lane. Runtime
+/// selection still keeps <=32-word tuples on suffix/recompute; this predicate
+/// proves that wider tuples fit the 512-fraction tile and audited width.
 pub fn relation_batch_one_read_eligible(batch: &RelationBatchProgram) -> bool {
     batch.columns.len() <= RELATION_FUSED_ONE_READ_MAX_COLUMNS
         && relation_batch_max_tuple_words(batch) <= RELATION_FUSED_MAX_TUPLE_WORDS
 }
 
-/// Static fused-lane eligibility of every instance of `batch`. Batches of at
-/// most 512 columns use the one-read lane. Batches from 513 through 1024 retain
-/// the proven suffix/recompute fallback only for tuples of at most 32 words.
-/// Anything outside either audited envelope keeps the proven 3-stage path.
+/// Static fused-lane eligibility of every instance of `batch`. Tuples of at
+/// most 32 words use suffix/recompute through 1024 columns. Wider tuples use
+/// one-read only when they fit its 512-fraction tile and 126-word audited
+/// width. Anything outside either envelope keeps the proven 3-stage path.
 pub fn relation_batch_fused_eligible(batch: &RelationBatchProgram) -> bool {
     if batch.columns.len() > RELATION_FUSED_MAX_COLUMNS {
         return false;

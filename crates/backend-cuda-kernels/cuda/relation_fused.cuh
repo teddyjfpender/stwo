@@ -27,6 +27,7 @@ constexpr uint32_t RELATION_USE_WORDS = 7;
 constexpr uint32_t RELATION_LARGE_MEMORY_VALUE_ID_BASE = 0x40000000u;
 constexpr uint32_t RELATION_XOR12_LIMB_BITS = 10;
 constexpr uint32_t RELATION_XOR12_EXPAND_BITS = 2;
+constexpr uint32_t RELATION_FUSED_NARROW_MAX_TUPLE_WORDS = 32;
 // The one-read lane pads each bounded row tile to one 512-leaf Montgomery tree.
 // Its shared SoA is numerator[512] + denominator[512] + tree[511].
 constexpr uint32_t RELATION_FUSED_ONE_READ_FRACTIONS = 512;
