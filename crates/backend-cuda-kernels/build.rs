@@ -1103,6 +1103,9 @@ fn write_aot_pack(
             Some(AotKernelAbiSchema::OrdinaryConstraintV1) => {
                 "Some(AotKernelAbiSchema::OrdinaryConstraintV1)"
             }
+            Some(AotKernelAbiSchema::CompositionWaveV2) => {
+                "Some(AotKernelAbiSchema::CompositionWaveV2)"
+            }
             None => "None",
         };
         let scope = match scope {

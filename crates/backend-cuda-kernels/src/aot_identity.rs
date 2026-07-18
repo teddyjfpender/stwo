@@ -45,6 +45,7 @@ pub enum AotKernelAbiKind {
     U32 = 1,
     DevicePointerU32 = 2,
     DevicePointerTableU32 = 3,
+    DevicePointerCompositionWavePart = 4,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -56,6 +57,9 @@ pub enum AotKernelAbiAccess {
     LaunchRowCount = 4,
     TraceLogSize = 5,
     RandomCoefficientBase = 6,
+    FullDomainRows = 7,
+    ShardStart = 8,
+    ShardRows = 9,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -72,6 +76,7 @@ pub struct AotKernelAbiArgument {
 pub enum AotKernelAbiSchema {
     RecordedWitnessV1,
     OrdinaryConstraintV1,
+    CompositionWaveV2,
 }
 
 impl AotKernelAbiSchema {
@@ -79,6 +84,7 @@ impl AotKernelAbiSchema {
         match self {
             Self::RecordedWitnessV1 => "recorded_witness_v1",
             Self::OrdinaryConstraintV1 => "ordinary_constraint_v1",
+            Self::CompositionWaveV2 => "composition_wave_v2",
         }
     }
 
@@ -86,6 +92,7 @@ impl AotKernelAbiSchema {
         match self {
             Self::RecordedWitnessV1 => "recorded_witness",
             Self::OrdinaryConstraintV1 => "ordinary_constraint",
+            Self::CompositionWaveV2 => "composition_wave",
         }
     }
 
@@ -93,6 +100,7 @@ impl AotKernelAbiSchema {
         match self {
             Self::RecordedWitnessV1 => 1,
             Self::OrdinaryConstraintV1 => 1,
+            Self::CompositionWaveV2 => 2,
         }
     }
 
@@ -100,6 +108,7 @@ impl AotKernelAbiSchema {
         match self {
             Self::RecordedWitnessV1 => &RECORDED_WITNESS_V1_ARGUMENTS,
             Self::OrdinaryConstraintV1 => &ORDINARY_CONSTRAINT_V1_ARGUMENTS,
+            Self::CompositionWaveV2 => &COMPOSITION_WAVE_V2_ARGUMENTS,
         }
     }
 
@@ -128,9 +137,7 @@ pub(crate) fn module_globals_for_source(
             Ok(AotKernelModuleGlobals::WitnessPedersenV1)
         }
         (Some(_), false) => Ok(AotKernelModuleGlobals::None),
-        (Some(AotKernelAbiSchema::OrdinaryConstraintV1), true) => {
-            Err("ordinary constraint source unexpectedly names witness Pedersen globals")
-        }
+        (Some(_), true) => Err("non-witness source unexpectedly names witness Pedersen globals"),
         (None, _) => unreachable!("schema absence returned above"),
     }
 }
@@ -271,6 +278,63 @@ const ORDINARY_CONSTRAINT_V1_ARGUMENTS: [AotKernelAbiArgument; 13] = [
         "rc_base",
         AotKernelAbiKind::U32,
         AotKernelAbiAccess::RandomCoefficientBase,
+    ),
+];
+
+const COMPOSITION_WAVE_V2_ARGUMENTS: [AotKernelAbiArgument; 9] = [
+    abi_argument(
+        0,
+        "parts",
+        AotKernelAbiKind::DevicePointerCompositionWavePart,
+        AotKernelAbiAccess::Read,
+    ),
+    abi_argument(
+        1,
+        "random_coeff_powers",
+        AotKernelAbiKind::DevicePointerU32,
+        AotKernelAbiAccess::Read,
+    ),
+    abi_argument(
+        2,
+        "coord_0",
+        AotKernelAbiKind::DevicePointerU32,
+        AotKernelAbiAccess::Write,
+    ),
+    abi_argument(
+        3,
+        "coord_1",
+        AotKernelAbiKind::DevicePointerU32,
+        AotKernelAbiAccess::Write,
+    ),
+    abi_argument(
+        4,
+        "coord_2",
+        AotKernelAbiKind::DevicePointerU32,
+        AotKernelAbiAccess::Write,
+    ),
+    abi_argument(
+        5,
+        "coord_3",
+        AotKernelAbiKind::DevicePointerU32,
+        AotKernelAbiAccess::Write,
+    ),
+    abi_argument(
+        6,
+        "full_domain_rows",
+        AotKernelAbiKind::U32,
+        AotKernelAbiAccess::FullDomainRows,
+    ),
+    abi_argument(
+        7,
+        "shard_start",
+        AotKernelAbiKind::U32,
+        AotKernelAbiAccess::ShardStart,
+    ),
+    abi_argument(
+        8,
+        "shard_rows",
+        AotKernelAbiKind::U32,
+        AotKernelAbiAccess::ShardRows,
     ),
 ];
 
@@ -575,6 +639,25 @@ mod tests {
             abi_schema_identity(witness),
             abi_schema_identity(constraint)
         );
+
+        let wave = AotKernelAbiSchema::CompositionWaveV2;
+        assert_eq!(wave.family(), "composition_wave");
+        assert_eq!(wave.version(), 2);
+        assert_eq!(wave.arguments().len(), 9);
+        assert_eq!(
+            wave.arguments()[0].kind,
+            AotKernelAbiKind::DevicePointerCompositionWavePart
+        );
+        assert!(wave.arguments()[2..6]
+            .iter()
+            .all(|argument| argument.access == AotKernelAbiAccess::Write));
+        assert_eq!(
+            wave.arguments()[6].access,
+            AotKernelAbiAccess::FullDomainRows
+        );
+        assert_eq!(wave.arguments()[7].access, AotKernelAbiAccess::ShardStart);
+        assert_eq!(wave.arguments()[8].access, AotKernelAbiAccess::ShardRows);
+        assert_ne!(abi_schema_identity(wave), abi_schema_identity(constraint));
     }
 
     #[test]

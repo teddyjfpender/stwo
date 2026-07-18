@@ -194,6 +194,10 @@ impl ConstraintWaveFragment {
     pub fn semantic_hash(&self) -> u64 {
         self.program.header().semantic_hash
     }
+
+    fn program_identity(&self) -> [u8; 32] {
+        self.program.semantic_identity()
+    }
 }
 
 /// Stable identity of one exact evaluation-domain composition wave.
@@ -218,7 +222,15 @@ pub struct CompositionWaveKernelPartIdentity {
 
 /// Version of the wave ABI/source emitter. Independent from the ordinary
 /// per-part emitter because both kernel families coexist in the AOT pack.
-pub const COMPOSITION_WAVE_CODEGEN_VERSION: u64 = 1;
+///
+/// V2 separates the immutable full-domain trace stride from the shard's
+/// start/length and writes each result at the shard-local output index.
+pub const COMPOSITION_WAVE_CODEGEN_VERSION: u64 = 2;
+pub const COMPOSITION_WAVE_KERNEL_ARGUMENT_COUNT: u8 = 9;
+pub const COMPOSITION_WAVE_FULL_DOMAIN_ROWS_ARGUMENT: u8 = 6;
+pub const COMPOSITION_WAVE_SHARD_START_ARGUMENT: u8 = 7;
+pub const COMPOSITION_WAVE_SHARD_ROWS_ARGUMENT: u8 = 8;
+pub const COMPOSITION_WAVE_THREADS_PER_BLOCK: usize = 128;
 
 fn composition_wave_semantic_hashes_match(
     identities: &[CompositionWaveKernelPartIdentity],
@@ -229,6 +241,41 @@ fn composition_wave_semantic_hashes_match(
             .iter()
             .zip(fragment_semantic_hashes)
             .all(|(identity, &fragment_hash)| identity.semantic_hash == fragment_hash)
+}
+
+fn composition_wave_program_identity(
+    evaluation_log_size: u32,
+    parts: &[(CompositionWaveKernelPartIdentity, ConstraintWaveFragment)],
+) -> Option<[u8; 32]> {
+    if !(2..=30).contains(&evaluation_log_size)
+        || parts.is_empty()
+        || parts.iter().any(|(part, fragment)| {
+            part.semantic_hash == 0
+                || part.coefficient_start >= part.coefficient_end
+                || fragment.semantic_hash() != part.semantic_hash
+                || fragment.program_identity() == [0; 32]
+        })
+        || parts
+            .windows(2)
+            .any(|pair| pair[0].0.coefficient_end > pair[1].0.coefficient_start)
+    {
+        return None;
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"stwo-cuda-composition-wave-program-v2\0");
+    hasher.update(&super::jit::cuda_codegen::CODEGEN_VERSION.to_le_bytes());
+    hasher.update(&COMPOSITION_WAVE_CODEGEN_VERSION.to_le_bytes());
+    hasher.update(&AotKernelAbiSchema::CompositionWaveV2.identity());
+    hasher.update(&(COMPOSITION_WAVE_THREADS_PER_BLOCK as u64).to_le_bytes());
+    hasher.update(&evaluation_log_size.to_le_bytes());
+    hasher.update(&(parts.len() as u64).to_le_bytes());
+    for (part, fragment) in parts {
+        hasher.update(&part.semantic_hash.to_le_bytes());
+        hasher.update(&part.coefficient_start.to_le_bytes());
+        hasher.update(&part.coefficient_end.to_le_bytes());
+        hasher.update(&fragment.program_identity());
+    }
+    Some(*hasher.finalize().as_bytes())
 }
 
 /// Derive the runtime identity without retaining CUDA source or bytecode.
@@ -254,7 +301,14 @@ pub fn composition_wave_kernel_identity(
             semantic_hash = semantic_hash.wrapping_mul(0x100000001b3);
         }
     };
-    feed(b"stwo-cuda-composition-wave-v1\0");
+    feed(b"stwo-cuda-composition-wave-v2\0");
+    feed(&[
+        COMPOSITION_WAVE_KERNEL_ARGUMENT_COUNT,
+        COMPOSITION_WAVE_FULL_DOMAIN_ROWS_ARGUMENT,
+        COMPOSITION_WAVE_SHARD_START_ARGUMENT,
+        COMPOSITION_WAVE_SHARD_ROWS_ARGUMENT,
+    ]);
+    feed(&(COMPOSITION_WAVE_THREADS_PER_BLOCK as u64).to_le_bytes());
     feed(&evaluation_log_size.to_le_bytes());
     feed(&(parts.len() as u64).to_le_bytes());
     for part in parts {
@@ -298,11 +352,12 @@ pub fn composition_wave_kernel_source(
         return None;
     }
     let identity = composition_wave_kernel_identity(evaluation_log_size, &part_identities)?;
+    let program_identity = composition_wave_program_identity(evaluation_log_size, parts)?;
     let programs = parts
         .iter()
         .map(|(_, fragment)| &fragment.program)
         .collect::<Vec<_>>();
-    let source = super::jit::cuda_codegen::compile_v1_composition_wave_to_cuda_source(
+    let source = super::jit::cuda_codegen::compile_composition_wave_to_cuda_source(
         &programs,
         &identity.kernel_name,
     )?;
@@ -311,8 +366,8 @@ pub fn composition_wave_kernel_source(
         cache_key: identity.cache_key,
         semantic_hash: identity.semantic_hash,
         source,
-        abi_schema: None,
-        program_identity: None,
+        abi_schema: Some(AotKernelAbiSchema::CompositionWaveV2),
+        program_identity: Some(program_identity),
     })
 }
 
@@ -662,6 +717,11 @@ mod tests {
 
     #[test]
     fn composition_wave_identity_is_deterministic_and_seals_every_axis() {
+        assert_eq!(COMPOSITION_WAVE_CODEGEN_VERSION, 2);
+        assert_eq!(COMPOSITION_WAVE_KERNEL_ARGUMENT_COUNT, 9);
+        assert_eq!(COMPOSITION_WAVE_FULL_DOMAIN_ROWS_ARGUMENT, 6);
+        assert_eq!(COMPOSITION_WAVE_SHARD_START_ARGUMENT, 7);
+        assert_eq!(COMPOSITION_WAVE_SHARD_ROWS_ARGUMENT, 8);
         let parts = [
             CompositionWaveKernelPartIdentity {
                 semantic_hash: 11,
@@ -836,6 +896,47 @@ mod tests {
              *random_coeff_powers,\n    const unsigned *denom_inv,\n    unsigned *coord_0,\n    \
              unsigned *coord_1,\n    unsigned *coord_2,\n    unsigned *coord_3,\n    unsigned \
              row_count,\n    unsigned log_n_rows,\n    unsigned rc_base"
+        ));
+    }
+
+    #[test]
+    fn composition_wave_emitter_owns_typed_program_and_shard_abi() {
+        let program = constraint_program(
+            &OrdinaryConstraintEval,
+            1,
+            SecureField::from_u32_unchecked(0, 0, 0, 0),
+            4,
+            usize::MAX,
+        )
+        .unwrap();
+        let fragment = program.kernels[0].wave_fragment.clone();
+        let identity = CompositionWaveKernelPartIdentity {
+            semantic_hash: fragment.semantic_hash(),
+            coefficient_start: 0,
+            coefficient_end: 1,
+        };
+        let emitted = composition_wave_kernel_source(5, &[(identity, fragment)]).unwrap();
+        assert_eq!(
+            emitted.abi_schema,
+            Some(AotKernelAbiSchema::CompositionWaveV2)
+        );
+        assert!(emitted
+            .program_identity
+            .is_some_and(|identity| identity != [0; 32]));
+        let schema = AotKernelAbiSchema::CompositionWaveV2;
+        assert_eq!(schema.arguments().len(), 9);
+        assert_eq!(schema.arguments()[0].name, "parts");
+        assert_eq!(
+            schema.arguments()[6].access,
+            AotKernelAbiAccess::FullDomainRows
+        );
+        assert_eq!(schema.arguments()[7].access, AotKernelAbiAccess::ShardStart);
+        assert_eq!(schema.arguments()[8].access, AotKernelAbiAccess::ShardRows);
+        assert!(emitted.source.contains(
+            "const StwoCudaCompositionWavePart *parts,\n    const unsigned \
+             *random_coeff_powers,\n    unsigned *coord_0,\n    unsigned *coord_1,\n    unsigned \
+             *coord_2,\n    unsigned *coord_3,\n    unsigned full_domain_rows,\n    unsigned \
+             shard_start,\n    unsigned shard_rows"
         ));
     }
 

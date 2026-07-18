@@ -326,6 +326,9 @@ impl AuthorityFacts {
             ) | (
                 AotKernelAbiSchema::OrdinaryConstraintV1,
                 AotKernelModuleGlobals::None
+            ) | (
+                AotKernelAbiSchema::CompositionWaveV2,
+                AotKernelModuleGlobals::None
             )
         );
         if self.kernel_symbol.is_empty()

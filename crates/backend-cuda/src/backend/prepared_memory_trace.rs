@@ -7,15 +7,32 @@
 use std::collections::BTreeSet;
 
 use super::exec_context::{
-    check_cuda, ArenaSlice, CudaLaunchContext, CudaRuntimeError, DeviceArena,
+    check_cuda, ArenaError, ArenaSlice, CudaLaunchContext, CudaRuntimeError, DeviceArena,
 };
 use super::prepared_execution_tables::{
     PreparedExecutionTablesGraph, EXECUTION_TABLE_BIG_LIMBS, EXECUTION_TABLE_SMALL_LIMBS,
 };
 
+mod authority;
+
+#[cfg(test)]
+mod tests;
+
+pub use authority::{
+    MemoryBaseTraceAbi, MemoryBaseTraceAbiAccess, MemoryBaseTraceAbiArgument,
+    MemoryBaseTraceAbiArgumentKind, MemoryBaseTraceAuthorityError, MemoryBaseTraceContract,
+    MemoryBaseTraceEffectAccess, MemoryBaseTraceEffectRole, MemoryBaseTraceKernelLaunch,
+    MemoryBaseTraceLinkedContract, MemoryBaseTraceRequirements, MemoryBaseTraceStepContract,
+    MemoryBaseTraceStepKind, MemoryBaseTraceValuePartRequirements,
+};
+
 pub const MEMORY_ADDRESS_BASE_COLUMNS: usize = 32;
 pub const MEMORY_BIG_BASE_COLUMNS: usize = EXECUTION_TABLE_BIG_LIMBS + 1;
 pub const MEMORY_SMALL_BASE_COLUMNS: usize = EXECUTION_TABLE_SMALL_LIMBS + 1;
+
+fn readable_source_words(source_words: usize, source_offset: usize, row_count: usize) -> usize {
+    source_words.saturating_sub(source_offset).min(row_count)
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct MemoryBaseTracePart<'a> {
@@ -40,6 +57,7 @@ pub enum PreparedMemoryBaseTraceError {
     },
     ContextMismatch(&'static str),
     DuplicateSlice,
+    Arena(ArenaError),
     Cuda(CudaRuntimeError),
 }
 
@@ -57,8 +75,17 @@ impl From<CudaRuntimeError> for PreparedMemoryBaseTraceError {
     }
 }
 
+impl From<ArenaError> for PreparedMemoryBaseTraceError {
+    fn from(value: ArenaError) -> Self {
+        Self::Arena(value)
+    }
+}
+
 struct PreparedValuePart {
-    source_offset: u32,
+    source_pointers: Vec<*const u32>,
+    source_slice_words: u32,
+    multiplicities: *const u32,
+    multiplicity_slice_words: u32,
     row_count: u32,
     output_pointers: Vec<*mut u32>,
     rc99_limb_pointers: Vec<*const u32>,
@@ -66,21 +93,13 @@ struct PreparedValuePart {
 
 pub struct PreparedMemoryBaseTraceGraph<'a> {
     arena: &'a DeviceArena,
-    raw_addr_to_id: ArenaSlice,
-    n_addrs: u32,
+    address_ids: *const u32,
+    address_id_words: u32,
     address_counts: ArenaSlice,
     address_count_words: u32,
     address_rows: u32,
     address_output_pointers: Vec<*mut u32>,
-    big_source_pointers: Vec<*const u32>,
-    big_source_words: u32,
-    big_counts: ArenaSlice,
-    big_count_words: u32,
     big_parts: Vec<PreparedValuePart>,
-    small_source_pointers: Vec<*const u32>,
-    small_source_words: u32,
-    small_counts: ArenaSlice,
-    small_count_words: u32,
     small_part: PreparedValuePart,
     rc99_lut: ArenaSlice,
     rc99_table_size: u32,
@@ -147,6 +166,14 @@ impl<'a> PreparedMemoryBaseTraceGraph<'a> {
                 role: "address multiplicities",
                 expected: expected_address_words,
                 actual: address_count_words,
+            });
+        }
+        let address_id_words = execution.requirements().n_addrs.saturating_sub(1);
+        if address_id_words > address_count_words {
+            return Err(PreparedMemoryBaseTraceError::ShapeMismatch {
+                role: "address id words",
+                expected: address_count_words,
+                actual: address_id_words,
             });
         }
         let expected_big_words = big_parts.iter().try_fold(0usize, |end, part| {
@@ -233,9 +260,39 @@ impl<'a> PreparedMemoryBaseTraceGraph<'a> {
             return Err(PreparedMemoryBaseTraceError::DuplicateSlice);
         }
 
-        let prepared_part = |part: &MemoryBaseTracePart<'_>| {
+        let address_ids = if address_id_words == 0 {
+            checked_subslice("address ids from one", execution.raw_addr_to_id(), 0, 0)?
+        } else {
+            checked_subslice(
+                "address ids from one",
+                execution.raw_addr_to_id(),
+                1,
+                address_id_words,
+            )?
+        };
+        let prepared_part = |part: &MemoryBaseTracePart<'_>,
+                             sources: &[ArenaSlice],
+                             source_words: usize,
+                             counts: ArenaSlice| {
+            let source_slice_words =
+                readable_source_words(source_words, part.source_offset, part.row_count);
+            let source_pointers = sources
+                .iter()
+                .copied()
+                .map(|source| source_pointer(source, part.source_offset, source_slice_words))
+                .collect::<Result<Vec<_>, _>>()?;
+            let multiplicities = checked_subslice(
+                "memory value multiplicity slice",
+                counts,
+                part.source_offset,
+                part.row_count,
+            )?;
             Ok::<_, PreparedMemoryBaseTraceError>(PreparedValuePart {
-                source_offset: u32::try_from(part.source_offset)
+                source_pointers,
+                source_slice_words: u32::try_from(source_slice_words)
+                    .map_err(|_| PreparedMemoryBaseTraceError::SizeOverflow)?,
+                multiplicities: multiplicities.as_u32_ptr().cast_const(),
+                multiplicity_slice_words: u32::try_from(part.row_count)
                     .map_err(|_| PreparedMemoryBaseTraceError::SizeOverflow)?,
                 row_count: u32::try_from(part.row_count)
                     .map_err(|_| PreparedMemoryBaseTraceError::SizeOverflow)?,
@@ -252,10 +309,27 @@ impl<'a> PreparedMemoryBaseTraceGraph<'a> {
                     .collect(),
             })
         };
+        let big_parts = big_parts
+            .iter()
+            .map(|part| {
+                prepared_part(
+                    part,
+                    execution.big_limbs(),
+                    execution.requirements().big_column_words,
+                    big_counts,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let small_part = prepared_part(
+            &small_part,
+            execution.small_limbs(),
+            execution.requirements().small_column_words,
+            small_counts,
+        )?;
         Ok(Self {
             arena,
-            raw_addr_to_id: execution.raw_addr_to_id(),
-            n_addrs: u32::try_from(execution.requirements().n_addrs)
+            address_ids: address_ids.as_u32_ptr().cast_const(),
+            address_id_words: u32::try_from(address_id_words)
                 .map_err(|_| PreparedMemoryBaseTraceError::SizeOverflow)?,
             address_counts,
             address_count_words: u32::try_from(address_count_words)
@@ -266,31 +340,8 @@ impl<'a> PreparedMemoryBaseTraceGraph<'a> {
                 .iter()
                 .map(|slice| slice.as_u32_ptr())
                 .collect(),
-            big_source_pointers: execution
-                .big_limbs()
-                .iter()
-                .map(|slice| slice.as_u32_ptr().cast_const())
-                .collect(),
-            big_source_words: u32::try_from(execution.requirements().big_column_words)
-                .map_err(|_| PreparedMemoryBaseTraceError::SizeOverflow)?,
-            big_counts,
-            big_count_words: u32::try_from(big_count_words)
-                .map_err(|_| PreparedMemoryBaseTraceError::SizeOverflow)?,
-            big_parts: big_parts
-                .iter()
-                .map(prepared_part)
-                .collect::<Result<Vec<_>, _>>()?,
-            small_source_pointers: execution
-                .small_limbs()
-                .iter()
-                .map(|slice| slice.as_u32_ptr().cast_const())
-                .collect(),
-            small_source_words: u32::try_from(execution.requirements().small_column_words)
-                .map_err(|_| PreparedMemoryBaseTraceError::SizeOverflow)?,
-            small_counts,
-            small_count_words: u32::try_from(small_count_words)
-                .map_err(|_| PreparedMemoryBaseTraceError::SizeOverflow)?,
-            small_part: prepared_part(&small_part)?,
+            big_parts,
+            small_part,
             rc99_lut,
             rc99_table_size: u32::try_from(rc99_table_size)
                 .map_err(|_| PreparedMemoryBaseTraceError::SizeOverflow)?,
@@ -322,9 +373,9 @@ impl<'a> PreparedMemoryBaseTraceGraph<'a> {
         }
         let stream = launch.stream_raw().as_ptr();
         let address = unsafe {
-            stwo_backend_cuda_kernels::raw::memory_address_base_trace_on(
-                self.raw_addr_to_id.as_u32_ptr().cast_const(),
-                self.n_addrs,
+            stwo_backend_cuda_kernels::raw::memory_address_base_trace_sliced_on(
+                self.address_ids,
+                self.address_id_words,
                 self.address_counts.as_u32_ptr().cast_const(),
                 self.address_count_words,
                 self.address_rows,
@@ -332,56 +383,34 @@ impl<'a> PreparedMemoryBaseTraceGraph<'a> {
                 stream,
             )
         };
-        check_cuda("memory_address_base_trace_on", address)?;
+        check_cuda("memory_address_base_trace_sliced_on", address)?;
         for part in &self.big_parts {
-            self.launch_value_part(
-                &self.big_source_pointers,
-                EXECUTION_TABLE_BIG_LIMBS,
-                self.big_source_words,
-                self.big_counts,
-                self.big_count_words,
-                part,
-                stream,
-            )?;
+            self.launch_value_part(EXECUTION_TABLE_BIG_LIMBS, part, stream)?;
             self.launch_rc99(part, EXECUTION_TABLE_BIG_LIMBS / 2, stream)?;
         }
-        self.launch_value_part(
-            &self.small_source_pointers,
-            EXECUTION_TABLE_SMALL_LIMBS,
-            self.small_source_words,
-            self.small_counts,
-            self.small_count_words,
-            &self.small_part,
-            stream,
-        )?;
+        self.launch_value_part(EXECUTION_TABLE_SMALL_LIMBS, &self.small_part, stream)?;
         self.launch_rc99(&self.small_part, EXECUTION_TABLE_SMALL_LIMBS / 2, stream)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn launch_value_part(
         &self,
-        sources: &[*const u32],
         n_limbs: usize,
-        source_words: u32,
-        counts: ArenaSlice,
-        count_words: u32,
         part: &PreparedValuePart,
         stream: *mut core::ffi::c_void,
     ) -> Result<(), PreparedMemoryBaseTraceError> {
         let code = unsafe {
-            stwo_backend_cuda_kernels::raw::memory_value_base_trace_on(
-                sources.as_ptr(),
+            stwo_backend_cuda_kernels::raw::memory_value_base_trace_sliced_on(
+                part.source_pointers.as_ptr(),
                 n_limbs as u32,
-                source_words,
-                part.source_offset,
-                counts.as_u32_ptr().cast_const(),
-                count_words,
+                part.source_slice_words,
+                part.multiplicities,
+                part.multiplicity_slice_words,
                 part.row_count,
                 part.output_pointers.as_ptr(),
                 stream,
             )
         };
-        check_cuda("memory_value_base_trace_on", code)?;
+        check_cuda("memory_value_base_trace_sliced_on", code)?;
         Ok(())
     }
 
@@ -456,4 +485,42 @@ fn validate_slice(
         });
     }
     Ok(())
+}
+
+fn checked_subslice(
+    role: &'static str,
+    slice: ArenaSlice,
+    offset_words: usize,
+    len_words: usize,
+) -> Result<ArenaSlice, PreparedMemoryBaseTraceError> {
+    let required_words = offset_words
+        .checked_add(len_words)
+        .ok_or(PreparedMemoryBaseTraceError::SizeOverflow)?;
+    if required_words > slice.len_words() {
+        return Err(PreparedMemoryBaseTraceError::SliceTooSmall {
+            role,
+            required_words,
+            actual_words: slice.len_words(),
+        });
+    }
+    slice
+        .checked_subslice(offset_words, len_words)
+        .map_err(Into::into)
+}
+
+fn source_pointer(
+    source: ArenaSlice,
+    source_offset: usize,
+    source_slice_words: usize,
+) -> Result<*const u32, PreparedMemoryBaseTraceError> {
+    if source_slice_words == 0 {
+        return Ok(core::ptr::null());
+    }
+    checked_subslice(
+        "memory value source slice",
+        source,
+        source_offset,
+        source_slice_words,
+    )
+    .map(|slice| slice.as_u32_ptr().cast_const())
 }

@@ -496,6 +496,33 @@ pub unsafe extern "C" fn memory_value_base_trace_on(
     no_cuda_symbol("memory_value_base_trace_on")
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn memory_address_base_trace_sliced_on(
+    _address_ids: *const u32,
+    _address_id_words: u32,
+    _multiplicities: *const u32,
+    _multiplicity_words: u32,
+    _column_length: u32,
+    _outputs_host: *const *mut u32,
+    _stream: *mut c_void,
+) -> i32 {
+    no_cuda_symbol("memory_address_base_trace_sliced_on")
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn memory_value_base_trace_sliced_on(
+    _sources_host: *const *const u32,
+    _n_limbs: u32,
+    _source_slice_words: u32,
+    _multiplicities: *const u32,
+    _multiplicity_slice_words: u32,
+    _column_length: u32,
+    _outputs_host: *const *mut u32,
+    _stream: *mut c_void,
+) -> i32 {
+    no_cuda_symbol("memory_value_base_trace_sliced_on")
+}
+
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn ec_op_builtin_witness_on(
@@ -2593,7 +2620,9 @@ pub unsafe extern "C" fn stwo_cuda_jit_eval_composition_wave_on(
     _coord_1: *mut u32,
     _coord_2: *mut u32,
     _coord_3: *mut u32,
-    _row_count: u32,
+    _full_domain_rows: u32,
+    _shard_start: u32,
+    _shard_rows: u32,
     _stream: *mut core::ffi::c_void,
 ) -> bool {
     no_cuda_symbol("stwo_cuda_jit_eval_composition_wave_on")

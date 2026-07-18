@@ -102,7 +102,7 @@ pub fn compile_v1_to_cuda_source(program: &OwnedMetalEvaluationProgramV1) -> Opt
 /// function so the component split's register/resource boundary survives
 /// ptxas, while the global kernel keeps the accumulator in registers and writes
 /// each coordinate exactly once.
-pub(crate) fn compile_v1_composition_wave_to_cuda_source(
+pub(crate) fn compile_composition_wave_to_cuda_source(
     programs: &[&OwnedMetalEvaluationProgramV1],
     kernel_name: &str,
 ) -> Option<String> {
@@ -142,23 +142,27 @@ pub(crate) fn compile_v1_composition_wave_to_cuda_source(
          \x20   unsigned *coord_1,\n\
          \x20   unsigned *coord_2,\n\
          \x20   unsigned *coord_3,\n\
-         \x20   unsigned row_count\n\
+         \x20   unsigned full_domain_rows,\n\
+         \x20   unsigned shard_start,\n\
+         \x20   unsigned shard_rows\n\
          ) {{\n\
-         \x20   unsigned row_index = blockIdx.x * blockDim.x + threadIdx.x;\n\
-         \x20   if (row_index >= row_count) {{ return; }}\n\
+         \x20   unsigned local_row = blockIdx.x * blockDim.x + threadIdx.x;\n\
+         \x20   if (shard_rows == 0u || shard_start >= full_domain_rows ||\n\
+         \x20       shard_rows > full_domain_rows - shard_start || local_row >= shard_rows) {{ return; }}\n\
+         \x20   unsigned row_index = shard_start + local_row;\n\
          \x20   StwoCudaQm31 wave_acc = StwoCudaQm31{{0u, 0u, 0u, 0u}};\n",
     ));
     for ordinal in 0..programs.len() {
         src.push_str(&format!(
             "    wave_acc = stwo_qm31_add(wave_acc, stwo_composition_wave_part_{ordinal}(\n\
-             \x20       parts[{ordinal}u], random_coeff_powers, row_count, row_index));\n"
+             \x20       parts[{ordinal}u], random_coeff_powers, full_domain_rows, row_index));\n"
         ));
     }
     src.push_str(
-        "    coord_0[row_index] = wave_acc.a;\n\
-         \x20   coord_1[row_index] = wave_acc.b;\n\
-         \x20   coord_2[row_index] = wave_acc.c;\n\
-         \x20   coord_3[row_index] = wave_acc.d;\n\
+        "    coord_0[local_row] = wave_acc.a;\n\
+         \x20   coord_1[local_row] = wave_acc.b;\n\
+         \x20   coord_2[local_row] = wave_acc.c;\n\
+         \x20   coord_3[local_row] = wave_acc.d;\n\
          }\n",
     );
     Some(src)
@@ -173,9 +177,10 @@ fn emit_composition_wave_fragment(
         "__device__ __noinline__ StwoCudaQm31 stwo_composition_wave_part_{ordinal}(\n\
          \x20   const StwoCudaCompositionWavePart &part,\n\
          \x20   const unsigned *random_coeff_powers,\n\
-         \x20   unsigned row_count,\n\
+         \x20   unsigned full_domain_rows,\n\
          \x20   unsigned row_index\n\
          ) {{\n\
+         \x20   unsigned row_count = full_domain_rows;\n\
          \x20   const unsigned *const *trace_cols = part.trace_cols;\n\
          \x20   const unsigned *interaction_offsets = part.interaction_offsets;\n\
          \x20   const unsigned *base_params = part.base_params;\n\

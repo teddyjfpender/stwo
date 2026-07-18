@@ -71,6 +71,13 @@ fn authority_mutations_fail_closed() {
     for changed in invalid {
         assert!(changed.validate().is_err(), "{changed:?}");
     }
+
+    let wave = AuthorityFacts {
+        abi_schema_identity: AotKernelAbiSchema::CompositionWaveV2.identity(),
+        schema: Some(AotKernelAbiSchema::CompositionWaveV2),
+        ..authority()
+    };
+    assert_eq!(wave.validate(), Ok(AotKernelAbiSchema::CompositionWaveV2));
 }
 
 #[test]

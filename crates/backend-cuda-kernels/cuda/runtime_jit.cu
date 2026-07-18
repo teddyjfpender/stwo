@@ -1910,7 +1910,9 @@ extern "C" bool stwo_cuda_jit_eval_fused_on(
 // Resident explicit-stream launch for one generated same-domain composition
 // wave. The generated kernel bakes in the exact descriptor count and canonical
 // call order, so this sibling ABI intentionally has no runtime part-count
-// parameter which could drift or silently truncate work.
+// parameter which could drift or silently truncate work. Full-domain rows
+// remain the trace stride; shard rows alone size the grid, and each coordinate
+// pointer names the start of its disjoint shard-local output.
 extern "C" bool stwo_cuda_jit_eval_composition_wave_on(
     const char *source,
     const char *kernel_name,
@@ -1921,23 +1923,30 @@ extern "C" bool stwo_cuda_jit_eval_composition_wave_on(
     uint32_t *coord_1,
     uint32_t *coord_2,
     uint32_t *coord_3,
-    uint32_t row_count,
+    uint32_t full_domain_rows,
+    uint32_t shard_start,
+    uint32_t shard_rows,
     void *stream
 ) {
+    if (full_domain_rows == 0 || shard_rows == 0 ||
+        shard_start >= full_domain_rows ||
+        shard_rows > full_domain_rows - shard_start) {
+        return false;
+    }
     JitOperationAdmission launch_admission;
     CUfunction function = nullptr;
     if (!get_or_compile(source, kernel_name, cache_key, false, &function)) {
         return false;
     }
-    if (row_count == 0) return true;
     void *args[] = {
         (void *)&parts,               (void *)&random_coeff_powers,
         (void *)&coord_0,             (void *)&coord_1,
         (void *)&coord_2,             (void *)&coord_3,
-        (void *)&row_count,
+        (void *)&full_domain_rows,     (void *)&shard_start,
+        (void *)&shard_rows,
     };
     const unsigned block = 128;
-    const unsigned grid = ceil_div_nonzero_u32(row_count, block);
+    const unsigned grid = ceil_div_nonzero_u32(shard_rows, block);
     if (cuLaunchKernel(function, grid, 1, 1, block, 1, 1, 0, (CUstream)stream, args,
                        nullptr) != CUDA_SUCCESS) {
         fprintf(stderr, "stwo resident AOT: composition wave launch failed for %s\n",

@@ -14,9 +14,10 @@ pub const IPC_EXCHANGE_ALLOCATION_ALIGNMENT: usize = 2 * 1024 * 1024;
 #[path = "ipc_exchange_wire.rs"]
 mod wire;
 pub use wire::{
-    CudaDeviceUuid, IpcExchangeDescriptor, IpcExchangeKey, IpcPeerCloseReceipt,
-    CUDA_DEVICE_UUID_BYTES, CUDA_IPC_HANDLE_BYTES, IPC_EXCHANGE_CLOSE_RECEIPT_BYTES,
-    IPC_EXCHANGE_DESCRIPTOR_BYTES,
+    CudaDeviceUuid, IpcExchangeDescriptor, IpcExchangeInstallDomain, IpcExchangeKey,
+    IpcPeerCloseReceipt, CUDA_DEVICE_UUID_BYTES, CUDA_IPC_HANDLE_BYTES,
+    IPC_EXCHANGE_CLOSE_RECEIPT_BYTES, IPC_EXCHANGE_DESCRIPTOR_BYTES,
+    IPC_EXCHANGE_INSTALL_DOMAIN_BYTES,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -25,6 +26,37 @@ pub enum IpcExchangePhase {
     Consumed,
     Reclaimed,
     Armed,
+}
+
+/// Backend-issued observation of one live CUDA execution context's device.
+///
+/// Unlike a UUID decoded from an IPC descriptor, this receipt can only be
+/// constructed by querying a live [`CudaExecContext`]. Its private,
+/// non-cloneable fields bind the context token, CUDA device ordinal and Driver
+/// UUID observed by that query.
+///
+/// ```compile_fail
+/// use stwo_backend_cuda::CudaDeviceIdentityReceipt;
+///
+/// fn duplicate(receipt: CudaDeviceIdentityReceipt) {
+///     let _copy = receipt.clone();
+/// }
+/// ```
+#[must_use = "consume this receipt when installing the fleet worker roster"]
+pub struct CudaDeviceIdentityReceipt {
+    _context_token: usize,
+    device_ordinal: u32,
+    device_uuid: CudaDeviceUuid,
+}
+
+impl CudaDeviceIdentityReceipt {
+    pub const fn device_ordinal(&self) -> u32 {
+        self.device_ordinal
+    }
+
+    pub const fn device_uuid(&self) -> CudaDeviceUuid {
+        self.device_uuid
+    }
 }
 
 /// Backend-issued authority that one exact IPC operation was accepted by CUDA.
@@ -81,6 +113,7 @@ pub enum IpcExchangeImportState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum IpcExchangeError {
     Cuda(CudaRuntimeError),
+    InvalidDeviceIdentity(&'static str),
     InvalidKey(&'static str),
     InvalidDescriptor(&'static str),
     DescriptorMismatch,
@@ -104,6 +137,39 @@ impl From<CudaRuntimeError> for IpcExchangeError {
     }
 }
 
+pub fn cuda_context_device_identity(
+    context: &CudaExecContext,
+) -> Result<CudaDeviceIdentityReceipt, IpcExchangeError> {
+    if !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
+        return Err(CudaRuntimeError::Unavailable.into());
+    }
+    let mut device = -1i32;
+    let code = unsafe {
+        stwo_backend_cuda_kernels::raw::stwo_exec_context_device(
+            context.identity_token().as_ptr(),
+            &mut device,
+        )
+    };
+    check_cuda("ipc_exchange_context_device", code)?;
+    let device_ordinal = u32::try_from(device)
+        .map_err(|_| IpcExchangeError::InvalidDeviceIdentity("negative CUDA device ordinal"))?;
+    let device_uuid = cuda_context_device_uuid(context)?;
+    if device_uuid.as_bytes() == &[0; CUDA_DEVICE_UUID_BYTES] {
+        return Err(IpcExchangeError::InvalidDeviceIdentity(
+            "zero CUDA device UUID",
+        ));
+    }
+    Ok(CudaDeviceIdentityReceipt {
+        _context_token: context.identity_token().as_ptr() as usize,
+        device_ordinal,
+        device_uuid,
+    })
+}
+
+/// Query the UUID value used in an exchange key.
+///
+/// This copyable value is not context-identity authority. Fleet roster
+/// installation must consume [`CudaDeviceIdentityReceipt`] instead.
 pub fn cuda_context_device_uuid(
     context: &CudaExecContext,
 ) -> Result<CudaDeviceUuid, IpcExchangeError> {

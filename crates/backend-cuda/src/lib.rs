@@ -31,11 +31,13 @@ pub use backend::exec_context::{
     CudaGraphExec, CudaLaunchContext, CudaPoolMemory, CudaRuntimeError, DeviceArena,
 };
 pub use backend::ipc_exchange::{
-    cuda_context_device_uuid, CudaDeviceUuid, CudaIpcExchangeImport, CudaIpcExchangeOwner,
-    IpcExchangeDescriptor, IpcExchangeError, IpcExchangeImportState, IpcExchangeKey,
+    cuda_context_device_identity, cuda_context_device_uuid, CudaDeviceIdentityReceipt,
+    CudaDeviceUuid, CudaIpcExchangeImport, CudaIpcExchangeOwner, IpcExchangeDescriptor,
+    IpcExchangeError, IpcExchangeImportState, IpcExchangeInstallDomain, IpcExchangeKey,
     IpcExchangeOwnerState, IpcExchangePhase, IpcExchangePhaseReceipt, IpcPeerCloseReceipt,
     CUDA_DEVICE_UUID_BYTES, CUDA_IPC_HANDLE_BYTES, IPC_EXCHANGE_ALLOCATION_ALIGNMENT,
     IPC_EXCHANGE_CLOSE_RECEIPT_BYTES, IPC_EXCHANGE_DESCRIPTOR_BYTES,
+    IPC_EXCHANGE_INSTALL_DOMAIN_BYTES,
 };
 pub use backend::pcs_driver::{
     prove_values_with_config as prove_cuda_pcs_values, CudaPcsDriverConfig, CudaPcsDriverError,
@@ -123,8 +125,13 @@ pub use backend::prepared_interpolation::{
     INTERPOLATION_POINTER_ALIGNMENT_WORDS,
 };
 pub use backend::prepared_memory_trace::{
-    MemoryBaseTracePart, PreparedMemoryBaseTraceError, PreparedMemoryBaseTraceGraph,
-    MEMORY_ADDRESS_BASE_COLUMNS, MEMORY_BIG_BASE_COLUMNS, MEMORY_SMALL_BASE_COLUMNS,
+    MemoryBaseTraceAbi, MemoryBaseTraceAbiAccess, MemoryBaseTraceAbiArgument,
+    MemoryBaseTraceAbiArgumentKind, MemoryBaseTraceAuthorityError, MemoryBaseTraceContract,
+    MemoryBaseTraceEffectAccess, MemoryBaseTraceEffectRole, MemoryBaseTraceKernelLaunch,
+    MemoryBaseTraceLinkedContract, MemoryBaseTracePart, MemoryBaseTraceRequirements,
+    MemoryBaseTraceStepContract, MemoryBaseTraceStepKind, MemoryBaseTraceValuePartRequirements,
+    PreparedMemoryBaseTraceError, PreparedMemoryBaseTraceGraph, MEMORY_ADDRESS_BASE_COLUMNS,
+    MEMORY_BIG_BASE_COLUMNS, MEMORY_SMALL_BASE_COLUMNS,
 };
 pub use backend::prepared_oods::{
     oods_canonical_sample_order, oods_workspace_requirements, OodsArenaSlotRequirement,

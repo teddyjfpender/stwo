@@ -659,6 +659,8 @@ mod composition_wave_abi_tests {
             *mut u32,
             *mut u32,
             u32,
+            u32,
+            u32,
             *mut core::ffi::c_void,
         ) -> bool;
         let _: LaunchFn = super::stwo_cuda_jit_eval_composition_wave_on;
@@ -666,6 +668,14 @@ mod composition_wave_abi_tests {
         let native = include_str!("../cuda/runtime_jit.cu");
         assert!(native.contains("sizeof(StwoCudaCompositionWavePart) == 48"));
         assert!(native.contains("alignof(StwoCudaCompositionWavePart) == 8"));
+        assert!(native.contains("uint32_t full_domain_rows"));
+        assert!(native.contains("uint32_t shard_start"));
+        assert!(native.contains("uint32_t shard_rows"));
+        assert!(native.contains("shard_rows > full_domain_rows - shard_start"));
+        assert!(native.contains(
+            "(void *)&full_domain_rows,     (void *)&shard_start,\n        (void *)&shard_rows,"
+        ));
+        assert!(native.contains("ceil_div_nonzero_u32(shard_rows, block)"));
         assert!(!native.contains("composition_wave_on(\n    const char *source,\n    const char *kernel_name,\n    uint64_t cache_key,\n    uint32_t part_count"));
     }
 }
@@ -782,9 +792,10 @@ extern "C" {
         relax_opt: bool,
         stream: *mut c_void,
     ) -> bool;
-    /// Launch one precompiled same-domain composition wave. The generated
-    /// kernel fixes the descriptor count and order in its source; callers must
-    /// validate the plan identity before binding this raw ABI.
+    /// Launch one precompiled same-domain composition wave over an exact row
+    /// shard. The generated kernel fixes descriptor order in its source,
+    /// retains `full_domain_rows` as the read stride, and writes `shard_rows`
+    /// elements through each already-sliced coordinate pointer.
     #[allow(clippy::too_many_arguments)]
     pub fn stwo_cuda_jit_eval_composition_wave_on(
         source: *const core::ffi::c_char,
@@ -796,7 +807,9 @@ extern "C" {
         coord_1: *mut u32,
         coord_2: *mut u32,
         coord_3: *mut u32,
-        row_count: u32,
+        full_domain_rows: u32,
+        shard_start: u32,
+        shard_rows: u32,
         stream: *mut c_void,
     ) -> bool;
     /// Generate `[alpha^(count-1), ..., alpha, 1]` from a device-resident
@@ -2301,6 +2314,25 @@ extern "C" {
         source_offset: u32,
         multiplicities: *const u32,
         count_words: u32,
+        column_length: u32,
+        outputs_host: *const *mut u32,
+        stream: *mut c_void,
+    ) -> i32;
+    pub fn memory_address_base_trace_sliced_on(
+        address_ids: *const u32,
+        address_id_words: u32,
+        multiplicities: *const u32,
+        multiplicity_words: u32,
+        column_length: u32,
+        outputs_host: *const *mut u32,
+        stream: *mut c_void,
+    ) -> i32;
+    pub fn memory_value_base_trace_sliced_on(
+        sources_host: *const *const u32,
+        n_limbs: u32,
+        source_slice_words: u32,
+        multiplicities: *const u32,
+        multiplicity_slice_words: u32,
         column_length: u32,
         outputs_host: *const *mut u32,
         stream: *mut c_void,

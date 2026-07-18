@@ -68,11 +68,9 @@ fn composition_wave_keeps_parts_ordered_and_writes_each_accumulator_row_once() {
     };
     let first = program(0x1111, 3);
     let second = program(0x2222, 7);
-    let source = compile_v1_composition_wave_to_cuda_source(
-        &[&first, &second],
-        "stwo_composition_wave_test",
-    )
-    .unwrap();
+    let source =
+        compile_composition_wave_to_cuda_source(&[&first, &second], "stwo_composition_wave_test")
+            .unwrap();
     let global = source.find("extern \"C\" __global__").unwrap();
     let first_call = source[global..]
         .find("wave_acc = stwo_qm31_add(wave_acc, stwo_composition_wave_part_0(")
@@ -87,8 +85,15 @@ fn composition_wave_keeps_parts_ordered_and_writes_each_accumulator_row_once() {
     assert!(source.contains("parts[1u], random_coeff_powers"));
     assert!(source.contains("unsigned rc_base = part.rc_base;"));
     assert!(source.contains("return stwo_qm31_mul_base(acc, part.denom_inv[denom_idx]);"));
-    assert!(source.contains("coord_0[row_index] = wave_acc.a;"));
-    assert!(!source.contains("coord_0[row_index] = stwo_m31_add"));
+    assert!(source.contains("unsigned full_domain_rows,"));
+    assert!(source.contains("unsigned shard_start,"));
+    assert!(source.contains("unsigned shard_rows"));
+    assert!(source.contains("shard_rows > full_domain_rows - shard_start"));
+    assert!(source.contains("unsigned row_index = shard_start + local_row;"));
+    assert!(source.contains("parts[0u], random_coeff_powers, full_domain_rows, row_index"));
+    assert!(source.contains("coord_0[local_row] = wave_acc.a;"));
+    assert!(!source.contains("coord_0[row_index]"));
+    assert!(!source.contains("local_row, row_index"));
     assert!(!source.contains("part_count"));
 }
 

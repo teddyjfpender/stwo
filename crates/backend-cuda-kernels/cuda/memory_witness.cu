@@ -143,6 +143,32 @@ __global__ void memory_address_base_trace_kernel(
     }
 }
 
+// Sliced ABI: address zero has already been removed from `address_ids`, so the
+// kernel's index is local to the declared read range. Keep the legacy kernel
+// above unchanged for existing callers.
+__global__ void memory_address_base_trace_sliced_kernel(
+    const uint32_t *address_ids,
+    uint32_t address_id_words,
+    const uint32_t *multiplicities,
+    uint32_t multiplicity_words,
+    uint32_t column_length,
+    MemoryBaseTraceColumns outputs
+) {
+    uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= column_length) {
+        return;
+    }
+    for (uint32_t chunk = 0; chunk < 16; ++chunk) {
+        uint32_t index = chunk * column_length + row;
+        outputs.columns[2 * chunk][row] = index < address_id_words
+            ? address_ids[index]
+            : 0u;
+        outputs.columns[2 * chunk + 1][row] = index < multiplicity_words
+            ? multiplicities[index]
+            : 0u;
+    }
+}
+
 __global__ void memory_value_base_trace_kernel(
     MemoryBaseTraceSources sources,
     uint32_t n_limbs,
@@ -165,6 +191,29 @@ __global__ void memory_value_base_trace_kernel(
     }
     outputs.columns[n_limbs][row] = index < count_words
         ? multiplicities[index]
+        : 0u;
+}
+
+__global__ void memory_value_base_trace_sliced_kernel(
+    MemoryBaseTraceSources sources,
+    uint32_t n_limbs,
+    uint32_t source_slice_words,
+    const uint32_t *multiplicities,
+    uint32_t multiplicity_slice_words,
+    uint32_t column_length,
+    MemoryBaseTraceColumns outputs
+) {
+    uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= column_length) {
+        return;
+    }
+    for (uint32_t limb = 0; limb < n_limbs; ++limb) {
+        outputs.columns[limb][row] = row < source_slice_words
+            ? sources.columns[limb][row]
+            : 0u;
+    }
+    outputs.columns[n_limbs][row] = row < multiplicity_slice_words
+        ? multiplicities[row]
         : 0u;
 }
 
@@ -490,6 +539,69 @@ extern "C" int memory_value_base_trace_on(
     return static_cast<int>(cudaGetLastError());
 }
 
+extern "C" int memory_address_base_trace_sliced_on(
+    const uint32_t *address_ids,
+    uint32_t address_id_words,
+    const uint32_t *multiplicities,
+    uint32_t multiplicity_words,
+    uint32_t column_length,
+    uint32_t *const *outputs_host,
+    cudaStream_t stream
+) {
+    if (address_ids == nullptr || multiplicities == nullptr || outputs_host == nullptr ||
+        stream == nullptr || column_length == 0 || column_length > 0xffffffffu / 16u ||
+        multiplicity_words != 16u * column_length || address_id_words > multiplicity_words) {
+        return static_cast<int>(cudaErrorInvalidValue);
+    }
+    MemoryBaseTraceColumns outputs = {};
+    for (uint32_t column = 0; column < 32; ++column) {
+        if (outputs_host[column] == nullptr) {
+            return static_cast<int>(cudaErrorInvalidDevicePointer);
+        }
+        outputs.columns[column] = outputs_host[column];
+    }
+    uint32_t blocks = 1u + (column_length - 1u) / MW_BLOCK;
+    memory_address_base_trace_sliced_kernel<<<blocks, MW_BLOCK, 0, stream>>>(
+        address_ids, address_id_words, multiplicities, multiplicity_words, column_length, outputs);
+    return static_cast<int>(cudaGetLastError());
+}
+
+extern "C" int memory_value_base_trace_sliced_on(
+    const uint32_t *const *sources_host,
+    uint32_t n_limbs,
+    uint32_t source_slice_words,
+    const uint32_t *multiplicities,
+    uint32_t multiplicity_slice_words,
+    uint32_t column_length,
+    uint32_t *const *outputs_host,
+    cudaStream_t stream
+) {
+    if (sources_host == nullptr || multiplicities == nullptr || outputs_host == nullptr ||
+        stream == nullptr || column_length == 0 || n_limbs == 0 || n_limbs > MW_MAX_LIMBS ||
+        source_slice_words > column_length || multiplicity_slice_words != column_length) {
+        return static_cast<int>(cudaErrorInvalidValue);
+    }
+    MemoryBaseTraceSources sources = {};
+    MemoryBaseTraceColumns outputs = {};
+    for (uint32_t limb = 0; limb < n_limbs; ++limb) {
+        if ((source_slice_words != 0 && sources_host[limb] == nullptr) ||
+            outputs_host[limb] == nullptr) {
+            return static_cast<int>(cudaErrorInvalidDevicePointer);
+        }
+        sources.columns[limb] = sources_host[limb];
+        outputs.columns[limb] = outputs_host[limb];
+    }
+    if (outputs_host[n_limbs] == nullptr) {
+        return static_cast<int>(cudaErrorInvalidDevicePointer);
+    }
+    outputs.columns[n_limbs] = outputs_host[n_limbs];
+    uint32_t blocks = 1u + (column_length - 1u) / MW_BLOCK;
+    memory_value_base_trace_sliced_kernel<<<blocks, MW_BLOCK, 0, stream>>>(
+        sources, n_limbs, source_slice_words, multiplicities, multiplicity_slice_words,
+        column_length, outputs);
+    return static_cast<int>(cudaGetLastError());
+}
+
 extern "C" void memory_rc99_count(
     const uint32_t *const *limb_cols,
     uint32_t n_pairs,
@@ -526,7 +638,7 @@ extern "C" int memory_rc99_count_on(
         }
         limb_cols.columns[limb] = limb_cols_host[limb];
     }
-    uint32_t blocks = (column_length + MW_BLOCK - 1) / MW_BLOCK;
+    uint32_t blocks = 1u + (column_length - 1u) / MW_BLOCK;
     rc99_count_on_kernel<<<blocks, MW_BLOCK, 0, stream>>>(
         limb_cols, n_pairs, column_length, input_to_row_lut, rc_table_size, counts);
     return static_cast<int>(cudaGetLastError());

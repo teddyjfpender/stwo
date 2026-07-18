@@ -1,8 +1,7 @@
 //! Strict parser for the checked-in AOT source manifest.
 //!
-//! The generator emits structured ABIs for ordinary recorded-witness and
-//! ordinary fused-constraint kernels. Composition waves remain symbol-only and
-//! fail closed if they claim typed program or argument authority.
+//! The generator emits structured ABIs for recorded-witness, ordinary
+//! fused-constraint and composition-wave kernels.
 
 use std::collections::BTreeSet;
 
@@ -156,7 +155,9 @@ fn expected_abi_schema(
         "constraint" if kernel_symbol.starts_with("stwo_jit_fused_") => {
             Ok(Some(AotKernelAbiSchema::OrdinaryConstraintV1))
         }
-        "constraint" if kernel_symbol.starts_with("stwo_composition_wave_") => Ok(None),
+        "constraint" if kernel_symbol.starts_with("stwo_composition_wave_") => {
+            Ok(Some(AotKernelAbiSchema::CompositionWaveV2))
+        }
         "constraint" => Err(format!(
             "AOT source manifest entry {index} has an unsupported constraint family"
         )),
@@ -266,8 +267,14 @@ fn canonical_c_argument(
     let prefix = match (argument.kind, argument.access) {
         (AotKernelAbiKind::U32, AotKernelAbiAccess::LaunchRowCount)
         | (AotKernelAbiKind::U32, AotKernelAbiAccess::TraceLogSize)
-        | (AotKernelAbiKind::U32, AotKernelAbiAccess::RandomCoefficientBase) => "unsigned",
+        | (AotKernelAbiKind::U32, AotKernelAbiAccess::RandomCoefficientBase)
+        | (AotKernelAbiKind::U32, AotKernelAbiAccess::FullDomainRows)
+        | (AotKernelAbiKind::U32, AotKernelAbiAccess::ShardStart)
+        | (AotKernelAbiKind::U32, AotKernelAbiAccess::ShardRows) => "unsigned",
         (AotKernelAbiKind::DevicePointerU32, AotKernelAbiAccess::Read) => "constunsigned*",
+        (AotKernelAbiKind::DevicePointerCompositionWavePart, AotKernelAbiAccess::Read) => {
+            "constStwoCudaCompositionWavePart*"
+        }
         (
             AotKernelAbiKind::DevicePointerU32,
             AotKernelAbiAccess::Write | AotKernelAbiAccess::ReadWrite,
@@ -376,11 +383,13 @@ mod tests {
             "file":"constraint_add_ap_0000000000000001.cu"
           },
           {
+            "abi_schema":"composition_wave_v2",
             "kind":"constraint",
             "label":"wave_log_10",
             "kernel_name":"stwo_composition_wave_a",
             "cache_key":"0000000000000003",
             "semantic_hash":"0000000000000004",
+            "program_identity":"0303030303030303030303030303030303030303030303030303030303030303",
             "file":"constraint_wave_log_10_0000000000000003.cu"
           },
           {
@@ -404,12 +413,16 @@ mod tests {
         assert_eq!(parsed[0].cache_key, 1);
         assert_eq!(parsed[0].program_identity, [2; 32]);
         assert_eq!(parsed[1].semantic_hash, 4);
+        assert_eq!(parsed[1].program_identity, [3; 32]);
         assert_eq!(parsed[2].program_identity, [1; 32]);
         assert_eq!(
             parsed[0].abi_schema,
             Some(AotKernelAbiSchema::OrdinaryConstraintV1)
         );
-        assert_eq!(parsed[1].abi_schema, None);
+        assert_eq!(
+            parsed[1].abi_schema,
+            Some(AotKernelAbiSchema::CompositionWaveV2)
+        );
         assert_eq!(
             parsed[2].abi_schema,
             Some(AotKernelAbiSchema::RecordedWitnessV1)
@@ -488,14 +501,8 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .insert("program_identity".into(), program_identity.clone());
-        entries[1]
-            .as_object_mut()
-            .unwrap()
-            .insert("abi_schema".into(), abi);
-        entries[1]
-            .as_object_mut()
-            .unwrap()
-            .insert("program_identity".into(), program_identity);
+        entries[1]["abi_schema"] = abi;
+        entries[1]["program_identity"] = program_identity;
         assert!(parse_source_manifest(&serde_json::to_vec(&entries).unwrap()).is_err());
 
         let mut unsupported =
@@ -554,6 +561,39 @@ mod tests {
             )
             .is_err());
         }
+
+        let wave_source = br#"
+            struct StwoCudaCompositionWavePart {};
+            extern "C" __global__ void __launch_bounds__(128) stwo_composition_wave_a(
+                const StwoCudaCompositionWavePart *parts,
+                const unsigned *random_coeff_powers,
+                unsigned *coord_0,
+                unsigned *coord_1,
+                unsigned *coord_2,
+                unsigned *coord_3,
+                unsigned full_domain_rows,
+                unsigned shard_start,
+                unsigned shard_rows) {}
+        "#;
+        let wave_schema = AotKernelAbiSchema::CompositionWaveV2;
+        validate_structured_kernel_signature(wave_source, "stwo_composition_wave_a", wave_schema)
+            .unwrap();
+        for changed in [
+            String::from_utf8_lossy(wave_source).replace(
+                "const StwoCudaCompositionWavePart *parts",
+                "const unsigned *parts",
+            ),
+            String::from_utf8_lossy(wave_source)
+                .replace("unsigned shard_start", "unsigned wrong_start"),
+            String::from_utf8_lossy(wave_source).replace("unsigned shard_rows", ""),
+        ] {
+            assert!(validate_structured_kernel_signature(
+                changed.as_bytes(),
+                "stwo_composition_wave_a",
+                wave_schema,
+            )
+            .is_err());
+        }
     }
 
     #[test]
@@ -585,8 +625,8 @@ mod tests {
                         && entry.program_identity != [0; 32]
                 } else {
                     entry.kernel_symbol.starts_with("stwo_composition_wave_")
-                        && entry.abi_schema.is_none()
-                        && entry.program_identity == [0; 32]
+                        && entry.abi_schema == Some(AotKernelAbiSchema::CompositionWaveV2)
+                        && entry.program_identity != [0; 32]
                 }
             }));
         for entry in entries {

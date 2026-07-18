@@ -132,7 +132,13 @@ fn recorded_launch_geometry_matches_the_legacy_wrapper_exactly() {
         native
             .matches("const unsigned grid = ceil_div_nonzero_u32(row_count, block);")
             .count(),
-        5
+        4
+    );
+    assert_eq!(
+        native
+            .matches("const unsigned grid = ceil_div_nonzero_u32(shard_rows, block);")
+            .count(),
+        1
     );
 
     for (rows, grid) in [

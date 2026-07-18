@@ -337,9 +337,13 @@ fn pack_is_well_formed(
                 Some(AotKernelAbiSchema::RecordedWitnessV1),
                 AotKernelModuleGlobals::None | AotKernelModuleGlobals::WitnessPedersenV1,
             )
-            | (Some(AotKernelAbiSchema::OrdinaryConstraintV1), AotKernelModuleGlobals::None) => {
-                true
-            }
+            | (
+                Some(
+                    AotKernelAbiSchema::OrdinaryConstraintV1
+                    | AotKernelAbiSchema::CompositionWaveV2,
+                ),
+                AotKernelModuleGlobals::None,
+            ) => true,
             _ => false,
         };
         if authority.abi_schema_identity != expected_abi_identity
@@ -474,7 +478,10 @@ mod manifest_tests {
             );
             assert!(match authority.abi_schema() {
                 None => authority.module_globals() == AotKernelModuleGlobals::Unspecified,
-                Some(AotKernelAbiSchema::OrdinaryConstraintV1) => {
+                Some(
+                    AotKernelAbiSchema::OrdinaryConstraintV1
+                    | AotKernelAbiSchema::CompositionWaveV2,
+                ) => {
                     authority.module_globals() == AotKernelModuleGlobals::None
                 }
                 Some(AotKernelAbiSchema::RecordedWitnessV1) => matches!(

@@ -4,8 +4,12 @@ fn uuid(seed: u8) -> CudaDeviceUuid {
     CudaDeviceUuid::from_bytes([seed; CUDA_DEVICE_UUID_BYTES])
 }
 
+fn domain(seed: u8) -> IpcExchangeInstallDomain {
+    IpcExchangeInstallDomain::from_digest([seed; IPC_EXCHANGE_INSTALL_DOMAIN_BYTES]).unwrap()
+}
+
 fn key() -> IpcExchangeKey {
-    IpcExchangeKey::new(7, 1, 3, uuid(0x11), uuid(0x33), 2_097_153, 9).unwrap()
+    IpcExchangeKey::new(7, 1, 3, uuid(0x11), uuid(0x33), domain(0x77), 2_097_153, 9).unwrap()
 }
 
 fn descriptor() -> IpcExchangeDescriptor {
@@ -33,20 +37,22 @@ fn key_and_two_mib_allocation_geometry_fail_closed() {
         rounded_allocation_bytes(2 * 1024 * 1024 + 1).unwrap(),
         4 * 1024 * 1024
     );
-    assert!(IpcExchangeKey::new(1, 2, 2, uuid(1), uuid(2), 64, 0).is_err());
-    assert!(IpcExchangeKey::new(1, 1, 2, uuid(1), uuid(1), 64, 0).is_err());
+    assert!(IpcExchangeKey::new(1, 2, 2, uuid(1), uuid(2), domain(1), 64, 0).is_err());
+    assert!(IpcExchangeKey::new(1, 1, 2, uuid(1), uuid(1), domain(1), 64, 0).is_err());
     assert!(IpcExchangeKey::new(
         1,
         1,
         2,
         CudaDeviceUuid::from_bytes([0; CUDA_DEVICE_UUID_BYTES]),
         uuid(2),
+        domain(1),
         64,
         0,
     )
     .is_err());
-    assert!(IpcExchangeKey::new(1, 1, 2, uuid(1), uuid(2), 0, 0).is_err());
-    assert!(IpcExchangeKey::new(1, 1, 2, uuid(1), uuid(2), 64, u64::MAX).is_err());
+    assert!(IpcExchangeInstallDomain::from_digest([0; IPC_EXCHANGE_INSTALL_DOMAIN_BYTES]).is_err());
+    assert!(IpcExchangeKey::new(1, 1, 2, uuid(1), uuid(2), domain(1), 0, 0).is_err());
+    assert!(IpcExchangeKey::new(1, 1, 2, uuid(1), uuid(2), domain(1), 64, u64::MAX).is_err());
     assert!(rounded_allocation_bytes(usize::MAX).is_err());
 }
 
@@ -70,11 +76,19 @@ fn descriptor_wire_image_binds_direction_devices_extent_generation_and_handles()
         );
     }
 
-    for offset in [16, 24, 28, 32, 56, 72, 88, 152, 216] {
+    for offset in [16, 24, 28, 32, 56, 72, 88, 120, 184, 248] {
         let mut mutated = encoded;
         mutated[offset] ^= 0x80;
         assert_ne!(IpcExchangeDescriptor::decode(&mutated).unwrap(), descriptor);
     }
+
+    let mut legacy_v1 = encoded;
+    legacy_v1[8..12].copy_from_slice(&1u32.to_le_bytes());
+    assert!(IpcExchangeDescriptor::decode(&legacy_v1).is_err());
+
+    let mut zero_domain = encoded;
+    zero_domain[88..120].fill(0);
+    assert!(IpcExchangeDescriptor::decode(&zero_domain).is_err());
 
     let mut wrong_logical_extent = encoded;
     wrong_logical_extent[40] ^= 1;
@@ -86,7 +100,9 @@ fn descriptor_wire_image_binds_direction_devices_extent_generation_and_handles()
     assert_eq!(decoded.key().peer_rank(), 3);
     assert_eq!(decoded.key().logical_bytes(), 2_097_153);
     assert_eq!(decoded.key().initial_generation(), 9);
+    assert_eq!(decoded.key().install_domain(), domain(0x77));
     assert_eq!(decoded.allocation_bytes(), 4 * 1024 * 1024);
+    assert_eq!(encoded.len(), 312);
 }
 
 #[test]
@@ -99,6 +115,7 @@ fn peer_close_receipt_is_transportable_and_binds_the_post_reclaim_generation() {
     assert_eq!(IpcPeerCloseReceipt::decode(&encoded).unwrap(), receipt);
     assert_eq!(receipt.key(), key());
     assert_eq!(receipt.generation(), 10);
+    assert_eq!(encoded.len(), 120);
 
     let mut wrong_direction = encoded;
     wrong_direction[12] ^= 1;
@@ -108,6 +125,13 @@ fn peer_close_receipt_is_transportable_and_binds_the_post_reclaim_generation() {
     wrong_generation[48] ^= 1;
     assert_ne!(
         IpcPeerCloseReceipt::decode(&wrong_generation).unwrap(),
+        receipt
+    );
+
+    let mut wrong_install_domain = encoded;
+    wrong_install_domain[88] ^= 1;
+    assert_ne!(
+        IpcPeerCloseReceipt::decode(&wrong_install_domain).unwrap(),
         receipt
     );
 
