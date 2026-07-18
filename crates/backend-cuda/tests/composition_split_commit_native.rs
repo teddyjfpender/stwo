@@ -6,7 +6,7 @@
 //! qualified fused split at log 24 and 25, followed directly by compact hashing
 //! of its evaluations.
 //! gpu-lab-cohesion-review: one native gate must bind both graph lifetimes and compare every
-//! boundary. Run on a >=16 GiB CUDA device with:
+//! shared semantic boundary. Run on a >=16 GiB CUDA device with:
 //!
 //! ```text
 //! cargo test -p stwo-backend-cuda --test composition_split_commit_native \
