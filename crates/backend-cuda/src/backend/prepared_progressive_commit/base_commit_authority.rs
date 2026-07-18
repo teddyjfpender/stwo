@@ -1,10 +1,10 @@
-//! Address-free compiler authority for the unfused direct-retained Base commit.
+//! Address-free compiler authority for the direct-retained Base commit.
 //!
 //! The input programs are the only schedule authority. The compiler replaces
 //! each ordinary `Lde` with an explicit B2N/N2B pair and preserves every
-//! state, absorb, finalize, and Merkle operation in exact order. Fused leaf,
-//! interior, and tail variants fail closed until they have equally explicit
-//! effects and shard binders.
+//! state, absorb, finalize, and Merkle operation in exact order. Fused leaf
+//! and tail selections are lowered to the same ordinary wrappers. Interior4
+//! remains fail-closed until it has equally explicit effects and binders.
 
 use super::*;
 use crate::backend::prepared_decommit::TraceTreeRole;
@@ -16,10 +16,11 @@ mod abi;
 mod compiler;
 mod effect;
 mod encoding;
+mod execution;
 mod invocation;
 
 pub use abi::{BaseCommitAbiAccess, BaseCommitAbiArgument, BaseCommitAbiArgumentKind};
-use compiler::{u32_value, Compiler};
+use compiler::Compiler;
 pub use effect::{
     BaseCommitAccess, BaseCommitAccessKind, BaseCommitAliasAuthority, BaseCommitAliasDiscipline,
     BaseCommitAliasRequirement, BaseCommitDependencyRange, BaseCommitDependencyRole,
@@ -36,7 +37,7 @@ const ZERO_IDENTITY: [u8; 32] = [0; 32];
 const SOURCE_DOMAIN: &[u8] = b"stwo-cuda-base-commit-source-v1\0";
 const ABI_DOMAIN: &[u8] = b"stwo-cuda-base-commit-abi-v1\0";
 const EFFECT_DOMAIN: &[u8] = b"stwo-cuda-base-commit-effect-v1\0";
-const LAUNCH_DOMAIN: &[u8] = b"stwo-cuda-base-commit-launch-v1\0";
+const LAUNCH_DOMAIN: &[u8] = b"stwo-cuda-base-commit-launch-v2\0";
 const OPERATION_DOMAIN: &[u8] = b"stwo-cuda-base-commit-operation-v1\0";
 const PROGRAM_DOMAIN: &[u8] = b"stwo-cuda-base-commit-program-v1\0";
 const STATIC_BUILD_DOMAIN: &[u8] = b"stwo-cuda-base-commit-static-build-v1\0";
@@ -49,6 +50,7 @@ const EFFECT_AUTHORITY_SOURCE: &[u8] = include_bytes!("base_commit_authority/eff
 const EFFECT_VALIDATION_SOURCE: &[u8] =
     include_bytes!("base_commit_authority/effect/validation.rs");
 const ENCODING_AUTHORITY_SOURCE: &[u8] = include_bytes!("base_commit_authority/encoding.rs");
+const EXECUTION_AUTHORITY_SOURCE: &[u8] = include_bytes!("base_commit_authority/execution.rs");
 const INVOCATION_AUTHORITY_SOURCE: &[u8] = include_bytes!("base_commit_authority/invocation.rs");
 const COMMIT_SOURCE: &[u8] = include_bytes!("program.rs");
 const DIRECT_SOURCE: &[u8] = include_bytes!("direct_retained_b2n.rs");
@@ -142,12 +144,14 @@ impl BaseCommitAbi {
 pub enum BaseCommitOperationKind {
     DirectB2n {
         batch_index: u32,
+        segment_offset: u32,
         source_log_size: u32,
         retained_log_size: u32,
         canonical_columns: Vec<u32>,
     },
     DirectN2b {
         batch_index: u32,
+        segment_offset: u32,
         source_log_size: u32,
         retained_log_size: u32,
         canonical_columns: Vec<u32>,
@@ -163,6 +167,7 @@ pub enum BaseCommitOperationKind {
     },
     StateAbsorb {
         batch_index: u32,
+        segment_offset: u32,
         log_size: u32,
         absorbed_columns_before: u32,
         canonical_columns: Vec<u32>,
@@ -183,6 +188,22 @@ pub enum BaseCommitOperationKind {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BaseCommitKernelLaunch {
+    pub symbol: &'static str,
+    pub grid: [u32; 3],
+    pub block: [u32; 3],
+    pub cluster: Option<[u32; 3]>,
+    pub dynamic_shared_bytes: u32,
+    pub cooperative: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BaseCommitExecutionStep {
+    KernelLaunch(BaseCommitKernelLaunch),
+    DeviceCopyD2D { bytes: u64 },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BaseCommitOperation {
     pub kind: BaseCommitOperationKind,
@@ -190,8 +211,7 @@ pub struct BaseCommitOperation {
     pub effect: BaseCommitEffect,
     pub invocation: BaseCommitInvocation,
     pub partition: BaseCommitPartitionAuthority,
-    pub nested_kernel_launches: u32,
-    pub nested_device_copies: u32,
+    pub execution: Vec<BaseCommitExecutionStep>,
     pub source_identity: [u8; 32],
     pub abi_identity: [u8; 32],
     pub launch_identity: [u8; 32],
@@ -251,6 +271,7 @@ pub enum BaseCommitAuthorityError {
     InvalidStaticAbi(&'static str),
     InvalidEffect,
     InvalidInvocation,
+    InvalidExecutionManifest,
     SizeOverflow,
     StaticBuildUnavailable,
     StaticBuildMismatch,
@@ -290,14 +311,8 @@ impl BaseCommitProgramAuthority {
         if commit.identity().storage != ProgressiveCommitStorageMode::InPlaceSlab {
             return Err(BaseCommitAuthorityError::UnsupportedStorage);
         }
-        if commit.identity().ntt_leaf_fusion != ProgressiveNttLeafFusionMode::Separate {
-            return Err(BaseCommitAuthorityError::UnsupportedLeafFusion);
-        }
         if commit.identity().interior4_fused {
             return Err(BaseCommitAuthorityError::UnsupportedInteriorFusion);
-        }
-        if commit.identity().config.max_fused_tail_levels != 0 {
-            return Err(BaseCommitAuthorityError::UnsupportedTailFusion);
         }
         for abi in BaseCommitAbi::ALL {
             if !abi.source_declares_entry(abi.wrapper_source()) {
@@ -379,83 +394,20 @@ impl BaseCommitProgramAuthority {
         self.identity
     }
 
-    /// Project the explicit B2N/N2B pair back to the source program's single
-    /// LDE entry. This is a parity view only; execution remains decomposed.
+    /// Return the exact source view sealed by this validated authority.
+    ///
+    /// Execution remains decomposed into ordinary wrappers; this view exists
+    /// only for source-program parity checks.
     pub fn commit_operation_view(
         &self,
     ) -> Result<Vec<CommitProgramOperation>, BaseCommitAuthorityError> {
-        let mut view = Vec::new();
-        for operation in &self.operations {
-            let source = match &operation.kind {
-                BaseCommitOperationKind::DirectB2n { .. } => continue,
-                BaseCommitOperationKind::DirectN2b {
-                    batch_index,
-                    retained_log_size,
-                    canonical_columns,
-                    ..
-                } => CommitProgramOperation::Lde {
-                    batch_index: *batch_index,
-                    segment_offset: 0,
-                    columns: u32_value(canonical_columns.len())?,
-                    log_size: *retained_log_size,
-                },
-                BaseCommitOperationKind::StateInit { log_size } => {
-                    CommitProgramOperation::StateInit {
-                        log_size: *log_size,
-                    }
-                }
-                BaseCommitOperationKind::StateExpandInPlace {
-                    from_log_size,
-                    to_log_size,
-                    absorbed_columns,
-                    bands,
-                } => CommitProgramOperation::StateExpandInPlace {
-                    from_log_size: *from_log_size,
-                    to_log_size: *to_log_size,
-                    absorbed_columns: *absorbed_columns,
-                    bands: *bands,
-                },
-                BaseCommitOperationKind::StateAbsorb {
-                    batch_index,
-                    log_size,
-                    absorbed_columns_before,
-                    canonical_columns,
-                } => CommitProgramOperation::Absorb {
-                    batch_index: *batch_index,
-                    segment_offset: 0,
-                    columns: u32_value(canonical_columns.len())?,
-                    log_size: *log_size,
-                    absorbed_columns_before: *absorbed_columns_before,
-                },
-                BaseCommitOperationKind::StateFinalizeInPlace {
-                    log_size,
-                    absorbed_columns,
-                    bands,
-                } => CommitProgramOperation::FinalizeInPlace {
-                    log_size: *log_size,
-                    absorbed_columns: *absorbed_columns,
-                    bands: *bands,
-                },
-                BaseCommitOperationKind::MerkleLayerInPlace {
-                    level,
-                    output_hashes,
-                    bands,
-                } => CommitProgramOperation::MerkleLayerInPlace {
-                    level: *level,
-                    output_hashes: *output_hashes,
-                    bands: *bands,
-                },
-                BaseCommitOperationKind::MerkleLayer {
-                    level,
-                    output_hashes,
-                } => CommitProgramOperation::MerkleLayer {
-                    level: *level,
-                    output_hashes: *output_hashes,
-                },
-            };
-            view.push(source);
-        }
-        Ok(view)
+        self.validate()?;
+        Ok(self
+            .commit
+            .steps()
+            .iter()
+            .map(|step| step.operation)
+            .collect())
     }
 }
 

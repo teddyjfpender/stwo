@@ -34,7 +34,7 @@ pub(super) fn source_identity_from_parts(
     Ok(*hasher.finalize().as_bytes())
 }
 
-pub(super) fn authority_sources() -> [&'static [u8]; 19] {
+pub(super) fn authority_sources() -> [&'static [u8]; 20] {
     [
         AUTHORITY_SOURCE,
         ABI_AUTHORITY_SOURCE,
@@ -42,6 +42,7 @@ pub(super) fn authority_sources() -> [&'static [u8]; 19] {
         EFFECT_AUTHORITY_SOURCE,
         EFFECT_VALIDATION_SOURCE,
         ENCODING_AUTHORITY_SOURCE,
+        EXECUTION_AUTHORITY_SOURCE,
         INVOCATION_AUTHORITY_SOURCE,
         COMMIT_SOURCE,
         DIRECT_SOURCE,
@@ -87,14 +88,41 @@ pub(super) fn operation_abi_identity(
 pub(super) fn launch_identity(
     abi: BaseCommitAbi,
     kind: &BaseCommitOperationKind,
-    traffic: CommitProgramTraffic,
+    execution: &[BaseCommitExecutionStep],
 ) -> Result<[u8; 32], BaseCommitAuthorityError> {
     let mut hasher = blake3::Hasher::new();
     hasher.update(LAUNCH_DOMAIN);
     hasher.update(&[abi.tag()]);
     hash_operation(&mut hasher, kind)?;
-    hasher.update(&traffic.kernel_launches.to_le_bytes());
-    hasher.update(&traffic.device_copies.to_le_bytes());
+    hash_size(&mut hasher, execution.len());
+    for step in execution {
+        match step {
+            BaseCommitExecutionStep::KernelLaunch(launch) => {
+                hasher.update(&[0]);
+                hash_bytes(&mut hasher, launch.symbol.as_bytes());
+                for value in launch.grid.into_iter().chain(launch.block) {
+                    hash_u32(&mut hasher, value);
+                }
+                match launch.cluster {
+                    Some(cluster) => {
+                        hasher.update(&[1]);
+                        for value in cluster {
+                            hash_u32(&mut hasher, value);
+                        }
+                    }
+                    None => {
+                        hasher.update(&[0]);
+                    }
+                }
+                hash_u32(&mut hasher, launch.dynamic_shared_bytes);
+                hasher.update(&[u8::from(launch.cooperative)]);
+            }
+            BaseCommitExecutionStep::DeviceCopyD2D { bytes } => {
+                hasher.update(&[1]);
+                hasher.update(&bytes.to_le_bytes());
+            }
+        }
+    }
     Ok(*hasher.finalize().as_bytes())
 }
 
@@ -203,24 +231,28 @@ pub(super) fn hash_operation(
     match operation {
         BaseCommitOperationKind::DirectB2n {
             batch_index,
+            segment_offset,
             source_log_size,
             retained_log_size,
             canonical_columns,
         } => {
             hasher.update(&[1]);
             hash_u32(hasher, *batch_index);
+            hash_u32(hasher, *segment_offset);
             hash_u32(hasher, *source_log_size);
             hash_u32(hasher, *retained_log_size);
             hash_u32_slice(hasher, canonical_columns);
         }
         BaseCommitOperationKind::DirectN2b {
             batch_index,
+            segment_offset,
             source_log_size,
             retained_log_size,
             canonical_columns,
         } => {
             hasher.update(&[2]);
             hash_u32(hasher, *batch_index);
+            hash_u32(hasher, *segment_offset);
             hash_u32(hasher, *source_log_size);
             hash_u32(hasher, *retained_log_size);
             hash_u32_slice(hasher, canonical_columns);
@@ -243,12 +275,14 @@ pub(super) fn hash_operation(
         }
         BaseCommitOperationKind::StateAbsorb {
             batch_index,
+            segment_offset,
             log_size,
             absorbed_columns_before,
             canonical_columns,
         } => {
             hasher.update(&[5]);
             hash_u32(hasher, *batch_index);
+            hash_u32(hasher, *segment_offset);
             hash_u32(hasher, *log_size);
             hash_u32(hasher, *absorbed_columns_before);
             hash_u32_slice(hasher, canonical_columns);

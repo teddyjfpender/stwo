@@ -5,8 +5,17 @@ use super::effect::{
 use super::encoding::{
     launch_identity, operation_abi_identity, operation_identity, operation_source_identity,
 };
+use super::execution::execution_manifest;
 use super::invocation::compile_invocation;
 use super::*;
+
+struct PendingLde {
+    batch_index: u32,
+    segment_offset: u32,
+    columns: u32,
+    log_size: u32,
+    canonical_columns: Vec<u32>,
+}
 
 pub(super) struct Compiler<'a> {
     commit: &'a CommitProgram,
@@ -16,6 +25,7 @@ pub(super) struct Compiler<'a> {
     state: Option<BaseCommitValueRole>,
     next_state_version: u32,
     next_batch: usize,
+    next_segment_offset: usize,
     hash: Option<BaseCommitValueRole>,
 }
 
@@ -33,12 +43,13 @@ impl<'a> Compiler<'a> {
             state: None,
             next_state_version: 0,
             next_batch: 0,
+            next_segment_offset: 0,
             hash: None,
         }
     }
 
     pub(super) fn compile_steps(&mut self) -> Result<(), BaseCommitAuthorityError> {
-        let mut pending_lde = None;
+        let mut pending_lde: Option<PendingLde> = None;
         for (step_index, step) in self.commit.steps().iter().enumerate() {
             match step.operation {
                 CommitProgramOperation::StateInit { log_size } => {
@@ -51,7 +62,6 @@ impl<'a> Compiler<'a> {
                         BaseCommitAbi::StateInitV1,
                         state_init_effect(log_size, destination)?,
                         BaseCommitPartitionAuthority::Monolithic,
-                        step.traffic,
                     )?;
                     self.state = Some(destination);
                 }
@@ -64,55 +74,28 @@ impl<'a> Compiler<'a> {
                     if pending_lde.is_some() {
                         return Err(BaseCommitAuthorityError::InvalidProgramOrder);
                     }
-                    let batch = self.direct.batches().get(self.next_batch).filter(|batch| {
-                        batch.batch_index == batch_index
-                            && segment_offset == 0
-                            && batch.retained_log_size == log_size
-                            && batch.canonical_columns.len() == columns as usize
-                            && self.commit.canonical_columns_for_step(step_index)
-                                == Some(batch.canonical_columns.as_slice())
-                    });
-                    let batch = batch.ok_or(BaseCommitAuthorityError::ProgramMismatch)?;
-                    let canonical = canonical_u32(&batch.canonical_columns)?;
-                    let b2n = direct_b2n_effect(
+                    let (source_log_size, retained_log_size, canonical_columns) = self
+                        .consume_direct_segment(
+                            step_index,
+                            batch_index,
+                            segment_offset,
+                            columns,
+                            log_size,
+                        )?;
+                    self.push_direct_transforms(
                         batch_index,
-                        &canonical,
-                        batch.source_log_size,
-                        batch.retained_log_size,
+                        segment_offset,
+                        source_log_size,
+                        retained_log_size,
+                        &canonical_columns,
                     )?;
-                    self.push(
-                        BaseCommitOperationKind::DirectB2n {
-                            batch_index,
-                            source_log_size: batch.source_log_size,
-                            retained_log_size: batch.retained_log_size,
-                            canonical_columns: canonical.clone(),
-                        },
-                        BaseCommitAbi::DirectB2nV1,
-                        b2n,
-                        BaseCommitPartitionAuthority::Monolithic,
-                        traffic(
-                            b2n_columns_to_retained_launches(batch.source_log_size, columns)?,
-                            0,
-                        ),
-                    )?;
-                    let n2b = direct_n2b_effect(batch_index, &canonical, batch.retained_log_size)?;
-                    self.push(
-                        BaseCommitOperationKind::DirectN2b {
-                            batch_index,
-                            source_log_size: batch.source_log_size,
-                            retained_log_size: batch.retained_log_size,
-                            canonical_columns: canonical,
-                        },
-                        BaseCommitAbi::DirectN2bV1,
-                        n2b,
-                        BaseCommitPartitionAuthority::Monolithic,
-                        traffic(
-                            n2b_from_stage_two_launches(batch.retained_log_size, columns)?,
-                            0,
-                        ),
-                    )?;
-                    pending_lde = Some((batch_index, columns, log_size));
-                    self.next_batch += 1;
+                    pending_lde = Some(PendingLde {
+                        batch_index,
+                        segment_offset,
+                        columns,
+                        log_size,
+                        canonical_columns,
+                    });
                 }
                 CommitProgramOperation::Absorb {
                     batch_index,
@@ -121,40 +104,55 @@ impl<'a> Compiler<'a> {
                     log_size,
                     absorbed_columns_before,
                 } => {
-                    if pending_lde.take() != Some((batch_index, columns, log_size))
-                        || segment_offset != 0
-                    {
+                    let pending = pending_lde
+                        .take()
+                        .filter(|pending| {
+                            pending.batch_index == batch_index
+                                && pending.segment_offset == segment_offset
+                                && pending.columns == columns
+                                && pending.log_size == log_size
+                        })
+                        .ok_or(BaseCommitAuthorityError::InvalidProgramOrder)?;
+                    self.push_absorb(
+                        batch_index,
+                        segment_offset,
+                        log_size,
+                        absorbed_columns_before,
+                        pending.canonical_columns,
+                    )?;
+                }
+                CommitProgramOperation::FusedLdeAbsorb16 {
+                    batch_index,
+                    segment_offset,
+                    log_size,
+                    absorbed_columns_before,
+                    retained_write_mask,
+                } => {
+                    if pending_lde.is_some() || retained_write_mask != u32::from(u16::MAX) {
                         return Err(BaseCommitAuthorityError::InvalidProgramOrder);
                     }
-                    let batch = self
-                        .direct
-                        .batches()
-                        .get(self.next_batch - 1)
-                        .ok_or(BaseCommitAuthorityError::ProgramMismatch)?;
-                    let source = self
-                        .state
-                        .ok_or(BaseCommitAuthorityError::InvalidProgramOrder)?;
-                    let destination = self.new_state(log_size)?;
-                    let canonical = canonical_u32(&batch.canonical_columns)?;
-                    self.push(
-                        BaseCommitOperationKind::StateAbsorb {
+                    let (source_log_size, retained_log_size, canonical_columns) = self
+                        .consume_direct_segment(
+                            step_index,
                             batch_index,
+                            segment_offset,
+                            16,
                             log_size,
-                            absorbed_columns_before,
-                            canonical_columns: canonical.clone(),
-                        },
-                        BaseCommitAbi::StateAbsorbV1,
-                        state_absorb_effect(
-                            batch_index,
-                            log_size,
-                            source,
-                            destination,
-                            &canonical,
-                        )?,
-                        BaseCommitPartitionAuthority::Monolithic,
-                        step.traffic,
+                        )?;
+                    self.push_direct_transforms(
+                        batch_index,
+                        segment_offset,
+                        source_log_size,
+                        retained_log_size,
+                        &canonical_columns,
                     )?;
-                    self.state = Some(destination);
+                    self.push_absorb(
+                        batch_index,
+                        segment_offset,
+                        log_size,
+                        absorbed_columns_before,
+                        canonical_columns,
+                    )?;
                 }
                 CommitProgramOperation::StateExpandInPlace {
                     from_log_size,
@@ -174,7 +172,6 @@ impl<'a> Compiler<'a> {
                         BaseCommitAbi::StateExpandInPlaceV1,
                         state_expand_effect(from_log_size, to_log_size, source, destination)?,
                         BaseCommitPartitionAuthority::Monolithic,
-                        step.traffic,
                     )?;
                     self.state = Some(destination);
                 }
@@ -194,7 +191,6 @@ impl<'a> Compiler<'a> {
                         BaseCommitAbi::StateFinalizeInPlaceV1,
                         state_finalize_effect(log_size, source, destination)?,
                         BaseCommitPartitionAuthority::Monolithic,
-                        step.traffic,
                     )?;
                     self.hash = Some(destination);
                 }
@@ -213,7 +209,6 @@ impl<'a> Compiler<'a> {
                         BaseCommitAbi::MerkleLayerInPlaceV1,
                         merkle_in_place_effect(source, destination)?,
                         BaseCommitPartitionAuthority::Monolithic,
-                        step.traffic,
                     )?;
                     self.hash = Some(destination);
                 }
@@ -230,13 +225,14 @@ impl<'a> Compiler<'a> {
                         BaseCommitAbi::MerkleLayerV1,
                         merkle_effect(source, destination)?,
                         BaseCommitPartitionAuthority::Monolithic,
-                        step.traffic,
                     )?;
                     self.hash = Some(destination);
                 }
-                CommitProgramOperation::FusedLdeAbsorb16 { .. }
-                | CommitProgramOperation::MerkleInterior4 { .. }
-                | CommitProgramOperation::MerkleTail { .. } => {
+                CommitProgramOperation::MerkleTail {
+                    first_hashes,
+                    levels,
+                } => self.push_merkle_tail(first_hashes, levels)?,
+                CommitProgramOperation::MerkleInterior4 { .. } => {
                     return Err(BaseCommitAuthorityError::UnsupportedOperation(
                         step.operation,
                     ))
@@ -245,9 +241,167 @@ impl<'a> Compiler<'a> {
         }
         if pending_lde.is_some()
             || self.next_batch != self.direct.batches().len()
+            || self.next_segment_offset != 0
             || self.hash != Some(BaseCommitValueRole::HashLayer { log_size: 0 })
         {
             return Err(BaseCommitAuthorityError::InvalidProgramOrder);
+        }
+        Ok(())
+    }
+
+    fn consume_direct_segment(
+        &mut self,
+        step_index: usize,
+        batch_index: u32,
+        segment_offset: u32,
+        columns: u32,
+        retained_log_size: u32,
+    ) -> Result<(u32, u32, Vec<u32>), BaseCommitAuthorityError> {
+        let begin =
+            usize::try_from(segment_offset).map_err(|_| BaseCommitAuthorityError::SizeOverflow)?;
+        let end = begin
+            .checked_add(columns as usize)
+            .ok_or(BaseCommitAuthorityError::SizeOverflow)?;
+        let batch = self
+            .direct
+            .batches()
+            .get(self.next_batch)
+            .filter(|batch| {
+                batch.batch_index == batch_index
+                    && batch.retained_log_size == retained_log_size
+                    && begin == self.next_segment_offset
+                    && end <= batch.canonical_columns.len()
+                    && self.commit.canonical_columns_for_step(step_index)
+                        == batch.canonical_columns.get(begin..end)
+            })
+            .ok_or(BaseCommitAuthorityError::ProgramMismatch)?;
+        let source_log_size = batch.source_log_size;
+        let canonical_columns = canonical_u32(
+            batch
+                .canonical_columns
+                .get(begin..end)
+                .ok_or(BaseCommitAuthorityError::ProgramMismatch)?,
+        )?;
+        if end == batch.canonical_columns.len() {
+            self.next_batch += 1;
+            self.next_segment_offset = 0;
+        } else {
+            self.next_segment_offset = end;
+        }
+        Ok((source_log_size, retained_log_size, canonical_columns))
+    }
+
+    fn push_direct_transforms(
+        &mut self,
+        batch_index: u32,
+        segment_offset: u32,
+        source_log_size: u32,
+        retained_log_size: u32,
+        canonical_columns: &[u32],
+    ) -> Result<(), BaseCommitAuthorityError> {
+        self.push(
+            BaseCommitOperationKind::DirectB2n {
+                batch_index,
+                segment_offset,
+                source_log_size,
+                retained_log_size,
+                canonical_columns: canonical_columns.to_vec(),
+            },
+            BaseCommitAbi::DirectB2nV1,
+            direct_b2n_effect(
+                batch_index,
+                canonical_columns,
+                source_log_size,
+                retained_log_size,
+            )?,
+            BaseCommitPartitionAuthority::Monolithic,
+        )?;
+        self.push(
+            BaseCommitOperationKind::DirectN2b {
+                batch_index,
+                segment_offset,
+                source_log_size,
+                retained_log_size,
+                canonical_columns: canonical_columns.to_vec(),
+            },
+            BaseCommitAbi::DirectN2bV1,
+            direct_n2b_effect(batch_index, canonical_columns, retained_log_size)?,
+            BaseCommitPartitionAuthority::Monolithic,
+        )
+    }
+
+    fn push_absorb(
+        &mut self,
+        batch_index: u32,
+        segment_offset: u32,
+        log_size: u32,
+        absorbed_columns_before: u32,
+        canonical_columns: Vec<u32>,
+    ) -> Result<(), BaseCommitAuthorityError> {
+        let source = self
+            .state
+            .ok_or(BaseCommitAuthorityError::InvalidProgramOrder)?;
+        let destination = self.new_state(log_size)?;
+        self.push(
+            BaseCommitOperationKind::StateAbsorb {
+                batch_index,
+                segment_offset,
+                log_size,
+                absorbed_columns_before,
+                canonical_columns: canonical_columns.clone(),
+            },
+            BaseCommitAbi::StateAbsorbV1,
+            state_absorb_effect(
+                batch_index,
+                log_size,
+                source,
+                destination,
+                &canonical_columns,
+            )?,
+            BaseCommitPartitionAuthority::Monolithic,
+        )?;
+        self.state = Some(destination);
+        Ok(())
+    }
+
+    fn push_merkle_tail(
+        &mut self,
+        first_hashes: u32,
+        levels: u32,
+    ) -> Result<(), BaseCommitAuthorityError> {
+        let source_log = hash_log(
+            self.hash
+                .ok_or(BaseCommitAuthorityError::InvalidProgramOrder)?,
+        )?;
+        let expected_first_hashes = 1u32
+            .checked_shl(levels)
+            .ok_or(BaseCommitAuthorityError::InvalidProgramOrder)?;
+        if levels == 0 || source_log != levels || first_hashes != expected_first_hashes {
+            return Err(BaseCommitAuthorityError::InvalidProgramOrder);
+        }
+        let first_level = self
+            .commit
+            .identity()
+            .config
+            .lifting_log_size
+            .checked_sub(levels)
+            .ok_or(BaseCommitAuthorityError::InvalidProgramOrder)?;
+        for offset in 0..levels {
+            let output_hashes = first_hashes >> (offset + 1);
+            let (source, destination) = self.merkle_transition(output_hashes)?;
+            let level = first_level
+                .checked_add(offset)
+                .ok_or(BaseCommitAuthorityError::SizeOverflow)?;
+            self.push(
+                BaseCommitOperationKind::MerkleLayer {
+                    level,
+                    output_hashes,
+                },
+                BaseCommitAbi::MerkleLayerV1,
+                merkle_effect(source, destination)?,
+                BaseCommitPartitionAuthority::Monolithic,
+            )?;
+            self.hash = Some(destination);
         }
         Ok(())
     }
@@ -292,12 +446,12 @@ impl<'a> Compiler<'a> {
         abi: BaseCommitAbi,
         effect: BaseCommitEffect,
         partition: BaseCommitPartitionAuthority,
-        traffic: CommitProgramTraffic,
     ) -> Result<(), BaseCommitAuthorityError> {
         let source_identity = operation_source_identity(self.source_identity, abi);
         let abi_identity = operation_abi_identity(abi, &kind)?;
         let invocation = compile_invocation(abi, &kind, &effect)?;
-        let launch_identity = launch_identity(abi, &kind, traffic)?;
+        let execution = execution_manifest(&kind)?;
+        let launch_identity = launch_identity(abi, &kind, &execution)?;
         let identity = operation_identity(
             source_identity,
             abi_identity,
@@ -312,8 +466,7 @@ impl<'a> Compiler<'a> {
             effect,
             invocation,
             partition,
-            nested_kernel_launches: traffic.kernel_launches,
-            nested_device_copies: traffic.device_copies,
+            execution,
             source_identity,
             abi_identity,
             launch_identity,
@@ -483,6 +636,7 @@ fn exact_state(
 
 /// Exact physical launch count of
 /// `stwo_ntt_b2n_columns_to_retained_on`, including its 65,535-column tiling.
+#[cfg(test)]
 pub(super) fn b2n_columns_to_retained_launches(
     log_size: u32,
     columns: u32,
@@ -504,6 +658,7 @@ pub(super) fn b2n_columns_to_retained_launches(
 /// `stwo_ntt_n2b_columns_from_stage_two_on`, including its 65,535-column
 /// tiling. Native logs launch stages `2..=log_size`; optimized logs retain the
 /// audited fused-interval schedule.
+#[cfg(test)]
 pub(super) fn n2b_from_stage_two_launches(
     log_size: u32,
     columns: u32,
@@ -520,6 +675,7 @@ pub(super) fn n2b_from_stage_two_launches(
         .ok_or(BaseCommitAuthorityError::SizeOverflow)
 }
 
+#[cfg(test)]
 pub(super) fn ntt_column_chunks(columns: u32) -> Result<u32, BaseCommitAuthorityError> {
     const MAX_COLUMNS: u64 = 65_535;
     if columns == 0 {
@@ -527,13 +683,4 @@ pub(super) fn ntt_column_chunks(columns: u32) -> Result<u32, BaseCommitAuthority
     }
     u32::try_from(u64::from(columns).div_ceil(MAX_COLUMNS))
         .map_err(|_| BaseCommitAuthorityError::SizeOverflow)
-}
-
-const fn traffic(kernel_launches: u32, device_copies: u32) -> CommitProgramTraffic {
-    CommitProgramTraffic {
-        owned_read_bytes: 0,
-        owned_write_bytes: 0,
-        kernel_launches,
-        device_copies,
-    }
 }

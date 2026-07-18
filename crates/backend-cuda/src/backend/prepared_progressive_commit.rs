@@ -52,12 +52,12 @@ pub use base_commit_authority::{
     BaseCommitAbi, BaseCommitAbiAccess, BaseCommitAbiArgument, BaseCommitAbiArgumentKind,
     BaseCommitAccess, BaseCommitAccessKind, BaseCommitAliasAuthority, BaseCommitAliasDiscipline,
     BaseCommitAliasRequirement, BaseCommitAuthorityError, BaseCommitDependencyRange,
-    BaseCommitDependencyRole, BaseCommitEffect, BaseCommitInstalledAccess, BaseCommitInvocation,
-    BaseCommitInvocationArgument, BaseCommitInvocationValue, BaseCommitLayout,
-    BaseCommitLinkedAuthority, BaseCommitOperation, BaseCommitOperationKind,
-    BaseCommitPartitionAuthority, BaseCommitPointerBinding, BaseCommitPointerTarget,
-    BaseCommitProgramAuthority, BaseCommitRetainedEvaluation, BaseCommitRetainedLayer,
-    BaseCommitValueRole,
+    BaseCommitDependencyRole, BaseCommitEffect, BaseCommitExecutionStep, BaseCommitInstalledAccess,
+    BaseCommitInvocation, BaseCommitInvocationArgument, BaseCommitInvocationValue,
+    BaseCommitKernelLaunch, BaseCommitLayout, BaseCommitLinkedAuthority, BaseCommitOperation,
+    BaseCommitOperationKind, BaseCommitPartitionAuthority, BaseCommitPointerBinding,
+    BaseCommitPointerTarget, BaseCommitProgramAuthority, BaseCommitRetainedEvaluation,
+    BaseCommitRetainedLayer, BaseCommitValueRole,
 };
 pub use composition_split::{
     CompositionSplitColumns, CompositionSplitError, CompositionSplitLaunchMode,

@@ -8,6 +8,9 @@ use crate::backend::progressive_commit::{
     ProgressiveCommitGeometry, ProgressiveCommitGroupGeometry,
 };
 
+#[path = "base_commit_authority/manifest_tests.rs"]
+mod manifest_tests;
+
 fn programs(
     fusion: ProgressiveNttLeafFusionMode,
     interior4_fused: bool,
@@ -109,7 +112,10 @@ fn exact_program_emits_decomposed_direct_state_and_merkle_order() {
             "stwo_ntt_n2b_columns_from_stage_two_on"
         );
         assert_eq!(
-            n2b.nested_kernel_launches,
+            n2b.execution
+                .iter()
+                .filter(|step| matches!(step, BaseCommitExecutionStep::KernelLaunch(_)))
+                .count() as u32,
             n2b_from_stage_two_launches(
                 batch.retained_log_size,
                 u32::try_from(batch.canonical_columns.len()).unwrap(),
@@ -193,6 +199,7 @@ fn direct_ntt_launch_counts_include_checked_column_tiling() {
 fn canonical_operation_and_role_encodings_are_tagged_and_field_sensitive() {
     let operation = BaseCommitOperationKind::StateAbsorb {
         batch_index: 7,
+        segment_offset: 0,
         log_size: 11,
         absorbed_columns_before: 13,
         canonical_columns: vec![2, 5],
@@ -200,6 +207,7 @@ fn canonical_operation_and_role_encodings_are_tagged_and_field_sensitive() {
     let mut expected = blake3::Hasher::new();
     expected.update(&[5]);
     expected.update(&7u32.to_le_bytes());
+    expected.update(&0u32.to_le_bytes());
     expected.update(&11u32.to_le_bytes());
     expected.update(&13u32.to_le_bytes());
     expected.update(&2u64.to_le_bytes());
@@ -213,24 +221,28 @@ fn canonical_operation_and_role_encodings_are_tagged_and_field_sensitive() {
     let operations = [
         BaseCommitOperationKind::DirectB2n {
             batch_index: 1,
+            segment_offset: 0,
             source_log_size: 8,
             retained_log_size: 9,
             canonical_columns: vec![2, 3],
         },
         BaseCommitOperationKind::DirectB2n {
             batch_index: 2,
+            segment_offset: 0,
             source_log_size: 8,
             retained_log_size: 9,
             canonical_columns: vec![2, 3],
         },
         BaseCommitOperationKind::DirectB2n {
             batch_index: 1,
+            segment_offset: 0,
             source_log_size: 8,
             retained_log_size: 9,
             canonical_columns: vec![3, 2],
         },
         BaseCommitOperationKind::DirectN2b {
             batch_index: 1,
+            segment_offset: 0,
             source_log_size: 8,
             retained_log_size: 9,
             canonical_columns: vec![2, 3],
@@ -601,7 +613,7 @@ fn every_transitive_source_component_changes_the_source_identity() {
 }
 
 #[test]
-fn compiler_rejects_wrong_role_fusion_tail_and_program_pair() {
+fn compiler_accepts_lowerable_fusion_and_rejects_wrong_role_interior_and_pair() {
     let (commit, direct) = programs(ProgressiveNttLeafFusionMode::Separate, false, 0);
     let interaction =
         DirectRetainedB2nProgram::compile(TraceTreeRole::Interaction, &commit).unwrap();
@@ -613,10 +625,10 @@ fn compiler_rejects_wrong_role_fusion_tail_and_program_pair() {
     );
 
     let (fused, fused_direct) = programs(ProgressiveNttLeafFusionMode::Fused16, false, 0);
-    assert_eq!(
-        BaseCommitProgramAuthority::compile(&fused, &fused_direct),
-        Err(BaseCommitAuthorityError::UnsupportedLeafFusion)
-    );
+    BaseCommitProgramAuthority::compile(&fused, &fused_direct)
+        .unwrap()
+        .validate()
+        .unwrap();
 
     let (interior, interior_direct) = programs(ProgressiveNttLeafFusionMode::Separate, true, 0);
     assert_eq!(
@@ -625,9 +637,14 @@ fn compiler_rejects_wrong_role_fusion_tail_and_program_pair() {
     );
 
     let (tail, tail_direct) = programs(ProgressiveNttLeafFusionMode::Separate, false, 1);
+    let tail_authority = BaseCommitProgramAuthority::compile(&tail, &tail_direct).unwrap();
+    tail_authority.validate().unwrap();
     assert_eq!(
-        BaseCommitProgramAuthority::compile(&tail, &tail_direct),
-        Err(BaseCommitAuthorityError::UnsupportedTailFusion)
+        tail_authority.commit_operation_view().unwrap(),
+        tail.steps()
+            .iter()
+            .map(|step| step.operation)
+            .collect::<Vec<_>>()
     );
 
     let other = CommitProgram::compile(
