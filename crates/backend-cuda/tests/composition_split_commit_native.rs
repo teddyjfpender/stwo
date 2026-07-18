@@ -1,9 +1,10 @@
 //! Exact-shape native admission for the Composition split and compact commit.
 //!
-//! The reference is the production predecessor: full B2N, eight coefficient
-//! half copies, ordinary compact LDE, leaf hashing, and Merkle. The candidate
-//! uses the qualified fused split at log 24 and 25, followed directly by compact
-//! hashing of its evaluations.
+//! The reference materializes the production-predecessor semantics through the
+//! qualified stage-fused exact-alias B2N: full coefficients, eight half copies,
+//! ordinary compact LDE, leaf hashing, and Merkle. The candidate uses the
+//! qualified fused split at log 24 and 25, followed directly by compact hashing
+//! of its evaluations.
 //! gpu-lab-cohesion-review: one native gate must bind both graph lifetimes and compare every
 //! boundary. Run on a >=16 GiB CUDA device with:
 //!
@@ -321,13 +322,13 @@ fn prepare<'a>(
 fn launch_baseline(arena: &DeviceArena, log_size: u32) {
     let rows = 1usize << log_size;
     let half = rows / 2;
+    let source_pointers = arena.bind(BASELINE_SOURCE_POINTERS).unwrap().as_u32_ptr();
+    // Exact input/output aliases retain the full coefficient image while the
+    // qualified interval topology matches the split traffic and node model.
     let code = unsafe {
-        stwo_backend_cuda_kernels::raw::stwo_ntt_b2n_columns_on(
-            arena
-                .bind(BASELINE_SOURCE_POINTERS)
-                .unwrap()
-                .as_u32_ptr()
-                .cast::<*mut u32>(),
+        stwo_backend_cuda_kernels::raw::stwo_ntt_b2n_columns_out_of_place_on(
+            source_pointers.cast::<*const u32>(),
+            source_pointers.cast::<*mut u32>(),
             log_size,
             COMPOSITION_SOURCE_COORDINATES as u32,
             arena.bind(INVERSE_TWIDDLES).unwrap().as_u32_ptr(),
