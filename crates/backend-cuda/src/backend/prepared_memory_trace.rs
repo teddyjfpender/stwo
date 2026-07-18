@@ -14,6 +14,7 @@ use super::prepared_execution_tables::{
 };
 
 mod authority;
+mod loaded_binding;
 
 #[cfg(test)]
 mod tests;
@@ -25,6 +26,7 @@ pub use authority::{
     MemoryBaseTraceLinkedContract, MemoryBaseTraceRequirements, MemoryBaseTraceStepContract,
     MemoryBaseTraceStepKind, MemoryBaseTraceValuePartRequirements,
 };
+use loaded_binding::PreparedMemoryBaseTraceBinding;
 
 pub const MEMORY_ADDRESS_BASE_COLUMNS: usize = 32;
 pub const MEMORY_BIG_BASE_COLUMNS: usize = EXECUTION_TABLE_BIG_LIMBS + 1;
@@ -56,6 +58,11 @@ pub enum PreparedMemoryBaseTraceError {
         actual_words: usize,
     },
     ContextMismatch(&'static str),
+    ArenaBindingMismatch(&'static str),
+    InvalidContract,
+    InvalidBindingGeometry(&'static str),
+    InvalidBindingIdentity,
+    RawBindingMismatch,
     DuplicateSlice,
     Arena(ArenaError),
     Cuda(CudaRuntimeError),
@@ -93,17 +100,13 @@ struct PreparedValuePart {
 
 pub struct PreparedMemoryBaseTraceGraph<'a> {
     arena: &'a DeviceArena,
+    contract: MemoryBaseTraceContract,
+    binding: PreparedMemoryBaseTraceBinding,
     address_ids: *const u32,
     address_id_words: u32,
-    address_counts: ArenaSlice,
-    address_count_words: u32,
-    address_rows: u32,
     address_output_pointers: Vec<*mut u32>,
     big_parts: Vec<PreparedValuePart>,
     small_part: PreparedValuePart,
-    rc99_lut: ArenaSlice,
-    rc99_table_size: u32,
-    rc99_counts: ArenaSlice,
 }
 
 impl<'a> PreparedMemoryBaseTraceGraph<'a> {
@@ -201,6 +204,40 @@ impl<'a> PreparedMemoryBaseTraceGraph<'a> {
         let rc99_count_words = rc99_table_size
             .checked_mul(8)
             .ok_or(PreparedMemoryBaseTraceError::SizeOverflow)?;
+        let big_part_requirements = big_parts
+            .iter()
+            .enumerate()
+            .map(|(part_ordinal, part)| {
+                Ok(MemoryBaseTraceValuePartRequirements {
+                    part_ordinal: u32::try_from(part_ordinal)
+                        .map_err(|_| PreparedMemoryBaseTraceError::SizeOverflow)?,
+                    source_offset: part.source_offset,
+                    row_count: part.row_count,
+                })
+            })
+            .collect::<Result<Vec<_>, PreparedMemoryBaseTraceError>>()?;
+        let contract = MemoryBaseTraceContract::compile(&MemoryBaseTraceRequirements {
+            n_addrs: execution.requirements().n_addrs,
+            raw_address_words: execution.requirements().raw_addr_to_id_words,
+            address_rows,
+            address_count_words,
+            big_source_words: execution.requirements().big_column_words,
+            big_count_words,
+            big_parts: big_part_requirements,
+            small_source_words: execution.requirements().small_column_words,
+            small_count_words,
+            small_part: MemoryBaseTraceValuePartRequirements {
+                part_ordinal: 0,
+                source_offset: small_part.source_offset,
+                row_count: small_part.row_count,
+            },
+            rc99_lut_words: rc99_table_size,
+            rc99_count_words,
+        })
+        .map_err(|_| PreparedMemoryBaseTraceError::InvalidContract)?;
+        contract
+            .validate()
+            .map_err(|_| PreparedMemoryBaseTraceError::InvalidContract)?;
 
         let token = arena.context().identity_token();
         let mut all = Vec::new();
@@ -259,6 +296,19 @@ impl<'a> PreparedMemoryBaseTraceGraph<'a> {
         if all.into_iter().any(|id| !distinct.insert(id)) {
             return Err(PreparedMemoryBaseTraceError::DuplicateSlice);
         }
+        let binding = PreparedMemoryBaseTraceBinding::prepare(
+            arena,
+            &contract,
+            execution,
+            address_counts,
+            address_outputs,
+            big_counts,
+            big_parts,
+            small_counts,
+            small_part,
+            rc99_lut,
+            rc99_counts,
+        )?;
 
         let address_ids = if address_id_words == 0 {
             checked_subslice("address ids from one", execution.raw_addr_to_id(), 0, 0)?
@@ -326,15 +376,12 @@ impl<'a> PreparedMemoryBaseTraceGraph<'a> {
             execution.requirements().small_column_words,
             small_counts,
         )?;
-        Ok(Self {
+        let graph = Self {
             arena,
+            contract,
+            binding,
             address_ids: address_ids.as_u32_ptr().cast_const(),
             address_id_words: u32::try_from(address_id_words)
-                .map_err(|_| PreparedMemoryBaseTraceError::SizeOverflow)?,
-            address_counts,
-            address_count_words: u32::try_from(address_count_words)
-                .map_err(|_| PreparedMemoryBaseTraceError::SizeOverflow)?,
-            address_rows: u32::try_from(address_rows)
                 .map_err(|_| PreparedMemoryBaseTraceError::SizeOverflow)?,
             address_output_pointers: address_outputs
                 .iter()
@@ -342,11 +389,9 @@ impl<'a> PreparedMemoryBaseTraceGraph<'a> {
                 .collect(),
             big_parts,
             small_part,
-            rc99_lut,
-            rc99_table_size: u32::try_from(rc99_table_size)
-                .map_err(|_| PreparedMemoryBaseTraceError::SizeOverflow)?,
-            rc99_counts,
-        })
+        };
+        graph.validate_loaded_binding(arena)?;
+        Ok(graph)
     }
 
     pub fn launch(&self) -> Result<(), PreparedMemoryBaseTraceError> {
@@ -355,10 +400,11 @@ impl<'a> PreparedMemoryBaseTraceGraph<'a> {
 
     /// Seed the plan-owned canonical rc9_9 lookup table before capture.
     pub fn upload_rc99_lut(&self, words: &[u32]) -> Result<(), PreparedMemoryBaseTraceError> {
-        check_shape("rc9_9 LUT upload", self.rc99_lut.len_words(), words.len())?;
+        let rc99_lut = self.binding.rc99_lut();
+        check_shape("rc9_9 LUT upload", rc99_lut.len_words(), words.len())?;
         unsafe {
             self.arena.context().memcpy_h2d_async(
-                self.rc99_lut.as_void_ptr(),
+                rc99_lut.as_void_ptr(),
                 words.as_ptr().cast(),
                 core::mem::size_of_val(words),
             )?;
@@ -372,13 +418,14 @@ impl<'a> PreparedMemoryBaseTraceGraph<'a> {
             return Err(CudaRuntimeError::ContextMismatch.into());
         }
         let stream = launch.stream_raw().as_ptr();
+        let requirements = self.contract.requirements();
         let address = unsafe {
             stwo_backend_cuda_kernels::raw::memory_address_base_trace_sliced_on(
                 self.address_ids,
                 self.address_id_words,
-                self.address_counts.as_u32_ptr().cast_const(),
-                self.address_count_words,
-                self.address_rows,
+                self.binding.address_counts().as_u32_ptr().cast_const(),
+                requirements.address_count_words as u32,
+                requirements.address_rows as u32,
                 self.address_output_pointers.as_ptr(),
                 stream,
             )
@@ -425,9 +472,9 @@ impl<'a> PreparedMemoryBaseTraceGraph<'a> {
                 part.rc99_limb_pointers.as_ptr(),
                 n_pairs as u32,
                 part.row_count,
-                self.rc99_lut.as_u32_ptr().cast_const(),
-                self.rc99_table_size,
-                self.rc99_counts.as_u32_ptr(),
+                self.binding.rc99_lut().as_u32_ptr().cast_const(),
+                self.contract.requirements().rc99_lut_words as u32,
+                self.binding.rc99_counts().as_u32_ptr(),
                 stream,
             )
         };
@@ -440,15 +487,90 @@ impl<'a> PreparedMemoryBaseTraceGraph<'a> {
     }
 
     pub fn rc99_lut(&self) -> ArenaSlice {
-        self.rc99_lut
+        self.binding.rc99_lut()
     }
 
     pub fn rc99_counts(&self) -> ArenaSlice {
-        self.rc99_counts
+        self.binding.rc99_counts()
     }
 
     pub fn rc99_table_size(&self) -> usize {
-        self.rc99_table_size as usize
+        self.contract.requirements().rc99_lut_words
+    }
+
+    /// Exact address-free semantic authority compiled for this prepared graph.
+    pub fn contract(&self) -> &MemoryBaseTraceContract {
+        &self.contract
+    }
+
+    /// Address-free identity of the ordered logical arena binding.
+    pub fn binding_identity(&self) -> [u8; 32] {
+        self.binding.identity()
+    }
+
+    /// Revalidate arena ownership, exact dimensions, and every private launch
+    /// pointer before admitting a loaded graph.
+    pub fn validate_loaded_binding(
+        &self,
+        arena: &DeviceArena,
+    ) -> Result<(), PreparedMemoryBaseTraceError> {
+        if !core::ptr::eq(self.arena, arena) {
+            return Err(PreparedMemoryBaseTraceError::ArenaBindingMismatch(
+                "prepared graph",
+            ));
+        }
+        self.binding.validate(arena, &self.contract)?;
+        if !self.binding.raw_matches(
+            &self.contract,
+            self.address_ids,
+            self.address_id_words,
+            &self.address_output_pointers,
+            &self.big_parts,
+            &self.small_part,
+        ) {
+            return Err(PreparedMemoryBaseTraceError::RawBindingMismatch);
+        }
+        Ok(())
+    }
+
+    pub fn belongs_to(&self, arena: &DeviceArena) -> bool {
+        self.validate_loaded_binding(arena).is_ok()
+    }
+
+    pub fn address_source(&self) -> ArenaSlice {
+        self.binding.address_source()
+    }
+
+    pub fn address_counts(&self) -> ArenaSlice {
+        self.binding.address_counts()
+    }
+
+    pub fn address_outputs(&self) -> &[ArenaSlice] {
+        self.binding.address_outputs()
+    }
+
+    pub fn big_sources(&self) -> &[ArenaSlice] {
+        self.binding.big_sources()
+    }
+
+    pub fn big_counts(&self) -> ArenaSlice {
+        self.binding.big_counts()
+    }
+
+    pub fn big_outputs(&self, part_ordinal: usize) -> Option<&[ArenaSlice]> {
+        self.binding.big_outputs(part_ordinal)
+    }
+
+    pub fn small_sources(&self) -> &[ArenaSlice] {
+        self.binding.small_sources()
+    }
+
+    pub fn small_counts(&self) -> ArenaSlice {
+        self.binding.small_counts()
+    }
+
+    pub fn small_outputs(&self) -> &[ArenaSlice] {
+        self.binding.small_outputs()
     }
 }
 
