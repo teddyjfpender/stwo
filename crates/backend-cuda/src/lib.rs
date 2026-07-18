@@ -45,11 +45,12 @@ pub use backend::pcs_driver::{
     CudaPcsRuntimeMode,
 };
 pub use backend::prepared_casm_input::{
-    witness_casm_input_requirements, PreparedWitnessCasmInputError, PreparedWitnessCasmInputStage,
-    WitnessCasmInputAbi, WitnessCasmInputAbiAccess, WitnessCasmInputAbiArgument,
-    WitnessCasmInputAbiArgumentKind, WitnessCasmInputAuthorityError, WitnessCasmInputColumnEffect,
-    WitnessCasmInputColumnValue, WitnessCasmInputContract, WitnessCasmInputEffectAbi,
-    WitnessCasmInputEffectGeometry, WitnessCasmInputFixedField, WitnessCasmInputKernelLaunch,
+    witness_casm_input_requirements, PendingWitnessCasmInputIngressReceipt,
+    PreparedWitnessCasmInputError, PreparedWitnessCasmInputStage, WitnessCasmInputAbi,
+    WitnessCasmInputAbiAccess, WitnessCasmInputAbiArgument, WitnessCasmInputAbiArgumentKind,
+    WitnessCasmInputAuthorityError, WitnessCasmInputColumnEffect, WitnessCasmInputColumnValue,
+    WitnessCasmInputContract, WitnessCasmInputEffectAbi, WitnessCasmInputEffectGeometry,
+    WitnessCasmInputFixedField, WitnessCasmInputIngressReceipt, WitnessCasmInputKernelLaunch,
     WitnessCasmInputLinkedContract, WitnessCasmInputRequirements, WitnessCasmInputRowDomain,
     WitnessCasmInputSlots, WITNESS_CASM_BASE_INPUT_COLUMNS, WITNESS_CASM_INPUT_FIXED_ORDER,
     WITNESS_CASM_STATE_WORDS,

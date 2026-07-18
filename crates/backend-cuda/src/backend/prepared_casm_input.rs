@@ -4,7 +4,6 @@
 //! uploads. The device scatter preserves the generated witness writer's stable
 //! column ABI while deriving enabler/iota and padding from row zero.
 
-use core::cell::Cell;
 use core::ffi::c_void;
 use std::collections::BTreeSet;
 
@@ -12,6 +11,7 @@ use super::exec_context::{ArenaError, ArenaSlice, ArenaSlotId, CudaRuntimeError,
 use super::prepared_witness_input::WitnessInputGatherArenaSlotRequirement;
 
 mod authority;
+mod ingress_receipt;
 
 pub use authority::{
     WitnessCasmInputAbi, WitnessCasmInputAbiAccess, WitnessCasmInputAbiArgument,
@@ -20,6 +20,7 @@ pub use authority::{
     WitnessCasmInputEffectGeometry, WitnessCasmInputFixedField, WitnessCasmInputKernelLaunch,
     WitnessCasmInputLinkedContract, WitnessCasmInputRowDomain, WITNESS_CASM_INPUT_FIXED_ORDER,
 };
+pub use ingress_receipt::{PendingWitnessCasmInputIngressReceipt, WitnessCasmInputIngressReceipt};
 
 const WORD_BYTES: usize = core::mem::size_of::<u32>();
 
@@ -65,8 +66,11 @@ pub enum PreparedWitnessCasmInputError {
         expected: usize,
         actual: usize,
     },
+    IngressGenerationOverflow,
+    InvalidIngressReceipt,
     InputNotIngested,
     KernelLaunchFailed,
+    Authority(WitnessCasmInputAuthorityError),
     Arena(ArenaError),
     Cuda(CudaRuntimeError),
 }
@@ -88,6 +92,12 @@ impl From<ArenaError> for PreparedWitnessCasmInputError {
 impl From<CudaRuntimeError> for PreparedWitnessCasmInputError {
     fn from(value: CudaRuntimeError) -> Self {
         Self::Cuda(value)
+    }
+}
+
+impl From<WitnessCasmInputAuthorityError> for PreparedWitnessCasmInputError {
+    fn from(value: WitnessCasmInputAuthorityError) -> Self {
+        Self::Authority(value)
     }
 }
 
@@ -159,13 +169,15 @@ impl WitnessCasmInputRequirements {
 
 /// A same-stream staging/scatter edge. Multiple opcode lanes may reuse the
 /// same staging slot by calling `ingest_and_launch` sequentially; CUDA stream
-/// order prevents the next upload from overtaking the previous scatter.
+/// order prevents the next upload from overtaking the previous scatter. A new
+/// attempt invalidates this stage's prior receipt; all batched host sources
+/// must remain live through their shared fence.
 pub struct PreparedWitnessCasmInputStage<'a> {
     arena: &'a DeviceArena,
-    requirements: WitnessCasmInputRequirements,
+    contract: WitnessCasmInputContract,
     staging: ArenaSlice,
     consumer_input_columns: Vec<ArenaSlice>,
-    ingested: Cell<bool>,
+    ingress_state: ingress_receipt::WitnessCasmInputIngressState,
 }
 
 impl<'a> PreparedWitnessCasmInputStage<'a> {
@@ -182,6 +194,7 @@ impl<'a> PreparedWitnessCasmInputStage<'a> {
         {
             return Err(PreparedWitnessCasmInputError::MalformedRequirements);
         }
+        let contract = WitnessCasmInputContract::compile(requirements)?;
         requirements.arena_slot_requirements(slots)?;
         let staging = bind_min(arena, slots.staging, requirements.staging_words)?;
         let consumer_input_columns = slots
@@ -192,10 +205,10 @@ impl<'a> PreparedWitnessCasmInputStage<'a> {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             arena,
-            requirements: requirements.clone(),
+            contract,
             staging,
             consumer_input_columns,
-            ingested: Cell::new(false),
+            ingress_state: ingress_receipt::WitnessCasmInputIngressState::new(),
         })
     }
 
@@ -208,30 +221,50 @@ impl<'a> PreparedWitnessCasmInputStage<'a> {
     /// run eagerly outside CUDA graph capture. Pageable memory is admitted for
     /// correctness but does not promise asynchronous DMA overlap.
     pub unsafe fn ingest_words(&self, words: &[u32]) -> Result<(), PreparedWitnessCasmInputError> {
-        self.ingested.set(false);
-        if words.len() != self.requirements.staging_words {
+        if words.len() != self.contract.requirements().staging_words {
             return Err(PreparedWitnessCasmInputError::HostWordCountMismatch {
-                expected: self.requirements.staging_words,
+                expected: self.contract.requirements().staging_words,
                 actual: words.len(),
             });
         }
-        unsafe {
+        let generation = self.ingress_state.next_generation()?;
+        let binding = self.ingress_binding();
+        let receipt = WitnessCasmInputIngressReceipt::prepare(binding, words, generation)?;
+
+        // A valid attempt may overwrite staging, so no earlier receipt remains
+        // admissible. The generation is consumed even if enqueueing fails.
+        self.ingress_state.begin(receipt);
+        let upload_result = unsafe {
             self.arena.context().memcpy_h2d_async(
                 self.staging.as_void_ptr(),
                 words.as_ptr().cast::<c_void>(),
                 core::mem::size_of_val(words),
-            )?;
+            )
+        };
+        if let Err(error) = upload_result {
+            // An enqueue failure does not prove that no prior/partial async
+            // work retained the borrowed source. Drain before returning
+            // without a pending receipt.
+            let sync_result = self.arena.context().sync();
+            self.ingress_state.abort(receipt);
+            sync_result?;
+            return Err(error.into());
         }
-        self.ingested.set(true);
         Ok(())
     }
 
-    pub fn launch(&self) -> Result<(), PreparedWitnessCasmInputError> {
-        if !self.ingested.replace(false) {
-            return Err(PreparedWitnessCasmInputError::InputNotIngested);
-        }
+    /// Enqueue the scatter and return evidence which remains pending until the
+    /// caller acknowledges its existing setup fence.
+    pub fn launch(
+        &self,
+    ) -> Result<PendingWitnessCasmInputIngressReceipt, PreparedWitnessCasmInputError> {
+        let receipt = self
+            .ingress_state
+            .ingested()
+            .ok_or(PreparedWitnessCasmInputError::InputNotIngested)?;
         let columns = &self.consumer_input_columns;
-        let iota = if self.requirements.include_iota {
+        let requirements = self.contract.requirements();
+        let iota = if requirements.include_iota {
             columns[4].as_u32_ptr()
         } else {
             core::ptr::null_mut()
@@ -239,8 +272,8 @@ impl<'a> PreparedWitnessCasmInputStage<'a> {
         let code = unsafe {
             stwo_backend_cuda_kernels::raw::stwo_witness_casm_input_scatter_on(
                 self.staging.as_u32_ptr().cast_const(),
-                self.requirements.n_real_rows as u32,
-                self.requirements.consumer_rows as u32,
+                requirements.n_real_rows as u32,
+                requirements.consumer_rows as u32,
                 columns[0].as_u32_ptr(),
                 columns[1].as_u32_ptr(),
                 columns[2].as_u32_ptr(),
@@ -250,8 +283,27 @@ impl<'a> PreparedWitnessCasmInputStage<'a> {
             )
         };
         if code == 0 {
-            Ok(())
+            match self
+                .ingress_state
+                .mark_scatter_enqueued(receipt, self.ingress_binding())
+            {
+                Ok(pending) => Ok(pending),
+                Err(error) => {
+                    // Fail closed if internal receipt state ever disagrees
+                    // after launch: fence the enqueued work before returning
+                    // without a pending token.
+                    let sync_result = self.arena.context().sync();
+                    self.ingress_state.abort(receipt);
+                    sync_result?;
+                    Err(error)
+                }
+            }
         } else {
+            // The upload may already be in flight, but no pending receipt can
+            // represent a scatter which failed to enqueue.
+            let sync_result = self.arena.context().sync();
+            self.ingress_state.abort(receipt);
+            sync_result?;
             Err(PreparedWitnessCasmInputError::KernelLaunchFailed)
         }
     }
@@ -262,16 +314,46 @@ impl<'a> PreparedWitnessCasmInputStage<'a> {
     ///
     /// The source-address, immutability, lifetime, and eager-ingress contract
     /// of [`Self::ingest_words`] applies through the caller-owned fence.
+    /// Starting another attempt invalidates the returned pending receipt.
     pub unsafe fn ingest_and_launch(
         &self,
         words: &[u32],
-    ) -> Result<(), PreparedWitnessCasmInputError> {
+    ) -> Result<PendingWitnessCasmInputIngressReceipt, PreparedWitnessCasmInputError> {
         unsafe { self.ingest_words(words)? };
         self.launch()
     }
 
+    /// Publish one enqueued ingress after the caller's existing setup fence.
+    ///
+    /// # Safety
+    ///
+    /// Before calling, the caller must successfully fence this stage's arena
+    /// execution context after the upload and scatter represented by
+    /// `pending`. The fence must also discharge the source lifetime and
+    /// immutability obligation documented by [`Self::ingest_words`].
+    pub unsafe fn acknowledge_ingress_fence(
+        &self,
+        pending: PendingWitnessCasmInputIngressReceipt,
+    ) -> Result<WitnessCasmInputIngressReceipt, PreparedWitnessCasmInputError> {
+        self.ingress_state.publish(pending, self.ingress_binding())
+    }
+
+    /// The only published receipt. Pending or failed work is never returned.
+    pub fn ingress_receipt(&self) -> Option<WitnessCasmInputIngressReceipt> {
+        self.ingress_state.receipt()
+    }
+
+    pub fn ingress_is_current(&self, receipt: &WitnessCasmInputIngressReceipt) -> bool {
+        self.ingress_state
+            .is_current(receipt, self.ingress_binding())
+    }
+
+    pub fn contract(&self) -> &WitnessCasmInputContract {
+        &self.contract
+    }
+
     pub fn requirements(&self) -> &WitnessCasmInputRequirements {
-        &self.requirements
+        self.contract.requirements()
     }
 
     pub fn staging(&self) -> ArenaSlice {
@@ -280,6 +362,14 @@ impl<'a> PreparedWitnessCasmInputStage<'a> {
 
     pub fn consumer_input_columns(&self) -> &[ArenaSlice] {
         &self.consumer_input_columns
+    }
+
+    fn ingress_binding(&self) -> ingress_receipt::WitnessCasmInputIngressBinding {
+        ingress_receipt::WitnessCasmInputIngressBinding::new(
+            self.arena,
+            &self.contract,
+            self.staging,
+        )
     }
 }
 

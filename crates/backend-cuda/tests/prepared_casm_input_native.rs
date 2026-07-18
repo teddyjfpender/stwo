@@ -36,7 +36,7 @@ fn read(arena: &DeviceArena, source: ArenaSlice) -> Vec<u32> {
 fn row_major_casm_ingress_matches_host_padding_and_reuses_staging() {
     let requirements = witness_casm_input_requirements(3, true).unwrap();
     let slots = slots();
-    let mut offset = 0;
+    let mut offset = 0usize;
     let specs = requirements
         .arena_slot_requirements(&slots)
         .unwrap()
@@ -87,7 +87,11 @@ fn row_major_casm_ingress_matches_host_padding_and_reuses_staging() {
             seed + 32,
             seed + 33,
         ];
-        unsafe { stage.ingest_and_launch(&rows).unwrap() };
+        let pending = unsafe { stage.ingest_and_launch(&rows).unwrap() };
+        assert_eq!(stage.ingress_receipt(), None);
+        arena.context().sync().unwrap();
+        let receipt = unsafe { stage.acknowledge_ingress_fence(pending).unwrap() };
+        assert!(stage.ingress_is_current(&receipt));
         let columns = stage
             .consumer_input_columns()
             .iter()
