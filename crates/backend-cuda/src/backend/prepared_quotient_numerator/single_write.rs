@@ -16,6 +16,7 @@ use crate::backend::quotient_numerator_staged_single_write::{
 fn derive_group_direct_ranges(
     group_offsets: &[u32],
     term_descriptors: &[u32],
+    group_log_sizes: &[u32],
 ) -> Result<Vec<PreparedGroupDirectRange>, QuotientNumeratorStagedSingleWriteError> {
     if term_descriptors.len() % BATCH_TERM_WORDS != 0 {
         return Err(
@@ -29,6 +30,13 @@ fn derive_group_direct_ranges(
             "direct term count exceeds u32",
         )
     })?;
+    if group_offsets.len() != group_log_sizes.len().saturating_add(1) {
+        return Err(
+            QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+                "direct group offsets and log sizes differ",
+            ),
+        );
+    }
     if group_offsets.first() != Some(&0) || group_offsets.last() != Some(&term_count) {
         return Err(
             QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
@@ -38,7 +46,8 @@ fn derive_group_direct_ranges(
     }
     group_offsets
         .windows(2)
-        .map(|offsets| {
+        .zip(group_log_sizes)
+        .map(|(offsets, &group_log_size)| {
             if offsets[0] >= offsets[1] || offsets[1] > term_count {
                 return Err(
                     QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
@@ -48,15 +57,38 @@ fn derive_group_direct_ranges(
             }
             let begin = offsets[0] as usize * BATCH_TERM_WORDS;
             let end = offsets[1] as usize * BATCH_TERM_WORDS;
-            let group_b_term = term_descriptors[begin..end]
-                .chunks_exact(BATCH_TERM_WORDS)
-                .map(|descriptor| descriptor[1])
-                .min()
-                .ok_or(
+            let mut descriptors = term_descriptors[begin..end].chunks_exact(BATCH_TERM_WORDS);
+            let first = descriptors.next().ok_or(
+                QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+                    "direct group has no representative term",
+                ),
+            )?;
+            if first[2] > group_log_size {
+                return Err(
                     QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
-                        "direct group has no representative term",
+                        "direct descriptor source log exceeds its group",
                     ),
-                )?;
+                );
+            }
+            let mut group_b_term = first[1];
+            let mut previous_source_log = first[2];
+            for descriptor in descriptors {
+                if descriptor[2] > group_log_size {
+                    return Err(
+                        QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+                            "direct descriptor source log exceeds its group",
+                        ),
+                    );
+                } else if descriptor[2] < previous_source_log {
+                    return Err(
+                        QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+                            "direct group source logs are not monotone",
+                        ),
+                    );
+                }
+                previous_source_log = descriptor[2];
+                group_b_term = group_b_term.min(descriptor[1]);
+            }
             Ok(PreparedGroupDirectRange {
                 term_begin: offsets[0],
                 term_end: offsets[1],
@@ -516,8 +548,17 @@ impl<'a> PreparedQuotientNumeratorGraph<'a> {
             &topology,
             &overflow_capacities,
         )?;
-        let ranges =
-            derive_group_direct_ranges(candidate.group_offsets(), candidate.term_descriptors())?;
+        let group_log_sizes = candidate
+            .requirements()
+            .groups
+            .iter()
+            .map(|group| group.log_size)
+            .collect::<Vec<_>>();
+        let ranges = derive_group_direct_ranges(
+            candidate.group_offsets(),
+            candidate.term_descriptors(),
+            &group_log_sizes,
+        )?;
         let mut prepared = Self::prepare_staged_packed_single_write(
             arena,
             config,
@@ -693,13 +734,50 @@ mod staged_binding_tests {
 
     #[test]
     fn direct_group_ranges_choose_minimum_global_term() {
-        let descriptors = [0, 8, 0, 1, 2, 0, 2, 5, 0];
-        let ranges = derive_group_direct_ranges(&[0, 3], &descriptors).unwrap();
+        let descriptors = [0, 8, 0, 1, 2, 1, 2, 5, 1];
+        let ranges = derive_group_direct_ranges(&[0, 3], &descriptors, &[1]).unwrap();
         let range = ranges[0];
         assert_eq!(
             [range.term_begin, range.term_end, range.group_b_term],
             [0, 3, 2]
         );
+    }
+
+    #[test]
+    fn direct_group_ranges_seal_monotone_source_log_runs_per_group() {
+        let descriptors = [0, 8, 3, 1, 2, 4, 2, 5, 2, 3, 7, 2];
+        let ranges = derive_group_direct_ranges(&[0, 2, 4], &descriptors, &[4, 2]).unwrap();
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(ranges[0].term_begin, 0);
+        assert_eq!(ranges[0].term_end, 2);
+        assert_eq!(ranges[1].term_begin, 2);
+        assert_eq!(ranges[1].term_end, 4);
+
+        assert!(matches!(
+            derive_group_direct_ranges(&[0, 3], &descriptors[..9], &[4]),
+            Err(
+                QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+                    "direct group source logs are not monotone"
+                )
+            )
+        ));
+    }
+
+    #[test]
+    fn direct_group_ranges_bound_source_logs_and_admit_scalar_group() {
+        let scalar = [0, 4, 0];
+        assert!(derive_group_direct_ranges(&[0, 1], &scalar, &[0]).is_ok());
+
+        let out_of_bounds = [0, 4, 2];
+        assert!(matches!(
+            derive_group_direct_ranges(&[0, 1], &out_of_bounds, &[1]),
+            Err(
+                QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+                    "direct descriptor source log exceeds its group"
+                )
+            )
+        ));
+        assert!(derive_group_direct_ranges(&[0, 1], &scalar, &[]).is_err());
     }
 
     #[test]
@@ -714,8 +792,9 @@ mod staged_binding_tests {
             (&[0, 4, 3][..], &descriptors[..]),
             (&[0, 2, 1, 3][..], &descriptors[..]),
         ] {
+            let group_log_sizes = vec![0; offsets.len().saturating_sub(1)];
             assert!(matches!(
-                derive_group_direct_ranges(offsets, terms),
+                derive_group_direct_ranges(offsets, terms, &group_log_sizes),
                 Err(QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(_))
             ));
         }
