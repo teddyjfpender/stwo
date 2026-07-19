@@ -12,19 +12,21 @@ use stwo::core::vcs::blake2_hash::Blake2sHash;
 use stwo::prover::backend::CpuBackend;
 use stwo::prover::poly::circle::{CircleCoefficients, PolyOps};
 use stwo_backend_cuda::{
-    compact_domain_arena_slot_requirements, full_lifting_leaf_oracle,
-    fused_compact_domain_arena_slot_requirements, progressive_leaf_oracle, ArenaLayout, ArenaSlice,
-    ArenaSlotId, ArenaSlotSpec, CommitArenaSlotRequirement, CommitCoefficientColumn, CommitProgram,
-    CommitWorkspaceConfig, CompactDomainProgram, CudaExecContext, DeviceArena,
-    DirectCompactTerminalProgram, DirectRetainedB2nProgram, DomainCooperativeProgram,
-    FusedCompactDomainProgram, MerkleFromLeavesSlots, PreparedCompactDomainCommitGraph,
-    PreparedFusedCompactDomainCommitGraph, ProgressiveBatchSlots, ProgressiveCommitGeometry,
-    ProgressiveCommitGroupGeometry, ProgressiveCommitWorkspaceRequirements,
-    ProgressiveCommitWorkspaceSlots, ProgressiveLeafWorkspaceSlots, ProgressiveNttLeafFusionMode,
-    TraceTreeRole,
+    compact_domain_arena_slot_requirements, direct_compact_domain_arena_slot_requirements,
+    full_lifting_leaf_oracle, fused_compact_domain_arena_slot_requirements,
+    progressive_leaf_oracle, ArenaLayout, ArenaSlice, ArenaSlotId, ArenaSlotSpec,
+    CommitArenaSlotRequirement, CommitCoefficientColumn, CommitProgram, CommitWorkspaceConfig,
+    CompactDomainProgram, CudaExecContext, DeviceArena, DirectCompactTerminalBatchMode,
+    DirectCompactTerminalProgram, DirectRetainedB2nColumn, DirectRetainedB2nProgram,
+    DomainCooperativeProgram, FusedCompactDomainProgram, MerkleFromLeavesSlots,
+    PreparedCompactDomainCommitGraph, PreparedFusedCompactDomainCommitGraph, ProgressiveBatchSlots,
+    ProgressiveCommitGeometry, ProgressiveCommitGroupGeometry,
+    ProgressiveCommitWorkspaceRequirements, ProgressiveCommitWorkspaceSlots,
+    ProgressiveLeafWorkspaceSlots, ProgressiveNttLeafFusionMode, TraceTreeRole,
 };
 
 const TWIDDLES: ArenaSlotId = ArenaSlotId(50_000);
+const INVERSE_TWIDDLES: ArenaSlotId = ArenaSlotId(50_001);
 const COEFFICIENT_BASE: u32 = 51_000;
 const OUTPUT_BASE: u32 = 52_000;
 
@@ -146,14 +148,16 @@ fn arena(base: &CommitProgram, workspace: Vec<CommitArenaSlotRequirement>) -> De
     for requirement in workspace {
         insert(&mut requirements, requirement);
     }
-    insert(
-        &mut requirements,
-        CommitArenaSlotRequirement {
-            id: TWIDDLES,
-            len_words: base.requirements().leaves.twiddle_words,
-            alignment_words: 1,
-        },
-    );
+    for id in [TWIDDLES, INVERSE_TWIDDLES] {
+        insert(
+            &mut requirements,
+            CommitArenaSlotRequirement {
+                id,
+                len_words: base.requirements().leaves.twiddle_words,
+                alignment_words: 1,
+            },
+        );
+    }
     for column in &base.requirements().leaves.plan.columns {
         for (id, len_words) in [
             (
@@ -294,12 +298,23 @@ fn seed_arena(
     coefficient_words: &[Vec<u32>],
 ) -> (Vec<CommitCoefficientColumn>, Vec<Option<ArenaSlice>>) {
     let domain = CanonicCoset::new(base.identity().geometry.lifting_log_size).circle_domain();
-    let twiddles = CpuBackend::precompute_twiddles(domain.half_coset)
+    let twiddle_tree = CpuBackend::precompute_twiddles(domain.half_coset);
+    let twiddles = twiddle_tree
         .twiddles
         .iter()
         .map(|value| value.0)
         .collect::<Vec<_>>();
+    let inverse_twiddles = twiddle_tree
+        .itwiddles
+        .iter()
+        .map(|value| value.0)
+        .collect::<Vec<_>>();
     upload(arena, arena.bind(TWIDDLES).unwrap(), &twiddles);
+    upload(
+        arena,
+        arena.bind(INVERSE_TWIDDLES).unwrap(),
+        &inverse_twiddles,
+    );
     let columns = base
         .requirements()
         .leaves
@@ -336,6 +351,28 @@ fn seed_arena(
         .collect();
     arena.context().sync().unwrap();
     (columns, retained)
+}
+
+fn seed_direct_arena(
+    arena: &DeviceArena,
+    base: &CommitProgram,
+    source_evaluations: &[Vec<u32>],
+) -> Vec<DirectRetainedB2nColumn> {
+    let (_, retained) = seed_arena(arena, base, source_evaluations);
+    base.requirements()
+        .leaves
+        .plan
+        .columns
+        .iter()
+        .map(|column| DirectRetainedB2nColumn {
+            source_evaluations: arena
+                .bind(ArenaSlotId(
+                    COEFFICIENT_BASE + column.canonical_index as u32,
+                ))
+                .unwrap(),
+            retained_output: retained[column.canonical_index].unwrap(),
+        })
+        .collect()
 }
 
 fn assert_outputs(
@@ -558,4 +595,200 @@ fn fused_expand_absorb_matches_legacy_eager_capture_and_mutation() {
     ] {
         run(case);
     }
+}
+
+#[test]
+#[cfg_attr(not(stwo_cuda_link), ignore = "requires native CUDA")]
+fn direct_compact_terminal_log13_c16_matches_materialized_eager_capture_and_mutation() {
+    assert!(stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT);
+    let case = Case {
+        name: "direct-terminal-log13-c16",
+        lifting_log_size: 13,
+        groups: vec![vec![12; 16]],
+        transitions: 0,
+    };
+    let (base, domain, compact, _fused, direct, terminal) = programs(&case);
+    let batch = &terminal.receipt().batches[0];
+    assert_eq!(
+        batch.mode,
+        DirectCompactTerminalBatchMode::Fixed16Hybrid {
+            fixed_columns: 16,
+            tiles: 1,
+            generic_remainder_columns: 0,
+        }
+    );
+    let receipt = terminal.receipt();
+    assert_eq!(receipt.separate_absorb_reread_bytes_removed, 524_288);
+    assert_eq!(receipt.terminal_prefinal_read_bytes_added, 0);
+    assert_eq!(receipt.compact_tail_reread_bytes_added, 0);
+    assert_eq!(receipt.net_read_bytes_removed, 524_288);
+    assert_eq!(receipt.terminal_prefinal_write_bytes_added, 0);
+    assert_eq!(receipt.net_device_bytes_removed, 524_288);
+    assert_eq!(receipt.canonical_retained_write_bytes_before, 524_288);
+    assert_eq!(receipt.canonical_retained_write_bytes_after, 524_288);
+    assert_eq!(receipt.separate_absorb_launches_removed, 1);
+    assert_eq!(receipt.fixed_terminal_launches, 1);
+    assert_eq!(receipt.extra_remainder_interval_launches, 0);
+    assert_eq!(receipt.generic_remainder_terminal_launches, 0);
+    assert_eq!(receipt.net_cuda_launches_removed, 1);
+    assert_eq!(receipt.cooperative_quad_blake2s_batches, 1);
+    assert_eq!(receipt.compact_expansion_launches_unchanged, 0);
+    assert_eq!(receipt.compact_finalize_launches_unchanged, 1);
+    assert!(receipt.merkle_suffix_unchanged);
+    assert!(!receipt.same_gpu_timing_credit_applied);
+
+    let workspace_slots = slots(base.requirements());
+    let workspace = direct_compact_domain_arena_slot_requirements(
+        &compact,
+        &base,
+        &domain,
+        &direct,
+        &workspace_slots,
+    )
+    .unwrap();
+    let baseline_arena = arena(&base, workspace.clone());
+    let candidate_arena = arena(&base, workspace);
+    let first_sources = coefficients(&base, 0x51ab_1eaf);
+    let first_oracle = direct.oracle(&first_sources).unwrap();
+    let baseline_columns = seed_direct_arena(&baseline_arena, &base, &first_sources);
+    let candidate_columns = seed_direct_arena(&candidate_arena, &base, &first_sources);
+
+    let baseline = compact
+        .bind_prepared_direct(
+            &baseline_arena,
+            &base,
+            &domain,
+            &direct,
+            &workspace_slots,
+            &baseline_columns,
+            baseline_arena.bind(INVERSE_TWIDDLES).unwrap(),
+            baseline_arena.bind(TWIDDLES).unwrap(),
+        )
+        .unwrap();
+    let candidate = compact
+        .bind_prepared_direct_terminal_fused(
+            &candidate_arena,
+            &base,
+            &domain,
+            &direct,
+            terminal,
+            &workspace_slots,
+            &candidate_columns,
+            candidate_arena.bind(INVERSE_TWIDDLES).unwrap(),
+            candidate_arena.bind(TWIDDLES).unwrap(),
+        )
+        .unwrap();
+
+    baseline.launch().unwrap();
+    candidate.launch().unwrap();
+    let eager_baseline = assert_outputs(
+        &base,
+        &first_oracle.retained_evaluations,
+        &baseline_arena,
+        baseline.leaf_hashes(),
+        baseline.retained_evaluations(),
+    );
+    let eager_candidate = assert_outputs(
+        &base,
+        &first_oracle.retained_evaluations,
+        &candidate_arena,
+        candidate.leaf_hashes(),
+        candidate.retained_evaluations(),
+    );
+    assert_eq!(
+        eager_candidate, eager_baseline,
+        "{} eager leaves",
+        case.name
+    );
+    assert_eq!(
+        candidate.read_root_at_transcript_boundary().unwrap(),
+        baseline.read_root_at_transcript_boundary().unwrap(),
+        "{} eager root",
+        case.name
+    );
+    assert_eq!(
+        candidate.retained_layers_bottom_up().len(),
+        baseline.retained_layers_bottom_up().len()
+    );
+    for (index, (&candidate_layer, &baseline_layer)) in candidate
+        .retained_layers_bottom_up()
+        .iter()
+        .zip(baseline.retained_layers_bottom_up())
+        .enumerate()
+    {
+        assert_eq!(
+            read_hashes(&candidate_arena, candidate_layer),
+            read_hashes(&baseline_arena, baseline_layer),
+            "{} eager retained layer {index}",
+            case.name
+        );
+    }
+
+    let capture = baseline_arena.context().capture().unwrap();
+    baseline.launch().unwrap();
+    let baseline_graph = capture.finish().unwrap();
+    let capture = candidate_arena.context().capture().unwrap();
+    candidate.launch().unwrap();
+    let candidate_graph = capture.finish().unwrap();
+    assert_eq!(
+        baseline_graph.kernel_nodes() - candidate_graph.kernel_nodes(),
+        1,
+        "{} captured kernel savings",
+        case.name
+    );
+    baseline_graph.launch(baseline_arena.context()).unwrap();
+    candidate_graph.launch(candidate_arena.context()).unwrap();
+    assert_eq!(
+        assert_outputs(
+            &base,
+            &first_oracle.retained_evaluations,
+            &candidate_arena,
+            candidate.leaf_hashes(),
+            candidate.retained_evaluations(),
+        ),
+        eager_candidate,
+        "{} replay",
+        case.name
+    );
+
+    let second_sources = coefficients(&base, 0xc001_cafe);
+    for (column, words) in baseline_columns.iter().zip(&second_sources) {
+        upload(&baseline_arena, column.source_evaluations, words);
+    }
+    for (column, words) in candidate_columns.iter().zip(&second_sources) {
+        upload(&candidate_arena, column.source_evaluations, words);
+    }
+    baseline_graph.launch(baseline_arena.context()).unwrap();
+    candidate_graph.launch(candidate_arena.context()).unwrap();
+    let second_oracle = direct.oracle(&second_sources).unwrap();
+    let mutated_baseline = assert_outputs(
+        &base,
+        &second_oracle.retained_evaluations,
+        &baseline_arena,
+        baseline.leaf_hashes(),
+        baseline.retained_evaluations(),
+    );
+    let mutated_candidate = assert_outputs(
+        &base,
+        &second_oracle.retained_evaluations,
+        &candidate_arena,
+        candidate.leaf_hashes(),
+        candidate.retained_evaluations(),
+    );
+    assert_eq!(
+        mutated_candidate, mutated_baseline,
+        "{} mutation",
+        case.name
+    );
+    assert_ne!(
+        mutated_candidate, eager_candidate,
+        "{} stale replay",
+        case.name
+    );
+    assert_eq!(
+        candidate.read_root_at_transcript_boundary().unwrap(),
+        baseline.read_root_at_transcript_boundary().unwrap(),
+        "{} mutated root",
+        case.name
+    );
 }
