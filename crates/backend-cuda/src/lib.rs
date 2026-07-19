@@ -331,6 +331,13 @@ pub use backend::quotient_numerator_prepacked_terms::{
     QUOTIENT_NUMERATOR_PREPACKED_GROUP_WORDS, QUOTIENT_NUMERATOR_PREPACKED_STATUS_WORDS,
     QUOTIENT_NUMERATOR_PREPACKED_TERM_WORDS,
 };
+pub use backend::quotient_numerator_run_sum::{
+    quotient_numerator_run_sum_plan, QuotientNumeratorRunSumError,
+    QuotientNumeratorRunSumExpansionEntry, QuotientNumeratorRunSumExpansionManifest,
+    QuotientNumeratorRunSumLiveness, QuotientNumeratorRunSumReceipt,
+    QUOTIENT_NUMERATOR_RUN_SUM_EXPANSION_KERNEL_PARAMETER_BYTES,
+    QUOTIENT_NUMERATOR_RUN_SUM_EXPANSION_MANIFEST_BYTES, QUOTIENT_NUMERATOR_RUN_SUM_MAX_RUNS,
+};
 pub use backend::quotient_numerator_single_write::{
     quotient_numerator_hybrid_plan, quotient_numerator_single_write_plan,
     quotient_numerator_single_write_report, QuotientNumeratorHybridBatch,

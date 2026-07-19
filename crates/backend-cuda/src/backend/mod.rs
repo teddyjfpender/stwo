@@ -52,6 +52,7 @@ pub mod progressive_ntt_leaf_fusion;
 pub mod proof_assembly;
 mod quotient;
 pub mod quotient_numerator_prepacked_terms;
+pub mod quotient_numerator_run_sum;
 pub mod quotient_numerator_single_write;
 pub mod quotient_numerator_staged_single_write;
 pub mod quotient_producer_b2n;
