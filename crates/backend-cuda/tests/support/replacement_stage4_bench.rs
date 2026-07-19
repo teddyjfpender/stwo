@@ -269,7 +269,7 @@ pub fn benchmark_quotient(
         &[legacy_arena.bind(quotient::OVERFLOW).unwrap()],
     )
     .unwrap();
-    let candidate = PreparedQuotientNumeratorGraph::prepare_staged_group_direct_candidate(
+    let candidate = PreparedQuotientNumeratorGraph::prepare_staged_group_direct(
         &candidate_arena,
         config,
         &candidate_columns,
