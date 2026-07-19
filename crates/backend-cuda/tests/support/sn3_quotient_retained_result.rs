@@ -1,10 +1,12 @@
 //! Machine-readable result and promotion envelope for the retained SN3 A/B.
 
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 
 use blake3::{Hash, Hasher};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::sn3_quotient_numerator_bench::{artifact_identity, percentile};
@@ -19,10 +21,60 @@ const SEALED_A40_RETAINED_P50_MS: f64 = 335.177_948;
 const SEALED_A40_RETAINED_P95_MS: f64 = 336.626_038;
 const THREE_X_RETAINED_MAX_MS: f64 = 144.268;
 const FIVE_X_RETAINED_MAX_MS: f64 = 106.086;
-const STATIC_SASS_SHA256_ENV: &str = "STWO_SN3_RETAINED_RUN_SUM_STATIC_SASS_SHA256";
-const STATIC_SASS_GATE_ENV: &str = "STWO_SN3_RETAINED_RUN_SUM_STATIC_SASS_GATE";
+const STATIC_SASS_RECEIPT_ENV: &str = "STWO_SN3_RETAINED_RUN_SUM_STATIC_SASS_RECEIPT";
+const STATIC_SASS_SCHEMA: &str = "stwo.cuda.retained_run_sum.static_sass.v1";
+const STATIC_SASS_DLINK_MEMBER: &str = "stwo_cuda_kernels_dlink.staged.o";
+const RUN_PRECOMPUTE_KERNEL: &str = "stwo_quotient_numerator_native_run_precompute_kernel";
+const RUN_SUM_EXPAND_KERNEL: &str = "stwo_quotient_numerator_run_sum_expand_kernel";
 const EXACT_NUMERATOR_AND_AUXILIARY_BYTES: u64 = 402_645_136;
 const REQUIRED_EXACT_DIGESTS: usize = 13;
+
+#[derive(Deserialize)]
+struct StaticSassReceipt {
+    schema: String,
+    passed: bool,
+    archive: StaticSassArchive,
+    target: StaticSassTarget,
+    kernels: BTreeMap<String, StaticSassKernel>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct StaticSassArchive {
+    sha256: String,
+    dlink_member: String,
+    dlink_sha256: String,
+    sibling_sha256: String,
+    member_matches_sibling: bool,
+}
+
+#[derive(Deserialize, Serialize)]
+struct StaticSassTarget {
+    elf_count: u32,
+    sms: Vec<u32>,
+    ptx_files: u32,
+}
+
+#[derive(Deserialize, Serialize)]
+struct StaticSassKernel {
+    resource_definitions: u32,
+    sass_definitions: u32,
+    registers: u32,
+    stack_bytes: u64,
+    shared_bytes: u64,
+    local_bytes: u64,
+    ldl: u64,
+    stl: u64,
+    call: u64,
+    jcal: u64,
+    sm86_flag_occurrences: u64,
+}
+
+struct StaticSassEvidence {
+    path: PathBuf,
+    raw_blake3: Hash,
+    receipt: StaticSassReceipt,
+    validated: bool,
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn publish_result(
@@ -85,10 +137,8 @@ pub(crate) fn publish_result(
         && coefficient_direct.0 != canonical_pair.0
         && coefficient_direct.1 != canonical_pair.1;
     assert!(exact_checks_passed, "formal exact-check gate failed");
-    let static_sass_sha256 = static_sass_sha256();
-    let static_sass_gate_declaration = std::env::var(STATIC_SASS_GATE_ENV).ok();
-    let static_sass_gate_passed =
-        static_sass_sha256.is_some() && static_sass_gate_declaration.as_deref() == Some("pass");
+    let static_sass = load_static_sass_receipt(artifact.boundary_cuda_module_sha256());
+    let static_sass_gate_passed = static_sass.validated;
     let formal_promotion_eligible = artifact_eligible
         && all_pairs_won
         && p95_non_regression
@@ -212,11 +262,15 @@ pub(crate) fn publish_result(
             "identity_complete": artifact.is_complete(),
         },
         "static_sass_evidence": {
-            "sha256": static_sass_sha256,
-            "sha256_env": STATIC_SASS_SHA256_ENV,
-            "gate_declaration": static_sass_gate_declaration,
-            "gate_env": STATIC_SASS_GATE_ENV,
-            "gate_passed": static_sass_gate_passed,
+            "receipt_env": STATIC_SASS_RECEIPT_ENV,
+            "receipt_path": static_sass.path,
+            "receipt_blake3": static_sass.raw_blake3.to_string(),
+            "schema": static_sass.receipt.schema,
+            "passed": static_sass.receipt.passed,
+            "archive": static_sass.receipt.archive,
+            "target": static_sass.receipt.target,
+            "kernels": static_sass.receipt.kernels,
+            "validated": static_sass_gate_passed,
             "required_for_formal_promotion": true,
         },
         "formal_promotion": {
@@ -228,7 +282,7 @@ pub(crate) fn publish_result(
             "all_pairs_won": all_pairs_won,
             "p95_non_regression": p95_non_regression,
             "exact_checks_passed": exact_checks_passed,
-            "static_sass_gate_passed": static_sass_gate_passed,
+            "validated_static_sass_receipt": static_sass_gate_passed,
             "three_x_boundary_max_ms": THREE_X_RETAINED_MAX_MS,
             "five_x_boundary_max_ms": FIVE_X_RETAINED_MAX_MS,
             "passes_three_x": formal_promotion_eligible && candidate_p50 <= THREE_X_RETAINED_MAX_MS,
@@ -266,16 +320,96 @@ fn required_digest<'a>(
         .1
 }
 
-fn static_sass_sha256() -> Option<String> {
-    let value = std::env::var(STATIC_SASS_SHA256_ENV).ok()?;
+fn load_static_sass_receipt(expected_archive_sha256: Option<&str>) -> StaticSassEvidence {
+    let expected_archive_sha256 = expected_archive_sha256
+        .expect("static-SASS receipt requires the linked CUDA archive SHA-256 identity");
+    let path = std::env::var_os(STATIC_SASS_RECEIPT_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| panic!("{STATIC_SASS_RECEIPT_ENV} is required"));
+    let raw = fs::read(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+    let receipt: StaticSassReceipt = serde_json::from_slice(&raw)
+        .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()));
+    assert_eq!(receipt.schema, STATIC_SASS_SCHEMA, "static-SASS schema");
+    assert!(receipt.passed, "static-SASS producer did not pass");
+    assert_sha256("archive.sha256", &receipt.archive.sha256);
+    assert_sha256("archive.dlink_sha256", &receipt.archive.dlink_sha256);
+    assert_sha256("archive.sibling_sha256", &receipt.archive.sibling_sha256);
+    assert_eq!(
+        receipt.archive.sha256, expected_archive_sha256,
+        "static-SASS archive does not match the linked CUDA module"
+    );
+    assert_eq!(
+        receipt.archive.dlink_member, STATIC_SASS_DLINK_MEMBER,
+        "static-SASS dlink member"
+    );
+    assert!(
+        receipt.archive.member_matches_sibling,
+        "static-SASS dlink member was not matched to the published sibling"
+    );
+    assert_eq!(
+        receipt.archive.dlink_sha256, receipt.archive.sibling_sha256,
+        "static-SASS dlink and sibling SHA-256 differ"
+    );
+    assert_eq!(receipt.target.elf_count, 1, "static-SASS ELF count");
+    assert_eq!(
+        receipt.target.sms.as_slice(),
+        &[86],
+        "static-SASS target SMs"
+    );
+    assert_eq!(receipt.target.ptx_files, 0, "static-SASS PTX file count");
+    assert_eq!(receipt.kernels.len(), 2, "static-SASS kernel map size");
+    validate_static_sass_kernel(
+        RUN_PRECOMPUTE_KERNEL,
+        receipt
+            .kernels
+            .get(RUN_PRECOMPUTE_KERNEL)
+            .unwrap_or_else(|| panic!("missing static-SASS kernel {RUN_PRECOMPUTE_KERNEL}")),
+        38,
+    );
+    validate_static_sass_kernel(
+        RUN_SUM_EXPAND_KERNEL,
+        receipt
+            .kernels
+            .get(RUN_SUM_EXPAND_KERNEL)
+            .unwrap_or_else(|| panic!("missing static-SASS kernel {RUN_SUM_EXPAND_KERNEL}")),
+        40,
+    );
+    StaticSassEvidence {
+        path,
+        raw_blake3: blake3::hash(&raw),
+        receipt,
+        validated: true,
+    }
+}
+
+fn assert_sha256(label: &str, value: &str) {
     assert!(
         value.len() == 64
             && value
                 .bytes()
                 .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
-        "{STATIC_SASS_SHA256_ENV} must be a lowercase 64-character SHA-256"
+        "{label} must be a lowercase 64-character SHA-256"
     );
-    Some(value)
+}
+
+fn validate_static_sass_kernel(name: &str, kernel: &StaticSassKernel, registers: u32) {
+    assert_eq!(
+        kernel.resource_definitions, 1,
+        "{name} resource definitions"
+    );
+    assert_eq!(kernel.sass_definitions, 1, "{name} SASS definitions");
+    assert_eq!(kernel.registers, registers, "{name} registers");
+    assert_eq!(kernel.stack_bytes, 0, "{name} stack bytes");
+    assert_eq!(kernel.shared_bytes, 0, "{name} shared bytes");
+    assert_eq!(kernel.local_bytes, 0, "{name} local bytes");
+    assert_eq!(kernel.ldl, 0, "{name} LDL instructions");
+    assert_eq!(kernel.stl, 0, "{name} STL instructions");
+    assert_eq!(kernel.call, 0, "{name} CALL instructions");
+    assert_eq!(kernel.jcal, 0, "{name} JCAL instructions");
+    assert!(
+        kernel.sm86_flag_occurrences >= 1,
+        "{name} lacks an sm_86 header flag"
+    );
 }
 
 fn retained_measurement_source_digest() -> Hash {
