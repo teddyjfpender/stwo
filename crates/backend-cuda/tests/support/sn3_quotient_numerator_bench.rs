@@ -1,13 +1,12 @@
 use std::fs::File;
 use std::io::Read;
-use std::time::Instant;
 
 use blake3::{Hash, Hasher};
 use stwo::core::circle::CirclePoint;
 use stwo::core::fields::qm31::SecureField;
 use stwo_backend_cuda::{
-    ArenaSlice, ArenaSlotId, CudaExecContext, CudaGraphExec, DeviceArena,
-    QuotientNumeratorColumnTopology, QuotientNumeratorHybridPlan, QuotientNumeratorSourceKind,
+    ArenaSlice, ArenaSlotId, DeviceArena, QuotientNumeratorColumnTopology,
+    QuotientNumeratorHybridPlan, QuotientNumeratorSourceKind,
     QuotientNumeratorWorkspaceRequirements,
 };
 
@@ -344,13 +343,6 @@ fn fill_affine_pattern(output: &mut [u32], seed: u64, row_offset: usize) {
             state -= AFFINE_PATTERN_MODULUS;
         }
     }
-}
-
-pub(super) fn replay_ms(graph: &CudaGraphExec, context: &CudaExecContext) -> f64 {
-    let started = Instant::now();
-    graph.launch(context).unwrap();
-    context.sync().unwrap();
-    started.elapsed().as_secs_f64() * 1_000.0
 }
 
 pub(super) fn percentile(samples: &[f64], percentage: usize) -> f64 {
