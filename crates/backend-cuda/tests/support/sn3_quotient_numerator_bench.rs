@@ -43,7 +43,7 @@ pub(super) struct ArtifactIdentity {
     boundary_cuda_module_sha256: Option<String>,
     pub(super) cuda_build_mode: &'static str,
     pub(super) expected_cuda_module_build_identity: Hash,
-    pub(super) loaded_cuda_module_build_identity: Hash,
+    pub(super) linked_cuda_module_build_identity: Hash,
     pub(super) cuda_module_target_sms: Vec<u32>,
 }
 
@@ -62,7 +62,7 @@ impl ArtifactIdentity {
             && self.cuda_build_mode == "cuda"
             && self.ordinary_cuda_source_blake3.as_bytes() != &[0; 32]
             && self.expected_cuda_module_build_identity.as_bytes() != &[0; 32]
-            && self.expected_cuda_module_build_identity == self.loaded_cuda_module_build_identity
+            && self.expected_cuda_module_build_identity == self.linked_cuda_module_build_identity
             && !self.cuda_module_target_sms.is_empty()
     }
 }
@@ -79,13 +79,13 @@ pub(super) fn artifact_identity() -> ArtifactIdentity {
     let boundary_cuda_module_sha256 = optional_sha256("STWO_SN3_BOUNDARY_CUDA_MODULE_SHA256");
     let expected_cuda_module_build_identity =
         Hash::from_bytes(stwo_backend_cuda_kernels::expected_static_cuda_module_build_identity());
-    let loaded_cuda_module_build_identity = Hash::from_bytes(
+    let linked_cuda_module_build_identity = Hash::from_bytes(
         stwo_backend_cuda_kernels::static_cuda_module_build_identity()
-            .expect("load exact linked ordinary CUDA module build identity"),
+            .expect("read linked ordinary CUDA archive build-identity receipt"),
     );
     assert_eq!(
-        loaded_cuda_module_build_identity, expected_cuda_module_build_identity,
-        "linked ordinary CUDA module build identity drift"
+        linked_cuda_module_build_identity, expected_cuda_module_build_identity,
+        "linked ordinary CUDA archive build-identity receipt drift"
     );
     let cuda_module_target_sms =
         stwo_backend_cuda_kernels::static_cuda_module_target_sms().to_vec();
@@ -98,7 +98,7 @@ pub(super) fn artifact_identity() -> ArtifactIdentity {
         boundary_cuda_module_sha256.as_deref(),
         cuda_build_mode,
         expected_cuda_module_build_identity,
-        loaded_cuda_module_build_identity,
+        linked_cuda_module_build_identity,
         &cuda_module_target_sms,
     );
     ArtifactIdentity {
@@ -111,7 +111,7 @@ pub(super) fn artifact_identity() -> ArtifactIdentity {
         boundary_cuda_module_sha256,
         cuda_build_mode,
         expected_cuda_module_build_identity,
-        loaded_cuda_module_build_identity,
+        linked_cuda_module_build_identity,
         cuda_module_target_sms,
     }
 }
@@ -514,6 +514,11 @@ fn boundary_rust_source_digest() -> Hash {
             include_bytes!("../../src/backend/quotient_numerator_single_write.rs").as_slice(),
         ),
         (
+            "src/backend/quotient_numerator_staged_single_write.rs",
+            include_bytes!("../../src/backend/quotient_numerator_staged_single_write.rs")
+                .as_slice(),
+        ),
+        (
             "src/backend/prepared_quotient_numerator.rs",
             include_bytes!("../../src/backend/prepared_quotient_numerator.rs").as_slice(),
         ),
@@ -659,7 +664,7 @@ fn boundary_artifact_digest(
     boundary_cuda_module_sha256: Option<&str>,
     cuda_build_mode: &str,
     expected_cuda_module_build_identity: Hash,
-    loaded_cuda_module_build_identity: Hash,
+    linked_cuda_module_build_identity: Hash,
     cuda_module_target_sms: &[u32],
 ) -> Hash {
     let mut hasher = Hasher::new();
@@ -669,7 +674,7 @@ fn boundary_artifact_digest(
         ordinary_cuda_source_blake3,
         test_binary_blake3,
         expected_cuda_module_build_identity,
-        loaded_cuda_module_build_identity,
+        linked_cuda_module_build_identity,
     ] {
         hasher.update(digest.as_bytes());
     }

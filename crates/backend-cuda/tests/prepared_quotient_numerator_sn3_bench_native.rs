@@ -286,8 +286,8 @@ fn sn3_staged_group_direct_cuda_event_benchmark() {
         })
         .unwrap_or(DEFAULT_ITERATIONS);
     assert!(
-        iterations >= 5,
-        "formal SN3 numerator-to-FRI-input A/B requires at least five iterations"
+        iterations >= 6 && iterations % 2 == 0,
+        "formal SN3 numerator-to-FRI-input A/B requires an even iteration count of at least six"
     );
 
     // These two replays are causally bound to full output validation. They are recorded
@@ -419,7 +419,7 @@ fn sn3_staged_group_direct_cuda_event_benchmark() {
             "\"test_binary_blake3\":\"{}\",\"boundary_source_projection_sha256\":{}," ,
             "\"boundary_cuda_module_sha256\":{},\"cuda_build_mode\":\"{}\"," ,
             "\"expected_cuda_module_build_identity\":\"{}\"," ,
-            "\"loaded_cuda_module_build_identity\":\"{}\"," ,
+            "\"linked_cuda_module_build_identity\":\"{}\"," ,
             "\"cuda_module_target_sms\":{:?}," ,
             "\"archive_lto_covered_by_module_build_identity\":true," ,
             "\"identity_complete\":{}}}," ,
@@ -427,7 +427,7 @@ fn sn3_staged_group_direct_cuda_event_benchmark() {
             "\"numerator_comparator_source_blake3\":\"{}\"," ,
             "\"independent_truth\":false}}," ,
             "\"warmups_each\":{},\"equalization_replays_each\":1," ,
-            "\"iterations_each\":{},\"minimum_iterations\":5," ,
+            "\"iterations_each\":{},\"minimum_iterations\":6,\"iterations_must_be_even\":true," ,
             "\"causal_validation_cuda_event_ms\":{{\"packed\":{:.6},\"group_direct\":{:.6},",
             "\"excluded_from_samples\":true}}," ,
             "\"samples_ms\":{{\"packed\":{},\"group_direct\":{}}}," ,
@@ -480,7 +480,7 @@ fn sn3_staged_group_direct_cuda_event_benchmark() {
         artifact_identity.boundary_cuda_module_json(),
         artifact_identity.cuda_build_mode,
         artifact_identity.expected_cuda_module_build_identity,
-        artifact_identity.loaded_cuda_module_build_identity,
+        artifact_identity.linked_cuda_module_build_identity,
         artifact_identity.cuda_module_target_sms,
         artifact_identity.is_complete(),
         artifact_identity.numerator_comparator_source_blake3,
