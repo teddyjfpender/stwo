@@ -24,10 +24,14 @@ const EAGER_DIRECT_POISON: u32 = 0x5060_7080;
 const EAGER_CANDIDATE_POISON: u32 = 0x90a0_b0c0;
 const CAPTURE_DIRECT_POISON: u32 = 0xd0e0_f001;
 const CAPTURE_CANDIDATE_POISON: u32 = 0x1234_5678;
-const MUTATION_DIRECT_POISON: u32 = 0x89ab_cdef;
-const MUTATION_CANDIDATE_POISON: u32 = 0x0f1e_2d3c;
-const RESTORE_CANDIDATE_POISON: u32 = 0x4b5a_6978;
-const RESTORE_DIRECT_POISON: u32 = 0x8765_4321;
+const SOURCE_MUTATION_DIRECT_POISON: u32 = 0x89ab_cdef;
+const SOURCE_MUTATION_CANDIDATE_POISON: u32 = 0x0f1e_2d3c;
+const SOURCE_RESTORE_CANDIDATE_POISON: u32 = 0x4b5a_6978;
+const SOURCE_RESTORE_DIRECT_POISON: u32 = 0x8765_4321;
+const COEFFICIENT_MUTATION_DIRECT_POISON: u32 = 0x7654_3210;
+const COEFFICIENT_MUTATION_CANDIDATE_POISON: u32 = 0xf0e1_d2c3;
+const COEFFICIENT_RESTORE_CANDIDATE_POISON: u32 = 0x9687_a5b4;
+const COEFFICIENT_RESTORE_DIRECT_POISON: u32 = 0x2143_6587;
 const POST_TIMING_DIRECT_POISON: u32 = 0xc3d2_e1f0;
 const POST_TIMING_CANDIDATE_POISON: u32 = 0x55aa_33cc;
 const RETAINED_IMAGE_POISON: u32 = 0xfeed_5eed;
@@ -223,69 +227,74 @@ pub(super) fn run() {
     let mutation = retained_mutation(&shape, receipt);
     let image_id = retained_image_id(mutation.column);
     let original_image = read_slice(&fixture.arena, fixture.arena.bind(image_id).unwrap());
-    mutate_inputs(&fixture, image_id);
-    poison_boundary(
+    mutate_source(&fixture, image_id);
+    let (source_mutated, source_mutated_fri) = capture_direct_diff(
         &fixture,
         &shape.retained_requirements,
         &quotient,
-        MUTATION_DIRECT_POISON,
-    );
-    direct_graph.launch(fixture.arena.context()).unwrap();
-    fixture.arena.context().sync().unwrap();
-    let mutated = capture_canonical_output(&fixture, &shape.retained_requirements);
-    let mutated_fri = capture_fri_input(&fixture, &quotient);
-    assert_ne!(mutated.digest(), canonical.digest());
-    assert_ne!(mutated_fri.digest, canonical_fri.digest);
-
-    poison_boundary(
-        &fixture,
-        &shape.retained_requirements,
-        &quotient,
-        MUTATION_CANDIDATE_POISON,
-    );
-    candidate_graph.launch(fixture.arena.context()).unwrap();
-    fixture.arena.context().sync().unwrap();
-    let mutation_candidate = assert_boundary(
-        &fixture,
-        &shape.retained_requirements,
-        &quotient,
-        &mutated,
-        &mutated_fri,
-        "run-sum after retained image and random coefficient mutation",
-    );
-
-    restore_inputs(&fixture, image_id, &original_image);
-    poison_boundary(
-        &fixture,
-        &shape.retained_requirements,
-        &quotient,
-        RESTORE_CANDIDATE_POISON,
-    );
-    candidate_graph.launch(fixture.arena.context()).unwrap();
-    fixture.arena.context().sync().unwrap();
-    let restored_candidate = assert_boundary(
-        &fixture,
-        &shape.retained_requirements,
-        &quotient,
+        &direct_graph,
         &canonical,
         &canonical_fri,
-        "restored retained run-sum",
+        SOURCE_MUTATION_DIRECT_POISON,
+        "retained source-only mutation",
     );
-    poison_boundary(
+    let source_mutation_candidate = assert_graph_boundary(
         &fixture,
         &shape.retained_requirements,
         &quotient,
-        RESTORE_DIRECT_POISON,
+        &candidate_graph,
+        &source_mutated,
+        &source_mutated_fri,
+        SOURCE_MUTATION_CANDIDATE_POISON,
+        "run-sum after retained source-only mutation",
     );
-    direct_graph.launch(fixture.arena.context()).unwrap();
-    fixture.arena.context().sync().unwrap();
-    let restored_direct = assert_boundary(
+    restore_source(&fixture, image_id, &original_image);
+    let (source_restored_candidate, source_restored_direct) = assert_restored_pair(
         &fixture,
         &shape.retained_requirements,
         &quotient,
+        &candidate_graph,
+        &direct_graph,
         &canonical,
         &canonical_fri,
-        "restored retained direct",
+        SOURCE_RESTORE_CANDIDATE_POISON,
+        SOURCE_RESTORE_DIRECT_POISON,
+        "retained source restoration",
+    );
+
+    mutate_coefficient(&fixture);
+    let (coefficient_mutated, coefficient_mutated_fri) = capture_direct_diff(
+        &fixture,
+        &shape.retained_requirements,
+        &quotient,
+        &direct_graph,
+        &canonical,
+        &canonical_fri,
+        COEFFICIENT_MUTATION_DIRECT_POISON,
+        "random coefficient-only mutation",
+    );
+    let coefficient_mutation_candidate = assert_graph_boundary(
+        &fixture,
+        &shape.retained_requirements,
+        &quotient,
+        &candidate_graph,
+        &coefficient_mutated,
+        &coefficient_mutated_fri,
+        COEFFICIENT_MUTATION_CANDIDATE_POISON,
+        "run-sum after random coefficient-only mutation",
+    );
+    restore_coefficient(&fixture);
+    let (coefficient_restored_candidate, coefficient_restored_direct) = assert_restored_pair(
+        &fixture,
+        &shape.retained_requirements,
+        &quotient,
+        &candidate_graph,
+        &direct_graph,
+        &canonical,
+        &canonical_fri,
+        COEFFICIENT_RESTORE_CANDIDATE_POISON,
+        COEFFICIENT_RESTORE_DIRECT_POISON,
+        "random coefficient restoration",
     );
 
     for sample in 0..WARMUPS {
@@ -350,13 +359,36 @@ pub(super) fn run() {
         mutation,
         &canonical,
         &canonical_fri,
-        [
+        &[
             ("eager_candidate", eager_candidate),
             ("captured_direct", captured_direct),
             ("captured_candidate", captured_candidate),
-            ("mutation_candidate", mutation_candidate),
-            ("restored_candidate", restored_candidate),
-            ("restored_direct", restored_direct),
+            (
+                "source_mutation_direct",
+                (
+                    source_mutated.digest().to_owned(),
+                    source_mutated_fri.digest,
+                ),
+            ),
+            ("source_mutation_candidate", source_mutation_candidate),
+            ("source_restored_candidate", source_restored_candidate),
+            ("source_restored_direct", source_restored_direct),
+            (
+                "coefficient_mutation_direct",
+                (
+                    coefficient_mutated.digest().to_owned(),
+                    coefficient_mutated_fri.digest,
+                ),
+            ),
+            (
+                "coefficient_mutation_candidate",
+                coefficient_mutation_candidate,
+            ),
+            (
+                "coefficient_restored_candidate",
+                coefficient_restored_candidate,
+            ),
+            ("coefficient_restored_direct", coefficient_restored_direct),
             ("post_timing_direct", post_timing_direct),
             ("post_timing_candidate", post_timing_candidate),
         ],
@@ -417,7 +449,7 @@ fn retained_mutation(
         .expect("run-sum prefix must consume at least one retained FixedImage evaluation")
 }
 
-fn mutate_inputs(fixture: &BenchmarkArena, image_id: ArenaSlotId) {
+fn mutate_source(fixture: &BenchmarkArena, image_id: ArenaSlotId) {
     let image = fixture.arena.bind(image_id).unwrap();
     unsafe {
         fixture
@@ -426,22 +458,118 @@ fn mutate_inputs(fixture: &BenchmarkArena, image_id: ArenaSlotId) {
             .fill_u32_async(image.as_u32_ptr(), RETAINED_IMAGE_POISON, image.len_words())
             .unwrap();
     }
+    fixture.arena.context().sync().unwrap();
+}
+
+fn restore_source(fixture: &BenchmarkArena, image_id: ArenaSlotId, image: &[u32]) {
+    upload(&fixture.arena, image_id, image);
+}
+
+fn mutate_coefficient(fixture: &BenchmarkArena) {
     upload(
         &fixture.arena,
         RANDOM_COEFFICIENT,
         &secure_words(&[SecureField::from_u32_unchecked(331, 337, 347, 349)]),
     );
-    fixture.arena.context().sync().unwrap();
 }
 
-fn restore_inputs(fixture: &BenchmarkArena, image_id: ArenaSlotId, image: &[u32]) {
-    upload(&fixture.arena, image_id, image);
+fn restore_coefficient(fixture: &BenchmarkArena) {
     upload(
         &fixture.arena,
         RANDOM_COEFFICIENT,
         &secure_words(&[random_coefficient()]),
     );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn capture_direct_diff(
+    fixture: &BenchmarkArena,
+    requirements: &QuotientNumeratorWorkspaceRequirements,
+    quotient: &PreparedQuotientGraph<'_>,
+    direct_graph: &CudaGraphExec,
+    canonical: &sn3_quotient_numerator_bench::CanonicalOutput,
+    canonical_fri: &CanonicalFriInput,
+    poison: u32,
+    label: &str,
+) -> (
+    sn3_quotient_numerator_bench::CanonicalOutput,
+    CanonicalFriInput,
+) {
+    poison_boundary(fixture, requirements, quotient, poison);
+    direct_graph.launch(fixture.arena.context()).unwrap();
     fixture.arena.context().sync().unwrap();
+    let numerator = capture_canonical_output(fixture, requirements);
+    let fri = capture_fri_input(fixture, quotient);
+    assert_ne!(
+        numerator.digest(),
+        canonical.digest(),
+        "{label}: direct numerator did not change"
+    );
+    assert_ne!(
+        fri.digest, canonical_fri.digest,
+        "{label}: direct FRI input did not change"
+    );
+    (numerator, fri)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assert_graph_boundary(
+    fixture: &BenchmarkArena,
+    requirements: &QuotientNumeratorWorkspaceRequirements,
+    quotient: &PreparedQuotientGraph<'_>,
+    graph: &CudaGraphExec,
+    expected: &sn3_quotient_numerator_bench::CanonicalOutput,
+    expected_fri: &CanonicalFriInput,
+    poison: u32,
+    label: &str,
+) -> (Hash, Hash) {
+    poison_boundary(fixture, requirements, quotient, poison);
+    graph.launch(fixture.arena.context()).unwrap();
+    fixture.arena.context().sync().unwrap();
+    assert_boundary(
+        fixture,
+        requirements,
+        quotient,
+        expected,
+        expected_fri,
+        label,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assert_restored_pair(
+    fixture: &BenchmarkArena,
+    requirements: &QuotientNumeratorWorkspaceRequirements,
+    quotient: &PreparedQuotientGraph<'_>,
+    candidate_graph: &CudaGraphExec,
+    direct_graph: &CudaGraphExec,
+    canonical: &sn3_quotient_numerator_bench::CanonicalOutput,
+    canonical_fri: &CanonicalFriInput,
+    candidate_poison: u32,
+    direct_poison: u32,
+    label: &str,
+) -> ((Hash, Hash), (Hash, Hash)) {
+    let candidate = assert_graph_boundary(
+        fixture,
+        requirements,
+        quotient,
+        candidate_graph,
+        canonical,
+        canonical_fri,
+        candidate_poison,
+        &format!("{label} candidate"),
+    );
+    let direct = assert_graph_boundary(
+        fixture,
+        requirements,
+        quotient,
+        direct_graph,
+        canonical,
+        canonical_fri,
+        direct_poison,
+        &format!("{label} direct"),
+    );
+    (candidate, direct)
 }
 
 fn poison_boundary(
@@ -585,10 +713,14 @@ fn assert_unique_poisons() {
         EAGER_CANDIDATE_POISON,
         CAPTURE_DIRECT_POISON,
         CAPTURE_CANDIDATE_POISON,
-        MUTATION_DIRECT_POISON,
-        MUTATION_CANDIDATE_POISON,
-        RESTORE_CANDIDATE_POISON,
-        RESTORE_DIRECT_POISON,
+        SOURCE_MUTATION_DIRECT_POISON,
+        SOURCE_MUTATION_CANDIDATE_POISON,
+        SOURCE_RESTORE_CANDIDATE_POISON,
+        SOURCE_RESTORE_DIRECT_POISON,
+        COEFFICIENT_MUTATION_DIRECT_POISON,
+        COEFFICIENT_MUTATION_CANDIDATE_POISON,
+        COEFFICIENT_RESTORE_CANDIDATE_POISON,
+        COEFFICIENT_RESTORE_DIRECT_POISON,
         POST_TIMING_DIRECT_POISON,
         POST_TIMING_CANDIDATE_POISON,
         RETAINED_IMAGE_POISON,
