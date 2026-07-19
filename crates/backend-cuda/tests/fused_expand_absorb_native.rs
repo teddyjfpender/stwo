@@ -613,38 +613,75 @@ fn fused_expand_absorb_matches_legacy_eager_capture_and_mutation() {
     }
 }
 
-fn run_direct_terminal(case: Case, measure: bool) {
+fn run_direct_terminal(
+    case: Case,
+    expected_fixed_columns: u32,
+    expected_tiles: u32,
+    expected_expansions: u32,
+    measure: bool,
+) {
     assert!(stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT);
     let (base, domain, compact, _fused, direct, terminal) = programs(&case);
-    let batch = &terminal.receipt().batches[0];
+    let fixed_batches = terminal
+        .receipt()
+        .batches
+        .iter()
+        .filter(|batch| {
+            matches!(
+                batch.mode,
+                DirectCompactTerminalBatchMode::Fixed16Hybrid { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(fixed_batches.len(), 1);
+    let batch = fixed_batches[0];
     assert_eq!(
         batch.mode,
         DirectCompactTerminalBatchMode::Fixed16Hybrid {
-            fixed_columns: 16,
-            tiles: 1,
+            fixed_columns: expected_fixed_columns,
+            tiles: expected_tiles,
             generic_remainder_columns: 0,
         }
     );
     let receipt = terminal.receipt();
-    let retained_bytes = 16u64 * (1u64 << case.lifting_log_size) * 4;
-    assert_eq!(receipt.separate_absorb_reread_bytes_removed, retained_bytes);
+    let removed_bytes = u64::from(expected_fixed_columns) * (1u64 << batch.log_size) * 4;
+    let canonical_bytes = base
+        .requirements()
+        .leaves
+        .plan
+        .columns
+        .iter()
+        .map(|column| (1u64 << column.evaluation_log_size) * 4)
+        .sum::<u64>();
+    let tail_words = stwo_backend_cuda_kernels::raw::blake2s_compact_tail_words(
+        batch.first_column + expected_fixed_columns,
+    );
+    let tail_bytes =
+        u64::from(tail_words) * u64::from(expected_tiles - 1) * (1u64 << batch.log_size) * 4;
+    assert_eq!(receipt.separate_absorb_reread_bytes_removed, removed_bytes);
     assert_eq!(receipt.terminal_prefinal_read_bytes_added, 0);
-    assert_eq!(receipt.compact_tail_reread_bytes_added, 0);
-    assert_eq!(receipt.net_read_bytes_removed, retained_bytes);
+    assert_eq!(receipt.compact_tail_reread_bytes_added, tail_bytes);
+    assert_eq!(receipt.net_read_bytes_removed, removed_bytes - tail_bytes);
     assert_eq!(receipt.terminal_prefinal_write_bytes_added, 0);
-    assert_eq!(receipt.net_device_bytes_removed, retained_bytes);
+    assert_eq!(receipt.net_device_bytes_removed, removed_bytes - tail_bytes);
     assert_eq!(
         receipt.canonical_retained_write_bytes_before,
-        retained_bytes
+        canonical_bytes
     );
-    assert_eq!(receipt.canonical_retained_write_bytes_after, retained_bytes);
+    assert_eq!(
+        receipt.canonical_retained_write_bytes_after,
+        canonical_bytes
+    );
     assert_eq!(receipt.separate_absorb_launches_removed, 1);
     assert_eq!(receipt.fixed_terminal_launches, 1);
     assert_eq!(receipt.extra_remainder_interval_launches, 0);
     assert_eq!(receipt.generic_remainder_terminal_launches, 0);
     assert_eq!(receipt.net_cuda_launches_removed, 1);
     assert_eq!(receipt.cooperative_quad_blake2s_batches, 1);
-    assert_eq!(receipt.compact_expansion_launches_unchanged, 0);
+    assert_eq!(
+        receipt.compact_expansion_launches_unchanged,
+        expected_expansions
+    );
     assert_eq!(receipt.compact_finalize_launches_unchanged, 1);
     assert!(receipt.merkle_suffix_unchanged);
     assert!(!receipt.same_gpu_timing_credit_applied);
@@ -870,6 +907,43 @@ fn direct_compact_terminal_log13_c16_matches_materialized_eager_capture_and_muta
             groups: vec![vec![12; 16]],
             transitions: 0,
         },
+        16,
+        1,
+        0,
+        false,
+    );
+}
+
+#[test]
+#[cfg_attr(not(stwo_cuda_link), ignore = "requires native CUDA")]
+fn direct_compact_terminal_stage8_two_tiles_matches_materialized() {
+    run_direct_terminal(
+        Case {
+            name: "direct-terminal-log14-c32",
+            lifting_log_size: 14,
+            groups: vec![vec![13; 32]],
+            transitions: 0,
+        },
+        32,
+        2,
+        0,
+        false,
+    );
+}
+
+#[test]
+#[cfg_attr(not(stwo_cuda_link), ignore = "requires native CUDA")]
+fn direct_compact_terminal_nonempty_tail_matches_materialized() {
+    run_direct_terminal(
+        Case {
+            name: "direct-terminal-nonempty-tail",
+            lifting_log_size: 13,
+            groups: vec![vec![4; 5], vec![12; 16]],
+            transitions: 1,
+        },
+        16,
+        1,
+        1,
         false,
     );
 }
@@ -877,14 +951,17 @@ fn direct_compact_terminal_log13_c16_matches_materialized_eager_capture_and_muta
 #[test]
 #[ignore = "diagnostic A40 ABBA; run explicitly"]
 #[cfg_attr(not(stwo_cuda_link), ignore = "requires native CUDA")]
-fn direct_compact_terminal_log18_c16_abba() {
+fn direct_compact_terminal_log16_c16_abba() {
     run_direct_terminal(
         Case {
-            name: "direct-terminal-log18-c16",
-            lifting_log_size: 18,
-            groups: vec![vec![17; 16]],
+            name: "direct-terminal-log16-c16",
+            lifting_log_size: 16,
+            groups: vec![vec![15; 16]],
             transitions: 0,
         },
+        16,
+        1,
+        0,
         true,
     );
 }

@@ -55,4 +55,22 @@ extern "C" int stwo_ntt_direct_compact_final16_on(
     Blake2sHash *states,
     void *stream);
 
+// Column-parallel successor for final seven/eight-stage intervals. The ABI is
+// intentionally additive so the serial fixed16 implementation remains
+// available only as a forensic control.
+extern "C" int stwo_ntt_direct_compact_final16_col8_configure(
+    unsigned log_n);
+
+extern "C" int stwo_ntt_direct_compact_final16_col8_on(
+    uint32_t **device_values,
+    unsigned log_n,
+    uint32_t tiles,
+    uint32_t *twiddles,
+    unsigned twiddle_words,
+    unsigned eval_domain_size,
+    uint32_t cols_done,
+    const CompactBlake2sTailDescriptor *initial_tail,
+    Blake2sHash *states,
+    void *stream);
+
 #endif // NTT_LEAF_FUSED_H

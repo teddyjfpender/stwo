@@ -3947,3 +3947,24 @@ pub unsafe extern "C" fn stwo_ntt_direct_compact_final16_on(
 ) -> i32 {
     no_cuda_symbol("stwo_ntt_direct_compact_final16_on")
 }
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_ntt_direct_compact_final16_col8_configure(_log_n: u32) -> i32 {
+    no_cuda_symbol("stwo_ntt_direct_compact_final16_col8_configure")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_ntt_direct_compact_final16_col8_on(
+    _device_values: *const *mut u32,
+    _log_n: u32,
+    _tiles: u32,
+    _g_twiddles: *mut u32,
+    _twiddles_size: u32,
+    _eval_domain_size: u32,
+    _cols_done: u32,
+    _initial_tail: *const CompactBlake2sTailDescriptor,
+    _states: *mut Blake2sHash,
+    _stream: *mut c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_ntt_direct_compact_final16_col8_on")
+}

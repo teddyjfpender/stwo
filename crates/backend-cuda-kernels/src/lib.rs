@@ -535,6 +535,11 @@ mod tests {
         assert_ne!(raw::stwo_ntt_progressive_leaf_fused_on as usize, 0);
         assert_ne!(raw::stwo_ntt_direct_compact_final16_configure as usize, 0);
         assert_ne!(raw::stwo_ntt_direct_compact_final16_on as usize, 0);
+        assert_ne!(
+            raw::stwo_ntt_direct_compact_final16_col8_configure as usize,
+            0
+        );
+        assert_ne!(raw::stwo_ntt_direct_compact_final16_col8_on as usize, 0);
     }
 
     #[test]
@@ -608,6 +613,19 @@ mod tests {
         assert!(compact.contains("stwo_compact_consume_final16_quad"));
         assert!(compact.contains("stwo_blake2s_compress_leaf_block_quad_device"));
         assert!(source.contains("compact_scratch + quad * 16"));
+        let col8 = include_str!("../cuda/ntt_leaf_fused_col8.cuh");
+        for required in [
+            "__launch_bounds__(256, 4)",
+            "wave < 2",
+            "MESSAGE_STRIDE = 17",
+            "logical_warp = blockIdx.x",
+            "compact_scratch + quad * MESSAGE_STRIDE",
+        ] {
+            assert!(
+                col8.contains(required),
+                "missing col8 terminal contract: {required}"
+            );
+        }
         assert!(!source.contains("consume_fused_leaf_message<FusedLeafSink::DirectCompact>"));
         assert!(source.contains("#ifndef STWO_DIRECT_COMPACT_FAST32"));
         assert!(source.contains("#define STWO_DIRECT_COMPACT_FAST32 0"));

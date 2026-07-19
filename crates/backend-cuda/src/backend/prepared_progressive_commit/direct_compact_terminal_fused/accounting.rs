@@ -163,7 +163,7 @@ pub(super) fn batch_mode(
     log_size: u32,
     columns: u32,
 ) -> DirectCompactTerminalBatchMode {
-    if log_size < MIN_FIXED16_LOG_SIZE || columns < 16 {
+    if !column8_terminal_supported(log_size) || columns < 16 {
         return DirectCompactTerminalBatchMode::Materialized;
     }
     let fixed_columns = columns / 16 * 16;
@@ -189,6 +189,10 @@ pub(super) fn batch_mode(
         tiles,
         generic_remainder_columns: remainder,
     }
+}
+
+pub(super) const fn column8_terminal_supported(log_size: u32) -> bool {
+    matches!(log_size, 13..=16 | 20..=24)
 }
 
 pub(super) fn batch_receipt(

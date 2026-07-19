@@ -3546,6 +3546,26 @@ extern "C" {
         states: *mut Blake2sHash,
         stream: *mut c_void,
     ) -> i32;
+
+    /// Validate the additive eight-warp column-parallel terminal successor.
+    /// Only final seven/eight-stage interval shapes are admitted.
+    pub fn stwo_ntt_direct_compact_final16_col8_configure(log_n: u32) -> i32;
+
+    /// Complete `16 * tiles` prefinal columns with eight producer warps over
+    /// one shared row tile, then advance the compact leaf state in place.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stwo_ntt_direct_compact_final16_col8_on(
+        device_values: *const *mut u32,
+        log_n: u32,
+        tiles: u32,
+        g_twiddles: *mut u32,
+        twiddles_size: u32,
+        eval_domain_size: u32,
+        cols_done: u32,
+        initial_tail: *const CompactBlake2sTailDescriptor,
+        states: *mut Blake2sHash,
+        stream: *mut c_void,
+    ) -> i32;
 }
 
 #[cfg(test)]
