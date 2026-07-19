@@ -522,7 +522,7 @@ fn assert_reused_workspace_shape(
         };
         assert_eq!(slot.offset_words, role_base + lde.role_offset_words());
         assert_eq!(slot.len_words, lde.len_words());
-        words += slot.len_words();
+        words += slot.len_words;
     }
     assert_eq!(words, RETAINED_IMAGE_WORDS);
     assert_eq!(u64::try_from(words).unwrap() * 4, 3_919_863_424);
