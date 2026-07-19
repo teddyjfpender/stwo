@@ -126,6 +126,7 @@ pub fn run() -> FixtureReceipt {
             output_rows: plan.packed_output_rows()
         }
     );
+    assert!(candidate.group_direct_run_sum_receipt().is_none());
 
     let eager_alpha = SecureField::from_u32_unchecked(73, 79, 83, 89);
     for device in [&legacy_arena, &candidate_arena] {
@@ -163,6 +164,10 @@ pub fn run() -> FixtureReceipt {
     let candidate_capture = candidate_arena.context().capture().unwrap();
     candidate.launch().unwrap();
     let candidate_graph = candidate_capture.finish().unwrap();
+    let direct_capture = candidate_arena.context().capture().unwrap();
+    candidate.launch_group_direct_baseline().unwrap();
+    let direct_graph = direct_capture.finish().unwrap();
+    assert_eq!(candidate_graph.kernel_nodes(), direct_graph.kernel_nodes());
     let replay_alpha = SecureField::from_u32_unchecked(97, 101, 103, 107);
     for device in [&legacy_arena, &candidate_arena] {
         upload_sources(device, &second_sources);
@@ -243,6 +248,8 @@ pub fn run() -> FixtureReceipt {
     let checks = [
         ("eager_reference", true),
         ("legacy_candidate_byte_identity", true),
+        ("missing_run_sum_binding_fallback", true),
+        ("production_fallback_graph_topology", true),
         ("captured_graph_mutation", true),
         ("third_generation_graph_replay", true),
         ("source_preservation", true),
