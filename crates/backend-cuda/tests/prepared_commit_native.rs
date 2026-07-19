@@ -565,9 +565,6 @@ fn mixed_log_commit_eager_and_capture_match_cpu_leaf_and_every_layer() {
     };
 
     let third = coefficient_set(&logs, 0x9e37_79b9);
-    for (index, words) in third.iter().enumerate() {
-        upload(&arena, ArenaSlotId(SOURCE_BASE + index as u32), words);
-    }
     let mut launch_counts = Vec::new();
     for (retained_mode, leaf_mode) in [
         (RetainedLdeHashMode::Separate, CommitLeafUpdateMode::Scalar),
@@ -608,6 +605,12 @@ fn mixed_log_commit_eager_and_capture_match_cpu_leaf_and_every_layer() {
             }));
         }
 
+        // The previous mode's graph replay mutates the shared source slots to
+        // `first`. Restore this mode's eager fixture before comparing it with
+        // the `third` CPU oracle.
+        for (index, words) in third.iter().enumerate() {
+            upload(&arena, ArenaSlotId(SOURCE_BASE + index as u32), words);
+        }
         scramble_outputs();
         prepared.launch().unwrap();
         assert_all_retained_layers(&arena, &prepared, &cpu_layers(config, &logs, &third));
