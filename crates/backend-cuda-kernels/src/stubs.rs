@@ -7,7 +7,7 @@ use core::ffi::c_void;
 
 use crate::raw::{
     Blake2sHash, CirclePointBaseField, CompactBlake2sTailDescriptor, CudaFunctionAttributes,
-    CudaSecureField, LayerIndexPair, ProgressiveBlake2sState,
+    CudaQuotientNativeRunManifest, CudaSecureField, LayerIndexPair, ProgressiveBlake2sState,
 };
 
 const CUDA_ERROR_NOT_SUPPORTED: i32 = 801;
@@ -2026,6 +2026,58 @@ pub unsafe extern "C" fn stwo_quotient_numerator_group_direct_contribution_tiled
     _out: *mut CudaFunctionAttributes,
 ) -> i32 {
     no_cuda_symbol("stwo_quotient_numerator_group_direct_contribution_tiled_function_attributes")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_precompute_quotient_numerator_native_run_on(
+    _term_descriptors: *const u32,
+    _term_begin: u32,
+    _term_end: u32,
+    _source_log_size: u32,
+    _source_evaluations: *const *const u32,
+    _line_coefficients: *const CudaSecureField,
+    _scratch_0: *mut u32,
+    _scratch_1: *mut u32,
+    _scratch_2: *mut u32,
+    _scratch_3: *mut u32,
+    _scratch_offset_words: u32,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_precompute_quotient_numerator_native_run_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_expand_quotient_numerator_native_run_sums_on(
+    _manifest: *const CudaQuotientNativeRunManifest,
+    _term_descriptors: *const u32,
+    _source_evaluations: *const *const u32,
+    _line_coefficients: *const CudaSecureField,
+    _group_b: *const CudaSecureField,
+    _scratch_0: *const u32,
+    _scratch_1: *const u32,
+    _scratch_2: *const u32,
+    _scratch_3: *const u32,
+    _output_0: *mut u32,
+    _output_1: *mut u32,
+    _output_2: *mut u32,
+    _output_3: *mut u32,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_expand_quotient_numerator_native_run_sums_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_quotient_numerator_native_run_precompute_function_attributes(
+    _out: *mut CudaFunctionAttributes,
+) -> i32 {
+    no_cuda_symbol("stwo_quotient_numerator_native_run_precompute_function_attributes")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_quotient_numerator_native_run_sum_expand_function_attributes(
+    _out: *mut CudaFunctionAttributes,
+) -> i32 {
+    no_cuda_symbol("stwo_quotient_numerator_native_run_sum_expand_function_attributes")
 }
 
 #[unsafe(no_mangle)]

@@ -47,6 +47,33 @@ impl CudaSecureField {
     }
 }
 
+pub const STWO_QUOTIENT_NATIVE_RUN_MAX_RUNS: usize = 24;
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub struct CudaQuotientNativeRunEntry {
+    pub term_begin: u32,
+    pub term_end: u32,
+    pub source_log_size: u32,
+    pub scratch_offset_words: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub struct CudaQuotientNativeRunManifest {
+    pub run_count: u32,
+    pub direct_term_begin: u32,
+    pub direct_term_end: u32,
+    pub target_log_size: u32,
+    pub runs: [CudaQuotientNativeRunEntry; STWO_QUOTIENT_NATIVE_RUN_MAX_RUNS],
+}
+
+const _: () = assert!(core::mem::size_of::<CudaQuotientNativeRunEntry>() == 16);
+const _: () = assert!(core::mem::align_of::<CudaQuotientNativeRunEntry>() == 4);
+const _: () = assert!(core::mem::size_of::<CudaQuotientNativeRunManifest>() == 400);
+const _: () = assert!(core::mem::align_of::<CudaQuotientNativeRunManifest>() == 4);
+const _: () = assert!(core::mem::offset_of!(CudaQuotientNativeRunManifest, runs) == 16);
+
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 pub struct CirclePointBaseField {
@@ -1727,6 +1754,46 @@ extern "C" {
     ) -> i32;
 
     pub fn stwo_quotient_numerator_group_direct_contribution_tiled_function_attributes(
+        out: *mut CudaFunctionAttributes,
+    ) -> i32;
+
+    pub fn stwo_precompute_quotient_numerator_native_run_on(
+        term_descriptors: *const u32,
+        term_begin: u32,
+        term_end: u32,
+        source_log_size: u32,
+        source_evaluations: *const *const u32,
+        line_coefficients: *const CudaSecureField,
+        scratch_0: *mut u32,
+        scratch_1: *mut u32,
+        scratch_2: *mut u32,
+        scratch_3: *mut u32,
+        scratch_offset_words: u32,
+        stream: *mut c_void,
+    ) -> i32;
+
+    pub fn stwo_expand_quotient_numerator_native_run_sums_on(
+        manifest: *const CudaQuotientNativeRunManifest,
+        term_descriptors: *const u32,
+        source_evaluations: *const *const u32,
+        line_coefficients: *const CudaSecureField,
+        group_b: *const CudaSecureField,
+        scratch_0: *const u32,
+        scratch_1: *const u32,
+        scratch_2: *const u32,
+        scratch_3: *const u32,
+        output_0: *mut u32,
+        output_1: *mut u32,
+        output_2: *mut u32,
+        output_3: *mut u32,
+        stream: *mut c_void,
+    ) -> i32;
+
+    pub fn stwo_quotient_numerator_native_run_precompute_function_attributes(
+        out: *mut CudaFunctionAttributes,
+    ) -> i32;
+
+    pub fn stwo_quotient_numerator_native_run_sum_expand_function_attributes(
         out: *mut CudaFunctionAttributes,
     ) -> i32;
 
