@@ -93,6 +93,17 @@ struct StaticSassEvidence {
     validated: bool,
 }
 
+struct AotPackEvidence {
+    identity: Hash,
+    entries: usize,
+    entries_for_sm86: usize,
+    supports_sm86: bool,
+    manifest_hash: u64,
+    constraint_max_instrs: usize,
+    constraint_max_live_u32_lanes: usize,
+    validated: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn publish_result(
     sn3: &sn3_quotient_topology_fixture::LoadedTopologyFixture,
@@ -156,11 +167,13 @@ pub(crate) fn publish_result(
     assert!(exact_checks_passed, "formal exact-check gate failed");
     let static_sass = load_static_sass_receipt(artifact.boundary_cuda_module_sha256());
     let static_sass_gate_passed = static_sass.validated;
+    let aot_pack = aot_pack_evidence();
     let formal_promotion_eligible = artifact_eligible
         && all_pairs_won
         && p95_non_regression
         && exact_checks_passed
-        && static_sass_gate_passed;
+        && static_sass_gate_passed
+        && aot_pack.validated;
     let result = json!({
         "schema": SCHEMA,
         "passed": true,
@@ -291,9 +304,22 @@ pub(crate) fn publish_result(
             "validated": static_sass_gate_passed,
             "required_for_formal_promotion": true,
         },
+        "aot_pack_evidence": {
+            "identity": aot_pack.identity.to_string(),
+            "entries": aot_pack.entries,
+            "entries_for_sm86": aot_pack.entries_for_sm86,
+            "supports_sm86": aot_pack.supports_sm86,
+            "manifest_hash": aot_pack.manifest_hash,
+            "constraint_bounds": {
+                "max_instrs": aot_pack.constraint_max_instrs,
+                "max_live_u32_lanes": aot_pack.constraint_max_live_u32_lanes,
+            },
+            "validated": aot_pack.validated,
+            "required_for_formal_promotion": true,
+        },
         "formal_promotion": {
             "eligible": formal_promotion_eligible,
-            "requires": "artifact eligibility, 20/20 paired candidate wins, p95 non-regression, exact-output checks, and passing static-SASS evidence",
+            "requires": "artifact eligibility, 20/20 paired candidate wins, p95 non-regression, exact-output checks, validated static-SASS receipt, and validated nonempty sm_86 AOT pack",
             "required_paired_candidate_wins": SAMPLES,
             "observed_paired_candidate_wins": paired_candidate_wins,
             "exact_sample_count": exact_sample_count,
@@ -301,6 +327,7 @@ pub(crate) fn publish_result(
             "p95_non_regression": p95_non_regression,
             "exact_checks_passed": exact_checks_passed,
             "validated_static_sass_receipt": static_sass_gate_passed,
+            "validated_aot_pack": aot_pack.validated,
             "three_x_boundary_max_ms": THREE_X_RETAINED_MAX_MS,
             "five_x_boundary_max_ms": FIVE_X_RETAINED_MAX_MS,
             "passes_three_x": formal_promotion_eligible && candidate_p50 <= THREE_X_RETAINED_MAX_MS,
@@ -438,6 +465,35 @@ fn validate_static_sass_kernel(name: &str, kernel: &StaticSassKernel, registers:
         kernel.sm86_flag_occurrences >= 1,
         "{name} lacks an sm_86 header flag"
     );
+}
+
+fn aot_pack_evidence() -> AotPackEvidence {
+    use stwo_backend_cuda_kernels::aot_pack;
+
+    let identity_bytes = aot_pack::aot_pack_identity();
+    let entries = aot_pack::aot_pack_entries();
+    let entries_for_sm86 = aot_pack::aot_pack_entries_for_arch(8, 6);
+    let supports_sm86 = aot_pack::aot_pack_supports_arch(8, 6);
+    let manifest_hash = aot_pack::aot_pack_manifest_hash();
+    let constraint_max_instrs = aot_pack::aot_pack_constraint_max_instrs();
+    let constraint_max_live_u32_lanes = aot_pack::aot_pack_constraint_max_live_u32_lanes();
+    let validated = identity_bytes != [0; 32]
+        && entries > 0
+        && entries_for_sm86 == entries
+        && supports_sm86
+        && manifest_hash != 0
+        && constraint_max_instrs > 0
+        && constraint_max_live_u32_lanes > 0;
+    AotPackEvidence {
+        identity: Hash::from_bytes(identity_bytes),
+        entries,
+        entries_for_sm86,
+        supports_sm86,
+        manifest_hash,
+        constraint_max_instrs,
+        constraint_max_live_u32_lanes,
+        validated,
+    }
 }
 
 fn retained_measurement_source_digest() -> Hash {
