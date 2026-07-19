@@ -4,8 +4,8 @@
 //! Run receipts must place this JSON beside `nvidia-smi` identity/driver/clock output,
 //! `nvcc --version`, `rustc -Vv`, and `git rev-parse HEAD`; those are environment facts, not test
 //! semantics, so the existing pod wrapper owns them.
-//! Identity-complete records additionally set `STWO_SN3_NUMERATOR_SOURCE_PROJECTION_SHA256` and
-//! `STWO_SN3_NUMERATOR_CUDA_MODULE_SHA256`; a git HEAD alone is not an artifact identity.
+//! Identity-complete records additionally set `STWO_SN3_BOUNDARY_SOURCE_PROJECTION_SHA256` and
+//! `STWO_SN3_BOUNDARY_CUDA_MODULE_SHA256`; a git HEAD alone is not an artifact identity.
 
 #[path = "support/sn3_quotient_numerator_bench.rs"]
 mod sn3_quotient_numerator_bench;
@@ -277,55 +277,61 @@ fn sn3_staged_group_direct_cuda_event_benchmark() {
         }
     }
 
-    let iterations = std::env::var("STWO_SN3_NUMERATOR_BENCH_ITERS")
+    let iterations = std::env::var("STWO_SN3_BOUNDARY_BENCH_ITERS")
         .ok()
         .map(|value| {
             value
                 .parse::<usize>()
-                .expect("STWO_SN3_NUMERATOR_BENCH_ITERS must be an integer")
+                .expect("STWO_SN3_BOUNDARY_BENCH_ITERS must be an integer")
         })
         .unwrap_or(DEFAULT_ITERATIONS);
     assert!(
         iterations >= 5,
-        "formal SN3 numerator A/B requires at least five iterations"
+        "formal SN3 numerator-to-FRI-input A/B requires at least five iterations"
     );
-    let mut packed_ms = Vec::with_capacity(iterations);
-    let mut direct_ms = Vec::with_capacity(iterations);
 
-    // Sample zero is causally bound to work by poisoning immediately before the measured graph
-    // replay and validating that exact replay in full before either graph runs again.
+    // These two replays are causally bound to full output validation. They are recorded
+    // separately and excluded from the benchmark distribution because D2H validation occurs
+    // between them.
     poison_outputs(&fixture, &staged_requirements, TIMED_LEGACY_POISON);
     poison_fri_input(&fixture, &quotient, TIMED_LEGACY_POISON);
-    packed_ms.push(replay_cuda_ms(&packed_graph, fixture.arena.context()));
+    let causal_validation_packed_ms = replay_cuda_ms(&packed_graph, fixture.arena.context());
     let timed_packed_blake3 = assert_canonical_output(
         &fixture,
         &staged_requirements,
         &eager,
-        "timed packed sample 0",
+        "causal validation packed replay",
     );
     let timed_packed_fri_blake3 = assert_fri_input(
         &fixture,
         &quotient,
         &eager_fri_input,
-        "timed packed sample 0",
+        "causal validation packed replay",
     );
     poison_outputs(&fixture, &staged_requirements, TIMED_HYBRID_POISON);
     poison_fri_input(&fixture, &quotient, TIMED_HYBRID_POISON);
-    direct_ms.push(replay_cuda_ms(&direct_graph, fixture.arena.context()));
+    let causal_validation_direct_ms = replay_cuda_ms(&direct_graph, fixture.arena.context());
     let timed_direct_blake3 = assert_canonical_output(
         &fixture,
         &staged_requirements,
         &eager,
-        "timed group-direct sample 0",
+        "causal validation group-direct replay",
     );
     let timed_direct_fri_blake3 = assert_fri_input(
         &fixture,
         &quotient,
         &eager_fri_input,
-        "timed group-direct sample 0",
+        "causal validation group-direct replay",
     );
 
-    for iteration in 1..iterations {
+    // Re-establish an alternating steady state after poison/D2H validation. One unrecorded
+    // replay of each graph keeps the transition into measured iteration zero symmetric.
+    replay_cuda_ms(&packed_graph, fixture.arena.context());
+    replay_cuda_ms(&direct_graph, fixture.arena.context());
+
+    let mut packed_ms = Vec::with_capacity(iterations);
+    let mut direct_ms = Vec::with_capacity(iterations);
+    for iteration in 0..iterations {
         if iteration % 2 == 0 {
             packed_ms.push(replay_cuda_ms(&packed_graph, fixture.arena.context()));
             direct_ms.push(replay_cuda_ms(&direct_graph, fixture.arena.context()));
@@ -372,6 +378,7 @@ fn sn3_staged_group_direct_cuda_event_benchmark() {
             "\"percentile_method\":\"nearest-rank\"," ,
             "\"result_class\":\"diagnostic same-lineage packed/group-direct A/B; not independent mathematical truth\",",
             "\"input_pattern\":\"input-recipe-sealed nonzero canonical-M31 affine row and twiddle patterns; bounded chunked upload\",",
+            "\"twiddle_provenance\":\"synthetic affine-pattern diagnostic; not transcript-derived canonical STARK twiddles\",",
             "\"topology\":{{\"group_logs\":{:?},\"groups\":19,\"coefficient_columns\":161,",
             "\"coefficient_sources\":152,\"staged_batches\":19,\"terms\":6341,",
             "\"packed_output_rows\":25165264,\"quotient_lifting_log_size\":24,",
@@ -393,25 +400,36 @@ fn sn3_staged_group_direct_cuda_event_benchmark() {
             "\"numerator_input_recipe_blake3\":\"{}\",\"boundary_input_recipe_blake3\":\"{}\"," ,
             "\"eager_packed_blake3\":\"{}\"," ,
             "\"eager_direct_blake3\":\"{}\",\"captured_packed_blake3\":\"{}\"," ,
-            "\"captured_direct_blake3\":\"{}\",\"timed_sample_index\":0," ,
-            "\"timed_sample_causally_validated\":true,\"timed_packed_blake3\":\"{}\"," ,
-            "\"timed_direct_blake3\":\"{}\",\"post_timing_packed_blake3\":\"{}\"," ,
+            "\"captured_direct_blake3\":\"{}\"," ,
+            "\"causal_validation_replays_excluded_from_samples\":true," ,
+            "\"causal_validation_packed_blake3\":\"{}\"," ,
+            "\"causal_validation_direct_blake3\":\"{}\",\"post_timing_packed_blake3\":\"{}\"," ,
             "\"post_timing_direct_blake3\":\"{}\",\"capture_revalidated\":true," ,
             "\"post_timing_revalidated\":true}}," ,
             "\"fri_input_identity\":{{\"eager_packed_blake3\":\"{}\",",
             "\"eager_direct_blake3\":\"{}\",\"captured_packed_blake3\":\"{}\",",
-            "\"captured_direct_blake3\":\"{}\",\"timed_packed_blake3\":\"{}\",",
-            "\"timed_direct_blake3\":\"{}\",\"post_timing_packed_blake3\":\"{}\",",
+            "\"captured_direct_blake3\":\"{}\",\"causal_validation_packed_blake3\":\"{}\",",
+            "\"causal_validation_direct_blake3\":\"{}\",\"post_timing_packed_blake3\":\"{}\",",
             "\"post_timing_direct_blake3\":\"{}\",\"exact_word_comparison\":true}},",
             "\"capture_topology\":{{\"packed_kernel_nodes\":{},\"group_direct_kernel_nodes\":{},",
             "\"group_direct_minus_packed_kernel_nodes\":18}},",
-            "\"artifact_identity\":{{\"candidate_current_source_blake3\":\"{}\"," ,
-            "\"test_binary_blake3\":\"{}\",\"source_projection_sha256\":{}," ,
-            "\"cuda_module_sha256\":{},\"cuda_build_mode\":\"{}\"," ,
+            "\"artifact_identity\":{{\"boundary_seal_blake3\":\"{}\"," ,
+            "\"boundary_rust_source_blake3\":\"{}\"," ,
+            "\"ordinary_cuda_source_blake3\":\"{}\"," ,
+            "\"test_binary_blake3\":\"{}\",\"boundary_source_projection_sha256\":{}," ,
+            "\"boundary_cuda_module_sha256\":{},\"cuda_build_mode\":\"{}\"," ,
+            "\"expected_cuda_module_build_identity\":\"{}\"," ,
+            "\"loaded_cuda_module_build_identity\":\"{}\"," ,
+            "\"cuda_module_target_sms\":{:?}," ,
+            "\"archive_lto_covered_by_module_build_identity\":true," ,
             "\"identity_complete\":{}}}," ,
             "\"comparator\":{{\"lineage\":\"same staged LDE preparation, exact numerator ownership, and identical ordinary quotient tail; candidate replaces one packed row launch with one launch per exact group\"," ,
+            "\"numerator_comparator_source_blake3\":\"{}\"," ,
             "\"independent_truth\":false}}," ,
-            "\"warmups\":{},\"iterations\":{},\"minimum_iterations\":5," ,
+            "\"warmups_each\":{},\"equalization_replays_each\":1," ,
+            "\"iterations_each\":{},\"minimum_iterations\":5," ,
+            "\"causal_validation_cuda_event_ms\":{{\"packed\":{:.6},\"group_direct\":{:.6},",
+            "\"excluded_from_samples\":true}}," ,
             "\"samples_ms\":{{\"packed\":{},\"group_direct\":{}}}," ,
             "\"cuda_event_ms\":{{\"packed\":{{\"p50\":{:.6},\"p95\":{:.6}}}," ,
             "\"group_direct\":{{\"p50\":{:.6},\"p95\":{:.6}}}}}," ,
@@ -454,14 +472,22 @@ fn sn3_staged_group_direct_cuda_event_benchmark() {
         post_timing_direct_fri_blake3,
         packed_graph.kernel_nodes(),
         direct_graph.kernel_nodes(),
-        artifact_identity.candidate_source_blake3,
+        artifact_identity.boundary_seal_blake3,
+        artifact_identity.boundary_rust_source_blake3,
+        artifact_identity.ordinary_cuda_source_blake3,
         artifact_identity.test_binary_blake3,
-        artifact_identity.source_projection_json(),
-        artifact_identity.cuda_module_json(),
+        artifact_identity.boundary_source_projection_json(),
+        artifact_identity.boundary_cuda_module_json(),
         artifact_identity.cuda_build_mode,
+        artifact_identity.expected_cuda_module_build_identity,
+        artifact_identity.loaded_cuda_module_build_identity,
+        artifact_identity.cuda_module_target_sms,
         artifact_identity.is_complete(),
+        artifact_identity.numerator_comparator_source_blake3,
         DEFAULT_WARMUPS,
         iterations,
+        causal_validation_packed_ms,
+        causal_validation_direct_ms,
         json_samples(&packed_ms),
         json_samples(&direct_ms),
         packed_p50,
