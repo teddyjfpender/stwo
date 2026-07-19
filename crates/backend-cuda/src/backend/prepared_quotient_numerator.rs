@@ -254,6 +254,7 @@ pub enum PreparedQuotientNumeratorError {
     },
     PrepackedLayout(QuotientNumeratorPrepackedTermError),
     PrepackedScheduleInvariant(&'static str),
+    GroupDirectScheduleInvariant(&'static str),
     PrepackedDeviceStatus(u32),
     SizeOverflow,
     Arena(ArenaError),
@@ -317,6 +318,9 @@ pub enum PreparedNumeratorSchedule {
     SingleWriteCandidate,
     StagedPackedSingleWrite {
         packed_output_rows: u64,
+    },
+    StagedGroupDirect {
+        output_rows: u64,
     },
     #[doc(hidden)]
     StagedPrepackedSingleWrite {

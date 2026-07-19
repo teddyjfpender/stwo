@@ -105,7 +105,7 @@ pub fn run() -> FixtureReceipt {
         &legacy_columns,
         &legacy_destinations,
     );
-    let candidate = PreparedQuotientNumeratorGraph::prepare_staged_group_direct_candidate(
+    let candidate = PreparedQuotientNumeratorGraph::prepare_staged_group_direct(
         &candidate_arena,
         config,
         &candidate_columns,
@@ -122,8 +122,8 @@ pub fn run() -> FixtureReceipt {
     .unwrap();
     assert_eq!(
         candidate.schedule(),
-        PreparedNumeratorSchedule::StagedPackedSingleWrite {
-            packed_output_rows: plan.packed_output_rows()
+        PreparedNumeratorSchedule::StagedGroupDirect {
+            output_rows: plan.packed_output_rows()
         }
     );
 
@@ -252,10 +252,10 @@ pub fn run() -> FixtureReceipt {
     .map(|(name, passed)| (name.to_owned(), passed))
     .collect();
     FixtureReceipt {
-        name: "staged-packed-quotient-mixed-topology",
+        name: "staged-group-direct-quotient-mixed-topology",
         production_apis: vec![
             "quotient_numerator_staged_single_write_plan_with_overflow_capacities",
-            "PreparedQuotientNumeratorGraph::prepare_staged_group_direct_candidate",
+            "PreparedQuotientNumeratorGraph::prepare_staged_group_direct",
         ],
         cases: 3,
         arena_bytes: legacy_bytes + candidate_bytes,

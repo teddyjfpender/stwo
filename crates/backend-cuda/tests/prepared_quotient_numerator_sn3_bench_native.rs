@@ -140,8 +140,11 @@ fn sn3_staged_group_direct_cuda_event_benchmark() {
     let expected_schedule = PreparedNumeratorSchedule::StagedPackedSingleWrite {
         packed_output_rows: 25_165_264,
     };
+    let expected_direct_schedule = PreparedNumeratorSchedule::StagedGroupDirect {
+        output_rows: 25_165_264,
+    };
     assert_eq!(packed.schedule(), expected_schedule);
-    assert_eq!(direct.schedule(), expected_schedule);
+    assert_eq!(direct.schedule(), expected_direct_schedule);
 
     initialize(
         &fixture,
@@ -746,7 +749,7 @@ fn prepare<'a>(
     );
     let overflow_roles = [fixture.arena.bind(SHARED_STAGED_OVERFLOW).unwrap()];
     if group_direct {
-        PreparedQuotientNumeratorGraph::prepare_staged_group_direct_candidate(
+        PreparedQuotientNumeratorGraph::prepare_staged_group_direct(
             &fixture.arena,
             config,
             columns,

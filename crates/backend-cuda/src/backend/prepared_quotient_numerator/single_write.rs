@@ -1,7 +1,4 @@
-//! Disabled single-write schedule integration.
-//!
-//! The production constructor remains on legacy batches until the native CUDA
-//! equality, sanitizer, and timing gates admit this schedule.
+//! Single-write schedule integration.
 
 use core::ffi::c_void;
 
@@ -489,12 +486,10 @@ impl<'a> PreparedQuotientNumeratorGraph<'a> {
         Ok(prepared)
     }
 
-    /// Experimental direct-group schedule. Setup and staged LDE ownership are
-    /// identical to replacement-v1, but every captured launch owns one exact
-    /// group and receives its term range and output pointers as scalar facts.
-    #[doc(hidden)]
+    /// Staged direct-group schedule. Every captured launch owns one exact group
+    /// and receives its term range and output pointers as scalar facts.
     #[allow(clippy::too_many_arguments)]
-    pub fn prepare_staged_group_direct_candidate(
+    pub fn prepare_staged_group_direct(
         arena: &'a DeviceArena,
         config: QuotientNumeratorWorkspaceConfig,
         columns: &[QuotientNumeratorColumn],
@@ -546,7 +541,21 @@ impl<'a> PreparedQuotientNumeratorGraph<'a> {
                 ),
             );
         }
+        let expected_packed_schedule = PreparedNumeratorSchedule::StagedPackedSingleWrite {
+            packed_output_rows: candidate.packed_output_rows(),
+        };
+        if prepared.schedule != expected_packed_schedule || prepared.group_direct_ranges.is_some() {
+            return Err(
+                PreparedQuotientNumeratorError::GroupDirectScheduleInvariant(
+                    "staged packed preparation did not yield an unclaimed direct schedule",
+                )
+                .into(),
+            );
+        }
         prepared.group_direct_ranges = Some(ranges);
+        prepared.schedule = PreparedNumeratorSchedule::StagedGroupDirect {
+            output_rows: candidate.packed_output_rows(),
+        };
         Ok(prepared)
     }
 
@@ -625,7 +634,11 @@ impl<'a> PreparedQuotientNumeratorGraph<'a> {
     ) -> Result<(), PreparedQuotientNumeratorError> {
         if ranges.len() != self.requirements.groups.len() || ranges.len() != self.destinations.len()
         {
-            return Err(PreparedQuotientNumeratorError::SizeOverflow);
+            return Err(
+                PreparedQuotientNumeratorError::GroupDirectScheduleInvariant(
+                    "group-direct range, group, and destination counts differ",
+                ),
+            );
         }
         for ((range, group), destination) in ranges
             .iter()
