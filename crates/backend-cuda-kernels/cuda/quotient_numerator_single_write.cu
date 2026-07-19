@@ -285,9 +285,95 @@ extern "C" int stwo_accumulate_quotient_numerator_packed_single_write_on(
     return cudaGetLastError();
 }
 
-// One launch owns one canonical numerator group. The launch geometry supplies
-// the group row count, while scalar arguments replace the packed-row search,
-// row-prefix reads, group-log reads, and output-pointer-table reads.
+namespace {
+
+__device__ __forceinline__ uint32_t group_direct_source_row(
+        uint32_t row,
+        uint32_t group_log_size,
+        uint32_t source_log_size
+) {
+    const uint32_t log_ratio = group_log_size - source_log_size;
+    return (row >> (log_ratio + 1) << 1) + (row & 1);
+}
+
+template<bool TWO_ROWS>
+__device__ __forceinline__ void accumulate_group_direct_rows(
+        const uint32_t *term_descriptors,
+        uint32_t term_begin,
+        uint32_t term_end,
+        uint32_t group_log_size,
+        const uint32_t *const *source_evaluations,
+        const qm31 *line_coefficients,
+        const qm31 *group_b,
+        uint32_t *output_0,
+        uint32_t *output_1,
+        uint32_t *output_2,
+        uint32_t *output_3,
+        uint32_t row_0,
+        uint32_t row_1
+) {
+    qm31 numerator_0 = qm31{cm31{0, 0}, cm31{0, 0}};
+    qm31 numerator_1 = qm31{cm31{0, 0}, cm31{0, 0}};
+    uint32_t index = term_begin;
+    uint32_t source_log_size =
+        term_descriptors[static_cast<size_t>(index) * TERM_WORDS + 2];
+    while (index < term_end) {
+        const uint32_t source_row_0 = group_direct_source_row(
+            row_0, group_log_size, source_log_size);
+        const uint32_t source_row_1 = TWO_ROWS
+            ? group_direct_source_row(row_1, group_log_size, source_log_size)
+            : 0;
+        while (true) {
+            const uint32_t *descriptor =
+                term_descriptors + static_cast<size_t>(index) * TERM_WORDS;
+            const uint32_t source = descriptor[0];
+            const uint32_t term = descriptor[1];
+            const qm31 c =
+                line_coefficients[static_cast<size_t>(term) * 3 + 2];
+            const uint32_t *source_values = source_evaluations[source];
+            numerator_0 = prepacked_add(
+                numerator_0,
+                prepacked_mul_by_scalar(c, source_values[source_row_0]));
+            if constexpr (TWO_ROWS) {
+                numerator_1 = prepacked_add(
+                    numerator_1,
+                    prepacked_mul_by_scalar(c, source_values[source_row_1]));
+            }
+
+            ++index;
+            if (index == term_end) {
+                break;
+            }
+            const uint32_t next_source_log_size =
+                term_descriptors[static_cast<size_t>(index) * TERM_WORDS + 2];
+            if (next_source_log_size != source_log_size) {
+                source_log_size = next_source_log_size;
+                break;
+            }
+        }
+    }
+
+    const qm31 b = *group_b;
+    numerator_0 = prepacked_sub(numerator_0, b);
+    output_0[row_0] = numerator_0.a.a;
+    output_1[row_0] = numerator_0.a.b;
+    output_2[row_0] = numerator_0.b.a;
+    output_3[row_0] = numerator_0.b.b;
+    if constexpr (TWO_ROWS) {
+        numerator_1 = prepacked_sub(numerator_1, b);
+        output_0[row_1] = numerator_1.a.a;
+        output_1[row_1] = numerator_1.a.b;
+        output_2[row_1] = numerator_1.b.a;
+        output_3[row_1] = numerator_1.b.b;
+    }
+}
+
+} // namespace
+
+// One launch owns one canonical numerator group. One thread owns two rows in
+// opposite halves, sharing descriptor, coefficient, and source-pointer loads.
+// The prepared plan seals nondecreasing source-log runs and canonical backend
+// field inputs; TU-local fast32 operations normalize every result exactly.
 extern "C" __global__ void stwo_quotient_numerator_group_direct_kernel(
         const uint32_t *term_descriptors,
         uint32_t term_begin,
@@ -301,34 +387,39 @@ extern "C" __global__ void stwo_quotient_numerator_group_direct_kernel(
         uint32_t *output_2,
         uint32_t *output_3
 ) {
-    const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t owner = blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t row_count = 1u << group_log_size;
-    if (row >= row_count) {
+    const uint32_t half_rows = row_count >> 1;
+    if (owner >= half_rows) {
         return;
     }
-    qm31 numerator = qm31{cm31{0, 0}, cm31{0, 0}};
-    for (uint32_t index = term_begin; index < term_end; ++index) {
-        const uint32_t *descriptor =
-            term_descriptors + static_cast<size_t>(index) * TERM_WORDS;
-        const uint32_t source = descriptor[0];
-        const uint32_t term = descriptor[1];
-        const uint32_t source_log_size = descriptor[2];
-        const uint32_t log_ratio = group_log_size - source_log_size;
-        const uint32_t source_row =
-            (row >> (log_ratio + 1) << 1) + (row & 1);
-        const qm31 c =
-            line_coefficients[static_cast<size_t>(term) * 3 + 2];
-        const qm31 product =
-            mul_by_scalar(c, source_evaluations[source][source_row]);
-        numerator = add(numerator, product);
-    }
-    numerator = sub(numerator, *group_b);
-
-    output_0[row] = numerator.a.a;
-    output_1[row] = numerator.a.b;
-    output_2[row] = numerator.b.a;
-    output_3[row] = numerator.b.b;
+    accumulate_group_direct_rows<true>(
+        term_descriptors, term_begin, term_end, group_log_size,
+        source_evaluations, line_coefficients, group_b, output_0, output_1,
+        output_2, output_3, owner, owner + half_rows);
 }
+
+namespace {
+
+__global__ void stwo_quotient_numerator_group_direct_scalar_kernel(
+        const uint32_t *term_descriptors,
+        uint32_t term_begin,
+        uint32_t term_end,
+        const uint32_t *const *source_evaluations,
+        const qm31 *line_coefficients,
+        const qm31 *group_b,
+        uint32_t *output_0,
+        uint32_t *output_1,
+        uint32_t *output_2,
+        uint32_t *output_3
+) {
+    accumulate_group_direct_rows<false>(
+        term_descriptors, term_begin, term_end, 0, source_evaluations,
+        line_coefficients, group_b, output_0, output_1, output_2, output_3, 0,
+        0);
+}
+
+} // namespace
 
 extern "C" int stwo_accumulate_quotient_numerator_group_direct_on(
         const uint32_t *term_descriptors,
@@ -353,10 +444,20 @@ extern "C" int stwo_accumulate_quotient_numerator_group_direct_on(
         return cudaErrorInvalidValue;
     }
     const uint32_t row_count = 1u << group_log_size;
+    const cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    if (group_log_size == 0) {
+        stwo_quotient_numerator_group_direct_scalar_kernel<<<
+            1, 1, 0, cuda_stream>>>(
+                term_descriptors, term_begin, term_end, source_evaluations,
+                line_coefficients, group_b, output_0, output_1, output_2,
+                output_3);
+        return cudaGetLastError();
+    }
+    const uint32_t row_pairs = row_count >> 1;
     const uint32_t blocks =
-        (row_count + BLOCK_THREADS - 1) / BLOCK_THREADS;
+        (row_pairs + BLOCK_THREADS - 1) / BLOCK_THREADS;
     stwo_quotient_numerator_group_direct_kernel<<<
-        blocks, BLOCK_THREADS, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
+        blocks, BLOCK_THREADS, 0, cuda_stream>>>(
             term_descriptors, term_begin, term_end, group_log_size,
             source_evaluations, line_coefficients, group_b, output_0, output_1,
             output_2, output_3);
