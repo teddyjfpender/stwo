@@ -10,6 +10,7 @@ enum StwoQuotientNumeratorFunctionRole : uint32_t {
     STWO_QUOTIENT_NUMERATOR_PREPACKED_PREPARE = 1,
     STWO_QUOTIENT_NUMERATOR_PREPACKED_VALIDATE = 2,
     STWO_QUOTIENT_NUMERATOR_PREPACKED_HOT = 3,
+    STWO_QUOTIENT_NUMERATOR_GROUP_DIRECT = 4,
 };
 
 enum StwoQuotientNumeratorPrepackedStatus : uint32_t {
@@ -61,6 +62,22 @@ extern "C" int stwo_accumulate_quotient_numerator_packed_single_write_on(
         uint32_t *const *outputs_1,
         uint32_t *const *outputs_2,
         uint32_t *const *outputs_3,
+        void *stream);
+
+// Candidate-only direct group entry. The prepared host plan seals the exact
+// term range, row shape, and output ownership into scalar launch arguments.
+extern "C" int stwo_accumulate_quotient_numerator_group_direct_on(
+        const uint32_t *term_descriptors,
+        uint32_t term_begin,
+        uint32_t term_end,
+        uint32_t group_log_size,
+        const uint32_t *const *source_evaluations,
+        const qm31 *line_coefficients,
+        const qm31 *group_b,
+        uint32_t *output_0,
+        uint32_t *output_1,
+        uint32_t *output_2,
+        uint32_t *output_3,
         void *stream);
 
 // Candidate-only device preparation. It reuses term_points after group

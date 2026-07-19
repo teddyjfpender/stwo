@@ -16,6 +16,59 @@ use crate::backend::quotient_numerator_staged_single_write::{
     QuotientNumeratorStagedSource, QuotientNumeratorStagingRole,
 };
 
+fn derive_group_direct_ranges(
+    group_offsets: &[u32],
+    term_descriptors: &[u32],
+) -> Result<Vec<PreparedGroupDirectRange>, QuotientNumeratorStagedSingleWriteError> {
+    if term_descriptors.len() % BATCH_TERM_WORDS != 0 {
+        return Err(
+            QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+                "direct term descriptors are not word aligned",
+            ),
+        );
+    }
+    let term_count = u32::try_from(term_descriptors.len() / BATCH_TERM_WORDS).map_err(|_| {
+        QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+            "direct term count exceeds u32",
+        )
+    })?;
+    if group_offsets.first() != Some(&0) || group_offsets.last() != Some(&term_count) {
+        return Err(
+            QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+                "direct group offsets do not span every term",
+            ),
+        );
+    }
+    group_offsets
+        .windows(2)
+        .map(|offsets| {
+            if offsets[0] >= offsets[1] || offsets[1] > term_count {
+                return Err(
+                    QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+                        "direct group has an invalid term range",
+                    ),
+                );
+            }
+            let begin = offsets[0] as usize * BATCH_TERM_WORDS;
+            let end = offsets[1] as usize * BATCH_TERM_WORDS;
+            let group_b_term = term_descriptors[begin..end]
+                .chunks_exact(BATCH_TERM_WORDS)
+                .map(|descriptor| descriptor[1])
+                .min()
+                .ok_or(
+                    QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+                        "direct group has no representative term",
+                    ),
+                )?;
+            Ok(PreparedGroupDirectRange {
+                term_begin: offsets[0],
+                term_end: offsets[1],
+                group_b_term,
+            })
+        })
+        .collect()
+}
+
 impl<'a> PreparedQuotientNumeratorGraph<'a> {
     /// Experimental all-evaluation schedule. Setup reuses the validated legacy
     /// arena bindings and replaces only the flattened term descriptor payload.
@@ -436,6 +489,67 @@ impl<'a> PreparedQuotientNumeratorGraph<'a> {
         Ok(prepared)
     }
 
+    /// Experimental direct-group schedule. Setup and staged LDE ownership are
+    /// identical to replacement-v1, but every captured launch owns one exact
+    /// group and receives its term range and output pointers as scalar facts.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_staged_group_direct_candidate(
+        arena: &'a DeviceArena,
+        config: QuotientNumeratorWorkspaceConfig,
+        columns: &[QuotientNumeratorColumn],
+        oods_sample_points: ArenaSlice,
+        oods_sample_values: ArenaSlice,
+        random_coefficient: ArenaSlice,
+        sample_points_destination: ArenaSlice,
+        first_linear_terms_destination: ArenaSlice,
+        destinations: &[QuotientNumeratorDestination],
+        forward_twiddles: ArenaSlice,
+        slots: &QuotientNumeratorWorkspaceSlots,
+        overflow_roles: &[ArenaSlice],
+    ) -> Result<Self, QuotientNumeratorStagedSingleWriteError> {
+        let topology = columns
+            .iter()
+            .map(QuotientNumeratorColumnTopology::from)
+            .collect::<Vec<_>>();
+        let overflow_capacities = overflow_roles
+            .iter()
+            .map(|role| role.len_words())
+            .collect::<Vec<_>>();
+        let candidate = quotient_numerator_staged_single_write_plan_with_overflow_capacities(
+            config,
+            &topology,
+            &overflow_capacities,
+        )?;
+        let ranges =
+            derive_group_direct_ranges(candidate.group_offsets(), candidate.term_descriptors())?;
+        let mut prepared = Self::prepare_staged_packed_single_write(
+            arena,
+            config,
+            columns,
+            oods_sample_points,
+            oods_sample_values,
+            random_coefficient,
+            sample_points_destination,
+            first_linear_terms_destination,
+            destinations,
+            forward_twiddles,
+            slots,
+            overflow_roles,
+        )?;
+        if candidate.requirements() != prepared.requirements()
+            || ranges.len() != prepared.requirements.groups.len()
+        {
+            return Err(
+                QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+                    "direct group manifest differs from staged packed ownership",
+                ),
+            );
+        }
+        prepared.group_direct_ranges = Some(ranges);
+        Ok(prepared)
+    }
+
     pub(super) fn launch_single_write_candidate(
         &self,
         group_offsets: ArenaSlice,
@@ -503,6 +617,44 @@ impl<'a> PreparedQuotientNumeratorGraph<'a> {
         check_cuda("prepared_quotient_numerator_packed_single_write", code)?;
         Ok(())
     }
+
+    pub(super) fn launch_group_direct(
+        &self,
+        ranges: &[PreparedGroupDirectRange],
+        stream: *mut c_void,
+    ) -> Result<(), PreparedQuotientNumeratorError> {
+        if ranges.len() != self.requirements.groups.len() || ranges.len() != self.destinations.len()
+        {
+            return Err(PreparedQuotientNumeratorError::SizeOverflow);
+        }
+        for ((range, group), destination) in ranges
+            .iter()
+            .zip(&self.requirements.groups)
+            .zip(&self.destinations)
+        {
+            let code = unsafe {
+                stwo_backend_cuda_kernels::raw::stwo_accumulate_quotient_numerator_group_direct_on(
+                    self.batch_terms.as_u32_ptr(),
+                    range.term_begin,
+                    range.term_end,
+                    group.log_size,
+                    self.batch_source_ptrs.as_u32_ptr().cast(),
+                    self.line_coefficients.as_u32_ptr().cast(),
+                    self.line_coefficients
+                        .as_u32_ptr()
+                        .add(range.group_b_term as usize * LINE_COEFFICIENT_WORDS)
+                        .cast(),
+                    destination.coordinates[0].as_u32_ptr(),
+                    destination.coordinates[1].as_u32_ptr(),
+                    destination.coordinates[2].as_u32_ptr(),
+                    destination.coordinates[3].as_u32_ptr(),
+                    stream,
+                )
+            };
+            check_cuda("prepared_quotient_numerator_group_direct", code)?;
+        }
+        Ok(())
+    }
 }
 
 fn validate_staged_overflow_role_ids(
@@ -525,6 +677,36 @@ fn validate_staged_overflow_role_ids(
 #[cfg(test)]
 mod staged_binding_tests {
     use super::*;
+
+    #[test]
+    fn direct_group_ranges_choose_minimum_global_term() {
+        let descriptors = [0, 8, 0, 1, 2, 0, 2, 5, 0];
+        let ranges = derive_group_direct_ranges(&[0, 3], &descriptors).unwrap();
+        let range = ranges[0];
+        assert_eq!(
+            [range.term_begin, range.term_end, range.group_b_term],
+            [0, 3, 2]
+        );
+    }
+
+    #[test]
+    fn direct_group_ranges_reject_malformed_manifests() {
+        let descriptors = [0, 8, 0, 1, 2, 0, 2, 5, 0];
+        for (offsets, terms) in [
+            (&[][..], &[][..]),
+            (&[1][..], &[][..]),
+            (&[0][..], &[0, 8][..]),
+            (&[0, 2][..], &descriptors[..]),
+            (&[0, 0][..], &[][..]),
+            (&[0, 4, 3][..], &descriptors[..]),
+            (&[0, 2, 1, 3][..], &descriptors[..]),
+        ] {
+            assert!(matches!(
+                derive_group_direct_ranges(offsets, terms),
+                Err(QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(_))
+            ));
+        }
+    }
 
     #[test]
     fn overflow_roles_reject_source_destination_and_twiddle_aliases() {

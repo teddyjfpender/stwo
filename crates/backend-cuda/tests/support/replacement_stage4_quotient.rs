@@ -74,6 +74,7 @@ pub fn run() -> FixtureReceipt {
     ];
     let first_sources = source_set(0x1234_5678);
     let second_sources = source_set(0x6a09_e667);
+    let third_sources = source_set(0xbb67_ae85);
     let twiddle_words = required_forward_twiddle_words(config, &requirements);
 
     for device in [&legacy_arena, &candidate_arena] {
@@ -104,7 +105,7 @@ pub fn run() -> FixtureReceipt {
         &legacy_columns,
         &legacy_destinations,
     );
-    let candidate = PreparedQuotientNumeratorGraph::prepare_staged_packed_single_write(
+    let candidate = PreparedQuotientNumeratorGraph::prepare_staged_group_direct_candidate(
         &candidate_arena,
         config,
         &candidate_columns,
@@ -195,16 +196,55 @@ pub fn run() -> FixtureReceipt {
     assert_preserved(&legacy_arena, &second_sources);
     assert_preserved(&candidate_arena, &second_sources);
 
+    let third_alpha = SecureField::from_u32_unchecked(109, 113, 127, 131);
+    for device in [&legacy_arena, &candidate_arena] {
+        upload_sources(device, &third_sources);
+        upload_words(
+            device,
+            device.bind(ALPHA).unwrap(),
+            &secure_words(&[third_alpha]),
+        );
+    }
+    legacy_graph.launch(legacy_arena.context()).unwrap();
+    candidate_graph.launch(candidate_arena.context()).unwrap();
+    let third_evaluations = evaluations(config, &third_sources);
+    let third_legacy = snapshot(
+        &legacy_arena,
+        &requirements,
+        &legacy_destinations,
+        &values,
+        third_alpha,
+        &third_evaluations,
+    );
+    let third_candidate = snapshot(
+        &candidate_arena,
+        &requirements,
+        &candidate_destinations,
+        &values,
+        third_alpha,
+        &third_evaluations,
+    );
+    assert_eq!(third_candidate, third_legacy);
+    assert_ne!(third_candidate, eager_candidate);
+    assert_ne!(third_candidate, replay_candidate);
+    assert_preserved(&legacy_arena, &third_sources);
+    assert_preserved(&candidate_arena, &third_sources);
+
     let mut hashes = BTreeMap::new();
     hashes.insert("eager_outputs".to_owned(), hash_words(&eager_candidate));
     hashes.insert(
         "mutated_graph_outputs".to_owned(),
         hash_words(&replay_candidate),
     );
+    hashes.insert(
+        "third_generation_outputs".to_owned(),
+        hash_words(&third_candidate),
+    );
     let checks = [
         ("eager_reference", true),
         ("legacy_candidate_byte_identity", true),
         ("captured_graph_mutation", true),
+        ("third_generation_graph_replay", true),
         ("source_preservation", true),
         ("guard_preservation", true),
     ]
@@ -215,9 +255,9 @@ pub fn run() -> FixtureReceipt {
         name: "staged-packed-quotient-mixed-topology",
         production_apis: vec![
             "quotient_numerator_staged_single_write_plan_with_overflow_capacities",
-            "PreparedQuotientNumeratorGraph::prepare_staged_packed_single_write",
+            "PreparedQuotientNumeratorGraph::prepare_staged_group_direct_candidate",
         ],
-        cases: 2,
+        cases: 3,
         arena_bytes: legacy_bytes + candidate_bytes,
         checks,
         hashes,

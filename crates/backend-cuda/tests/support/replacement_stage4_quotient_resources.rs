@@ -24,6 +24,11 @@ pub fn loaded_function_receipts() -> Vec<LoadedFunctionReceipt> {
             "candidate_prepacked_hot",
             "stwo_quotient_numerator_prepacked_single_write_kernel",
         ),
+        (
+            4,
+            "candidate_group_direct",
+            "stwo_quotient_numerator_group_direct_kernel",
+        ),
     ];
     let target_sms = stwo_backend_cuda_kernels::static_cuda_module_target_sms();
     assert!(!target_sms.is_empty());

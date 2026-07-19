@@ -254,14 +254,22 @@ pub fn benchmark_quotient(
     let candidate_destinations = quotient::destinations(&candidate_arena, &requirements);
     let legacy_columns = quotient::columns(&legacy_arena, &topology);
     let candidate_columns = quotient::columns(&candidate_arena, &topology);
-    let legacy = quotient::prepare_legacy(
+    let legacy = PreparedQuotientNumeratorGraph::prepare_staged_packed_single_write(
         &legacy_arena,
         config,
-        &slots,
         &legacy_columns,
+        legacy_arena.bind(quotient::OODS_POINTS).unwrap(),
+        legacy_arena.bind(quotient::OODS_VALUES).unwrap(),
+        legacy_arena.bind(quotient::ALPHA).unwrap(),
+        legacy_arena.bind(quotient::SAMPLE_POINTS).unwrap(),
+        legacy_arena.bind(quotient::FIRST_TERMS).unwrap(),
         &legacy_destinations,
-    );
-    let candidate = PreparedQuotientNumeratorGraph::prepare_staged_packed_single_write(
+        legacy_arena.bind(quotient::TWIDDLES).unwrap(),
+        &slots,
+        &[legacy_arena.bind(quotient::OVERFLOW).unwrap()],
+    )
+    .unwrap();
+    let candidate = PreparedQuotientNumeratorGraph::prepare_staged_group_direct_candidate(
         &candidate_arena,
         config,
         &candidate_columns,
@@ -296,7 +304,7 @@ pub fn benchmark_quotient(
     quotient::assert_preserved(&candidate_arena, &sources);
     let report = plan.report();
     PerformanceReceipt {
-        name: format!("staged-packed-quotient-log{lifting_log_size}"),
+        name: format!("group-direct-quotient-log{lifting_log_size}"),
         parameters: [
             ("lifting_log_size".to_owned(), u64::from(lifting_log_size)),
             ("groups".to_owned(), requirements.groups.len() as u64),
@@ -325,8 +333,8 @@ pub fn benchmark_quotient(
         .into_iter()
         .collect(),
         loaded_functions: Vec::new(),
-        baseline_label: "legacy-batches-cuda-graph".to_owned(),
-        candidate_label: "staged-packed-single-write-cuda-graph".to_owned(),
+        baseline_label: "staged-packed-single-write-cuda-graph".to_owned(),
+        candidate_label: "staged-group-direct-cuda-graph".to_owned(),
         baseline,
         candidate: replacement,
         speedup: baseline.median_ms / replacement.median_ms,

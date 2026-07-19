@@ -331,6 +331,10 @@ mod tests {
             0
         );
         assert_ne!(
+            raw::stwo_accumulate_quotient_numerator_group_direct_on as usize,
+            0
+        );
+        assert_ne!(
             raw::stwo_prepare_quotient_numerator_prepacked_terms_on as usize,
             0
         );
@@ -373,6 +377,7 @@ mod tests {
             ("STWO_QUOTIENT_NUMERATOR_PREPACKED_PREPARE", 1),
             ("STWO_QUOTIENT_NUMERATOR_PREPACKED_VALIDATE", 2),
             ("STWO_QUOTIENT_NUMERATOR_PREPACKED_HOT", 3),
+            ("STWO_QUOTIENT_NUMERATOR_GROUP_DIRECT", 4),
         ] {
             assert!(status_abi.contains(&format!("{name} = {value},")));
         }
