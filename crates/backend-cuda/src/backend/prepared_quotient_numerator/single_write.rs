@@ -1,6 +1,7 @@
 //! Single-write schedule integration.
 
 use core::ffi::c_void;
+use core::ops::Range;
 
 use super::*;
 use crate::backend::quotient_numerator_single_write::{
@@ -20,7 +21,7 @@ enum GroupDirectLaunch {
     ContributionTiled,
 }
 
-fn derive_group_direct_ranges(
+pub(super) fn derive_group_direct_ranges(
     group_offsets: &[u32],
     term_descriptors: &[u32],
     group_log_sizes: &[u32],
@@ -103,6 +104,41 @@ fn derive_group_direct_ranges(
             })
         })
         .collect()
+}
+
+fn validate_group_direct_representatives(
+    ranges: &[PreparedGroupDirectRange],
+    canonical: &crate::backend::prepared_quotient_numerator::plan::NumeratorPlan,
+) -> Result<(), QuotientNumeratorStagedSingleWriteError> {
+    if ranges.len() != canonical.requirements.groups.len()
+        || canonical.group_offsets.len() != ranges.len() + 1
+    {
+        return Err(
+            QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+                "direct ranges do not cover canonical group representatives",
+            ),
+        );
+    }
+    for (group, range) in ranges.iter().enumerate() {
+        let offset = usize::try_from(canonical.group_offsets[group]).map_err(|_| {
+            QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+                "canonical group offset exceeds usize",
+            )
+        })?;
+        let representative = canonical.group_term_indices.get(offset).ok_or(
+            QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+                "canonical group representative is missing",
+            ),
+        )?;
+        if range.group_b_term != *representative {
+            return Err(
+                QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+                    "direct group-B representative differs from canonical ownership",
+                ),
+            );
+        }
+    }
+    Ok(())
 }
 
 impl<'a> PreparedQuotientNumeratorGraph<'a> {
@@ -273,6 +309,41 @@ impl<'a> PreparedQuotientNumeratorGraph<'a> {
             &topology,
             &overflow_capacities,
         )?;
+        Self::prepare_staged_packed_single_write_from_plan(
+            arena,
+            config,
+            columns,
+            oods_sample_points,
+            oods_sample_values,
+            random_coefficient,
+            sample_points_destination,
+            first_linear_terms_destination,
+            destinations,
+            forward_twiddles,
+            slots,
+            overflow_roles,
+            &canonical,
+            &candidate,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_staged_packed_single_write_from_plan(
+        arena: &'a DeviceArena,
+        config: QuotientNumeratorWorkspaceConfig,
+        columns: &[QuotientNumeratorColumn],
+        oods_sample_points: ArenaSlice,
+        oods_sample_values: ArenaSlice,
+        random_coefficient: ArenaSlice,
+        sample_points_destination: ArenaSlice,
+        first_linear_terms_destination: ArenaSlice,
+        destinations: &[QuotientNumeratorDestination],
+        forward_twiddles: ArenaSlice,
+        slots: &QuotientNumeratorWorkspaceSlots,
+        overflow_roles: &[ArenaSlice],
+        canonical: &crate::backend::prepared_quotient_numerator::plan::NumeratorPlan,
+        candidate: &crate::backend::quotient_numerator_staged_single_write::QuotientNumeratorStagedSingleWritePlan,
+    ) -> Result<Self, QuotientNumeratorStagedSingleWriteError> {
         if candidate.requirements() != &canonical.requirements
             || candidate.group_offsets() != canonical.group_offsets.as_slice()
         {
@@ -546,6 +617,7 @@ impl<'a> PreparedQuotientNumeratorGraph<'a> {
             .iter()
             .map(QuotientNumeratorColumnTopology::from)
             .collect::<Vec<_>>();
+        let canonical = build_plan(config, &topology)?;
         let overflow_capacities = overflow_roles
             .iter()
             .map(|role| role.len_words())
@@ -566,7 +638,8 @@ impl<'a> PreparedQuotientNumeratorGraph<'a> {
             candidate.term_descriptors(),
             &group_log_sizes,
         )?;
-        let mut prepared = Self::prepare_staged_packed_single_write(
+        validate_group_direct_representatives(&ranges, &canonical)?;
+        let mut prepared = Self::prepare_staged_packed_single_write_from_plan(
             arena,
             config,
             columns,
@@ -579,6 +652,8 @@ impl<'a> PreparedQuotientNumeratorGraph<'a> {
             forward_twiddles,
             slots,
             overflow_roles,
+            &canonical,
+            &candidate,
         )?;
         if candidate.requirements() != prepared.requirements()
             || ranges.len() != prepared.requirements.groups.len()
@@ -592,7 +667,10 @@ impl<'a> PreparedQuotientNumeratorGraph<'a> {
         let expected_packed_schedule = PreparedNumeratorSchedule::StagedPackedSingleWrite {
             packed_output_rows: candidate.packed_output_rows(),
         };
-        if prepared.schedule != expected_packed_schedule || prepared.group_direct_ranges.is_some() {
+        if prepared.schedule != expected_packed_schedule
+            || prepared.group_direct_ranges.is_some()
+            || prepared.group_direct_run_sum.is_some()
+        {
             return Err(
                 PreparedQuotientNumeratorError::GroupDirectScheduleInvariant(
                     "staged packed preparation did not yield an unclaimed direct schedule",
@@ -604,6 +682,7 @@ impl<'a> PreparedQuotientNumeratorGraph<'a> {
         prepared.schedule = PreparedNumeratorSchedule::StagedGroupDirect {
             output_rows: candidate.packed_output_rows(),
         };
+        prepared.bind_group_direct_run_sum(&candidate, columns, overflow_roles)?;
         Ok(prepared)
     }
 
@@ -683,6 +762,15 @@ impl<'a> PreparedQuotientNumeratorGraph<'a> {
         self.launch_group_direct_variant(ranges, stream, GroupDirectLaunch::Direct)
     }
 
+    pub(super) fn launch_group_direct_span(
+        &self,
+        ranges: &[PreparedGroupDirectRange],
+        groups: Range<usize>,
+        stream: *mut c_void,
+    ) -> Result<(), PreparedQuotientNumeratorError> {
+        self.launch_group_direct_variant_span(ranges, groups, stream, GroupDirectLaunch::Direct)
+    }
+
     pub(super) fn launch_group_direct_tiled(
         &self,
         ranges: &[PreparedGroupDirectRange],
@@ -706,19 +794,31 @@ impl<'a> PreparedQuotientNumeratorGraph<'a> {
         stream: *mut c_void,
         variant: GroupDirectLaunch,
     ) -> Result<(), PreparedQuotientNumeratorError> {
-        if ranges.len() != self.requirements.groups.len() || ranges.len() != self.destinations.len()
+        self.launch_group_direct_variant_span(ranges, 0..ranges.len(), stream, variant)
+    }
+
+    fn launch_group_direct_variant_span(
+        &self,
+        ranges: &[PreparedGroupDirectRange],
+        groups: Range<usize>,
+        stream: *mut c_void,
+        variant: GroupDirectLaunch,
+    ) -> Result<(), PreparedQuotientNumeratorError> {
+        if ranges.len() != self.requirements.groups.len()
+            || ranges.len() != self.destinations.len()
+            || groups.start > groups.end
+            || groups.end > ranges.len()
         {
             return Err(
                 PreparedQuotientNumeratorError::GroupDirectScheduleInvariant(
-                    "group-direct range, group, and destination counts differ",
+                    "group-direct range, group, destination, and span shapes differ",
                 ),
             );
         }
-        for ((range, group), destination) in ranges
-            .iter()
-            .zip(&self.requirements.groups)
-            .zip(&self.destinations)
-        {
+        for group_index in groups {
+            let range = &ranges[group_index];
+            let group = &self.requirements.groups[group_index];
+            let destination = &self.destinations[group_index];
             let code = unsafe {
                 let descriptors = self.batch_terms.as_u32_ptr();
                 let sources = self.batch_source_ptrs.as_u32_ptr().cast();
@@ -816,7 +916,89 @@ fn validate_staged_overflow_role_ids(
 
 #[cfg(test)]
 mod staged_binding_tests {
+    use stwo::core::circle::CirclePoint;
+    use stwo::core::fields::qm31::SecureField;
+
     use super::*;
+
+    #[test]
+    fn group_direct_upload_and_binding_share_one_candidate_object() {
+        let source = include_str!("single_write.rs");
+        let start = source.find("pub fn prepare_staged_group_direct").unwrap();
+        let end = source[start..]
+            .find("pub(super) fn launch_single_write_candidate")
+            .map(|offset| start + offset)
+            .unwrap();
+        let direct = &source[start..end];
+        assert!(direct.contains("prepare_staged_packed_single_write_from_plan"));
+        assert!(!direct.contains("Self::prepare_staged_packed_single_write("));
+
+        let helper_start = source
+            .find("fn prepare_staged_packed_single_write_from_plan")
+            .unwrap();
+        let helper_end = source[helper_start..]
+            .find("/// Staged direct-group schedule")
+            .map(|offset| helper_start + offset)
+            .unwrap();
+        let helper = &source[helper_start..helper_end];
+        assert!(helper.contains("candidate.term_descriptors().to_vec()"));
+        assert!(helper.contains("candidate.packed_group_row_offsets().to_vec()"));
+    }
+
+    #[test]
+    fn group_b_representative_is_sealed_to_canonical_first_term() {
+        let point = CirclePoint {
+            x: SecureField::from(0),
+            y: SecureField::from(0),
+        };
+        let topology = [4, 4, 6]
+            .into_iter()
+            .enumerate()
+            .map(
+                |(input_index, coefficient_log_size)| QuotientNumeratorColumnTopology {
+                    coefficient_log_size,
+                    source_kind: QuotientNumeratorSourceKind::Evaluation,
+                    samples: vec![QuotientOodsSample {
+                        input_index: input_index as u32,
+                        shape_point: point,
+                    }],
+                },
+            )
+            .collect::<Vec<_>>();
+        let config = QuotientNumeratorWorkspaceConfig {
+            lifting_log_size: 30,
+            log_blowup_factor: 1,
+            max_lde_tile_words: 32usize << 30,
+        };
+        let canonical = build_plan(config, &topology).unwrap();
+        let staged = quotient_numerator_staged_single_write_plan_with_overflow_capacities(
+            config,
+            &topology,
+            &[usize::MAX],
+        )
+        .unwrap();
+        let mut ranges = derive_group_direct_ranges(
+            staged.group_offsets(),
+            staged.term_descriptors(),
+            &staged
+                .requirements()
+                .groups
+                .iter()
+                .map(|group| group.log_size)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        validate_group_direct_representatives(&ranges, &canonical).unwrap();
+        ranges[0].group_b_term ^= 1;
+        assert!(matches!(
+            validate_group_direct_representatives(&ranges, &canonical),
+            Err(
+                QuotientNumeratorStagedSingleWriteError::DescriptorInvariant(
+                    "direct group-B representative differs from canonical ownership"
+                )
+            )
+        ));
+    }
 
     #[test]
     fn direct_group_ranges_choose_minimum_global_term() {
