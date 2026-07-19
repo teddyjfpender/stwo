@@ -166,7 +166,7 @@ pub(super) fn run() {
         EAGER_DIRECT_POISON,
     );
     poison_fri_input(&fixture, &quotient, EAGER_DIRECT_POISON);
-    prepared.launch().unwrap();
+    prepared.launch_group_direct_baseline().unwrap();
     quotient.launch().unwrap();
     fixture.arena.context().sync().unwrap();
     let canonical = capture_canonical_output(&fixture, &requirements);
@@ -182,7 +182,7 @@ pub(super) fn run() {
     );
 
     poison_boundary(&fixture, &requirements, &quotient, EAGER_CANDIDATE_POISON);
-    prepared.launch_group_direct_run_sum_candidate().unwrap();
+    prepared.launch().unwrap();
     quotient.launch().unwrap();
     fixture.arena.context().sync().unwrap();
     let eager_candidate = assert_boundary(
@@ -195,11 +195,11 @@ pub(super) fn run() {
     );
 
     let capture = fixture.arena.context().capture().unwrap();
-    prepared.launch().unwrap();
+    prepared.launch_group_direct_baseline().unwrap();
     quotient.launch().unwrap();
     let direct_graph = capture.finish().unwrap();
     let capture = fixture.arena.context().capture().unwrap();
-    prepared.launch_group_direct_run_sum_candidate().unwrap();
+    prepared.launch().unwrap();
     quotient.launch().unwrap();
     let candidate_graph = capture.finish().unwrap();
     assert_eq!(direct_graph.kernel_nodes(), EXPECTED_DIRECT_NODES);
