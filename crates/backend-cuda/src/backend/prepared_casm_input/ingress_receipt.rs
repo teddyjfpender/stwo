@@ -32,8 +32,8 @@ impl PendingWitnessCasmInputIngressReceipt {
     }
 }
 
-/// Process-local proof that one exact row-major source was ingested, scattered,
-/// and covered by the caller-owned setup fence.
+/// Process-local proof that one shape-checked row-major source was ingested,
+/// scattered, and covered by the caller-owned setup fence.
 ///
 /// Writer exclusivity for staging and consumer columns remains a proof-plan
 /// obligation. This receipt only tracks work submitted through its prepared
@@ -185,8 +185,8 @@ impl WitnessCasmInputIngressState {
             .ok_or(PreparedWitnessCasmInputError::IngressGenerationOverflow)
     }
 
-    /// Begin only after host shape and content have been validated. From this
-    /// point, no earlier receipt may attest potentially changed device bytes.
+    /// Begin only after host shape has been validated. From this point, no
+    /// earlier receipt may attest potentially changed device bytes.
     pub(super) fn begin(&self, receipt: WitnessCasmInputIngressReceipt) {
         debug_assert_eq!(
             receipt.generation(),
