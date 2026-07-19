@@ -20,6 +20,10 @@ const PATTERN_CHUNK_WORDS: usize = 1 << 22;
 const OUTPUT_DOMAIN: &[u8] = b"stwo.sn3-quotient-numerator.output.v1\0";
 const INPUT_RECIPE_DOMAIN: &[u8] = b"stwo.sn3-quotient-numerator.input-recipe.v2\0";
 const SOURCE_IDENTITY_DOMAIN: &[u8] = b"stwo.sn3-quotient-numerator.sources.v1\0";
+const BOUNDARY_RUST_SOURCE_IDENTITY_DOMAIN: &[u8] =
+    b"stwo.sn3-numerator-to-fri-input.rust-sources.v1\0";
+const BOUNDARY_ARTIFACT_IDENTITY_DOMAIN: &[u8] =
+    b"stwo.sn3-numerator-to-fri-input.artifact-identity.v1\0";
 const NO_INDEX: u32 = u32::MAX;
 const AFFINE_PATTERN_VERSION: u32 = 1;
 const AFFINE_PATTERN_MODULUS: u64 = 2_147_483_646;
@@ -30,34 +34,85 @@ const SOURCE_PATTERN_SEED_STRIDE: u64 = 104_729;
 pub(super) const TWIDDLE_PATTERN_SEED: u64 = 15_485_863;
 
 pub(super) struct ArtifactIdentity {
-    pub(super) candidate_source_blake3: Hash,
+    pub(super) boundary_seal_blake3: Hash,
+    pub(super) boundary_rust_source_blake3: Hash,
+    pub(super) numerator_comparator_source_blake3: Hash,
+    pub(super) ordinary_cuda_source_blake3: Hash,
     pub(super) test_binary_blake3: Hash,
-    source_projection_sha256: Option<String>,
-    cuda_module_sha256: Option<String>,
+    boundary_source_projection_sha256: Option<String>,
+    boundary_cuda_module_sha256: Option<String>,
     pub(super) cuda_build_mode: &'static str,
+    pub(super) expected_cuda_module_build_identity: Hash,
+    pub(super) loaded_cuda_module_build_identity: Hash,
+    pub(super) cuda_module_target_sms: Vec<u32>,
 }
 
 impl ArtifactIdentity {
-    pub(super) fn source_projection_json(&self) -> String {
-        optional_hash_json(self.source_projection_sha256.as_deref())
+    pub(super) fn boundary_source_projection_json(&self) -> String {
+        optional_hash_json(self.boundary_source_projection_sha256.as_deref())
     }
 
-    pub(super) fn cuda_module_json(&self) -> String {
-        optional_hash_json(self.cuda_module_sha256.as_deref())
+    pub(super) fn boundary_cuda_module_json(&self) -> String {
+        optional_hash_json(self.boundary_cuda_module_sha256.as_deref())
     }
 
     pub(super) fn is_complete(&self) -> bool {
-        self.source_projection_sha256.is_some() && self.cuda_module_sha256.is_some()
+        self.boundary_source_projection_sha256.is_some()
+            && self.boundary_cuda_module_sha256.is_some()
+            && self.cuda_build_mode == "cuda"
+            && self.ordinary_cuda_source_blake3.as_bytes() != &[0; 32]
+            && self.expected_cuda_module_build_identity.as_bytes() != &[0; 32]
+            && self.expected_cuda_module_build_identity == self.loaded_cuda_module_build_identity
+            && !self.cuda_module_target_sms.is_empty()
     }
 }
 
 pub(super) fn artifact_identity() -> ArtifactIdentity {
+    let boundary_rust_source_blake3 = boundary_rust_source_digest();
+    let numerator_comparator_source_blake3 = candidate_source_digest();
+    let ordinary_cuda_source_blake3 =
+        Hash::from_bytes(stwo_backend_cuda_kernels::static_cuda_source_identity());
+    let test_binary_blake3 =
+        file_blake3(std::env::current_exe().expect("current test binary path"));
+    let boundary_source_projection_sha256 =
+        optional_sha256("STWO_SN3_BOUNDARY_SOURCE_PROJECTION_SHA256");
+    let boundary_cuda_module_sha256 = optional_sha256("STWO_SN3_BOUNDARY_CUDA_MODULE_SHA256");
+    let expected_cuda_module_build_identity =
+        Hash::from_bytes(stwo_backend_cuda_kernels::expected_static_cuda_module_build_identity());
+    let loaded_cuda_module_build_identity = Hash::from_bytes(
+        stwo_backend_cuda_kernels::static_cuda_module_build_identity()
+            .expect("load exact linked ordinary CUDA module build identity"),
+    );
+    assert_eq!(
+        loaded_cuda_module_build_identity, expected_cuda_module_build_identity,
+        "linked ordinary CUDA module build identity drift"
+    );
+    let cuda_module_target_sms =
+        stwo_backend_cuda_kernels::static_cuda_module_target_sms().to_vec();
+    let cuda_build_mode = stwo_backend_cuda_kernels::BUILD_MODE;
+    let boundary_seal_blake3 = boundary_artifact_digest(
+        boundary_rust_source_blake3,
+        ordinary_cuda_source_blake3,
+        test_binary_blake3,
+        boundary_source_projection_sha256.as_deref(),
+        boundary_cuda_module_sha256.as_deref(),
+        cuda_build_mode,
+        expected_cuda_module_build_identity,
+        loaded_cuda_module_build_identity,
+        &cuda_module_target_sms,
+    );
     ArtifactIdentity {
-        candidate_source_blake3: candidate_source_digest(),
-        test_binary_blake3: file_blake3(std::env::current_exe().expect("current test binary path")),
-        source_projection_sha256: optional_sha256("STWO_SN3_NUMERATOR_SOURCE_PROJECTION_SHA256"),
-        cuda_module_sha256: optional_sha256("STWO_SN3_NUMERATOR_CUDA_MODULE_SHA256"),
-        cuda_build_mode: stwo_backend_cuda_kernels::BUILD_MODE,
+        boundary_seal_blake3,
+        boundary_rust_source_blake3,
+        numerator_comparator_source_blake3,
+        ordinary_cuda_source_blake3,
+        test_binary_blake3,
+        boundary_source_projection_sha256,
+        boundary_cuda_module_sha256,
+        cuda_build_mode,
+        expected_cuda_module_build_identity,
+        loaded_cuda_module_build_identity,
+        cuda_module_target_sms,
     }
 }
 
@@ -440,6 +495,85 @@ fn range_name(range: OutputRange) -> String {
     }
 }
 
+fn boundary_rust_source_digest() -> Hash {
+    let sources: &[(&str, &[u8])] = &[
+        (
+            "tests/prepared_quotient_numerator_sn3_bench_native.rs",
+            include_bytes!("../prepared_quotient_numerator_sn3_bench_native.rs").as_slice(),
+        ),
+        (
+            "tests/support/sn3_quotient_numerator_bench.rs",
+            include_bytes!("sn3_quotient_numerator_bench.rs").as_slice(),
+        ),
+        (
+            "tests/support/sn3_quotient_topology_fixture.rs",
+            include_bytes!("sn3_quotient_topology_fixture.rs").as_slice(),
+        ),
+        (
+            "src/backend/quotient_numerator_single_write.rs",
+            include_bytes!("../../src/backend/quotient_numerator_single_write.rs").as_slice(),
+        ),
+        (
+            "src/backend/prepared_quotient_numerator.rs",
+            include_bytes!("../../src/backend/prepared_quotient_numerator.rs").as_slice(),
+        ),
+        (
+            "src/backend/prepared_quotient_numerator/plan.rs",
+            include_bytes!("../../src/backend/prepared_quotient_numerator/plan.rs").as_slice(),
+        ),
+        (
+            "src/backend/prepared_quotient_numerator/bindings.rs",
+            include_bytes!("../../src/backend/prepared_quotient_numerator/bindings.rs").as_slice(),
+        ),
+        (
+            "src/backend/prepared_quotient_numerator/launch.rs",
+            include_bytes!("../../src/backend/prepared_quotient_numerator/launch.rs").as_slice(),
+        ),
+        (
+            "src/backend/prepared_quotient_numerator/single_write.rs",
+            include_bytes!("../../src/backend/prepared_quotient_numerator/single_write.rs")
+                .as_slice(),
+        ),
+        (
+            "src/backend/prepared_quotient.rs",
+            include_bytes!("../../src/backend/prepared_quotient.rs").as_slice(),
+        ),
+        (
+            "src/backend/prepared_interpolation.rs",
+            include_bytes!("../../src/backend/prepared_interpolation.rs").as_slice(),
+        ),
+        (
+            "src/backend/prepared_interpolation/authority.rs",
+            include_bytes!("../../src/backend/prepared_interpolation/authority.rs").as_slice(),
+        ),
+        (
+            "src/backend/quotient_producer_b2n.rs",
+            include_bytes!("../../src/backend/quotient_producer_b2n.rs").as_slice(),
+        ),
+        (
+            "src/backend/exec_context.rs",
+            include_bytes!("../../src/backend/exec_context.rs").as_slice(),
+        ),
+        (
+            "src/columns/bindings.rs",
+            include_bytes!("../../src/columns/bindings.rs").as_slice(),
+        ),
+        (
+            "backend-cuda-kernels/src/lib.rs",
+            include_bytes!("../../../backend-cuda-kernels/src/lib.rs").as_slice(),
+        ),
+        (
+            "backend-cuda-kernels/src/raw.rs",
+            include_bytes!("../../../backend-cuda-kernels/src/raw.rs").as_slice(),
+        ),
+        (
+            "backend-cuda-kernels/build.rs",
+            include_bytes!("../../../backend-cuda-kernels/build.rs").as_slice(),
+        ),
+    ];
+    source_set_digest(BOUNDARY_RUST_SOURCE_IDENTITY_DOMAIN, sources)
+}
+
 fn candidate_source_digest() -> Hash {
     let sources: &[(&str, &[u8])] = &[
         (
@@ -500,8 +634,12 @@ fn candidate_source_digest() -> Hash {
             include_bytes!("../../../backend-cuda-kernels/cuda/quotients.cuh").as_slice(),
         ),
     ];
+    source_set_digest(SOURCE_IDENTITY_DOMAIN, sources)
+}
+
+fn source_set_digest(domain: &[u8], sources: &[(&str, &[u8])]) -> Hash {
     let mut hasher = Hasher::new();
-    hasher.update(SOURCE_IDENTITY_DOMAIN);
+    hasher.update(domain);
     hasher.update(&u64::try_from(sources.len()).unwrap().to_le_bytes());
     for (name, bytes) in sources {
         hasher.update(&u64::try_from(name.len()).unwrap().to_le_bytes());
@@ -510,6 +648,57 @@ fn candidate_source_digest() -> Hash {
         hasher.update(bytes);
     }
     hasher.finalize()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn boundary_artifact_digest(
+    boundary_rust_source_blake3: Hash,
+    ordinary_cuda_source_blake3: Hash,
+    test_binary_blake3: Hash,
+    boundary_source_projection_sha256: Option<&str>,
+    boundary_cuda_module_sha256: Option<&str>,
+    cuda_build_mode: &str,
+    expected_cuda_module_build_identity: Hash,
+    loaded_cuda_module_build_identity: Hash,
+    cuda_module_target_sms: &[u32],
+) -> Hash {
+    let mut hasher = Hasher::new();
+    hasher.update(BOUNDARY_ARTIFACT_IDENTITY_DOMAIN);
+    for digest in [
+        boundary_rust_source_blake3,
+        ordinary_cuda_source_blake3,
+        test_binary_blake3,
+        expected_cuda_module_build_identity,
+        loaded_cuda_module_build_identity,
+    ] {
+        hasher.update(digest.as_bytes());
+    }
+    hash_optional_text(&mut hasher, boundary_source_projection_sha256);
+    hash_optional_text(&mut hasher, boundary_cuda_module_sha256);
+    hasher.update(&u64::try_from(cuda_build_mode.len()).unwrap().to_le_bytes());
+    hasher.update(cuda_build_mode.as_bytes());
+    hasher.update(
+        &u64::try_from(cuda_module_target_sms.len())
+            .unwrap()
+            .to_le_bytes(),
+    );
+    for sm in cuda_module_target_sms {
+        hasher.update(&sm.to_le_bytes());
+    }
+    hasher.finalize()
+}
+
+fn hash_optional_text(hasher: &mut Hasher, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            hasher.update(&[1]);
+            hasher.update(&u64::try_from(value.len()).unwrap().to_le_bytes());
+            hasher.update(value.as_bytes());
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
 }
 
 fn file_blake3(path: impl AsRef<std::path::Path>) -> Hash {
