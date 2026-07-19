@@ -104,6 +104,27 @@ struct AotPackEvidence {
     validated: bool,
 }
 
+pub(crate) fn assert_promotion_artifacts() {
+    assert_eq!(
+        option_env!("STWO_CUDA_ARCHIVE_LTO"),
+        Some("1"),
+        "formal retained A/B requires archive LTO"
+    );
+    let artifact = artifact_identity();
+    assert!(
+        artifact.is_complete(),
+        "formal retained A/B requires complete CUDA artifact identity"
+    );
+    assert!(
+        load_static_sass_receipt(artifact.boundary_cuda_module_sha256()).validated,
+        "formal retained A/B requires validated static SASS"
+    );
+    assert!(
+        aot_pack_evidence().validated,
+        "formal retained A/B requires a validated nonempty SM86 AOT pack"
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn publish_result(
     sn3: &sn3_quotient_topology_fixture::LoadedTopologyFixture,
