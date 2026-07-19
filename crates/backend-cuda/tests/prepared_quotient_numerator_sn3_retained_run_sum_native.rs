@@ -85,7 +85,14 @@ const BOTH_LIVE: u16 = ORACLE_LIVE | RETAINED_LIVE;
 #[test]
 #[ignore = "requires CUDA and the exact 42.97 GiB retained SN3 arena"]
 fn sn3_retained_run_sum_same_object_cuda_event_benchmark() {
+    sn3_quotient_retained_result::assert_promotion_artifacts();
     sn3_quotient_retained_run_sum_ab::run();
+}
+
+#[test]
+#[ignore = "requires the sealed production CUDA artifacts and receipt"]
+fn sn3_retained_run_sum_promotion_artifacts_are_exact() {
+    sn3_quotient_retained_result::assert_promotion_artifacts();
 }
 
 #[test]
