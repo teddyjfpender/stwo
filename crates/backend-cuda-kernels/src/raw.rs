@@ -1612,7 +1612,7 @@ extern "C" {
         group_term_indices: *const u32,
         group_count: u32,
         term_points: *const u32,
-        line_coefficients: *const CudaSecureField,
+        line_coefficients: *mut CudaSecureField,
         sample_points: *mut u32,
         first_linear_terms: *mut CudaSecureField,
         stream: *mut c_void,
@@ -1672,6 +1672,21 @@ extern "C" {
         outputs_1: *const *mut u32,
         outputs_2: *const *mut u32,
         outputs_3: *const *mut u32,
+        stream: *mut c_void,
+    ) -> i32;
+
+    pub fn stwo_accumulate_quotient_numerator_group_direct_on(
+        term_descriptors: *const u32,
+        term_begin: u32,
+        term_end: u32,
+        group_log_size: u32,
+        source_evaluations: *const *const u32,
+        line_coefficients: *const CudaSecureField,
+        group_b: *const CudaSecureField,
+        output_0: *mut u32,
+        output_1: *mut u32,
+        output_2: *mut u32,
+        output_3: *mut u32,
         stream: *mut c_void,
     ) -> i32;
 

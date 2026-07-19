@@ -1881,7 +1881,7 @@ pub unsafe extern "C" fn stwo_finalize_quotient_numerator_groups_on(
     _group_term_indices: *const u32,
     _group_count: u32,
     _term_points: *const u32,
-    _line_coefficients: *const CudaSecureField,
+    _line_coefficients: *mut CudaSecureField,
     _sample_points: *mut u32,
     _first_linear_terms: *mut CudaSecureField,
     _stream: *mut core::ffi::c_void,
@@ -1956,6 +1956,24 @@ pub unsafe extern "C" fn stwo_accumulate_quotient_numerator_packed_single_write_
     _stream: *mut core::ffi::c_void,
 ) -> i32 {
     no_cuda_symbol("stwo_accumulate_quotient_numerator_packed_single_write_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_accumulate_quotient_numerator_group_direct_on(
+    _term_descriptors: *const u32,
+    _term_begin: u32,
+    _term_end: u32,
+    _group_log_size: u32,
+    _source_evaluations: *const *const u32,
+    _line_coefficients: *const CudaSecureField,
+    _group_b: *const CudaSecureField,
+    _output_0: *mut u32,
+    _output_1: *mut u32,
+    _output_2: *mut u32,
+    _output_3: *mut u32,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_accumulate_quotient_numerator_group_direct_on")
 }
 
 #[unsafe(no_mangle)]

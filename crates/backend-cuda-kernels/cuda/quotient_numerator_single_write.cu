@@ -285,6 +285,84 @@ extern "C" int stwo_accumulate_quotient_numerator_packed_single_write_on(
     return cudaGetLastError();
 }
 
+// One launch owns one canonical numerator group. The launch geometry supplies
+// the group row count, while scalar arguments replace the packed-row search,
+// row-prefix reads, group-log reads, and output-pointer-table reads.
+extern "C" __global__ void stwo_quotient_numerator_group_direct_kernel(
+        const uint32_t *term_descriptors,
+        uint32_t term_begin,
+        uint32_t term_end,
+        uint32_t group_log_size,
+        const uint32_t *const *source_evaluations,
+        const qm31 *line_coefficients,
+        const qm31 *group_b,
+        uint32_t *output_0,
+        uint32_t *output_1,
+        uint32_t *output_2,
+        uint32_t *output_3
+) {
+    const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t row_count = 1u << group_log_size;
+    if (row >= row_count) {
+        return;
+    }
+    qm31 numerator = qm31{cm31{0, 0}, cm31{0, 0}};
+    for (uint32_t index = term_begin; index < term_end; ++index) {
+        const uint32_t *descriptor =
+            term_descriptors + static_cast<size_t>(index) * TERM_WORDS;
+        const uint32_t source = descriptor[0];
+        const uint32_t term = descriptor[1];
+        const uint32_t source_log_size = descriptor[2];
+        const uint32_t log_ratio = group_log_size - source_log_size;
+        const uint32_t source_row =
+            (row >> (log_ratio + 1) << 1) + (row & 1);
+        const qm31 c =
+            line_coefficients[static_cast<size_t>(term) * 3 + 2];
+        const qm31 product =
+            mul_by_scalar(c, source_evaluations[source][source_row]);
+        numerator = add(numerator, product);
+    }
+    numerator = sub(numerator, *group_b);
+
+    output_0[row] = numerator.a.a;
+    output_1[row] = numerator.a.b;
+    output_2[row] = numerator.b.a;
+    output_3[row] = numerator.b.b;
+}
+
+extern "C" int stwo_accumulate_quotient_numerator_group_direct_on(
+        const uint32_t *term_descriptors,
+        uint32_t term_begin,
+        uint32_t term_end,
+        uint32_t group_log_size,
+        const uint32_t *const *source_evaluations,
+        const qm31 *line_coefficients,
+        const qm31 *group_b,
+        uint32_t *output_0,
+        uint32_t *output_1,
+        uint32_t *output_2,
+        uint32_t *output_3,
+        void *stream
+) {
+    if (term_descriptors == nullptr || term_begin >= term_end ||
+        group_log_size >= 31 || source_evaluations == nullptr ||
+        line_coefficients == nullptr || group_b == nullptr ||
+        output_0 == nullptr ||
+        output_1 == nullptr || output_2 == nullptr || output_3 == nullptr ||
+        stream == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    const uint32_t row_count = 1u << group_log_size;
+    const uint32_t blocks =
+        (row_count + BLOCK_THREADS - 1) / BLOCK_THREADS;
+    stwo_quotient_numerator_group_direct_kernel<<<
+        blocks, BLOCK_THREADS, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
+            term_descriptors, term_begin, term_end, group_log_size,
+            source_evaluations, line_coefficients, group_b, output_0, output_1,
+            output_2, output_3);
+    return cudaGetLastError();
+}
+
 // Candidate-only preparation after finalize_quotient_numerator_groups has
 // consumed term_points. The same storage becomes descriptor-ordered records:
 // [source pointer lo/hi, four c words, source log], followed by one B_g per
@@ -678,6 +756,9 @@ extern "C" int stwo_quotient_numerator_single_write_function_attributes(
     case STWO_QUOTIENT_NUMERATOR_PREPACKED_HOT:
         return stwo_cuda_function_attributes(
             stwo_quotient_numerator_prepacked_single_write_kernel, out);
+    case STWO_QUOTIENT_NUMERATOR_GROUP_DIRECT:
+        return stwo_cuda_function_attributes(
+            stwo_quotient_numerator_group_direct_kernel, out);
     default:
         return cudaErrorInvalidValue;
     }

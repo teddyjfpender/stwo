@@ -70,7 +70,11 @@ impl PreparedQuotientNumeratorGraph<'_> {
             }
             PreparedNumeratorSchedule::StagedPackedSingleWrite { packed_output_rows } => {
                 self.launch_all_staged_ldes(stream)?;
-                self.launch_packed_single_write(packed_output_rows, stream)?;
+                if let Some(ranges) = self.group_direct_ranges.as_deref() {
+                    self.launch_group_direct(ranges, stream)?;
+                } else {
+                    self.launch_packed_single_write(packed_output_rows, stream)?;
+                }
                 return Ok(());
             }
             PreparedNumeratorSchedule::StagedPrepackedSingleWrite { packed_output_rows } => {

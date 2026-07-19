@@ -860,7 +860,7 @@ __global__ void finalize_quotient_numerator_groups(
         const uint32_t *group_term_indices,
         uint32_t group_count,
         const secure_field_point *term_points,
-        const qm31 *line_coefficients,
+        qm31 *line_coefficients,
         secure_field_point *sample_points,
         qm31 *first_linear_terms
 ) {
@@ -874,11 +874,19 @@ __global__ void finalize_quotient_numerator_groups(
     sample_points[group] = term_points[representative];
 
     qm31 first = qm31{cm31{0, 0}, cm31{0, 0}};
+    qm31 group_b = qm31{cm31{0, 0}, cm31{0, 0}};
     for (uint32_t index = begin; index < end; ++index) {
         const uint32_t term = group_term_indices[index];
         first = add(first, line_coefficients[static_cast<size_t>(term) * 3]);
+        group_b = add(
+            group_b,
+            line_coefficients[static_cast<size_t>(term) * 3 + 1]);
     }
     first_linear_terms[group] = first;
+    // Per-term a coefficients are dead after this finalizer. Reuse the
+    // representative term's a slot for the exact group-wide B constant, so the
+    // direct numerator path adds no allocation, descriptor pass, or launch.
+    line_coefficients[static_cast<size_t>(representative) * 3] = group_b;
 }
 
 __global__ void zero_quotient_numerator_outputs(
@@ -986,7 +994,7 @@ extern "C" int stwo_finalize_quotient_numerator_groups_on(
         const uint32_t *group_term_indices,
         uint32_t group_count,
         const secure_field_point *term_points,
-        const qm31 *line_coefficients,
+        qm31 *line_coefficients,
         secure_field_point *sample_points,
         qm31 *first_linear_terms,
         void *stream

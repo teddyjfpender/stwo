@@ -303,6 +303,13 @@ struct PreparedBatch {
     group_offset: usize,
 }
 
+#[derive(Clone, Copy)]
+struct PreparedGroupDirectRange {
+    term_begin: u32,
+    term_end: u32,
+    group_b_term: u32,
+}
+
 /// Exact quotient-numerator launch schedule sealed by the prepared constructor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PreparedNumeratorSchedule {
@@ -364,6 +371,7 @@ pub struct PreparedQuotientNumeratorGraph<'a> {
     lde_tile: Option<ArenaSlice>,
     batches: Vec<PreparedBatch>,
     schedule: PreparedNumeratorSchedule,
+    group_direct_ranges: Option<Vec<PreparedGroupDirectRange>>,
     prepacked: Option<PreparedPrepackedBinding>,
 }
 
@@ -715,6 +723,7 @@ impl<'a> PreparedQuotientNumeratorGraph<'a> {
             lde_tile,
             batches: prepared_batches,
             schedule: PreparedNumeratorSchedule::LegacyBatches,
+            group_direct_ranges: None,
             prepacked: None,
         })
     }

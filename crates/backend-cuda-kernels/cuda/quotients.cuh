@@ -139,7 +139,7 @@ int stwo_finalize_quotient_numerator_groups_on(
         const uint32_t *group_term_indices,
         uint32_t group_count,
         const secure_field_point *term_points,
-        const qm31 *line_coefficients,
+        qm31 *line_coefficients,
         secure_field_point *sample_points,
         qm31 *first_linear_terms,
         void *stream
