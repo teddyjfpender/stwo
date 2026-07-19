@@ -369,6 +369,73 @@ mod tests {
     }
 
     #[test]
+    fn quotient_native_run_sum_manifest_and_signatures_match() {
+        type PrecomputeFn = unsafe extern "C" fn(
+            *const u32,
+            u32,
+            u32,
+            u32,
+            *const *const u32,
+            *const raw::CudaSecureField,
+            *mut u32,
+            *mut u32,
+            *mut u32,
+            *mut u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32;
+        type ExpandFn = unsafe extern "C" fn(
+            *const raw::CudaQuotientNativeRunManifest,
+            *const u32,
+            *const *const u32,
+            *const raw::CudaSecureField,
+            *const raw::CudaSecureField,
+            *const u32,
+            *const u32,
+            *const u32,
+            *const u32,
+            *mut u32,
+            *mut u32,
+            *mut u32,
+            *mut u32,
+            *mut core::ffi::c_void,
+        ) -> i32;
+        type AttributesFn = unsafe extern "C" fn(*mut raw::CudaFunctionAttributes) -> i32;
+
+        assert_eq!(core::mem::size_of::<raw::CudaQuotientNativeRunEntry>(), 16);
+        assert_eq!(
+            core::mem::size_of::<raw::CudaQuotientNativeRunManifest>(),
+            400
+        );
+        assert_eq!(
+            core::mem::offset_of!(raw::CudaQuotientNativeRunManifest, runs),
+            16
+        );
+        assert_eq!(
+            core::mem::size_of::<raw::CudaQuotientNativeRunManifest>()
+                + 12 * core::mem::size_of::<*const u32>(),
+            496
+        );
+
+        let _: PrecomputeFn = raw::stwo_precompute_quotient_numerator_native_run_on;
+        let _: ExpandFn = raw::stwo_expand_quotient_numerator_native_run_sums_on;
+        let _: AttributesFn =
+            raw::stwo_quotient_numerator_native_run_precompute_function_attributes;
+        let _: AttributesFn =
+            raw::stwo_quotient_numerator_native_run_sum_expand_function_attributes;
+
+        #[cfg(not(stwo_cuda_link))]
+        {
+            let _: PrecomputeFn = super::stubs::stwo_precompute_quotient_numerator_native_run_on;
+            let _: ExpandFn = super::stubs::stwo_expand_quotient_numerator_native_run_sums_on;
+            let _: AttributesFn =
+                super::stubs::stwo_quotient_numerator_native_run_precompute_function_attributes;
+            let _: AttributesFn =
+                super::stubs::stwo_quotient_numerator_native_run_sum_expand_function_attributes;
+        }
+    }
+
+    #[test]
     fn prepared_quotient_symbols_are_linked_in_cuda_and_stub_builds() {
         assert_ne!(raw::stwo_combine_quotients_from_numerators_on as usize, 0);
         assert_ne!(raw::stwo_combine_quotients_b2n_init7_on as usize, 0);
@@ -407,6 +474,22 @@ mod tests {
         assert_ne!(
             raw::stwo_quotient_numerator_group_direct_contribution_tiled_function_attributes
                 as usize,
+            0
+        );
+        assert_ne!(
+            raw::stwo_precompute_quotient_numerator_native_run_on as usize,
+            0
+        );
+        assert_ne!(
+            raw::stwo_expand_quotient_numerator_native_run_sums_on as usize,
+            0
+        );
+        assert_ne!(
+            raw::stwo_quotient_numerator_native_run_precompute_function_attributes as usize,
+            0
+        );
+        assert_ne!(
+            raw::stwo_quotient_numerator_native_run_sum_expand_function_attributes as usize,
             0
         );
         assert_ne!(

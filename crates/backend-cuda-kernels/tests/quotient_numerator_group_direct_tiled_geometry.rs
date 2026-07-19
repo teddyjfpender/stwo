@@ -94,7 +94,7 @@ fn adaptive_sn3_batch_counts_and_logical_load_model_are_sealed() {
         (20, 1225),
         (21, 620),
         (22, 140),
-        (23, 159),
+        (23, 167),
     ];
     let batches = |tile_words| {
         runs.iter()
@@ -123,11 +123,11 @@ fn adaptive_sn3_batch_counts_and_logical_load_model_are_sealed() {
             terms * rows
         })
         .sum::<u32>();
-    assert_eq!(candidate_loads_per_cta, 604_424);
-    assert_eq!(5_877 * ROWS_PER_CTA, 3_009_024);
+    assert_eq!(candidate_loads_per_cta, 608_520);
+    assert_eq!(5_885 * ROWS_PER_CTA, 3_013_120);
     assert_eq!(
         u64::from(candidate_loads_per_cta) * 16_384 * 4,
-        39_611_531_264
+        39_879_966_720
     );
 
     // The product arm has 1,024 aligned uint4 entries (16 KiB). It therefore
@@ -135,6 +135,6 @@ fn adaptive_sn3_batch_counts_and_logical_load_model_are_sealed() {
     // scalar product once per unique (term, source row), not once per output.
     assert_eq!(batches(1024), 141);
     assert_eq!(batches(1024) * 2, 282);
-    assert_eq!(5_877 * ROWS_PER_CTA * 4, 12_036_096);
-    assert_eq!(candidate_loads_per_cta * 4, 2_417_696);
+    assert_eq!(5_885 * ROWS_PER_CTA * 4, 12_052_480);
+    assert_eq!(candidate_loads_per_cta * 4, 2_434_080);
 }
