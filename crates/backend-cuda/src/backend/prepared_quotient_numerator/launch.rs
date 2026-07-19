@@ -46,6 +46,10 @@ impl PreparedQuotientNumeratorGraph<'_> {
     }
 
     pub fn launch(&self) -> Result<(), PreparedQuotientNumeratorError> {
+        let use_group_direct_run_sum = matches!(
+            self.schedule,
+            PreparedNumeratorSchedule::StagedGroupDirect { .. }
+        ) && self.validate_group_direct_run_sum()?;
         let (group_count, max_output_size, stream) = self.prepare_terms_and_groups()?;
         let output_tables = |coordinate: usize| unsafe {
             self.output_ptrs
@@ -88,12 +92,16 @@ impl PreparedQuotientNumeratorGraph<'_> {
             }
             PreparedNumeratorSchedule::StagedGroupDirect { .. } => {
                 self.launch_all_staged_ldes(stream)?;
-                let ranges = self.group_direct_ranges.as_deref().ok_or(
-                    PreparedQuotientNumeratorError::GroupDirectScheduleInvariant(
-                        "group-direct schedule has no sealed ranges",
-                    ),
-                )?;
-                self.launch_group_direct(ranges, stream)?;
+                if use_group_direct_run_sum {
+                    self.launch_bound_group_direct_run_sum(stream)?;
+                } else {
+                    let ranges = self.group_direct_ranges.as_deref().ok_or(
+                        PreparedQuotientNumeratorError::GroupDirectScheduleInvariant(
+                            "group-direct schedule has no sealed ranges",
+                        ),
+                    )?;
+                    self.launch_group_direct(ranges, stream)?;
+                }
                 return Ok(());
             }
             PreparedNumeratorSchedule::StagedPrepackedSingleWrite { packed_output_rows } => {
@@ -230,8 +238,31 @@ impl PreparedQuotientNumeratorGraph<'_> {
         self.launch_group_direct_contribution_tiled(ranges, stream)
     }
 
-    /// Dormant native-domain run-sum candidate. Setup has already sealed the
-    /// scratch victim, raw ABI, and physical liveness proof.
+    /// Pure group-direct seam retained as an honest differential baseline.
+    #[doc(hidden)]
+    pub fn launch_group_direct_baseline(&self) -> Result<(), PreparedQuotientNumeratorError> {
+        if !matches!(
+            self.schedule,
+            PreparedNumeratorSchedule::StagedGroupDirect { .. }
+        ) {
+            return Err(
+                PreparedQuotientNumeratorError::GroupDirectScheduleInvariant(
+                    "group-direct baseline requires the group-direct schedule",
+                ),
+            );
+        }
+        let (_, _, stream) = self.prepare_terms_and_groups()?;
+        self.launch_all_staged_ldes(stream)?;
+        let ranges = self.group_direct_ranges.as_deref().ok_or(
+            PreparedQuotientNumeratorError::GroupDirectScheduleInvariant(
+                "group-direct baseline has no sealed ranges",
+            ),
+        )?;
+        self.launch_group_direct(ranges, stream)
+    }
+
+    /// Explicit native-domain run-sum seam for differential measurements.
+    /// Production uses the same sealed binding and group-direct fallback.
     #[doc(hidden)]
     pub fn launch_group_direct_run_sum_candidate(
         &self,
@@ -324,14 +355,19 @@ impl PreparedQuotientNumeratorGraph<'_> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn production_launch_does_not_select_the_run_sum_candidate() {
+    fn production_launch_selects_run_sum_with_group_direct_fallback() {
         let source = include_str!("launch.rs");
         let start = source.find("pub fn launch(&self)").unwrap();
         let end = source[start..]
             .find("/// Exact 4-KiB diagnostic seam")
             .map(|offset| start + offset)
             .unwrap();
-        assert!(!source[start..end].contains("run_sum"));
+        let production = &source[start..end];
+        assert!(production.contains("let use_group_direct_run_sum = matches!("));
+        assert!(production.contains("&& self.validate_group_direct_run_sum()?"));
+        assert!(production.contains("if use_group_direct_run_sum"));
+        assert!(production.contains("self.launch_bound_group_direct_run_sum(stream)?"));
+        assert!(production.contains("self.launch_group_direct(ranges, stream)?"));
     }
 
     #[test]
