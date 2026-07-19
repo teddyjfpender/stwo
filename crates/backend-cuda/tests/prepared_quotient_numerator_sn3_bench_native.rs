@@ -24,12 +24,14 @@ use stwo::core::fields::qm31::SecureField;
 use stwo_backend_cuda::{
     gpu_memory_info, quotient_numerator_staged_single_write_plan_with_overflow_capacities,
     quotient_numerator_workspace_requirements, quotient_workspace_requirements, ArenaLayout,
-    ArenaSlice, ArenaSlotId, ArenaSlotSpec, CudaExecContext, CudaGraphExec, DeviceArena,
-    PreparedNumeratorSchedule, PreparedQuotientGraph, PreparedQuotientNumeratorGraph,
+    ArenaRangeSpec, ArenaSlice, ArenaSlotId, ArenaSlotSpec, CudaExecContext, CudaGraphExec,
+    DeviceArena, PreparedNumeratorSchedule, PreparedQuotientGraph, PreparedQuotientNumeratorGraph,
     QuotientNumeratorColumn, QuotientNumeratorColumnSource, QuotientNumeratorColumnTopology,
-    QuotientNumeratorDestination, QuotientNumeratorSourceKind, QuotientNumeratorWorkspaceConfig,
-    QuotientNumeratorWorkspaceRequirements, QuotientNumeratorWorkspaceSlots,
-    QuotientWorkspaceConfig, QuotientWorkspaceRequirements, QuotientWorkspaceSlots,
+    QuotientNumeratorDestination, QuotientNumeratorSource, QuotientNumeratorSourceKind,
+    QuotientNumeratorStagedSingleWritePlan, QuotientNumeratorStagingRole,
+    QuotientNumeratorWorkspaceConfig, QuotientNumeratorWorkspaceRequirements,
+    QuotientNumeratorWorkspaceSlots, QuotientWorkspaceConfig, QuotientWorkspaceRequirements,
+    QuotientWorkspaceSlots,
 };
 
 const GROUP_LOGS: [u32; 19] = [
@@ -57,6 +59,14 @@ const LEGACY_LOGICAL_OUTPUT_BYTES: u64 = 59_993_989_376;
 const HYBRID_LOGICAL_OUTPUT_BYTES: u64 = 20_266_867_968;
 const STAGED_PRIMARY_WORDS: usize = 536_870_912;
 const STAGED_OVERFLOW_WORDS: usize = 452_984_832;
+const RETAINED_COLUMN_COUNT: usize = LEGACY_GROUP_COEFFICIENT_SOURCES;
+const RETAINED_IMAGE_WORDS: usize = 979_965_856;
+const MUTATED_RETAINED_COLUMN: usize = 102;
+const EXPECTED_CONTROL_GRAPH_KERNEL_NODES: u64 = 141;
+const EXPECTED_RETAINED_GRAPH_KERNEL_NODES: u64 = 38;
+const CONTROL_LIVE: u16 = 0b01;
+const RETAINED_LIVE: u16 = 0b10;
+const BOTH_LIVE: u16 = CONTROL_LIVE | RETAINED_LIVE;
 const STAGED_DESCRIPTOR_WORKSPACE_BYTES: u64 = 787_904;
 const QUOTIENT_INCREMENTAL_ARENA_WORDS: usize = 104_857_792;
 const QUOTIENT_INCREMENTAL_ARENA_BYTES: u64 = 419_431_168;
@@ -81,6 +91,7 @@ const POST_TIMING_LEGACY_POISON: u32 = 0x0bad_f00d;
 const POST_TIMING_HYBRID_POISON: u32 = 0xc001_d00d;
 const TIMED_LEGACY_POISON: u32 = 0x3141_5926;
 const TIMED_HYBRID_POISON: u32 = 0x2718_2818;
+const RETAINED_IMAGE_POISON: u32 = 0xfeed_5eed;
 
 const OODS_POINTS: ArenaSlotId = ArenaSlotId(100);
 const OODS_VALUES: ArenaSlotId = ArenaSlotId(101);
@@ -96,6 +107,7 @@ const SOURCE_BASE: u32 = 1_000;
 const OUTPUT_BASE: u32 = 10_000;
 const PACKED_WORKSPACE_BASE: u32 = 1;
 const DIRECT_WORKSPACE_BASE: u32 = 20;
+const RETAINED_IMAGE_BASE: u32 = 20_000;
 
 #[test]
 #[ignore = "requires CUDA and the reported 42.97 GiB numerator-to-FRI-input arena"]
@@ -127,49 +139,55 @@ fn sn3_staged_group_direct_cuda_event_benchmark() {
     )
     .unwrap();
     assert_staged_sn3_shape(&staged_requirements, &staged_plan);
+    let retained_topology = retained_topology(&sn3.topology, &staged_plan);
+    let retained_config = staged_config;
+    let retained_requirements =
+        quotient_numerator_workspace_requirements(retained_config, &retained_topology).unwrap();
+    let retained_plan = quotient_numerator_staged_single_write_plan_with_overflow_capacities(
+        retained_config,
+        &retained_topology,
+        &[],
+    )
+    .unwrap();
+    assert_retained_sn3_shape(&retained_requirements, &retained_plan);
 
     // All exact topology assertions above intentionally precede the first CUDA allocation.
     let (device_free_before_arena, device_total_bytes) = gpu_memory_info();
-    let fixture = BenchmarkArena::new(&sn3.topology, &staged_requirements, &quotient_requirements);
+    let fixture = BenchmarkArena::new(
+        &sn3.topology,
+        &staged_requirements,
+        &staged_plan,
+        &retained_requirements,
+        &quotient_requirements,
+    );
     assert!(fixture.allocation_bytes <= MAX_BENCHMARK_ARENA_BYTES);
     assert_eq!(fixture.allocation_bytes, EXPECTED_SN3_ARENA_BYTES);
+    let retained_manifest_blake3 = fixture.retained_manifest_blake3;
     let arena_pool = fixture.arena.context().pool_memory().unwrap();
     let (device_free_after_arena, device_total_after_arena) = gpu_memory_info();
     assert_eq!(device_total_after_arena, device_total_bytes);
     assert!(arena_pool.used_bytes >= fixture.allocation_bytes as usize);
     assert!(arena_pool.reserved_bytes >= arena_pool.used_bytes);
 
-    let columns = fixture.columns(&sn3.topology);
+    let columns = fixture.columns(&sn3.topology, &fixture.source_ids);
+    let retained_columns = fixture.columns(&retained_topology, &fixture.retained_source_ids);
     let destinations = fixture.destinations(&staged_requirements);
-    // Both prepared graphs remain live for alternating replay. Their immutable
-    // inputs, outputs, primary factor-32 tile, and overflow role may share
-    // because one stream executes and fences every sample. Setup mutates
-    // descriptors, so those stay disjoint.
-    let packed = prepare(
+    let control = prepare(
         &fixture,
         &columns,
         &destinations,
-        &fixture.packed_slots,
-        staged_config,
-        false,
-    );
-    let direct = prepare(
-        &fixture,
-        &columns,
-        &destinations,
-        &fixture.direct_slots,
+        &fixture.control_slots,
         staged_config,
         true,
+        &[SHARED_STAGED_OVERFLOW],
     );
-    let expected_schedule = PreparedNumeratorSchedule::StagedPackedSingleWrite {
-        packed_output_rows: 25_165_264,
-    };
-    let expected_direct_schedule = PreparedNumeratorSchedule::StagedGroupDirect {
-        output_rows: 25_165_264,
-    };
-    assert_eq!(packed.schedule(), expected_schedule);
-    assert_eq!(direct.schedule(), expected_direct_schedule);
-    let quotient_sources = direct.quotient_sources();
+    assert_eq!(
+        control.schedule(),
+        PreparedNumeratorSchedule::StagedGroupDirect {
+            output_rows: 25_165_264,
+        }
+    );
+    let quotient_sources = control.quotient_sources();
     let quotient = PreparedQuotientGraph::prepare(
         &fixture.arena,
         SN3_QUOTIENT_CONFIG,
@@ -192,21 +210,88 @@ fn sn3_staged_group_direct_cuda_event_benchmark() {
         &sn3.input_points,
         EAGER_LEGACY_POISON,
     );
+
+    // The packed implementation is an independent eager oracle only. Its
+    // descriptor workspace is then reused by the retained direct graph.
+    let (eager, eager_fri_input) = {
+        let oracle = prepare(
+            &fixture,
+            &columns,
+            &destinations,
+            &fixture.oracle_slots,
+            staged_config,
+            false,
+            &[SHARED_STAGED_OVERFLOW],
+        );
+        assert_eq!(
+            oracle.schedule(),
+            PreparedNumeratorSchedule::StagedPackedSingleWrite {
+                packed_output_rows: 25_165_264,
+            }
+        );
+        poison_fri_input(&fixture, &quotient, EAGER_LEGACY_POISON);
+        oracle.launch().unwrap();
+        quotient.launch().unwrap();
+        fixture.arena.context().sync().unwrap();
+        (
+            capture_canonical_output(&fixture, &staged_requirements),
+            capture_fri_input(&fixture, &quotient),
+        )
+    };
+
+    let retained = prepare(
+        &fixture,
+        &retained_columns,
+        &destinations,
+        &fixture.retained_slots,
+        retained_config,
+        true,
+        &[],
+    );
+    assert_eq!(
+        retained.schedule(),
+        PreparedNumeratorSchedule::StagedGroupDirect {
+            output_rows: 25_165_264,
+        }
+    );
+    assert_quotient_sources_same(&retained.quotient_sources(), &control.quotient_sources());
+
+    poison_outputs(&fixture, &staged_requirements, EAGER_LEGACY_POISON);
     poison_fri_input(&fixture, &quotient, EAGER_LEGACY_POISON);
-    packed.launch().unwrap();
+    control.launch().unwrap();
     quotient.launch().unwrap();
     fixture.arena.context().sync().unwrap();
-    let eager = capture_canonical_output(&fixture, &staged_requirements);
-    let eager_fri_input = capture_fri_input(&fixture, &quotient);
+    let eager_control_blake3 = assert_canonical_output(
+        &fixture,
+        &staged_requirements,
+        &eager,
+        "eager coefficient-direct",
+    );
+    let eager_control_fri_blake3 = assert_fri_input(
+        &fixture,
+        &quotient,
+        &eager_fri_input,
+        "eager coefficient-direct",
+    );
+
     poison_outputs(&fixture, &staged_requirements, EAGER_HYBRID_POISON);
     poison_fri_input(&fixture, &quotient, EAGER_HYBRID_POISON);
-    direct.launch().unwrap();
+    retained.launch().unwrap();
     quotient.launch().unwrap();
     fixture.arena.context().sync().unwrap();
-    let eager_direct_blake3 =
-        assert_canonical_output(&fixture, &staged_requirements, &eager, "eager group-direct");
-    let eager_direct_fri_blake3 =
-        assert_fri_input(&fixture, &quotient, &eager_fri_input, "eager group-direct");
+    let eager_retained_blake3 = assert_canonical_output(
+        &fixture,
+        &staged_requirements,
+        &eager,
+        "eager retained-direct",
+    );
+    let eager_retained_fri_blake3 = assert_fri_input(
+        &fixture,
+        &quotient,
+        &eager_fri_input,
+        "eager retained-direct",
+    );
+
     let validated_numerator_output_bytes = staged_requirements
         .groups
         .iter()
@@ -228,52 +313,151 @@ fn sn3_staged_group_direct_cuda_event_benchmark() {
     assert_eq!(eager_fri_input.len_bytes(), FRI_INPUT_OUTPUT_BYTES);
 
     let capture = fixture.arena.context().capture().unwrap();
-    packed.launch().unwrap();
+    control.launch().unwrap();
     quotient.launch().unwrap();
-    let packed_graph = capture.finish().unwrap();
+    let control_graph = capture.finish().unwrap();
     let capture = fixture.arena.context().capture().unwrap();
-    direct.launch().unwrap();
+    retained.launch().unwrap();
     quotient.launch().unwrap();
-    let direct_graph = capture.finish().unwrap();
+    let retained_graph = capture.finish().unwrap();
     assert_eq!(
-        direct_graph.kernel_nodes(),
-        packed_graph.kernel_nodes() + 18
+        control_graph.kernel_nodes(),
+        EXPECTED_CONTROL_GRAPH_KERNEL_NODES
+    );
+    assert_eq!(
+        retained_graph.kernel_nodes(),
+        EXPECTED_RETAINED_GRAPH_KERNEL_NODES
+    );
+    assert_eq!(
+        control_graph.kernel_nodes() - retained_graph.kernel_nodes(),
+        103
     );
     let (device_free_after_graphs, device_total_after_graphs) = gpu_memory_info();
     assert_eq!(device_total_after_graphs, device_total_bytes);
 
     poison_outputs(&fixture, &staged_requirements, CAPTURE_LEGACY_POISON);
     poison_fri_input(&fixture, &quotient, CAPTURE_LEGACY_POISON);
-    packed_graph.launch(fixture.arena.context()).unwrap();
+    control_graph.launch(fixture.arena.context()).unwrap();
     fixture.arena.context().sync().unwrap();
-    let captured_packed_blake3 =
-        assert_canonical_output(&fixture, &staged_requirements, &eager, "captured packed");
-    let captured_packed_fri_blake3 =
-        assert_fri_input(&fixture, &quotient, &eager_fri_input, "captured packed");
-    poison_outputs(&fixture, &staged_requirements, CAPTURE_HYBRID_POISON);
-    poison_fri_input(&fixture, &quotient, CAPTURE_HYBRID_POISON);
-    direct_graph.launch(fixture.arena.context()).unwrap();
-    fixture.arena.context().sync().unwrap();
-    let captured_direct_blake3 = assert_canonical_output(
+    let captured_control_blake3 = assert_canonical_output(
         &fixture,
         &staged_requirements,
         &eager,
-        "captured group-direct",
+        "captured coefficient-direct",
     );
-    let captured_direct_fri_blake3 = assert_fri_input(
+    let captured_control_fri_blake3 = assert_fri_input(
         &fixture,
         &quotient,
         &eager_fri_input,
-        "captured group-direct",
+        "captured coefficient-direct",
     );
+    poison_outputs(&fixture, &staged_requirements, CAPTURE_HYBRID_POISON);
+    poison_fri_input(&fixture, &quotient, CAPTURE_HYBRID_POISON);
+    retained_graph.launch(fixture.arena.context()).unwrap();
+    fixture.arena.context().sync().unwrap();
+    let captured_retained_blake3 = assert_canonical_output(
+        &fixture,
+        &staged_requirements,
+        &eager,
+        "captured retained-direct",
+    );
+    let captured_retained_fri_blake3 = assert_fri_input(
+        &fixture,
+        &quotient,
+        &eager_fri_input,
+        "captured retained-direct",
+    );
+
+    // Two uninterrupted retained replays prove the image is persistent and
+    // does not require a coefficient graph immediately before each launch.
+    let mut persistence_blake3 = Vec::with_capacity(2);
+    let mut persistence_fri_blake3 = Vec::with_capacity(2);
+    for replay in 0..2 {
+        poison_outputs(
+            &fixture,
+            &staged_requirements,
+            CAPTURE_HYBRID_POISON ^ replay,
+        );
+        poison_fri_input(&fixture, &quotient, CAPTURE_HYBRID_POISON ^ replay);
+        retained_graph.launch(fixture.arena.context()).unwrap();
+        fixture.arena.context().sync().unwrap();
+        persistence_blake3.push(assert_canonical_output(
+            &fixture,
+            &staged_requirements,
+            &eager,
+            "uninterrupted retained replay",
+        ));
+        persistence_fri_blake3.push(assert_fri_input(
+            &fixture,
+            &quotient,
+            &eager_fri_input,
+            "uninterrupted retained replay",
+        ));
+    }
+
+    // Poison one sampled resident column. A retained replay must consume the
+    // mutation, while the coefficient graph must rematerialize and restore it.
+    poison_retained_image(&fixture, MUTATED_RETAINED_COLUMN, RETAINED_IMAGE_POISON);
+    poison_outputs(&fixture, &staged_requirements, CAPTURE_HYBRID_POISON);
+    poison_fri_input(&fixture, &quotient, CAPTURE_HYBRID_POISON);
+    retained_graph.launch(fixture.arena.context()).unwrap();
+    fixture.arena.context().sync().unwrap();
+    let mutated_output = capture_canonical_output(&fixture, &staged_requirements);
+    let mutated_fri_input = capture_fri_input(&fixture, &quotient);
+    assert_ne!(
+        mutated_output.digest(),
+        eager.digest(),
+        "retained graph ignored the poisoned resident image"
+    );
+    assert_ne!(
+        mutated_fri_input.digest, eager_fri_input.digest,
+        "FRI boundary ignored the poisoned resident image"
+    );
+
+    control_graph.launch(fixture.arena.context()).unwrap();
+    fixture.arena.context().sync().unwrap();
+    let restored_control_blake3 = assert_canonical_output(
+        &fixture,
+        &staged_requirements,
+        &eager,
+        "coefficient-direct mutation restoration",
+    );
+    let restored_control_fri_blake3 = assert_fri_input(
+        &fixture,
+        &quotient,
+        &eager_fri_input,
+        "coefficient-direct mutation restoration",
+    );
+    for replay in 0..2 {
+        poison_outputs(
+            &fixture,
+            &staged_requirements,
+            POST_TIMING_HYBRID_POISON ^ replay,
+        );
+        poison_fri_input(&fixture, &quotient, POST_TIMING_HYBRID_POISON ^ replay);
+        retained_graph.launch(fixture.arena.context()).unwrap();
+        fixture.arena.context().sync().unwrap();
+        assert_canonical_output(
+            &fixture,
+            &staged_requirements,
+            &eager,
+            "restored retained persistence replay",
+        );
+        assert_fri_input(
+            &fixture,
+            &quotient,
+            &eager_fri_input,
+            "restored retained persistence replay",
+        );
+    }
 
     for round in 0..DEFAULT_WARMUPS {
         if round % 2 == 0 {
-            replay_cuda_ms(&packed_graph, fixture.arena.context());
-            replay_cuda_ms(&direct_graph, fixture.arena.context());
+            replay_cuda_ms(&control_graph, fixture.arena.context());
+            replay_cuda_ms(&retained_graph, fixture.arena.context());
         } else {
-            replay_cuda_ms(&direct_graph, fixture.arena.context());
-            replay_cuda_ms(&packed_graph, fixture.arena.context());
+            replay_cuda_ms(&retained_graph, fixture.arena.context());
+            replay_cuda_ms(&control_graph, fixture.arena.context());
         }
     }
 
@@ -287,215 +471,229 @@ fn sn3_staged_group_direct_cuda_event_benchmark() {
         .unwrap_or(DEFAULT_ITERATIONS);
     assert!(
         iterations >= 6 && iterations % 2 == 0,
-        "formal SN3 numerator-to-FRI-input A/B requires an even iteration count of at least six"
+        "formal coefficient-direct/retained-direct A/B requires an even iteration count of at least six"
     );
 
-    // These two replays are causally bound to full output validation. They are recorded
-    // separately and excluded from the benchmark distribution because D2H validation occurs
-    // between them.
     poison_outputs(&fixture, &staged_requirements, TIMED_LEGACY_POISON);
     poison_fri_input(&fixture, &quotient, TIMED_LEGACY_POISON);
-    let causal_validation_packed_ms = replay_cuda_ms(&packed_graph, fixture.arena.context());
-    let timed_packed_blake3 = assert_canonical_output(
+    let causal_validation_control_ms = replay_cuda_ms(&control_graph, fixture.arena.context());
+    let timed_control_blake3 = assert_canonical_output(
         &fixture,
         &staged_requirements,
         &eager,
-        "causal validation packed replay",
+        "causal validation coefficient-direct replay",
     );
-    let timed_packed_fri_blake3 = assert_fri_input(
+    let timed_control_fri_blake3 = assert_fri_input(
         &fixture,
         &quotient,
         &eager_fri_input,
-        "causal validation packed replay",
+        "causal validation coefficient-direct replay",
     );
     poison_outputs(&fixture, &staged_requirements, TIMED_HYBRID_POISON);
     poison_fri_input(&fixture, &quotient, TIMED_HYBRID_POISON);
-    let causal_validation_direct_ms = replay_cuda_ms(&direct_graph, fixture.arena.context());
-    let timed_direct_blake3 = assert_canonical_output(
+    let causal_validation_retained_ms = replay_cuda_ms(&retained_graph, fixture.arena.context());
+    let timed_retained_blake3 = assert_canonical_output(
         &fixture,
         &staged_requirements,
         &eager,
-        "causal validation group-direct replay",
+        "causal validation retained-direct replay",
     );
-    let timed_direct_fri_blake3 = assert_fri_input(
+    let timed_retained_fri_blake3 = assert_fri_input(
         &fixture,
         &quotient,
         &eager_fri_input,
-        "causal validation group-direct replay",
+        "causal validation retained-direct replay",
     );
 
-    // Re-establish an alternating steady state after poison/D2H validation. One unrecorded
-    // replay of each graph keeps the transition into measured iteration zero symmetric.
-    replay_cuda_ms(&packed_graph, fixture.arena.context());
-    replay_cuda_ms(&direct_graph, fixture.arena.context());
+    replay_cuda_ms(&control_graph, fixture.arena.context());
+    replay_cuda_ms(&retained_graph, fixture.arena.context());
 
-    let mut packed_ms = Vec::with_capacity(iterations);
-    let mut direct_ms = Vec::with_capacity(iterations);
+    let mut control_ms = Vec::with_capacity(iterations);
+    let mut retained_ms = Vec::with_capacity(iterations);
     for iteration in 0..iterations {
         if iteration % 2 == 0 {
-            packed_ms.push(replay_cuda_ms(&packed_graph, fixture.arena.context()));
-            direct_ms.push(replay_cuda_ms(&direct_graph, fixture.arena.context()));
+            control_ms.push(replay_cuda_ms(&control_graph, fixture.arena.context()));
+            retained_ms.push(replay_cuda_ms(&retained_graph, fixture.arena.context()));
         } else {
-            direct_ms.push(replay_cuda_ms(&direct_graph, fixture.arena.context()));
-            packed_ms.push(replay_cuda_ms(&packed_graph, fixture.arena.context()));
+            retained_ms.push(replay_cuda_ms(&retained_graph, fixture.arena.context()));
+            control_ms.push(replay_cuda_ms(&control_graph, fixture.arena.context()));
         }
     }
 
     poison_outputs(&fixture, &staged_requirements, POST_TIMING_LEGACY_POISON);
     poison_fri_input(&fixture, &quotient, POST_TIMING_LEGACY_POISON);
-    packed_graph.launch(fixture.arena.context()).unwrap();
+    control_graph.launch(fixture.arena.context()).unwrap();
     fixture.arena.context().sync().unwrap();
-    let post_timing_packed_blake3 =
-        assert_canonical_output(&fixture, &staged_requirements, &eager, "post-timing packed");
-    let post_timing_packed_fri_blake3 =
-        assert_fri_input(&fixture, &quotient, &eager_fri_input, "post-timing packed");
-    poison_outputs(&fixture, &staged_requirements, POST_TIMING_HYBRID_POISON);
-    poison_fri_input(&fixture, &quotient, POST_TIMING_HYBRID_POISON);
-    direct_graph.launch(fixture.arena.context()).unwrap();
-    fixture.arena.context().sync().unwrap();
-    let post_timing_direct_blake3 = assert_canonical_output(
+    let post_timing_control_blake3 = assert_canonical_output(
         &fixture,
         &staged_requirements,
         &eager,
-        "post-timing group-direct",
+        "post-timing coefficient-direct",
     );
-    let post_timing_direct_fri_blake3 = assert_fri_input(
+    let post_timing_control_fri_blake3 = assert_fri_input(
         &fixture,
         &quotient,
         &eager_fri_input,
-        "post-timing group-direct",
+        "post-timing coefficient-direct",
     );
-    let artifact_identity = artifact_identity();
+    poison_outputs(&fixture, &staged_requirements, POST_TIMING_HYBRID_POISON);
+    poison_fri_input(&fixture, &quotient, POST_TIMING_HYBRID_POISON);
+    retained_graph.launch(fixture.arena.context()).unwrap();
+    fixture.arena.context().sync().unwrap();
+    let post_timing_retained_blake3 = assert_canonical_output(
+        &fixture,
+        &staged_requirements,
+        &eager,
+        "post-timing retained-direct",
+    );
+    let post_timing_retained_fri_blake3 = assert_fri_input(
+        &fixture,
+        &quotient,
+        &eager_fri_input,
+        "post-timing retained-direct",
+    );
 
-    let packed_p50 = percentile(&packed_ms, 50);
-    let packed_p95 = percentile(&packed_ms, 95);
-    let direct_p50 = percentile(&direct_ms, 50);
-    let direct_p95 = percentile(&direct_ms, 95);
+    let artifact_identity = artifact_identity();
+    let control_p50 = percentile(&control_ms, 50);
+    let control_p95 = percentile(&control_ms, 95);
+    let retained_p50 = percentile(&retained_ms, 50);
+    let retained_p95 = percentile(&retained_ms, 95);
+    let boundary_source_projection_sha256: serde_json::Value =
+        serde_json::from_str(&artifact_identity.boundary_source_projection_json()).unwrap();
+    let boundary_cuda_module_sha256: serde_json::Value =
+        serde_json::from_str(&artifact_identity.boundary_cuda_module_json()).unwrap();
+    let control_samples: serde_json::Value =
+        serde_json::from_str(&json_samples(&control_ms)).unwrap();
+    let retained_samples: serde_json::Value =
+        serde_json::from_str(&json_samples(&retained_ms)).unwrap();
     println!(
-        concat!(
-            "{{\"schema\":\"stwo.sn3_numerator_to_fri_input_group_direct.cuda_event.v1\",",
-            "\"timing_scope\":\"per-replay CUDA-event device elapsed time for captured numerator then ordinary quotient-to-FRI-input graph\",",
-            "\"percentile_method\":\"nearest-rank\"," ,
-            "\"result_class\":\"diagnostic same-lineage packed/group-direct A/B; not independent mathematical truth\",",
-            "\"input_pattern\":\"input-recipe-sealed nonzero canonical-M31 affine row and twiddle patterns; bounded chunked upload\",",
-            "\"twiddle_provenance\":\"synthetic affine-pattern diagnostic; not transcript-derived canonical STARK twiddles\",",
-            "\"topology\":{{\"group_logs\":{:?},\"groups\":19,\"coefficient_columns\":161,",
-            "\"coefficient_sources\":152,\"staged_batches\":19,\"terms\":6341,",
-            "\"packed_output_rows\":25165264,\"quotient_lifting_log_size\":24,",
-            "\"quotient_subdomain_log_size\":23,\"log_blowup_factor\":1}},",
-            "\"bytes\":{{\"validated_numerator_output\":{}," ,
-            "\"validated_auxiliary_output\":{},\"validated_canonical_output\":{}," ,
-            "\"validated_fri_input_output\":{},\"incremental_quotient_workspace\":{}," ,
-            "\"shared_data_disjoint_descriptors_shared_staging_arena\":{}," ,
-            "\"descriptor_workspace_each\":{},\"shared_primary\":{}," ,
-            "\"shared_overflow\":{}}}," ,
-            "\"device_memory\":{{\"total\":{},\"free_before_arena\":{}," ,
-            "\"free_after_arena\":{},\"free_after_graph_instantiation\":{},",
-            "\"isolated_pool_used_after_arena\":{}," ,
-            "\"isolated_pool_reserved_after_arena\":{}}}," ,
-            "\"identity\":{{\"numerator_output_digest_encoding\":\"framed u32 little-endian v1\"," ,
-            "\"fri_input_digest_encoding\":\"contiguous [coord0|coord1|coord2|coord3] u32 little-endian v1\"," ,
-            "\"topology_fixture_blake3\":\"{}\"," ,
-            "\"input_recipe_encoding\":\"sealed numerator recipe v2 plus literal ordinary quotient requirements and inverse affine twiddle recipe v2\"," ,
-            "\"numerator_input_recipe_blake3\":\"{}\",\"boundary_input_recipe_blake3\":\"{}\"," ,
-            "\"eager_packed_blake3\":\"{}\"," ,
-            "\"eager_direct_blake3\":\"{}\",\"captured_packed_blake3\":\"{}\"," ,
-            "\"captured_direct_blake3\":\"{}\"," ,
-            "\"causal_validation_replays_excluded_from_samples\":true," ,
-            "\"causal_validation_packed_blake3\":\"{}\"," ,
-            "\"causal_validation_direct_blake3\":\"{}\",\"post_timing_packed_blake3\":\"{}\"," ,
-            "\"post_timing_direct_blake3\":\"{}\",\"capture_revalidated\":true," ,
-            "\"post_timing_revalidated\":true}}," ,
-            "\"fri_input_identity\":{{\"eager_packed_blake3\":\"{}\",",
-            "\"eager_direct_blake3\":\"{}\",\"captured_packed_blake3\":\"{}\",",
-            "\"captured_direct_blake3\":\"{}\",\"causal_validation_packed_blake3\":\"{}\",",
-            "\"causal_validation_direct_blake3\":\"{}\",\"post_timing_packed_blake3\":\"{}\",",
-            "\"post_timing_direct_blake3\":\"{}\",\"exact_word_comparison\":true}},",
-            "\"capture_topology\":{{\"packed_kernel_nodes\":{},\"group_direct_kernel_nodes\":{},",
-            "\"group_direct_minus_packed_kernel_nodes\":18}},",
-            "\"artifact_identity\":{{\"boundary_seal_blake3\":\"{}\"," ,
-            "\"boundary_rust_source_blake3\":\"{}\"," ,
-            "\"ordinary_cuda_source_blake3\":\"{}\"," ,
-            "\"test_binary_blake3\":\"{}\",\"boundary_source_projection_sha256\":{}," ,
-            "\"boundary_cuda_module_sha256\":{},\"cuda_build_mode\":\"{}\"," ,
-            "\"expected_cuda_module_build_identity\":\"{}\"," ,
-            "\"linked_cuda_module_build_identity\":\"{}\"," ,
-            "\"cuda_module_target_sms\":{:?}," ,
-            "\"archive_lto_covered_by_module_build_identity\":true," ,
-            "\"identity_complete\":{}}}," ,
-            "\"comparator\":{{\"lineage\":\"same staged LDE preparation, exact numerator ownership, and identical ordinary quotient tail; candidate replaces one packed row launch with one launch per exact group\"," ,
-            "\"numerator_comparator_source_blake3\":\"{}\"," ,
-            "\"independent_truth\":false}}," ,
-            "\"warmups_each\":{},\"equalization_replays_each\":1," ,
-            "\"iterations_each\":{},\"minimum_iterations\":6,\"iterations_must_be_even\":true," ,
-            "\"causal_validation_cuda_event_ms\":{{\"packed\":{:.6},\"group_direct\":{:.6},",
-            "\"excluded_from_samples\":true}}," ,
-            "\"samples_ms\":{{\"packed\":{},\"group_direct\":{}}}," ,
-            "\"cuda_event_ms\":{{\"packed\":{{\"p50\":{:.6},\"p95\":{:.6}}}," ,
-            "\"group_direct\":{{\"p50\":{:.6},\"p95\":{:.6}}}}}," ,
-            "\"speedup\":{{\"p50\":{:.9},\"p95\":{:.9}}}}}"
-        ),
-        GROUP_LOGS,
-        validated_numerator_output_bytes,
-        validated_auxiliary_output_bytes,
-        validated_canonical_output_bytes,
-        FRI_INPUT_OUTPUT_BYTES,
-        QUOTIENT_INCREMENTAL_ARENA_BYTES,
-        fixture.allocation_bytes,
-        STAGED_DESCRIPTOR_WORKSPACE_BYTES,
-        STAGED_PRIMARY_WORDS as u64 * 4,
-        STAGED_OVERFLOW_WORDS as u64 * 4,
-        device_total_bytes,
-        device_free_before_arena,
-        device_free_after_arena,
-        device_free_after_graphs,
-        arena_pool.used_bytes,
-        arena_pool.reserved_bytes,
-        sn3.digest,
-        input_recipe_blake3,
-        boundary_input_recipe_blake3,
-        eager.digest(),
-        eager_direct_blake3,
-        captured_packed_blake3,
-        captured_direct_blake3,
-        timed_packed_blake3,
-        timed_direct_blake3,
-        post_timing_packed_blake3,
-        post_timing_direct_blake3,
-        eager_fri_input.digest,
-        eager_direct_fri_blake3,
-        captured_packed_fri_blake3,
-        captured_direct_fri_blake3,
-        timed_packed_fri_blake3,
-        timed_direct_fri_blake3,
-        post_timing_packed_fri_blake3,
-        post_timing_direct_fri_blake3,
-        packed_graph.kernel_nodes(),
-        direct_graph.kernel_nodes(),
-        artifact_identity.boundary_seal_blake3,
-        artifact_identity.boundary_rust_source_blake3,
-        artifact_identity.ordinary_cuda_source_blake3,
-        artifact_identity.test_binary_blake3,
-        artifact_identity.boundary_source_projection_json(),
-        artifact_identity.boundary_cuda_module_json(),
-        artifact_identity.cuda_build_mode,
-        artifact_identity.expected_cuda_module_build_identity,
-        artifact_identity.linked_cuda_module_build_identity,
-        artifact_identity.cuda_module_target_sms,
-        artifact_identity.is_complete(),
-        artifact_identity.numerator_comparator_source_blake3,
-        DEFAULT_WARMUPS,
-        iterations,
-        causal_validation_packed_ms,
-        causal_validation_direct_ms,
-        json_samples(&packed_ms),
-        json_samples(&direct_ms),
-        packed_p50,
-        packed_p95,
-        direct_p50,
-        direct_p95,
-        packed_p50 / direct_p50,
-        packed_p95 / direct_p95,
+        "{}",
+        serde_json::json!({
+            "schema": "stwo.sn3_numerator_to_fri_input_fixed_image.cuda_event.v1",
+            "timing_scope": "per-replay CUDA-event device elapsed time for captured numerator then ordinary quotient-to-FRI-input graph",
+            "result_class": "CURRENT TOPOLOGY / 0 NEW DELIVERY CREDIT; same-binary retained-direct versus coefficient-direct counterfactual; not end-to-end proof MHz",
+            "topology": {
+                "groups": 19,
+                "terms": 6_341,
+                "control_staged_batches": 19,
+                "retained_staged_batches": 18,
+                "converted_control_lde_aliases": RETAINED_COLUMN_COUNT,
+                "retained_evaluation_log_sizes": retained_requirements.batches.iter().map(|batch| batch.evaluation_log_size).collect::<Vec<_>>(),
+                "retained_coefficient_sources": 0,
+                "output_rows": 25_165_264,
+            },
+            "bytes": {
+                "validated_numerator_output": validated_numerator_output_bytes,
+                "validated_auxiliary_output": validated_auxiliary_output_bytes,
+                "validated_canonical_output": validated_canonical_output_bytes,
+                "validated_fri_input_output": FRI_INPUT_OUTPUT_BYTES,
+                "retained_image": RETAINED_IMAGE_WORDS as u64 * 4,
+                "arena": fixture.allocation_bytes,
+                "candidate_additional_physical": 0,
+                "descriptor_workspace_each": STAGED_DESCRIPTOR_WORKSPACE_BYTES,
+                "control_primary": STAGED_PRIMARY_WORDS as u64 * 4,
+                "control_overflow": STAGED_OVERFLOW_WORDS as u64 * 4,
+                "retained_staging_roles": 0,
+                "incremental_quotient_workspace": QUOTIENT_INCREMENTAL_ARENA_BYTES,
+            },
+            "device_memory": {
+                "total": device_total_bytes,
+                "free_before_arena": device_free_before_arena,
+                "free_after_arena": device_free_after_arena,
+                "free_after_graph_instantiation": device_free_after_graphs,
+                "isolated_pool_used_after_arena": arena_pool.used_bytes,
+                "isolated_pool_reserved_after_arena": arena_pool.reserved_bytes,
+            },
+            "identity": {
+                "topology_fixture_blake3": sn3.digest.to_string(),
+                "numerator_input_recipe_blake3": input_recipe_blake3.to_string(),
+                "boundary_input_recipe_blake3": boundary_input_recipe_blake3.to_string(),
+                "retained_manifest_blake3": retained_manifest_blake3.to_string(),
+                "oracle_blake3": eager.digest().to_string(),
+                "eager_control_blake3": eager_control_blake3.to_string(),
+                "eager_retained_blake3": eager_retained_blake3.to_string(),
+                "captured_control_blake3": captured_control_blake3.to_string(),
+                "captured_retained_blake3": captured_retained_blake3.to_string(),
+                "persistence_blake3": persistence_blake3.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                "mutation_numerator_blake3": mutated_output.digest().to_string(),
+                "restored_control_blake3": restored_control_blake3.to_string(),
+                "causal_control_blake3": timed_control_blake3.to_string(),
+                "causal_retained_blake3": timed_retained_blake3.to_string(),
+                "post_timing_control_blake3": post_timing_control_blake3.to_string(),
+                "post_timing_retained_blake3": post_timing_retained_blake3.to_string(),
+            },
+            "fri_input_identity": {
+                "oracle_blake3": eager_fri_input.digest.to_string(),
+                "eager_control_blake3": eager_control_fri_blake3.to_string(),
+                "eager_retained_blake3": eager_retained_fri_blake3.to_string(),
+                "captured_control_blake3": captured_control_fri_blake3.to_string(),
+                "captured_retained_blake3": captured_retained_fri_blake3.to_string(),
+                "persistence_blake3": persistence_fri_blake3.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                "mutation_blake3": mutated_fri_input.digest.to_string(),
+                "restored_control_blake3": restored_control_fri_blake3.to_string(),
+                "causal_control_blake3": timed_control_fri_blake3.to_string(),
+                "causal_retained_blake3": timed_retained_fri_blake3.to_string(),
+                "post_timing_control_blake3": post_timing_control_fri_blake3.to_string(),
+                "post_timing_retained_blake3": post_timing_retained_fri_blake3.to_string(),
+                "exact_word_comparison": true,
+            },
+            "correctness": {
+                "candidate_only_consecutive_replays": 2,
+                "mutation_consumed": true,
+                "control_restored_image": true,
+                "post_restore_candidate_only_replays": 2,
+                "capture_revalidated": true,
+                "post_timing_revalidated": true,
+            },
+            "capture_topology": {
+                "control_kernel_nodes": control_graph.kernel_nodes(),
+                "retained_kernel_nodes": retained_graph.kernel_nodes(),
+                "removed_kernel_nodes": control_graph.kernel_nodes() - retained_graph.kernel_nodes(),
+            },
+            "artifact_identity": {
+                "boundary_seal_blake3": artifact_identity.boundary_seal_blake3.to_string(),
+                "boundary_rust_source_blake3": artifact_identity.boundary_rust_source_blake3.to_string(),
+                "ordinary_cuda_source_blake3": artifact_identity.ordinary_cuda_source_blake3.to_string(),
+                "test_binary_blake3": artifact_identity.test_binary_blake3.to_string(),
+                "boundary_source_projection_sha256": boundary_source_projection_sha256,
+                "boundary_cuda_module_sha256": boundary_cuda_module_sha256,
+                "cuda_build_mode": artifact_identity.cuda_build_mode,
+                "expected_cuda_module_build_identity": artifact_identity.expected_cuda_module_build_identity.to_string(),
+                "linked_cuda_module_build_identity": artifact_identity.linked_cuda_module_build_identity.to_string(),
+                "cuda_module_target_sms": artifact_identity.cuda_module_target_sms,
+                "identity_complete": artifact_identity.is_complete(),
+            },
+            "comparator": {
+                "control": "counterfactual coefficient-direct; materializes all 152 sampled coefficient LDEs every replay",
+                "candidate": "current-policy analogue retained-direct; consumes all 152 resident evaluation aliases and materializes no coefficient sources",
+                "delivery_credit": "zero; this measures work already retired by the corrected production FixedImage policy",
+                "cold_retained_image_setup_in_timing": false,
+                "numerator_comparator_source_blake3": artifact_identity.numerator_comparator_source_blake3.to_string(),
+                "independent_truth": false,
+            },
+            "warmups_each": DEFAULT_WARMUPS,
+            "equalization_replays_each": 1,
+            "iterations_each": iterations,
+            "causal_validation_cuda_event_ms": {
+                "control": causal_validation_control_ms,
+                "retained": causal_validation_retained_ms,
+                "excluded_from_samples": true,
+            },
+            "samples_ms": {
+                "control": control_samples,
+                "retained": retained_samples,
+            },
+            "cuda_event_ms": {
+                "control": {"p50": control_p50, "p95": control_p95},
+                "retained": {"p50": retained_p50, "p95": retained_p95},
+            },
+            "speedup": {
+                "p50": control_p50 / retained_p50,
+                "p95": control_p95 / retained_p95,
+                "current_topology_vs_counterfactual_saved_p50_ms": control_p50 - retained_p50,
+                "new_delivery_credit_ms": 0.0,
+            },
+        })
     );
 }
 
@@ -544,13 +742,31 @@ fn sn3_input_recipe_is_deterministic_and_shape_exact() {
     )
     .unwrap();
     assert_staged_sn3_shape(&requirements, &staged);
-    let plan = benchmark_arena_plan(&sn3.topology, &requirements, &quotient_requirements);
+    let retained_topology = retained_topology(&sn3.topology, &staged);
+    let retained_config = config;
+    let retained_requirements =
+        quotient_numerator_workspace_requirements(retained_config, &retained_topology).unwrap();
+    let retained = quotient_numerator_staged_single_write_plan_with_overflow_capacities(
+        retained_config,
+        &retained_topology,
+        &[],
+    )
+    .unwrap();
+    assert_retained_sn3_shape(&retained_requirements, &retained);
+    let plan = benchmark_arena_plan(
+        &sn3.topology,
+        &requirements,
+        &staged,
+        &retained_requirements,
+        &quotient_requirements,
+    );
     assert_eq!(plan.allocation_bytes, EXPECTED_SN3_ARENA_BYTES);
     assert_descriptor_workspaces_are_disjoint(
         &requirements,
-        &plan.packed_slots,
-        &plan.direct_slots,
+        &plan.oracle_slots,
+        &plan.control_slots,
     );
+    assert_reused_workspace_shape(&plan, &staged);
 }
 
 fn assert_sn3_shape(
@@ -650,9 +866,52 @@ fn staged_config(
     }
 }
 
+fn retained_topology(
+    control: &[QuotientNumeratorColumnTopology],
+    staged: &QuotientNumeratorStagedSingleWritePlan,
+) -> Vec<QuotientNumeratorColumnTopology> {
+    let mut retained = control.to_vec();
+    assert_eq!(staged.coefficient_ldes().len(), RETAINED_COLUMN_COUNT);
+    for lde in staged.coefficient_ldes() {
+        let column_index = lde.column();
+        let column = &mut retained[column_index];
+        assert_eq!(
+            column.source_kind,
+            QuotientNumeratorSourceKind::Coefficients
+        );
+        assert!(
+            !column.samples.is_empty(),
+            "retained FixedImage column {column_index} must be sampled"
+        );
+        assert_eq!(lde.evaluation_log_size(), column.coefficient_log_size + 1);
+        column.source_kind = QuotientNumeratorSourceKind::Evaluation;
+    }
+    assert_eq!(
+        retained
+            .iter()
+            .filter(|column| {
+                column.source_kind == QuotientNumeratorSourceKind::Evaluation
+                    && !column.samples.is_empty()
+            })
+            .count()
+            - control
+                .iter()
+                .filter(|column| {
+                    column.source_kind == QuotientNumeratorSourceKind::Evaluation
+                        && !column.samples.is_empty()
+                })
+                .count(),
+        RETAINED_COLUMN_COUNT,
+    );
+    assert!(retained.iter().all(|column| {
+        column.source_kind == QuotientNumeratorSourceKind::Evaluation || column.samples.is_empty()
+    }));
+    retained
+}
+
 fn assert_staged_sn3_shape(
     requirements: &QuotientNumeratorWorkspaceRequirements,
-    staged: &stwo_backend_cuda::QuotientNumeratorStagedSingleWritePlan,
+    staged: &QuotientNumeratorStagedSingleWritePlan,
 ) {
     assert_eq!(requirements.config.max_lde_tile_words, STAGED_PRIMARY_WORDS);
     assert_eq!(requirements.batches.len(), 19);
@@ -676,23 +935,77 @@ fn assert_staged_sn3_shape(
     assert_eq!(report.overflow_staging_role_count, 1);
 }
 
+fn assert_retained_sn3_shape(
+    requirements: &QuotientNumeratorWorkspaceRequirements,
+    staged: &QuotientNumeratorStagedSingleWritePlan,
+) {
+    assert_eq!(requirements.config.max_lde_tile_words, STAGED_PRIMARY_WORDS);
+    assert_eq!(
+        requirements.config.lifting_log_size,
+        EXPECTED_SN3_TOPOLOGY_CONFIG.lifting_log_size
+    );
+    assert_eq!(
+        requirements.config.log_blowup_factor,
+        EXPECTED_SN3_TOPOLOGY_CONFIG.log_blowup_factor
+    );
+    assert_eq!(requirements.batches.len(), 18);
+    assert_eq!(requirements.term_count, TERMS);
+    assert_eq!(
+        requirements
+            .groups
+            .iter()
+            .map(|group| group.log_size)
+            .collect::<Vec<_>>(),
+        GROUP_LOGS
+    );
+    assert_eq!(requirements.groups[0].coefficient_source_count, 0);
+    assert_eq!(
+        requirements
+            .batches
+            .iter()
+            .map(|batch| batch.coefficient_count)
+            .sum::<usize>(),
+        0
+    );
+    assert_eq!(requirements.lde_tile_words, 0);
+    assert_eq!(requirements.forward_twiddle_words, 0);
+    assert_eq!(staged.requirements(), requirements);
+    assert_eq!(staged.packed_output_rows(), 25_165_264);
+    assert!(staged.coefficient_ldes().is_empty());
+    assert!(staged.overflow_role_words().is_empty());
+    let report = staged.report();
+    assert_eq!(report.factor32_batch_count, 18);
+    assert_eq!(report.coefficient_source_count, 0);
+    assert_eq!(report.total_staging_words, 0);
+    assert_eq!(report.factor32_staging_words, 0);
+    assert_eq!(report.primary_staging_words, 0);
+    assert_eq!(report.overflow_staging_words, 0);
+    assert_eq!(report.overflow_staging_role_count, 0);
+}
+
 struct BenchmarkArena {
     arena: DeviceArena,
-    packed_slots: QuotientNumeratorWorkspaceSlots,
-    direct_slots: QuotientNumeratorWorkspaceSlots,
+    oracle_slots: QuotientNumeratorWorkspaceSlots,
+    control_slots: QuotientNumeratorWorkspaceSlots,
+    retained_slots: QuotientNumeratorWorkspaceSlots,
     quotient_slots: QuotientWorkspaceSlots,
     source_ids: Vec<ArenaSlotId>,
+    retained_source_ids: Vec<ArenaSlotId>,
     destination_ids: Vec<[ArenaSlotId; 4]>,
+    retained_manifest_blake3: Hash,
     allocation_bytes: u64,
 }
 
 struct BenchmarkArenaPlan {
     layout: ArenaLayout,
-    packed_slots: QuotientNumeratorWorkspaceSlots,
-    direct_slots: QuotientNumeratorWorkspaceSlots,
+    oracle_slots: QuotientNumeratorWorkspaceSlots,
+    control_slots: QuotientNumeratorWorkspaceSlots,
+    retained_slots: QuotientNumeratorWorkspaceSlots,
     quotient_slots: QuotientWorkspaceSlots,
     source_ids: Vec<ArenaSlotId>,
+    retained_source_ids: Vec<ArenaSlotId>,
     destination_ids: Vec<[ArenaSlotId; 4]>,
+    retained_manifest_blake3: Hash,
     allocation_bytes: u64,
 }
 
@@ -700,17 +1013,28 @@ impl BenchmarkArena {
     fn new(
         topology: &[QuotientNumeratorColumnTopology],
         requirements: &QuotientNumeratorWorkspaceRequirements,
+        staged: &QuotientNumeratorStagedSingleWritePlan,
+        retained_requirements: &QuotientNumeratorWorkspaceRequirements,
         quotient_requirements: &QuotientWorkspaceRequirements,
     ) -> Self {
-        let plan = benchmark_arena_plan(topology, requirements, quotient_requirements);
+        let plan = benchmark_arena_plan(
+            topology,
+            requirements,
+            staged,
+            retained_requirements,
+            quotient_requirements,
+        );
         let arena = DeviceArena::new(CudaExecContext::new().unwrap(), plan.layout).unwrap();
         Self {
             arena,
-            packed_slots: plan.packed_slots,
-            direct_slots: plan.direct_slots,
+            oracle_slots: plan.oracle_slots,
+            control_slots: plan.control_slots,
+            retained_slots: plan.retained_slots,
             quotient_slots: plan.quotient_slots,
             source_ids: plan.source_ids,
+            retained_source_ids: plan.retained_source_ids,
             destination_ids: plan.destination_ids,
+            retained_manifest_blake3: plan.retained_manifest_blake3,
             allocation_bytes: plan.allocation_bytes,
         }
     }
@@ -718,10 +1042,12 @@ impl BenchmarkArena {
     fn columns(
         &self,
         topology: &[QuotientNumeratorColumnTopology],
+        source_ids: &[ArenaSlotId],
     ) -> Vec<QuotientNumeratorColumn> {
+        assert_eq!(topology.len(), source_ids.len());
         topology
             .iter()
-            .zip(&self.source_ids)
+            .zip(source_ids)
             .map(|(topology, &id)| QuotientNumeratorColumn {
                 coefficient_log_size: topology.coefficient_log_size,
                 source: match topology.source_kind {
@@ -756,14 +1082,21 @@ impl BenchmarkArena {
 fn benchmark_arena_plan(
     topology: &[QuotientNumeratorColumnTopology],
     requirements: &QuotientNumeratorWorkspaceRequirements,
+    staged: &QuotientNumeratorStagedSingleWritePlan,
+    retained_requirements: &QuotientNumeratorWorkspaceRequirements,
     quotient_requirements: &QuotientWorkspaceRequirements,
 ) -> BenchmarkArenaPlan {
-    let packed_slots = workspace_slots(requirements, PACKED_WORKSPACE_BASE);
-    let direct_slots = workspace_slots(requirements, DIRECT_WORKSPACE_BASE);
+    let oracle_slots = workspace_slots(requirements, PACKED_WORKSPACE_BASE, SHARED_STAGED_PRIMARY);
+    let control_slots = workspace_slots(requirements, DIRECT_WORKSPACE_BASE, SHARED_STAGED_PRIMARY);
+    let retained_slots = workspace_slots(
+        retained_requirements,
+        PACKED_WORKSPACE_BASE,
+        SHARED_STAGED_PRIMARY,
+    );
     let quotient_slots = quotient_workspace_slots();
     let mut specs = Vec::new();
     let mut cursor = 0usize;
-    for slots in [&packed_slots, &direct_slots] {
+    for slots in [&oracle_slots, &control_slots] {
         let workspace_start = cursor;
         for requirement in requirements.arena_slot_requirements(slots).unwrap() {
             if requirement.id == SHARED_STAGED_PRIMARY {
@@ -853,13 +1186,89 @@ fn benchmark_arena_plan(
     assert_eq!(cursor - quotient_start, QUOTIENT_INCREMENTAL_ARENA_WORDS);
     let allocation_bytes = (cursor as u64).checked_mul(4).unwrap();
     assert!(allocation_bytes <= MAX_BENCHMARK_ARENA_BYTES);
+
+    assert_workspace_capacity(retained_requirements, &retained_slots, &specs);
+    let primary = slot_spec(&specs, SHARED_STAGED_PRIMARY);
+    let overflow = slot_spec(&specs, SHARED_STAGED_OVERFLOW);
+    let mut ranges = specs
+        .iter()
+        .copied()
+        .map(|slot| ArenaRangeSpec {
+            live_mask: if matches!(slot.id, SHARED_STAGED_PRIMARY | SHARED_STAGED_OVERFLOW) {
+                CONTROL_LIVE
+            } else {
+                BOTH_LIVE
+            },
+            slot,
+        })
+        .collect::<Vec<_>>();
+
+    let mut retained_source_ids = source_ids.clone();
+    let mut retained_primary_columns = 0usize;
+    let mut retained_overflow_columns = 0usize;
+    let mut retained_image_words = 0usize;
+    for lde in staged.coefficient_ldes() {
+        let role_base = match lde.staging_role() {
+            QuotientNumeratorStagingRole::Primary => {
+                retained_primary_columns += 1;
+                primary.offset_words
+            }
+            QuotientNumeratorStagingRole::Overflow(0) => {
+                retained_overflow_columns += 1;
+                overflow.offset_words
+            }
+            role => panic!("retained FixedImage column uses unexpected staging role {role:?}"),
+        };
+        retained_image_words = retained_image_words.checked_add(lde.len_words()).unwrap();
+        let id = retained_image_id(lde.column());
+        retained_source_ids[lde.column()] = id;
+        ranges.push(ArenaRangeSpec {
+            slot: ArenaSlotSpec {
+                id,
+                offset_words: role_base + lde.role_offset_words(),
+                len_words: lde.len_words(),
+                alignment_words: 8,
+            },
+            live_mask: RETAINED_LIVE,
+        });
+    }
+    assert_eq!(retained_primary_columns, 125);
+    assert_eq!(retained_overflow_columns, 27);
+    assert_eq!(retained_image_words, RETAINED_IMAGE_WORDS);
+    assert_eq!(
+        staged
+            .coefficient_ldes()
+            .iter()
+            .map(|lde| retained_source_ids[lde.column()])
+            .collect::<Vec<_>>(),
+        staged
+            .coefficient_ldes()
+            .iter()
+            .map(|lde| retained_image_id(lde.column()))
+            .collect::<Vec<_>>()
+    );
+    assert!(staged
+        .coefficient_ldes()
+        .iter()
+        .any(|lde| lde.column() == MUTATED_RETAINED_COLUMN));
+    let layout = unsafe {
+        // SAFETY: control and retained graphs run on one explicit stream and
+        // every transition is synchronized. CONTROL_LIVE owns coefficient
+        // staging; RETAINED_LIVE owns disjoint aliases of those same bytes.
+        ArenaLayout::new_reused(cursor, &ranges)
+    }
+    .unwrap();
+    let retained_manifest_blake3 = retained_manifest_digest(&layout, staged);
     BenchmarkArenaPlan {
-        layout: ArenaLayout::new(cursor, &specs).unwrap(),
-        packed_slots,
-        direct_slots,
+        layout,
+        oracle_slots,
+        control_slots,
+        retained_slots,
         quotient_slots,
         source_ids,
+        retained_source_ids,
         destination_ids,
+        retained_manifest_blake3,
         allocation_bytes,
     }
 }
@@ -867,6 +1276,7 @@ fn benchmark_arena_plan(
 fn workspace_slots(
     requirements: &QuotientNumeratorWorkspaceRequirements,
     base: u32,
+    lde_tile: ArenaSlotId,
 ) -> QuotientNumeratorWorkspaceSlots {
     let id = |offset| ArenaSlotId(base + offset);
     QuotientNumeratorWorkspaceSlots {
@@ -884,7 +1294,7 @@ fn workspace_slots(
         coefficient_sizes: (requirements.coefficient_size_words != 0).then_some(id(11)),
         coefficient_output_ptrs: (requirements.coefficient_output_pointer_words != 0)
             .then_some(id(12)),
-        lde_tile: (requirements.lde_tile_words != 0).then_some(SHARED_STAGED_PRIMARY),
+        lde_tile: (requirements.lde_tile_words != 0).then_some(lde_tile),
     }
 }
 
@@ -921,6 +1331,162 @@ fn assert_descriptor_workspaces_are_disjoint(
             .all(|right| left.id != right.id)));
 }
 
+fn assert_workspace_capacity(
+    retained_requirements: &QuotientNumeratorWorkspaceRequirements,
+    retained_slots: &QuotientNumeratorWorkspaceSlots,
+    specs: &[ArenaSlotSpec],
+) {
+    for requirement in retained_requirements
+        .arena_slot_requirements(retained_slots)
+        .unwrap()
+    {
+        let allocated = slot_spec(specs, requirement.id);
+        assert!(
+            allocated.len_words >= requirement.len_words,
+            "retained descriptor {:?} needs {} words but the reused oracle slot has {}",
+            requirement.id,
+            requirement.len_words,
+            allocated.len_words
+        );
+        assert_eq!(
+            allocated.offset_words % requirement.alignment_words,
+            0,
+            "retained descriptor {:?} alignment drift",
+            requirement.id
+        );
+    }
+}
+
+fn assert_reused_workspace_shape(
+    plan: &BenchmarkArenaPlan,
+    staged: &QuotientNumeratorStagedSingleWritePlan,
+) {
+    assert_eq!(plan.oracle_slots.lde_tile, Some(SHARED_STAGED_PRIMARY));
+    assert_eq!(plan.control_slots.lde_tile, Some(SHARED_STAGED_PRIMARY));
+    assert_eq!(plan.retained_slots.lde_tile, None);
+    assert_eq!(plan.retained_slots.coefficient_ptrs, None);
+    assert_eq!(plan.retained_slots.coefficient_sizes, None);
+    assert_eq!(plan.retained_slots.coefficient_output_ptrs, None);
+    assert_eq!(
+        [
+            plan.retained_slots.runtime_terms,
+            plan.retained_slots.group_term_indices,
+            plan.retained_slots.group_offsets,
+            plan.retained_slots.line_coefficients,
+            plan.retained_slots.term_points,
+            plan.retained_slots.batch_terms,
+            plan.retained_slots.batch_group_offsets,
+            plan.retained_slots.batch_source_ptrs,
+            plan.retained_slots.output_ptrs,
+            plan.retained_slots.output_log_sizes,
+        ],
+        [
+            plan.oracle_slots.runtime_terms,
+            plan.oracle_slots.group_term_indices,
+            plan.oracle_slots.group_offsets,
+            plan.oracle_slots.line_coefficients,
+            plan.oracle_slots.term_points,
+            plan.oracle_slots.batch_terms,
+            plan.oracle_slots.batch_group_offsets,
+            plan.oracle_slots.batch_source_ptrs,
+            plan.oracle_slots.output_ptrs,
+            plan.oracle_slots.output_log_sizes,
+        ]
+    );
+
+    let primary = plan.layout.slot(SHARED_STAGED_PRIMARY).unwrap();
+    let overflow = plan.layout.slot(SHARED_STAGED_OVERFLOW).unwrap();
+    assert_eq!(primary.len_words, STAGED_PRIMARY_WORDS);
+    assert_eq!(overflow.len_words, STAGED_OVERFLOW_WORDS);
+    let mut words = 0usize;
+    for lde in staged.coefficient_ldes() {
+        let slot = plan.layout.slot(retained_image_id(lde.column())).unwrap();
+        let role_base = match lde.staging_role() {
+            QuotientNumeratorStagingRole::Primary => primary.offset_words,
+            QuotientNumeratorStagingRole::Overflow(0) => overflow.offset_words,
+            role => panic!("retained FixedImage column uses unexpected staging role {role:?}"),
+        };
+        assert_eq!(slot.offset_words, role_base + lde.role_offset_words());
+        assert_eq!(slot.len_words, lde.len_words());
+        words = words.checked_add(slot.len_words).unwrap();
+    }
+    assert_eq!(words, RETAINED_IMAGE_WORDS);
+    assert_eq!(
+        RETAINED_IMAGE_WORDS as u64 * 4,
+        3_919_863_424,
+        "all 152 sampled coefficient LDE aliases must retain the exact control image"
+    );
+}
+
+fn slot_spec(specs: &[ArenaSlotSpec], id: ArenaSlotId) -> ArenaSlotSpec {
+    specs
+        .iter()
+        .copied()
+        .find(|spec| spec.id == id)
+        .unwrap_or_else(|| panic!("missing arena slot {id:?}"))
+}
+
+fn retained_image_id(column: usize) -> ArenaSlotId {
+    ArenaSlotId(
+        RETAINED_IMAGE_BASE
+            .checked_add(u32::try_from(column).unwrap())
+            .unwrap(),
+    )
+}
+
+fn retained_manifest_digest(
+    layout: &ArenaLayout,
+    staged: &QuotientNumeratorStagedSingleWritePlan,
+) -> Hash {
+    let mut hasher = Hasher::new();
+    hasher.update(b"stwo.sn3-fixed-image-arena-manifest.v1\0");
+    for lde in staged.coefficient_ldes() {
+        let id = retained_image_id(lde.column());
+        let slot = layout.slot(id).unwrap();
+        for value in [
+            u64::try_from(lde.column()).unwrap(),
+            u64::from(lde.evaluation_log_size()),
+            u64::from(id.0),
+            u64::try_from(slot.offset_words).unwrap(),
+            u64::try_from(slot.len_words).unwrap(),
+            u64::try_from(slot.alignment_words).unwrap(),
+        ] {
+            hasher.update(&value.to_le_bytes());
+        }
+    }
+    hasher.finalize()
+}
+
+fn assert_quotient_sources_same(
+    retained: &[QuotientNumeratorSource],
+    control: &[QuotientNumeratorSource],
+) {
+    assert_eq!(retained.len(), control.len());
+    for (index, (retained, control)) in retained.iter().zip(control).enumerate() {
+        assert_eq!(retained.log_size, control.log_size, "source {index} log");
+        assert_eq!(
+            retained.constants.sample_point, control.constants.sample_point,
+            "source {index} sample point"
+        );
+        assert_eq!(
+            retained.constants.first_linear_term_acc, control.constants.first_linear_term_acc,
+            "source {index} first linear term"
+        );
+        for coordinate in 0..4 {
+            assert_eq!(
+                retained.coordinates[coordinate].id(),
+                control.coordinates[coordinate].id(),
+                "source {index} coordinate {coordinate} id"
+            );
+            assert_eq!(
+                retained.coordinates[coordinate].len_words(),
+                control.coordinates[coordinate].len_words(),
+                "source {index} coordinate {coordinate} length"
+            );
+        }
+    }
+}
+
 fn push_spec(
     specs: &mut Vec<ArenaSlotSpec>,
     cursor: &mut usize,
@@ -954,6 +1520,7 @@ fn prepare<'a>(
     slots: &QuotientNumeratorWorkspaceSlots,
     config: QuotientNumeratorWorkspaceConfig,
     group_direct: bool,
+    overflow_role_ids: &[ArenaSlotId],
 ) -> PreparedQuotientNumeratorGraph<'a> {
     let arguments = (
         fixture.arena.bind(OODS_POINTS).unwrap(),
@@ -963,7 +1530,10 @@ fn prepare<'a>(
         fixture.arena.bind(FIRST_TERMS_OUTPUT).unwrap(),
         fixture.arena.bind(TWIDDLES).unwrap(),
     );
-    let overflow_roles = [fixture.arena.bind(SHARED_STAGED_OVERFLOW).unwrap()];
+    let overflow_roles = overflow_role_ids
+        .iter()
+        .map(|&id| fixture.arena.bind(id).unwrap())
+        .collect::<Vec<_>>();
     if group_direct {
         PreparedQuotientNumeratorGraph::prepare_staged_group_direct(
             &fixture.arena,
@@ -1123,6 +1693,18 @@ fn poison_fri_input(fixture: &BenchmarkArena, quotient: &PreparedQuotientGraph<'
             .arena
             .context()
             .fill_u32_async(output.as_u32_ptr(), poison, output.len_words())
+            .unwrap();
+    }
+    fixture.arena.context().sync().unwrap();
+}
+
+fn poison_retained_image(fixture: &BenchmarkArena, column: usize, poison: u32) {
+    let image = fixture.arena.bind(retained_image_id(column)).unwrap();
+    unsafe {
+        fixture
+            .arena
+            .context()
+            .fill_u32_async(image.as_u32_ptr(), poison, image.len_words())
             .unwrap();
     }
     fixture.arena.context().sync().unwrap();
