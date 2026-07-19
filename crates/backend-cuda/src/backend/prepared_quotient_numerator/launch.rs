@@ -230,6 +230,35 @@ impl PreparedQuotientNumeratorGraph<'_> {
         self.launch_group_direct_contribution_tiled(ranges, stream)
     }
 
+    /// Dormant native-domain run-sum candidate. Setup has already sealed the
+    /// scratch victim, raw ABI, and physical liveness proof.
+    #[doc(hidden)]
+    pub fn launch_group_direct_run_sum_candidate(
+        &self,
+    ) -> Result<(), PreparedQuotientNumeratorError> {
+        if !matches!(
+            self.schedule,
+            PreparedNumeratorSchedule::StagedGroupDirect { .. }
+        ) {
+            return Err(PreparedQuotientNumeratorError::RunSumScheduleInvariant(
+                "run-sum candidate requires the group-direct schedule",
+            ));
+        }
+        let use_run_sum = self.validate_group_direct_run_sum()?;
+        let (_, _, stream) = self.prepare_terms_and_groups()?;
+        self.launch_all_staged_ldes(stream)?;
+        if use_run_sum {
+            self.launch_bound_group_direct_run_sum(stream)
+        } else {
+            self.launch_group_direct(
+                self.group_direct_ranges
+                    .as_deref()
+                    .expect("validated group-direct ranges"),
+                stream,
+            )
+        }
+    }
+
     fn launch_group_direct_tiled_candidate(
         &self,
         tile_words: u32,
@@ -294,6 +323,33 @@ impl PreparedQuotientNumeratorGraph<'_> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn production_launch_does_not_select_the_run_sum_candidate() {
+        let source = include_str!("launch.rs");
+        let start = source.find("pub fn launch(&self)").unwrap();
+        let end = source[start..]
+            .find("/// Exact 4-KiB diagnostic seam")
+            .map(|offset| start + offset)
+            .unwrap();
+        assert!(!source[start..end].contains("run_sum"));
+    }
+
+    #[test]
+    fn missing_run_sum_binding_falls_back_to_group_direct() {
+        let source = include_str!("launch.rs");
+        let start = source
+            .find("pub fn launch_group_direct_run_sum_candidate")
+            .unwrap();
+        let end = source[start..]
+            .find("fn launch_group_direct_tiled_candidate")
+            .map(|offset| start + offset)
+            .unwrap();
+        let candidate = &source[start..end];
+        assert!(candidate.contains("let use_run_sum = self.validate_group_direct_run_sum()?"));
+        assert!(candidate.contains("if use_run_sum"));
+        assert!(candidate.contains("self.launch_group_direct("));
+    }
+
     #[test]
     fn prepacked_schedule_reuses_term_points_only_after_finalize() {
         let source = include_str!("launch.rs");

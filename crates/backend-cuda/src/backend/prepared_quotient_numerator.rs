@@ -14,6 +14,7 @@ mod bindings;
 mod launch;
 mod plan;
 mod prepacked;
+mod run_sum;
 mod single_write;
 
 use core::ffi::c_void;
@@ -29,6 +30,9 @@ use super::exec_context::{
 };
 use super::prepared_quotient::{QuotientNumeratorSource, QuotientSampleConstants};
 use super::quotient_numerator_prepacked_terms::QuotientNumeratorPrepackedTermError;
+use super::quotient_numerator_run_sum::{
+    QuotientNumeratorRunSumError, QuotientNumeratorRunSumReceipt,
+};
 
 const WORD_BYTES: usize = core::mem::size_of::<u32>();
 const SECURE_WORDS: usize = 4;
@@ -255,6 +259,8 @@ pub enum PreparedQuotientNumeratorError {
     PrepackedLayout(QuotientNumeratorPrepackedTermError),
     PrepackedScheduleInvariant(&'static str),
     GroupDirectScheduleInvariant(&'static str),
+    RunSumScheduleInvariant(&'static str),
+    RunSumPlan(QuotientNumeratorRunSumError),
     PrepackedDeviceStatus(u32),
     SizeOverflow,
     Arena(ArenaError),
@@ -287,6 +293,12 @@ impl From<CudaRuntimeError> for PreparedQuotientNumeratorError {
 impl From<QuotientNumeratorPrepackedTermError> for PreparedQuotientNumeratorError {
     fn from(value: QuotientNumeratorPrepackedTermError) -> Self {
         Self::PrepackedLayout(value)
+    }
+}
+
+impl From<QuotientNumeratorRunSumError> for PreparedQuotientNumeratorError {
+    fn from(value: QuotientNumeratorRunSumError) -> Self {
+        Self::RunSumPlan(value)
     }
 }
 
@@ -346,6 +358,7 @@ use self::bindings::{
     bind_optional, bind_slot, checked_mul, pow2, require_words, upload_and_sync, upload_ptrs,
     upload_u32, upload_u64,
 };
+use self::run_sum::PreparedRunSumBinding;
 
 /// Stable quotient numerator launch object. [`Self::launch`] performs no host
 /// transfer, allocation, synchronization, or default-stream operation.
@@ -376,6 +389,7 @@ pub struct PreparedQuotientNumeratorGraph<'a> {
     batches: Vec<PreparedBatch>,
     schedule: PreparedNumeratorSchedule,
     group_direct_ranges: Option<Vec<PreparedGroupDirectRange>>,
+    group_direct_run_sum: Option<PreparedRunSumBinding>,
     prepacked: Option<PreparedPrepackedBinding>,
 }
 
@@ -728,6 +742,7 @@ impl<'a> PreparedQuotientNumeratorGraph<'a> {
             batches: prepared_batches,
             schedule: PreparedNumeratorSchedule::LegacyBatches,
             group_direct_ranges: None,
+            group_direct_run_sum: None,
             prepacked: None,
         })
     }
@@ -750,6 +765,14 @@ impl<'a> PreparedQuotientNumeratorGraph<'a> {
     #[doc(hidden)]
     pub fn prepacked_receipt(&self) -> Option<PreparedPrepackedQuotientNumeratorReceipt> {
         self.prepacked.map(|binding| binding.receipt)
+    }
+
+    /// Sealed setup proof for the dormant native-domain run-sum candidate.
+    #[doc(hidden)]
+    pub fn group_direct_run_sum_receipt(&self) -> Option<&QuotientNumeratorRunSumReceipt> {
+        self.group_direct_run_sum
+            .as_ref()
+            .map(|binding| &binding.receipt)
     }
 
     /// Setup-only adapter for [`super::prepared_quotient::PreparedQuotientGraph::prepare`].

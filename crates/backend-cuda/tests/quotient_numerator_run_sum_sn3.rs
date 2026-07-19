@@ -27,6 +27,34 @@ fn sealed_sn3_group0_run_sum_receipt_is_exact_and_zero_incremental() {
         &[OVERFLOW_WORDS],
     )
     .unwrap();
+    let mut selected = None;
+    'selection: for target_group in 0..staged.requirements().groups.len() {
+        for victim_group in target_group + 1..staged.requirements().groups.len() {
+            let capacity = staged.requirements().groups[victim_group].value_words;
+            let Ok(candidate) = quotient_numerator_run_sum_plan(
+                &staged,
+                target_group,
+                victim_group,
+                QuotientNumeratorRunSumLiveness {
+                    same_stream_canonical_group_order: true,
+                    external_destination_ids_unique: true,
+                    victim_unread_before_own_producer: true,
+                    victim_fully_overwritten_by_own_producer: true,
+                    downstream_consumers_after_all_group_producers: true,
+                    victim_coordinate_capacity_words: [capacity; 4],
+                },
+            ) else {
+                continue;
+            };
+            if candidate.add_units_saved != 0 {
+                selected = Some(candidate);
+                break 'selection;
+            }
+        }
+    }
+    let selected = selected.unwrap();
+    assert_eq!((selected.target_group, selected.victim_group), (0, 12));
+
     let receipt = quotient_numerator_run_sum_plan(
         &staged,
         0,

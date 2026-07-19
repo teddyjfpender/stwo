@@ -169,6 +169,11 @@ fn sn3_staged_group_direct_cuda_event_benchmark() {
     };
     assert_eq!(packed.schedule(), expected_schedule);
     assert_eq!(direct.schedule(), expected_direct_schedule);
+    let run_sum = direct
+        .group_direct_run_sum_receipt()
+        .expect("sealed SN3 arena must admit the run-sum candidate");
+    assert_eq!((run_sum.target_group, run_sum.victim_group), (0, 12));
+    assert_eq!(run_sum.scratch_words_per_coordinate, 8_388_048);
     let quotient_sources = direct.quotient_sources();
     let quotient = PreparedQuotientGraph::prepare(
         &fixture.arena,
