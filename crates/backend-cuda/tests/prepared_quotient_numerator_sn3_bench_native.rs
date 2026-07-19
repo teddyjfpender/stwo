@@ -12,6 +12,7 @@ mod sn3_quotient_numerator_bench;
 #[path = "support/sn3_quotient_topology_fixture.rs"]
 mod sn3_quotient_topology_fixture;
 
+use blake3::{Hash, Hasher};
 use sn3_quotient_numerator_bench::{
     artifact_identity, assert_affine_pattern_sanity, assert_canonical_output,
     capture_canonical_output, input_recipe_digest, json_samples, percentile, poison_outputs,
@@ -22,12 +23,13 @@ use stwo::core::circle::CirclePoint;
 use stwo::core::fields::qm31::SecureField;
 use stwo_backend_cuda::{
     gpu_memory_info, quotient_numerator_staged_single_write_plan_with_overflow_capacities,
-    quotient_numerator_workspace_requirements, ArenaLayout, ArenaSlotId, ArenaSlotSpec,
-    CudaExecContext, CudaGraphExec, DeviceArena, PreparedNumeratorSchedule,
-    PreparedQuotientNumeratorGraph, QuotientNumeratorColumn, QuotientNumeratorColumnSource,
-    QuotientNumeratorColumnTopology, QuotientNumeratorDestination, QuotientNumeratorSourceKind,
-    QuotientNumeratorWorkspaceConfig, QuotientNumeratorWorkspaceRequirements,
-    QuotientNumeratorWorkspaceSlots,
+    quotient_numerator_workspace_requirements, quotient_workspace_requirements, ArenaLayout,
+    ArenaSlice, ArenaSlotId, ArenaSlotSpec, CudaExecContext, CudaGraphExec, DeviceArena,
+    PreparedNumeratorSchedule, PreparedQuotientGraph, PreparedQuotientNumeratorGraph,
+    QuotientNumeratorColumn, QuotientNumeratorColumnSource, QuotientNumeratorColumnTopology,
+    QuotientNumeratorDestination, QuotientNumeratorSourceKind, QuotientNumeratorWorkspaceConfig,
+    QuotientNumeratorWorkspaceRequirements, QuotientNumeratorWorkspaceSlots,
+    QuotientWorkspaceConfig, QuotientWorkspaceRequirements, QuotientWorkspaceSlots,
 };
 
 const GROUP_LOGS: [u32; 19] = [
@@ -42,6 +44,10 @@ const EXPECTED_SN3_TOPOLOGY_CONFIG: QuotientNumeratorWorkspaceConfig =
         log_blowup_factor: 1,
         max_lde_tile_words: 1 << 24,
     };
+const SN3_QUOTIENT_CONFIG: QuotientWorkspaceConfig = QuotientWorkspaceConfig {
+    lifting_log_size: 24,
+    log_blowup_factor: 1,
+};
 const COEFFICIENT_COLUMNS: usize = 161;
 const LEGACY_GROUP_COEFFICIENT_SOURCES: usize = 152;
 const LEGACY_BATCHES: usize = 74;
@@ -52,7 +58,11 @@ const HYBRID_LOGICAL_OUTPUT_BYTES: u64 = 20_266_867_968;
 const STAGED_PRIMARY_WORDS: usize = 536_870_912;
 const STAGED_OVERFLOW_WORDS: usize = 452_984_832;
 const STAGED_DESCRIPTOR_WORKSPACE_BYTES: u64 = 787_904;
-const EXPECTED_SN3_ARENA_BYTES: u64 = 45_714_317_824;
+const QUOTIENT_INCREMENTAL_ARENA_WORDS: usize = 104_857_792;
+const QUOTIENT_INCREMENTAL_ARENA_BYTES: u64 = 419_431_168;
+const EXPECTED_SN3_ARENA_BYTES: u64 = 46_133_748_992;
+const FRI_INPUT_OUTPUT_BYTES: u64 = 268_435_456;
+const FRI_COPY_CHUNK_WORDS: usize = 1 << 20;
 const MAX_BENCHMARK_ARENA_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const DEFAULT_WARMUPS: usize = 3;
 const DEFAULT_ITERATIONS: usize = 20;
@@ -60,6 +70,9 @@ const EXPECTED_SN3_TOPOLOGY_FIXTURE_BLAKE3: &str =
     "ea31e3ff054c8d12d32d5b84a3d712987b31bb1fd3fb044fb27758453b49fbda";
 const EXPECTED_SN3_INPUT_RECIPE_BLAKE3: &str =
     "e4c2f871c2d05b81588a5407f06cb49c7ed76834d2e363d2214bd34e7defcf31";
+const EXPECTED_SN3_BOUNDARY_INPUT_RECIPE_BLAKE3: &str =
+    "a88aaa1f23b4c22201c9f9b1ed0aedc17bde8ababb50eae72a828a0eeab06ae9";
+const INVERSE_TWIDDLE_PATTERN_SEED: u64 = 32_452_843;
 const EAGER_LEGACY_POISON: u32 = 0xdead_beef;
 const EAGER_HYBRID_POISON: u32 = 0xa5a5_5a5a;
 const CAPTURE_LEGACY_POISON: u32 = 0x1357_9bdf;
@@ -77,13 +90,15 @@ const FIRST_TERMS_OUTPUT: ArenaSlotId = ArenaSlotId(104);
 const TWIDDLES: ArenaSlotId = ArenaSlotId(105);
 const SHARED_STAGED_PRIMARY: ArenaSlotId = ArenaSlotId(106);
 const SHARED_STAGED_OVERFLOW: ArenaSlotId = ArenaSlotId(107);
+const QUOTIENT_WORKSPACE_BASE: u32 = 200;
+const INVERSE_TWIDDLES: ArenaSlotId = ArenaSlotId(207);
 const SOURCE_BASE: u32 = 1_000;
 const OUTPUT_BASE: u32 = 10_000;
 const PACKED_WORKSPACE_BASE: u32 = 1;
 const DIRECT_WORKSPACE_BASE: u32 = 20;
 
 #[test]
-#[ignore = "requires CUDA and the reported 42.58 GiB shared-staging arena"]
+#[ignore = "requires CUDA and the reported 42.97 GiB numerator-to-FRI-input arena"]
 fn sn3_staged_group_direct_cuda_event_benchmark() {
     let sn3 = load_sn3_topology_fixture(EXPECTED_SN3_TOPOLOGY_FIXTURE_BLAKE3);
     assert_sn3_shape(sn3.config, &sn3.topology, &sn3.requirements, &sn3.hybrid);
@@ -92,6 +107,15 @@ fn sn3_staged_group_direct_cuda_event_benchmark() {
         &sn3.requirements,
         &sn3.hybrid,
         &sn3.input_points,
+    );
+    let quotient_requirements =
+        quotient_workspace_requirements(SN3_QUOTIENT_CONFIG, &GROUP_LOGS).unwrap();
+    assert_sn3_quotient_shape(&quotient_requirements);
+    let boundary_input_recipe_blake3 =
+        boundary_input_recipe_digest(input_recipe_blake3, &quotient_requirements);
+    assert_eq!(
+        boundary_input_recipe_blake3.to_hex().as_str(),
+        EXPECTED_SN3_BOUNDARY_INPUT_RECIPE_BLAKE3
     );
     let staged_config = staged_config(sn3.config);
     let staged_requirements =
@@ -106,7 +130,7 @@ fn sn3_staged_group_direct_cuda_event_benchmark() {
 
     // All exact topology assertions above intentionally precede the first CUDA allocation.
     let (device_free_before_arena, device_total_bytes) = gpu_memory_info();
-    let fixture = BenchmarkArena::new(&sn3.topology, &staged_requirements);
+    let fixture = BenchmarkArena::new(&sn3.topology, &staged_requirements, &quotient_requirements);
     assert!(fixture.allocation_bytes <= MAX_BENCHMARK_ARENA_BYTES);
     assert_eq!(fixture.allocation_bytes, EXPECTED_SN3_ARENA_BYTES);
     let arena_pool = fixture.arena.context().pool_memory().unwrap();
@@ -145,22 +169,44 @@ fn sn3_staged_group_direct_cuda_event_benchmark() {
     };
     assert_eq!(packed.schedule(), expected_schedule);
     assert_eq!(direct.schedule(), expected_direct_schedule);
+    let quotient_sources = direct.quotient_sources();
+    let quotient = PreparedQuotientGraph::prepare(
+        &fixture.arena,
+        SN3_QUOTIENT_CONFIG,
+        &quotient_sources,
+        fixture.arena.bind(TWIDDLES).unwrap(),
+        fixture.arena.bind(INVERSE_TWIDDLES).unwrap(),
+        &fixture.quotient_slots,
+    )
+    .unwrap();
+    assert_eq!(
+        quotient.output_evaluation().len_words(),
+        quotient_requirements.output_value_words
+    );
 
     initialize(
         &fixture,
         &sn3.topology,
         &staged_requirements,
+        &quotient_requirements,
         &sn3.input_points,
         EAGER_LEGACY_POISON,
     );
+    poison_fri_input(&fixture, &quotient, EAGER_LEGACY_POISON);
     packed.launch().unwrap();
+    quotient.launch().unwrap();
     fixture.arena.context().sync().unwrap();
     let eager = capture_canonical_output(&fixture, &staged_requirements);
+    let eager_fri_input = capture_fri_input(&fixture, &quotient);
     poison_outputs(&fixture, &staged_requirements, EAGER_HYBRID_POISON);
+    poison_fri_input(&fixture, &quotient, EAGER_HYBRID_POISON);
     direct.launch().unwrap();
+    quotient.launch().unwrap();
     fixture.arena.context().sync().unwrap();
     let eager_direct_blake3 =
         assert_canonical_output(&fixture, &staged_requirements, &eager, "eager group-direct");
+    let eager_direct_fri_blake3 =
+        assert_fri_input(&fixture, &quotient, &eager_fri_input, "eager group-direct");
     let validated_numerator_output_bytes = staged_requirements
         .groups
         .iter()
@@ -179,26 +225,45 @@ fn sn3_staged_group_direct_cuda_event_benchmark() {
         validated_canonical_output_bytes,
         validated_numerator_output_bytes + validated_auxiliary_output_bytes
     );
+    assert_eq!(eager_fri_input.len_bytes(), FRI_INPUT_OUTPUT_BYTES);
 
     let capture = fixture.arena.context().capture().unwrap();
     packed.launch().unwrap();
+    quotient.launch().unwrap();
     let packed_graph = capture.finish().unwrap();
     let capture = fixture.arena.context().capture().unwrap();
     direct.launch().unwrap();
+    quotient.launch().unwrap();
     let direct_graph = capture.finish().unwrap();
+    assert_eq!(
+        direct_graph.kernel_nodes(),
+        packed_graph.kernel_nodes() + 18
+    );
+    let (device_free_after_graphs, device_total_after_graphs) = gpu_memory_info();
+    assert_eq!(device_total_after_graphs, device_total_bytes);
 
     poison_outputs(&fixture, &staged_requirements, CAPTURE_LEGACY_POISON);
+    poison_fri_input(&fixture, &quotient, CAPTURE_LEGACY_POISON);
     packed_graph.launch(fixture.arena.context()).unwrap();
     fixture.arena.context().sync().unwrap();
     let captured_packed_blake3 =
         assert_canonical_output(&fixture, &staged_requirements, &eager, "captured packed");
+    let captured_packed_fri_blake3 =
+        assert_fri_input(&fixture, &quotient, &eager_fri_input, "captured packed");
     poison_outputs(&fixture, &staged_requirements, CAPTURE_HYBRID_POISON);
+    poison_fri_input(&fixture, &quotient, CAPTURE_HYBRID_POISON);
     direct_graph.launch(fixture.arena.context()).unwrap();
     fixture.arena.context().sync().unwrap();
     let captured_direct_blake3 = assert_canonical_output(
         &fixture,
         &staged_requirements,
         &eager,
+        "captured group-direct",
+    );
+    let captured_direct_fri_blake3 = assert_fri_input(
+        &fixture,
+        &quotient,
+        &eager_fri_input,
         "captured group-direct",
     );
 
@@ -230,6 +295,7 @@ fn sn3_staged_group_direct_cuda_event_benchmark() {
     // Sample zero is causally bound to work by poisoning immediately before the measured graph
     // replay and validating that exact replay in full before either graph runs again.
     poison_outputs(&fixture, &staged_requirements, TIMED_LEGACY_POISON);
+    poison_fri_input(&fixture, &quotient, TIMED_LEGACY_POISON);
     packed_ms.push(replay_cuda_ms(&packed_graph, fixture.arena.context()));
     let timed_packed_blake3 = assert_canonical_output(
         &fixture,
@@ -237,12 +303,25 @@ fn sn3_staged_group_direct_cuda_event_benchmark() {
         &eager,
         "timed packed sample 0",
     );
+    let timed_packed_fri_blake3 = assert_fri_input(
+        &fixture,
+        &quotient,
+        &eager_fri_input,
+        "timed packed sample 0",
+    );
     poison_outputs(&fixture, &staged_requirements, TIMED_HYBRID_POISON);
+    poison_fri_input(&fixture, &quotient, TIMED_HYBRID_POISON);
     direct_ms.push(replay_cuda_ms(&direct_graph, fixture.arena.context()));
     let timed_direct_blake3 = assert_canonical_output(
         &fixture,
         &staged_requirements,
         &eager,
+        "timed group-direct sample 0",
+    );
+    let timed_direct_fri_blake3 = assert_fri_input(
+        &fixture,
+        &quotient,
+        &eager_fri_input,
         "timed group-direct sample 0",
     );
 
@@ -257,17 +336,27 @@ fn sn3_staged_group_direct_cuda_event_benchmark() {
     }
 
     poison_outputs(&fixture, &staged_requirements, POST_TIMING_LEGACY_POISON);
+    poison_fri_input(&fixture, &quotient, POST_TIMING_LEGACY_POISON);
     packed_graph.launch(fixture.arena.context()).unwrap();
     fixture.arena.context().sync().unwrap();
     let post_timing_packed_blake3 =
         assert_canonical_output(&fixture, &staged_requirements, &eager, "post-timing packed");
+    let post_timing_packed_fri_blake3 =
+        assert_fri_input(&fixture, &quotient, &eager_fri_input, "post-timing packed");
     poison_outputs(&fixture, &staged_requirements, POST_TIMING_HYBRID_POISON);
+    poison_fri_input(&fixture, &quotient, POST_TIMING_HYBRID_POISON);
     direct_graph.launch(fixture.arena.context()).unwrap();
     fixture.arena.context().sync().unwrap();
     let post_timing_direct_blake3 = assert_canonical_output(
         &fixture,
         &staged_requirements,
         &eager,
+        "post-timing group-direct",
+    );
+    let post_timing_direct_fri_blake3 = assert_fri_input(
+        &fixture,
+        &quotient,
+        &eager_fri_input,
         "post-timing group-direct",
     );
     let artifact_identity = artifact_identity();
@@ -278,37 +367,49 @@ fn sn3_staged_group_direct_cuda_event_benchmark() {
     let direct_p95 = percentile(&direct_ms, 95);
     println!(
         concat!(
-            "{{\"schema\":\"stwo.sn3_quotient_numerator_group_direct.cuda_event.v1\",",
-            "\"timing_scope\":\"per-replay CUDA-event device elapsed time for the captured numerator graph\",",
+            "{{\"schema\":\"stwo.sn3_numerator_to_fri_input_group_direct.cuda_event.v1\",",
+            "\"timing_scope\":\"per-replay CUDA-event device elapsed time for captured numerator then ordinary quotient-to-FRI-input graph\",",
             "\"percentile_method\":\"nearest-rank\"," ,
             "\"result_class\":\"diagnostic same-lineage packed/group-direct A/B; not independent mathematical truth\",",
-            "\"input_pattern\":\"input-recipe-sealed nonzero canonical-M31 affine row pattern; bounded chunked upload\",",
+            "\"input_pattern\":\"input-recipe-sealed nonzero canonical-M31 affine row and twiddle patterns; bounded chunked upload\",",
             "\"topology\":{{\"group_logs\":{:?},\"groups\":19,\"coefficient_columns\":161,",
             "\"coefficient_sources\":152,\"staged_batches\":19,\"terms\":6341,",
-            "\"packed_output_rows\":25165264}},",
+            "\"packed_output_rows\":25165264,\"quotient_lifting_log_size\":24,",
+            "\"quotient_subdomain_log_size\":23,\"log_blowup_factor\":1}},",
             "\"bytes\":{{\"validated_numerator_output\":{}," ,
             "\"validated_auxiliary_output\":{},\"validated_canonical_output\":{}," ,
+            "\"validated_fri_input_output\":{},\"incremental_quotient_workspace\":{}," ,
             "\"shared_data_disjoint_descriptors_shared_staging_arena\":{}," ,
             "\"descriptor_workspace_each\":{},\"shared_primary\":{}," ,
             "\"shared_overflow\":{}}}," ,
             "\"device_memory\":{{\"total\":{},\"free_before_arena\":{}," ,
-            "\"free_after_arena\":{},\"isolated_pool_used_after_arena\":{}," ,
+            "\"free_after_arena\":{},\"free_after_graph_instantiation\":{},",
+            "\"isolated_pool_used_after_arena\":{}," ,
             "\"isolated_pool_reserved_after_arena\":{}}}," ,
-            "\"identity\":{{\"output_digest_encoding\":\"framed u32 little-endian v1\"," ,
+            "\"identity\":{{\"numerator_output_digest_encoding\":\"framed u32 little-endian v1\"," ,
+            "\"fri_input_digest_encoding\":\"contiguous [coord0|coord1|coord2|coord3] u32 little-endian v1\"," ,
             "\"topology_fixture_blake3\":\"{}\"," ,
-            "\"input_recipe_encoding\":\"typed topology, descriptors, and affine row recipes v2\"," ,
-            "\"input_recipe_blake3\":\"{}\",\"eager_packed_blake3\":\"{}\"," ,
+            "\"input_recipe_encoding\":\"sealed numerator recipe v2 plus literal ordinary quotient requirements and inverse affine twiddle recipe v2\"," ,
+            "\"numerator_input_recipe_blake3\":\"{}\",\"boundary_input_recipe_blake3\":\"{}\"," ,
+            "\"eager_packed_blake3\":\"{}\"," ,
             "\"eager_direct_blake3\":\"{}\",\"captured_packed_blake3\":\"{}\"," ,
             "\"captured_direct_blake3\":\"{}\",\"timed_sample_index\":0," ,
             "\"timed_sample_causally_validated\":true,\"timed_packed_blake3\":\"{}\"," ,
             "\"timed_direct_blake3\":\"{}\",\"post_timing_packed_blake3\":\"{}\"," ,
             "\"post_timing_direct_blake3\":\"{}\",\"capture_revalidated\":true," ,
             "\"post_timing_revalidated\":true}}," ,
+            "\"fri_input_identity\":{{\"eager_packed_blake3\":\"{}\",",
+            "\"eager_direct_blake3\":\"{}\",\"captured_packed_blake3\":\"{}\",",
+            "\"captured_direct_blake3\":\"{}\",\"timed_packed_blake3\":\"{}\",",
+            "\"timed_direct_blake3\":\"{}\",\"post_timing_packed_blake3\":\"{}\",",
+            "\"post_timing_direct_blake3\":\"{}\",\"exact_word_comparison\":true}},",
+            "\"capture_topology\":{{\"packed_kernel_nodes\":{},\"group_direct_kernel_nodes\":{},",
+            "\"group_direct_minus_packed_kernel_nodes\":18}},",
             "\"artifact_identity\":{{\"candidate_current_source_blake3\":\"{}\"," ,
             "\"test_binary_blake3\":\"{}\",\"source_projection_sha256\":{}," ,
             "\"cuda_module_sha256\":{},\"cuda_build_mode\":\"{}\"," ,
             "\"identity_complete\":{}}}," ,
-            "\"comparator\":{{\"lineage\":\"same staged LDE preparation and exact output ownership; candidate replaces one packed row launch with one launch per exact group\"," ,
+            "\"comparator\":{{\"lineage\":\"same staged LDE preparation, exact numerator ownership, and identical ordinary quotient tail; candidate replaces one packed row launch with one launch per exact group\"," ,
             "\"independent_truth\":false}}," ,
             "\"warmups\":{},\"iterations\":{},\"minimum_iterations\":5," ,
             "\"samples_ms\":{{\"packed\":{},\"group_direct\":{}}}," ,
@@ -320,6 +421,8 @@ fn sn3_staged_group_direct_cuda_event_benchmark() {
         validated_numerator_output_bytes,
         validated_auxiliary_output_bytes,
         validated_canonical_output_bytes,
+        FRI_INPUT_OUTPUT_BYTES,
+        QUOTIENT_INCREMENTAL_ARENA_BYTES,
         fixture.allocation_bytes,
         STAGED_DESCRIPTOR_WORKSPACE_BYTES,
         STAGED_PRIMARY_WORDS as u64 * 4,
@@ -327,10 +430,12 @@ fn sn3_staged_group_direct_cuda_event_benchmark() {
         device_total_bytes,
         device_free_before_arena,
         device_free_after_arena,
+        device_free_after_graphs,
         arena_pool.used_bytes,
         arena_pool.reserved_bytes,
         sn3.digest,
         input_recipe_blake3,
+        boundary_input_recipe_blake3,
         eager.digest(),
         eager_direct_blake3,
         captured_packed_blake3,
@@ -339,6 +444,16 @@ fn sn3_staged_group_direct_cuda_event_benchmark() {
         timed_direct_blake3,
         post_timing_packed_blake3,
         post_timing_direct_blake3,
+        eager_fri_input.digest,
+        eager_direct_fri_blake3,
+        captured_packed_fri_blake3,
+        captured_direct_fri_blake3,
+        timed_packed_fri_blake3,
+        timed_direct_fri_blake3,
+        post_timing_packed_fri_blake3,
+        post_timing_direct_fri_blake3,
+        packed_graph.kernel_nodes(),
+        direct_graph.kernel_nodes(),
         artifact_identity.candidate_source_blake3,
         artifact_identity.test_binary_blake3,
         artifact_identity.source_projection_json(),
@@ -370,6 +485,15 @@ fn sn3_input_recipe_is_deterministic_and_shape_exact() {
         &sn3.input_points,
     );
     assert_eq!(digest.to_hex().as_str(), EXPECTED_SN3_INPUT_RECIPE_BLAKE3);
+    let quotient_requirements =
+        quotient_workspace_requirements(SN3_QUOTIENT_CONFIG, &GROUP_LOGS).unwrap();
+    assert_sn3_quotient_shape(&quotient_requirements);
+    assert_eq!(
+        boundary_input_recipe_digest(digest, &quotient_requirements)
+            .to_hex()
+            .as_str(),
+        EXPECTED_SN3_BOUNDARY_INPUT_RECIPE_BLAKE3
+    );
     let mut changed_points = sn3.input_points.clone();
     let distinct = changed_points
         .iter()
@@ -394,7 +518,7 @@ fn sn3_input_recipe_is_deterministic_and_shape_exact() {
     )
     .unwrap();
     assert_staged_sn3_shape(&requirements, &staged);
-    let plan = benchmark_arena_plan(&sn3.topology, &requirements);
+    let plan = benchmark_arena_plan(&sn3.topology, &requirements, &quotient_requirements);
     assert_eq!(plan.allocation_bytes, EXPECTED_SN3_ARENA_BYTES);
     assert_descriptor_workspaces_are_disjoint(
         &requirements,
@@ -471,6 +595,26 @@ fn assert_sn3_shape(
     assert_eq!(hybrid.packed_group_offsets().len(), 168);
 }
 
+fn assert_sn3_quotient_shape(requirements: &QuotientWorkspaceRequirements) {
+    assert_eq!(requirements.config, SN3_QUOTIENT_CONFIG);
+    assert_eq!(requirements.subdomain_log_size, 23);
+    assert_eq!(requirements.sample_count, 19);
+    assert_eq!(requirements.sample_point_words, 152);
+    assert_eq!(requirements.first_linear_term_words, 76);
+    assert_eq!(requirements.partial_log_size_words, 19);
+    assert_eq!(requirements.partial_pointer_words, 152);
+    assert_eq!(requirements.coordinate_pointer_words, 8);
+    assert_eq!(requirements.coefficient_size_words, 4);
+    assert_eq!(requirements.subdomain_value_words, 33_554_432);
+    assert_eq!(requirements.output_value_words, 67_108_864);
+    assert_eq!(requirements.forward_twiddle_words, 8_388_608);
+    assert_eq!(requirements.inverse_twiddle_words, 4_194_304);
+    assert_eq!(
+        u64::try_from(requirements.output_value_words).unwrap() * 4,
+        FRI_INPUT_OUTPUT_BYTES
+    );
+}
+
 fn staged_config(
     topology_config: QuotientNumeratorWorkspaceConfig,
 ) -> QuotientNumeratorWorkspaceConfig {
@@ -510,6 +654,7 @@ struct BenchmarkArena {
     arena: DeviceArena,
     packed_slots: QuotientNumeratorWorkspaceSlots,
     direct_slots: QuotientNumeratorWorkspaceSlots,
+    quotient_slots: QuotientWorkspaceSlots,
     source_ids: Vec<ArenaSlotId>,
     destination_ids: Vec<[ArenaSlotId; 4]>,
     allocation_bytes: u64,
@@ -519,6 +664,7 @@ struct BenchmarkArenaPlan {
     layout: ArenaLayout,
     packed_slots: QuotientNumeratorWorkspaceSlots,
     direct_slots: QuotientNumeratorWorkspaceSlots,
+    quotient_slots: QuotientWorkspaceSlots,
     source_ids: Vec<ArenaSlotId>,
     destination_ids: Vec<[ArenaSlotId; 4]>,
     allocation_bytes: u64,
@@ -528,13 +674,15 @@ impl BenchmarkArena {
     fn new(
         topology: &[QuotientNumeratorColumnTopology],
         requirements: &QuotientNumeratorWorkspaceRequirements,
+        quotient_requirements: &QuotientWorkspaceRequirements,
     ) -> Self {
-        let plan = benchmark_arena_plan(topology, requirements);
+        let plan = benchmark_arena_plan(topology, requirements, quotient_requirements);
         let arena = DeviceArena::new(CudaExecContext::new().unwrap(), plan.layout).unwrap();
         Self {
             arena,
             packed_slots: plan.packed_slots,
             direct_slots: plan.direct_slots,
+            quotient_slots: plan.quotient_slots,
             source_ids: plan.source_ids,
             destination_ids: plan.destination_ids,
             allocation_bytes: plan.allocation_bytes,
@@ -582,9 +730,11 @@ impl BenchmarkArena {
 fn benchmark_arena_plan(
     topology: &[QuotientNumeratorColumnTopology],
     requirements: &QuotientNumeratorWorkspaceRequirements,
+    quotient_requirements: &QuotientWorkspaceRequirements,
 ) -> BenchmarkArenaPlan {
     let packed_slots = workspace_slots(requirements, PACKED_WORKSPACE_BASE);
     let direct_slots = workspace_slots(requirements, DIRECT_WORKSPACE_BASE);
+    let quotient_slots = quotient_workspace_slots();
     let mut specs = Vec::new();
     let mut cursor = 0usize;
     for slots in [&packed_slots, &direct_slots] {
@@ -651,12 +801,37 @@ fn benchmark_arena_plan(
             })
         })
         .collect::<Vec<_>>();
+    let quotient_start = cursor;
+    for requirement in quotient_requirements
+        .arena_slot_requirements(&quotient_slots)
+        .unwrap()
+    {
+        if requirement.id == SAMPLE_POINTS_OUTPUT || requirement.id == FIRST_TERMS_OUTPUT {
+            continue;
+        }
+        push_spec(
+            &mut specs,
+            &mut cursor,
+            requirement.id,
+            requirement.len_words,
+            requirement.alignment_words,
+        );
+    }
+    push_spec(
+        &mut specs,
+        &mut cursor,
+        INVERSE_TWIDDLES,
+        quotient_requirements.inverse_twiddle_words,
+        1,
+    );
+    assert_eq!(cursor - quotient_start, QUOTIENT_INCREMENTAL_ARENA_WORDS);
     let allocation_bytes = (cursor as u64).checked_mul(4).unwrap();
     assert!(allocation_bytes <= MAX_BENCHMARK_ARENA_BYTES);
     BenchmarkArenaPlan {
         layout: ArenaLayout::new(cursor, &specs).unwrap(),
         packed_slots,
         direct_slots,
+        quotient_slots,
         source_ids,
         destination_ids,
         allocation_bytes,
@@ -684,6 +859,21 @@ fn workspace_slots(
         coefficient_output_ptrs: (requirements.coefficient_output_pointer_words != 0)
             .then_some(id(12)),
         lde_tile: (requirements.lde_tile_words != 0).then_some(SHARED_STAGED_PRIMARY),
+    }
+}
+
+fn quotient_workspace_slots() -> QuotientWorkspaceSlots {
+    let id = |offset| ArenaSlotId(QUOTIENT_WORKSPACE_BASE + offset);
+    QuotientWorkspaceSlots {
+        sample_points: SAMPLE_POINTS_OUTPUT,
+        first_linear_terms: FIRST_TERMS_OUTPUT,
+        partial_log_sizes: id(0),
+        partial_coordinate_ptrs: id(1),
+        subdomain_coordinate_ptrs: id(2),
+        output_coordinate_ptrs: id(3),
+        coefficient_sizes: id(4),
+        subdomain_values: id(5),
+        output_values: id(6),
     }
 }
 
@@ -791,10 +981,174 @@ fn replay_cuda_ms(graph: &CudaGraphExec, context: &CudaExecContext) -> f64 {
     f64::from(context.elapsed_timing_ms(1).unwrap()[0])
 }
 
+fn boundary_input_recipe_digest(
+    numerator_recipe: Hash,
+    requirements: &QuotientWorkspaceRequirements,
+) -> Hash {
+    let mut hasher = Hasher::new();
+    hasher.update(b"stwo.sn3-numerator-to-fri-input.input-recipe.v2\0");
+    hasher.update(numerator_recipe.as_bytes());
+    hasher.update(&u64::try_from(GROUP_LOGS.len()).unwrap().to_le_bytes());
+    for log_size in GROUP_LOGS {
+        hasher.update(&u64::from(log_size).to_le_bytes());
+    }
+    let pass = requirements.combine_pass_bytes;
+    let fields = [
+        u64::from(requirements.config.lifting_log_size),
+        u64::from(requirements.config.log_blowup_factor),
+        u64::from(requirements.subdomain_log_size),
+        u64::try_from(requirements.sample_count).unwrap(),
+        u64::try_from(requirements.sample_point_words).unwrap(),
+        u64::try_from(requirements.first_linear_term_words).unwrap(),
+        u64::try_from(requirements.partial_log_size_words).unwrap(),
+        u64::try_from(requirements.partial_pointer_words).unwrap(),
+        u64::try_from(requirements.coordinate_pointer_words).unwrap(),
+        u64::try_from(requirements.coefficient_size_words).unwrap(),
+        u64::try_from(requirements.subdomain_value_words).unwrap(),
+        u64::try_from(requirements.output_value_words).unwrap(),
+        u64::try_from(pass.rows).unwrap(),
+        u64::try_from(pass.samples).unwrap(),
+        u64::try_from(pass.denominator_inversions).unwrap(),
+        u64::try_from(pass.eliminated_scratch_bytes).unwrap(),
+        u64::try_from(pass.eliminated_logical_traffic_bytes).unwrap(),
+        u64::try_from(pass.denominator_global_passes).unwrap(),
+        u64::try_from(pass.output_write_bytes).unwrap(),
+        u64::try_from(requirements.forward_twiddle_words).unwrap(),
+        u64::try_from(requirements.inverse_twiddle_words).unwrap(),
+        u64::from(requirements.half_coset_initial_index),
+        u64::from(requirements.half_coset_step_size),
+        INVERSE_TWIDDLE_PATTERN_SEED,
+    ];
+    hasher.update(&u64::try_from(fields.len()).unwrap().to_le_bytes());
+    for value in fields {
+        hasher.update(&value.to_le_bytes());
+    }
+    hasher.finalize()
+}
+
+struct CanonicalFriInput {
+    words: Vec<u32>,
+    digest: Hash,
+}
+
+impl CanonicalFriInput {
+    fn len_bytes(&self) -> u64 {
+        u64::try_from(self.words.len()).unwrap() * 4
+    }
+}
+
+fn capture_fri_input(
+    fixture: &BenchmarkArena,
+    quotient: &PreparedQuotientGraph<'_>,
+) -> CanonicalFriInput {
+    let source = quotient.output_evaluation();
+    let mut words = Vec::with_capacity(source.len_words());
+    let mut hasher = fri_input_hasher(source.len_words());
+    for offset in (0..source.len_words()).step_by(FRI_COPY_CHUNK_WORDS) {
+        let chunk = read_fri_input_chunk(&fixture.arena, source, offset);
+        hash_fri_input_words(&mut hasher, &chunk);
+        words.extend_from_slice(&chunk);
+    }
+    assert_eq!(words.len(), source.len_words());
+    CanonicalFriInput {
+        words,
+        digest: hasher.finalize(),
+    }
+}
+
+fn assert_fri_input(
+    fixture: &BenchmarkArena,
+    quotient: &PreparedQuotientGraph<'_>,
+    expected: &CanonicalFriInput,
+    label: &str,
+) -> Hash {
+    let source = quotient.output_evaluation();
+    assert_eq!(
+        source.len_words(),
+        expected.words.len(),
+        "{label}: FRI-input shape drift"
+    );
+    let mut hasher = fri_input_hasher(source.len_words());
+    for offset in (0..source.len_words()).step_by(FRI_COPY_CHUNK_WORDS) {
+        let actual = read_fri_input_chunk(&fixture.arena, source, offset);
+        let expected_chunk = &expected.words[offset..offset + actual.len()];
+        if let Some(relative_index) = actual
+            .iter()
+            .zip(expected_chunk)
+            .position(|(actual, expected)| actual != expected)
+        {
+            let index = offset + relative_index;
+            panic!(
+                "{label}: FRI input differs at word {index}: expected {}, got {}",
+                expected.words[index], actual[relative_index]
+            );
+        }
+        hash_fri_input_words(&mut hasher, &actual);
+    }
+    let digest = hasher.finalize();
+    assert_eq!(digest, expected.digest, "{label}: FRI-input digest drift");
+    digest
+}
+
+fn poison_fri_input(fixture: &BenchmarkArena, quotient: &PreparedQuotientGraph<'_>, poison: u32) {
+    let output = quotient.output_evaluation();
+    unsafe {
+        fixture
+            .arena
+            .context()
+            .fill_u32_async(output.as_u32_ptr(), poison, output.len_words())
+            .unwrap();
+    }
+    fixture.arena.context().sync().unwrap();
+}
+
+fn read_fri_input_chunk(arena: &DeviceArena, source: ArenaSlice, offset: usize) -> Vec<u32> {
+    let count = FRI_COPY_CHUNK_WORDS.min(source.len_words() - offset);
+    let chunk = source.checked_subslice(offset, count).unwrap();
+    let mut words = vec![0u32; count];
+    unsafe {
+        arena
+            .context()
+            .memcpy_d2h_async(
+                words.as_mut_ptr().cast(),
+                chunk.as_void_ptr(),
+                std::mem::size_of_val(&*words),
+            )
+            .unwrap();
+    }
+    arena.context().sync().unwrap();
+    words
+}
+
+fn fri_input_hasher(word_count: usize) -> Hasher {
+    let mut hasher = Hasher::new();
+    hasher.update(b"stwo.sn3-quotient-fri-input.output.v1\0");
+    hasher.update(&u64::try_from(word_count).unwrap().to_le_bytes());
+    hasher
+}
+
+#[cfg(target_endian = "little")]
+fn hash_fri_input_words(hasher: &mut Hasher, words: &[u32]) {
+    // SAFETY: the byte view covers initialized `u32` objects and preserves
+    // the required little-endian word framing on supported CUDA hosts.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(words.as_ptr().cast::<u8>(), std::mem::size_of_val(words))
+    };
+    hasher.update(bytes);
+}
+
+#[cfg(target_endian = "big")]
+fn hash_fri_input_words(hasher: &mut Hasher, words: &[u32]) {
+    for word in words {
+        hasher.update(&word.to_le_bytes());
+    }
+}
+
 fn initialize(
     fixture: &BenchmarkArena,
     topology: &[QuotientNumeratorColumnTopology],
     requirements: &QuotientNumeratorWorkspaceRequirements,
+    quotient_requirements: &QuotientWorkspaceRequirements,
     points: &[CirclePoint<SecureField>],
     poison: u32,
 ) {
@@ -811,6 +1165,12 @@ fn initialize(
         TWIDDLES,
         requirements.forward_twiddle_words,
         TWIDDLE_PATTERN_SEED,
+    );
+    upload_affine_pattern(
+        &fixture.arena,
+        INVERSE_TWIDDLES,
+        quotient_requirements.inverse_twiddle_words,
+        INVERSE_TWIDDLE_PATTERN_SEED,
     );
     for (index, (&id, column)) in fixture.source_ids.iter().zip(topology).enumerate() {
         upload_affine_pattern(
