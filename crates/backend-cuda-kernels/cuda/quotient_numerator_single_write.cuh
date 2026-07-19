@@ -65,7 +65,9 @@ extern "C" int stwo_accumulate_quotient_numerator_packed_single_write_on(
         void *stream);
 
 // Candidate-only direct group entry. The prepared host plan seals the exact
-// term range, row shape, and output ownership into scalar launch arguments.
+// term range, monotone source-log runs, row shape, and output ownership into
+// scalar launch arguments. For log >= 1 each thread owns two half-separated
+// rows; log 0 dispatches one exact scalar owner.
 extern "C" int stwo_accumulate_quotient_numerator_group_direct_on(
         const uint32_t *term_descriptors,
         uint32_t term_begin,
