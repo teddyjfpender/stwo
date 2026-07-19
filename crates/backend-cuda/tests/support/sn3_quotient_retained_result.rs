@@ -24,21 +24,27 @@ const FIVE_X_RETAINED_MAX_MS: f64 = 106.086;
 const STATIC_SASS_RECEIPT_ENV: &str = "STWO_SN3_RETAINED_RUN_SUM_STATIC_SASS_RECEIPT";
 const STATIC_SASS_SCHEMA: &str = "stwo.cuda.retained_run_sum.static_sass.v1";
 const STATIC_SASS_DLINK_MEMBER: &str = "stwo_cuda_kernels_dlink.staged.o";
+const STATIC_SASS_ELF: &str = "stwo_cuda_kernels_dlink.staged.1.sm_86.cubin";
+const CUOBJDUMP_PATH: &str = "/usr/local/cuda/bin/cuobjdump";
+const CUDA_VERSION_MARKER: &str = "Cuda compilation tools, release 13.3";
 const RUN_PRECOMPUTE_KERNEL: &str = "stwo_quotient_numerator_native_run_precompute_kernel";
 const RUN_SUM_EXPAND_KERNEL: &str = "stwo_quotient_numerator_run_sum_expand_kernel";
 const EXACT_NUMERATOR_AND_AUXILIARY_BYTES: u64 = 402_645_136;
 const REQUIRED_EXACT_DIGESTS: usize = 13;
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StaticSassReceipt {
     schema: String,
     passed: bool,
     archive: StaticSassArchive,
+    tool: StaticSassTool,
     target: StaticSassTarget,
     kernels: BTreeMap<String, StaticSassKernel>,
 }
 
 #[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct StaticSassArchive {
     sha256: String,
     dlink_member: String,
@@ -48,13 +54,24 @@ struct StaticSassArchive {
 }
 
 #[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StaticSassTool {
+    cuobjdump_path: String,
+    cuobjdump_sha256: String,
+    version: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct StaticSassTarget {
     elf_count: u32,
+    elf: String,
     sms: Vec<u32>,
     ptx_files: u32,
 }
 
 #[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct StaticSassKernel {
     resource_definitions: u32,
     sass_definitions: u32,
@@ -268,6 +285,7 @@ pub(crate) fn publish_result(
             "schema": static_sass.receipt.schema,
             "passed": static_sass.receipt.passed,
             "archive": static_sass.receipt.archive,
+            "tool": static_sass.receipt.tool,
             "target": static_sass.receipt.target,
             "kernels": static_sass.receipt.kernels,
             "validated": static_sass_gate_passed,
@@ -334,6 +352,7 @@ fn load_static_sass_receipt(expected_archive_sha256: Option<&str>) -> StaticSass
     assert_sha256("archive.sha256", &receipt.archive.sha256);
     assert_sha256("archive.dlink_sha256", &receipt.archive.dlink_sha256);
     assert_sha256("archive.sibling_sha256", &receipt.archive.sibling_sha256);
+    assert_sha256("tool.cuobjdump_sha256", &receipt.tool.cuobjdump_sha256);
     assert_eq!(
         receipt.archive.sha256, expected_archive_sha256,
         "static-SASS archive does not match the linked CUDA module"
@@ -350,7 +369,16 @@ fn load_static_sass_receipt(expected_archive_sha256: Option<&str>) -> StaticSass
         receipt.archive.dlink_sha256, receipt.archive.sibling_sha256,
         "static-SASS dlink and sibling SHA-256 differ"
     );
+    assert_eq!(
+        receipt.tool.cuobjdump_path, CUOBJDUMP_PATH,
+        "static-SASS cuobjdump path"
+    );
+    assert!(
+        !receipt.tool.version.is_empty() && receipt.tool.version.contains(CUDA_VERSION_MARKER),
+        "static-SASS cuobjdump version must contain {CUDA_VERSION_MARKER}"
+    );
     assert_eq!(receipt.target.elf_count, 1, "static-SASS ELF count");
+    assert_eq!(receipt.target.elf, STATIC_SASS_ELF, "static-SASS ELF name");
     assert_eq!(
         receipt.target.sms.as_slice(),
         &[86],
