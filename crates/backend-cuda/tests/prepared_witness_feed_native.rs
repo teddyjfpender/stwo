@@ -385,10 +385,6 @@ fn prepared_witness_feed_eager_capture_and_mutated_replay_match_host() {
     let mutated = source(5);
     let mutated_receipt = prepared.upload_source(&mutated).unwrap();
     assert_eq!(mutated_receipt.generation(), 2);
-    assert_ne!(
-        mutated_receipt.content_identity(),
-        initial_receipt.content_identity()
-    );
     assert!(!prepared.source_upload_is_current(&initial_receipt));
     assert!(prepared.source_upload_is_current(&mutated_receipt));
     graph.launch(arena.context()).unwrap();

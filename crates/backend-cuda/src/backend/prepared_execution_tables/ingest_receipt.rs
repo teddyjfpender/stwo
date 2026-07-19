@@ -7,14 +7,11 @@ use core::cell::Cell;
 
 use super::{
     ArenaSlice, ArenaSlotId, DeviceArena, ExecutionTablesContract, ExecutionTablesHostData,
-    PreparedExecutionTablesError, F252_WORDS, SMALL_WORDS,
+    PreparedExecutionTablesError, F252_WORDS,
 };
 
-const INGEST_DOMAIN: &[u8] = b"stwo-cuda-execution-tables-ingest-v1\0";
-const U32_CHUNK_WORDS: usize = 1024;
-const U128_CHUNK_WORDS: usize = 256;
-
-/// Process-local proof that one exact host table set was copied and fenced.
+/// Process-local proof that one shape-checked host table set was copied and
+/// fenced.
 ///
 /// The receipt is unforgeable outside this module. Writer exclusivity for the
 /// three raw slots remains a proof-plan obligation.
@@ -32,7 +29,6 @@ pub struct ExecutionTablesIngestReceipt {
     raw_small_slot: ArenaSlotId,
     raw_small_address: usize,
     raw_small_words: usize,
-    content_identity: [u8; 32],
     generation: u64,
 }
 
@@ -74,7 +70,6 @@ impl ExecutionTablesIngestReceipt {
             raw_small_slot: binding.raw_small.slot,
             raw_small_address: binding.raw_small.address,
             raw_small_words: binding.raw_small.words,
-            content_identity: ingest_content_identity(host)?,
             generation,
         })
     }
@@ -135,9 +130,6 @@ impl ExecutionTablesIngestReceipt {
     }
     pub const fn raw_small_words(self) -> usize {
         self.raw_small_words
-    }
-    pub const fn content_identity(self) -> [u8; 32] {
-        self.content_identity
     }
     pub const fn generation(self) -> u64 {
         self.generation
@@ -240,46 +232,6 @@ pub(super) fn next_ingest_generation(current: u64) -> Result<u64, PreparedExecut
         .ok_or(PreparedExecutionTablesError::IngestGenerationOverflow)
 }
 
-fn ingest_content_identity(
-    host: ExecutionTablesHostData<'_>,
-) -> Result<[u8; 32], PreparedExecutionTablesError> {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(INGEST_DOMAIN);
-
-    hash_field_header(&mut hasher, 1, host.addr_to_id.len(), 1)?;
-    hash_u32_words(&mut hasher, host.addr_to_id.iter().copied());
-
-    hash_field_header(&mut hasher, 2, host.f252_values.len(), F252_WORDS)?;
-    hash_u32_words(
-        &mut hasher,
-        host.f252_values.iter().flat_map(|row| row.iter().copied()),
-    );
-
-    hash_field_header(&mut hasher, 3, host.small_values.len(), SMALL_WORDS)?;
-    hash_u128_words(&mut hasher, host.small_values.iter().copied());
-    Ok(*hasher.finalize().as_bytes())
-}
-
-fn hash_field_header(
-    hasher: &mut blake3::Hasher,
-    role: u8,
-    rows: usize,
-    words_per_row: usize,
-) -> Result<(), PreparedExecutionTablesError> {
-    hasher.update(&[role]);
-    hasher.update(
-        &u64::try_from(rows)
-            .map_err(|_| PreparedExecutionTablesError::SizeOverflow)?
-            .to_le_bytes(),
-    );
-    hasher.update(
-        &u64::try_from(words_per_row)
-            .map_err(|_| PreparedExecutionTablesError::SizeOverflow)?
-            .to_le_bytes(),
-    );
-    Ok(())
-}
-
 fn check_host_shape(
     role: &'static str,
     expected: usize,
@@ -293,38 +245,6 @@ fn check_host_shape(
             expected,
             actual,
         })
-    }
-}
-
-fn hash_u32_words(hasher: &mut blake3::Hasher, mut words: impl Iterator<Item = u32>) {
-    let mut bytes = [0u8; U32_CHUNK_WORDS * 4];
-    loop {
-        let mut count = 0;
-        for destination in bytes.chunks_exact_mut(4) {
-            let Some(word) = words.next() else { break };
-            destination.copy_from_slice(&word.to_le_bytes());
-            count += 1;
-        }
-        if count == 0 {
-            return;
-        }
-        hasher.update(&bytes[..count * 4]);
-    }
-}
-
-fn hash_u128_words(hasher: &mut blake3::Hasher, mut words: impl Iterator<Item = u128>) {
-    let mut bytes = [0u8; U128_CHUNK_WORDS * 16];
-    loop {
-        let mut count = 0;
-        for destination in bytes.chunks_exact_mut(16) {
-            let Some(word) = words.next() else { break };
-            destination.copy_from_slice(&word.to_le_bytes());
-            count += 1;
-        }
-        if count == 0 {
-            return;
-        }
-        hasher.update(&bytes[..count * 16]);
     }
 }
 
@@ -342,57 +262,6 @@ mod tests {
             f252_values,
             small_values,
         }
-    }
-
-    #[test]
-    fn content_identity_binds_every_canonical_little_endian_field() {
-        let addr = [0x0102_0304, 5];
-        let f252 = [[6, 7, 8, 9, 10, 11, 12, 0xa1b2_c3d4]];
-        let small = [0x0102_0304_0506_0708_1112_1314_1516_1718u128];
-        let actual = ingest_content_identity(host(&addr, &f252, &small)).unwrap();
-
-        let mut reference = blake3::Hasher::new();
-        reference.update(INGEST_DOMAIN);
-        for (role, rows, width) in [(1u8, 2u64, 1u64), (2, 1, 8), (3, 1, 4)] {
-            reference.update(&[role]);
-            reference.update(&rows.to_le_bytes());
-            reference.update(&width.to_le_bytes());
-            match role {
-                1 => addr.iter().for_each(|word| {
-                    reference.update(&word.to_le_bytes());
-                }),
-                2 => f252[0].iter().for_each(|word| {
-                    reference.update(&word.to_le_bytes());
-                }),
-                3 => small.iter().for_each(|word| {
-                    reference.update(&word.to_le_bytes());
-                }),
-                _ => unreachable!(),
-            }
-        }
-        assert_eq!(actual, *reference.finalize().as_bytes());
-
-        let mut changed_addr = addr;
-        changed_addr.swap(0, 1);
-        assert_ne!(
-            actual,
-            ingest_content_identity(host(&changed_addr, &f252, &small)).unwrap()
-        );
-        let mut changed_f252 = f252;
-        changed_f252[0][7] ^= 1;
-        assert_ne!(
-            actual,
-            ingest_content_identity(host(&addr, &changed_f252, &small)).unwrap()
-        );
-        let changed_small = [small[0].swap_bytes()];
-        assert_ne!(
-            actual,
-            ingest_content_identity(host(&addr, &f252, &changed_small)).unwrap()
-        );
-        assert_ne!(
-            actual,
-            ingest_content_identity(host(&addr[..1], &f252, &small)).unwrap()
-        );
     }
 
     #[test]

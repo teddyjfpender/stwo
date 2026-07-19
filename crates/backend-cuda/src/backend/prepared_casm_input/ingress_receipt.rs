@@ -10,9 +10,6 @@ use super::{
     WitnessCasmInputContract, WitnessCasmInputRowDomain, WITNESS_CASM_STATE_WORDS,
 };
 
-const INGRESS_DOMAIN: &[u8] = b"stwo-cuda-witness-casm-input-ingress-v1\0";
-const HASH_CHUNK_WORDS: usize = 1024;
-
 /// Enqueued CASM ingress which is not admission evidence until its setup fence
 /// has completed.
 ///
@@ -28,10 +25,6 @@ pub struct PendingWitnessCasmInputIngressReceipt {
 impl PendingWitnessCasmInputIngressReceipt {
     pub const fn contract_identity(&self) -> [u8; 32] {
         self.receipt.contract_identity()
-    }
-
-    pub const fn content_identity(&self) -> [u8; 32] {
-        self.receipt.content_identity()
     }
 
     pub const fn generation(&self) -> u64 {
@@ -59,7 +52,6 @@ pub struct WitnessCasmInputIngressReceipt {
     real_rows: usize,
     consumer_rows: usize,
     include_iota: bool,
-    content_identity: [u8; 32],
     generation: u64,
 }
 
@@ -91,7 +83,6 @@ impl WitnessCasmInputIngressReceipt {
             real_rows: binding.real_rows,
             consumer_rows: binding.consumer_rows,
             include_iota: binding.include_iota,
-            content_identity: ingress_content_identity(binding, words)?,
             generation,
         })
     }
@@ -163,10 +154,6 @@ impl WitnessCasmInputIngressReceipt {
 
     pub const fn include_iota(self) -> bool {
         self.include_iota
-    }
-
-    pub const fn content_identity(self) -> [u8; 32] {
-        self.content_identity
     }
 
     pub const fn generation(self) -> u64 {
@@ -328,41 +315,6 @@ impl WitnessCasmInputIngressBinding {
     }
 }
 
-fn ingress_content_identity(
-    binding: WitnessCasmInputIngressBinding,
-    words: &[u32],
-) -> Result<[u8; 32], PreparedWitnessCasmInputError> {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(INGRESS_DOMAIN);
-    hasher.update(&[binding.abi as u8, binding.row_domain as u8]);
-    hash_usize(&mut hasher, binding.state_words_per_row)?;
-    hash_usize(&mut hasher, binding.real_rows)?;
-    hash_usize(&mut hasher, binding.consumer_rows)?;
-    hasher.update(&[u8::from(binding.include_iota)]);
-    hash_usize(&mut hasher, words.len())?;
-
-    let mut bytes = [0u8; HASH_CHUNK_WORDS * core::mem::size_of::<u32>()];
-    for chunk in words.chunks(HASH_CHUNK_WORDS) {
-        for (word, destination) in chunk.iter().zip(bytes.chunks_exact_mut(4)) {
-            destination.copy_from_slice(&word.to_le_bytes());
-        }
-        hasher.update(&bytes[..chunk.len() * core::mem::size_of::<u32>()]);
-    }
-    Ok(*hasher.finalize().as_bytes())
-}
-
-fn hash_usize(
-    hasher: &mut blake3::Hasher,
-    value: usize,
-) -> Result<(), PreparedWitnessCasmInputError> {
-    hasher.update(
-        &u64::try_from(value)
-            .map_err(|_| PreparedWitnessCasmInputError::SizeOverflow)?
-            .to_le_bytes(),
-    );
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,62 +351,7 @@ mod tests {
     }
 
     #[test]
-    fn content_identity_binds_order_extent_and_typed_geometry() {
-        let binding = binding();
-        let words = [1, 2, 3, 4, 5, 6];
-        let identity = ingress_content_identity(binding, &words).unwrap();
-        assert_eq!(identity, ingress_content_identity(binding, &words).unwrap());
-        assert_ne!(
-            identity,
-            ingress_content_identity(binding, &[1, 2, 3, 4, 6, 5]).unwrap()
-        );
-        assert_ne!(
-            identity,
-            ingress_content_identity(binding, &[1, 2, 3, 4, 5]).unwrap()
-        );
-
-        let mut geometry = binding;
-        geometry.real_rows = 1;
-        assert_ne!(
-            identity,
-            ingress_content_identity(geometry, &words).unwrap()
-        );
-        assert_ne!(identity, [0; 32]);
-    }
-
-    #[test]
-    fn chunked_content_hash_is_canonical_at_the_chunk_boundary() {
-        let mut binding = binding();
-        binding.real_rows = 342;
-        binding.consumer_rows = 512;
-        binding.staging_words = 1026;
-        let words = (0..binding.staging_words)
-            .map(|word| word as u32)
-            .collect::<Vec<_>>();
-
-        let mut reference = blake3::Hasher::new();
-        reference.update(INGRESS_DOMAIN);
-        reference.update(&[binding.abi as u8, binding.row_domain as u8]);
-        for value in [
-            binding.state_words_per_row,
-            binding.real_rows,
-            binding.consumer_rows,
-        ] {
-            reference.update(&u64::try_from(value).unwrap().to_le_bytes());
-        }
-        reference.update(&[u8::from(binding.include_iota)]);
-        reference.update(&u64::try_from(words.len()).unwrap().to_le_bytes());
-        for word in &words {
-            reference.update(&word.to_le_bytes());
-        }
-        assert_eq!(
-            ingress_content_identity(binding, &words).unwrap(),
-            *reference.finalize().as_bytes()
-        );
-    }
-
-    #[test]
-    fn receipt_binds_slot_context_content_and_row_major_geometry() {
+    fn receipt_binds_slot_context_and_row_major_geometry() {
         let binding = binding();
         let words = [1, 2, 3, 4, 5, 6];
         let receipt = receipt(binding, &words, 1);
@@ -496,10 +393,6 @@ mod tests {
             assert!(!receipt.matches(mutation, 1));
         }
         assert!(!receipt.matches(binding, 2));
-        assert_ne!(
-            receipt.content_identity(),
-            self::receipt(binding, &[6, 5, 4, 3, 2, 1], 1).content_identity()
-        );
         assert_eq!(receipt.contract_identity(), [7; 32]);
         assert_eq!(receipt.arena_identity(), 11);
         assert_eq!(receipt.exec_context_token(), 13);
@@ -536,7 +429,6 @@ mod tests {
 
         let pending = state.mark_scatter_enqueued(first, binding).unwrap();
         assert_eq!(pending.contract_identity(), [7; 32]);
-        assert_eq!(pending.content_identity(), first.content_identity());
         assert_eq!(pending.generation(), 1);
         assert_eq!(state.receipt(), None);
         assert!(!state.is_current(&first, binding));
@@ -564,14 +456,6 @@ mod tests {
         state.publish(pending, binding).unwrap();
         assert_eq!(
             state.publish(replay, binding),
-            Err(PreparedWitnessCasmInputError::InvalidIngressReceipt)
-        );
-        assert!(state.is_current(&second, binding));
-
-        let mut changed_content = second;
-        changed_content.content_identity[0] ^= 1;
-        assert_eq!(
-            state.publish(pending_for_test(changed_content), binding),
             Err(PreparedWitnessCasmInputError::InvalidIngressReceipt)
         );
         assert!(state.is_current(&second, binding));
