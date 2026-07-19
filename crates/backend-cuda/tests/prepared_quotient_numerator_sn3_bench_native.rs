@@ -183,7 +183,7 @@ fn sn3_staged_group_direct_cuda_event_benchmark() {
     assert_eq!((run_sum.target_group, run_sum.victim_group), (0, 12));
     assert_eq!(run_sum.scratch_words_per_coordinate, 8_388_048);
     assert_eq!(run_sum.manifest.run_count, 17);
-    let run_count = usize::try_from(run_sum.manifest.run_count).unwrap();
+    let run_count = u64::from(run_sum.manifest.run_count);
     let quotient_sources = production.quotient_sources();
     let quotient = PreparedQuotientGraph::prepare(
         &fixture.arena,
