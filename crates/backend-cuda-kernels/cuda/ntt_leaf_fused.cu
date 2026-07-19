@@ -127,6 +127,8 @@ DEVICE_FORCEINLINE m31 fused_sub(m31 a, m31 b) {
     return sub(a, b);
 }
 
+#include "ntt_leaf_fused_col8.cuh"
+
 // n2b_final_warp_hash16_batch (rfft.cu) + the evaluation writeback. Rows
 // [global_warp_start, global_warp_start + VALUES_PER_WARP) are owned by one
 // warp for both the store and the absorb.
@@ -520,6 +522,40 @@ cudaError_t leaf_fused_final_warp_on(
     return cudaGetLastError();
 }
 
+template <unsigned LOG_VALS_PER_THREAD>
+cudaError_t leaf_fused_final_col8_compact_on(
+    m31 **values,
+    unsigned log_n,
+    unsigned start_stage,
+    m31 *twiddles,
+    unsigned twiddle_words,
+    unsigned eval_domain_size,
+    uint32_t cols_done,
+    Blake2sHash *states,
+    uint32_t tiles,
+    CompactBlake2sTailDescriptor initial_tail,
+    cudaStream_t stream
+) {
+    constexpr unsigned WARPS = 8;
+    constexpr unsigned MESSAGE_STRIDE = 17;
+    constexpr unsigned ROWS = 1u << (LOG_WARP + LOG_VALS_PER_THREAD);
+    constexpr unsigned QUADS = 32u * WARPS / 4u;
+    if (log_n + 1 - (LOG_VALS_PER_THREAD + LOG_WARP) != start_stage) {
+        return cudaErrorInvalidValue;
+    }
+    twiddles += twiddle_words - eval_domain_size;
+    dim3 block_dim{32, WARPS, 1};
+    dim3 grid_dim{
+        1u << (log_n - LOG_WARP - LOG_VALS_PER_THREAD), 1, 1};
+    constexpr size_t shared_bytes =
+        size_t(ROWS + QUADS) * MESSAGE_STRIDE * sizeof(uint32_t);
+    n2b_final_warp_col8_compact16_write_batch<LOG_VALS_PER_THREAD>
+        <<<grid_dim, block_dim, shared_bytes, stream>>>(
+            values, log_n, start_stage, twiddles, cols_done, states, tiles,
+            initial_tail);
+    return cudaGetLastError();
+}
+
 template <unsigned LOG_WARP_PER_BLOCK, FusedLeafSink SINK>
 cudaError_t leaf_fused_final_block_on(
     m31 **values,
@@ -632,6 +668,55 @@ int launch_leaf_fused_final(
         default:
             return cudaErrorInvalidConfiguration;
     }
+}
+
+int launch_leaf_fused_final_col8_compact(
+    uint32_t **device_values,
+    unsigned log_n,
+    uint32_t *twiddles,
+    unsigned twiddle_words,
+    unsigned eval_domain_size,
+    uint32_t cols_done,
+    Blake2sHash *states,
+    uint32_t tiles,
+    CompactBlake2sTailDescriptor initial_tail,
+    void *stream
+) {
+    const unsigned final_stages = leaf_fused_final_stages(log_n);
+    const unsigned final_start = log_n + 1 - final_stages;
+    m31 **values = reinterpret_cast<m31 **>(device_values);
+    cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    switch (final_stages) {
+        case 7:
+            return leaf_fused_final_col8_compact_on<2>(
+                values, log_n, final_start, twiddles, twiddle_words,
+                eval_domain_size, cols_done, states, tiles, initial_tail,
+                cuda_stream);
+        case 8:
+            return leaf_fused_final_col8_compact_on<3>(
+                values, log_n, final_start, twiddles, twiddle_words,
+                eval_domain_size, cols_done, states, tiles, initial_tail,
+                cuda_stream);
+        default:
+            return cudaErrorNotSupported;
+    }
+}
+
+template <unsigned LOG_VALS_PER_THREAD>
+cudaError_t configure_leaf_fused_final_col8_compact() {
+    cudaFuncAttributes attributes{};
+    cudaError_t status = cudaFuncGetAttributes(
+        &attributes,
+        n2b_final_warp_col8_compact16_write_batch<LOG_VALS_PER_THREAD>);
+    if (status != cudaSuccess) {
+        return status;
+    }
+    // `localSizeBytes` includes compiler-managed ABI state and does not match
+    // ptxas/cubin spill accounting. The artifact gate separately requires
+    // STACK=LOCAL=0; runtime admission can soundly enforce the architectural
+    // register ceiling exposed by cudaFuncGetAttributes.
+    return attributes.numRegs <= 64
+        ? cudaSuccess : cudaErrorInvalidConfiguration;
 }
 
 template <FusedLeafSink SINK>
@@ -762,4 +847,47 @@ extern "C" int stwo_ntt_direct_compact_final16_on(
     return launch_leaf_fused_final<FusedLeafSink::DirectCompact>(
         device_values, log_n, twiddles, twiddle_words, eval_domain_size,
         cols_done, 0u, 0xffffu, states, tiles, tail, stream);
+}
+
+extern "C" int stwo_ntt_direct_compact_final16_col8_configure(
+    unsigned log_n
+) {
+    switch (leaf_fused_final_stages(log_n)) {
+        case 7:
+            return configure_leaf_fused_final_col8_compact<2>();
+        case 8:
+            return configure_leaf_fused_final_col8_compact<3>();
+        default:
+            return cudaErrorNotSupported;
+    }
+}
+
+extern "C" int stwo_ntt_direct_compact_final16_col8_on(
+    uint32_t **device_values,
+    unsigned log_n,
+    uint32_t tiles,
+    uint32_t *twiddles,
+    unsigned twiddle_words,
+    unsigned eval_domain_size,
+    uint32_t cols_done,
+    const CompactBlake2sTailDescriptor *initial_tail,
+    Blake2sHash *states,
+    void *stream
+) {
+    constexpr uint32_t kMaxFixed16Tiles = 4095;
+    if (device_values == nullptr || log_n < 13 || log_n > 30 || tiles == 0 ||
+        tiles > kMaxFixed16Tiles || twiddles == nullptr ||
+        eval_domain_size != (1u << (log_n - 1)) ||
+        eval_domain_size > twiddle_words ||
+        cols_done > 65535u - 16u * tiles || initial_tail == nullptr ||
+        states == nullptr || stream == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    const CompactBlake2sTailDescriptor tail = *initial_tail;
+    if (!stwo_compact_tail_descriptor_valid(1u << log_n, cols_done, tail)) {
+        return cudaErrorInvalidValue;
+    }
+    return launch_leaf_fused_final_col8_compact(
+        device_values, log_n, twiddles, twiddle_words, eval_domain_size,
+        cols_done, states, tiles, tail, stream);
 }

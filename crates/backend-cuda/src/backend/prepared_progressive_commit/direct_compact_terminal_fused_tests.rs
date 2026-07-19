@@ -294,6 +294,14 @@ fn fixed16_hybrid_is_selected_only_when_exact_traffic_stays_positive() {
         batch_mode(0, 12, 16),
         DirectCompactTerminalBatchMode::Materialized
     );
+    assert_eq!(
+        batch_mode(0, 18, 16),
+        DirectCompactTerminalBatchMode::Materialized
+    );
+    assert_eq!(
+        batch_mode(0, 25, 16),
+        DirectCompactTerminalBatchMode::Materialized
+    );
 }
 
 #[test]

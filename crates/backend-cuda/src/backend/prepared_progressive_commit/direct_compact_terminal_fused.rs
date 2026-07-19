@@ -466,11 +466,11 @@ impl PreparedDirectCompactTerminalExecution {
             };
             if configured.insert(batch.retained_log_size) {
                 let code = unsafe {
-                    stwo_backend_cuda_kernels::raw::stwo_ntt_direct_compact_final16_configure(
+                    stwo_backend_cuda_kernels::raw::stwo_ntt_direct_compact_final16_col8_configure(
                         batch.retained_log_size,
                     )
                 };
-                check_cuda("direct_compact_final16_configure", code)
+                check_cuda("direct_compact_final16_col8_configure", code)
                     .map_err(CompactDomainBindingError::from)?;
             }
         }
@@ -535,7 +535,7 @@ impl PreparedDirectCompactTerminalExecution {
                         .ok_or(DirectCompactTerminalError::SizeOverflow)?;
                     let eval_domain_size = size / 2;
                     let code = unsafe {
-                        stwo_backend_cuda_kernels::raw::stwo_ntt_direct_compact_final16_on(
+                        stwo_backend_cuda_kernels::raw::stwo_ntt_direct_compact_final16_col8_on(
                             batch.output_pointers.as_u32_ptr().cast(),
                             batch.retained_log_size,
                             tiles,
@@ -548,7 +548,7 @@ impl PreparedDirectCompactTerminalExecution {
                             stream,
                         )
                     };
-                    check_cuda("direct_compact_final16", code)
+                    check_cuda("direct_compact_final16_col8", code)
                         .map_err(CompactDomainBindingError::from)?;
                     if remainder_columns != 0 {
                         let pointers = direct.launch_final_interval_before_circle(
