@@ -161,7 +161,7 @@ fn sn3_staged_group_direct_cuda_event_benchmark() {
         staged_config,
         false,
     );
-    let direct = prepare(
+    let production = prepare(
         &fixture,
         &columns,
         &destinations,
@@ -172,17 +172,17 @@ fn sn3_staged_group_direct_cuda_event_benchmark() {
     let expected_schedule = PreparedNumeratorSchedule::StagedPackedSingleWrite {
         packed_output_rows: 25_165_264,
     };
-    let expected_direct_schedule = PreparedNumeratorSchedule::StagedGroupDirect {
+    let expected_production_schedule = PreparedNumeratorSchedule::StagedGroupDirect {
         output_rows: 25_165_264,
     };
     assert_eq!(packed.schedule(), expected_schedule);
-    assert_eq!(direct.schedule(), expected_direct_schedule);
-    let run_sum = direct
+    assert_eq!(production.schedule(), expected_production_schedule);
+    let run_sum = production
         .group_direct_run_sum_receipt()
-        .expect("sealed SN3 arena must admit the run-sum candidate");
+        .expect("sealed SN3 arena must admit the production run-sum binding");
     assert_eq!((run_sum.target_group, run_sum.victim_group), (0, 12));
     assert_eq!(run_sum.scratch_words_per_coordinate, 8_388_048);
-    let quotient_sources = direct.quotient_sources();
+    let quotient_sources = production.quotient_sources();
     let quotient = PreparedQuotientGraph::prepare(
         &fixture.arena,
         SN3_QUOTIENT_CONFIG,
@@ -213,13 +213,13 @@ fn sn3_staged_group_direct_cuda_event_benchmark() {
     let eager_fri_input = capture_fri_input(&fixture, &quotient);
     poison_outputs(&fixture, &staged_requirements, EAGER_HYBRID_POISON);
     poison_fri_input(&fixture, &quotient, EAGER_HYBRID_POISON);
-    direct.launch().unwrap();
+    production.launch().unwrap();
     quotient.launch().unwrap();
     fixture.arena.context().sync().unwrap();
-    let eager_direct_blake3 =
-        assert_canonical_output(&fixture, &staged_requirements, &eager, "eager group-direct");
-    let eager_direct_fri_blake3 =
-        assert_fri_input(&fixture, &quotient, &eager_fri_input, "eager group-direct");
+    let eager_production_blake3 =
+        assert_canonical_output(&fixture, &staged_requirements, &eager, "eager production");
+    let eager_production_fri_blake3 =
+        assert_fri_input(&fixture, &quotient, &eager_fri_input, "eager production");
     let validated_numerator_output_bytes = staged_requirements
         .groups
         .iter()
@@ -245,12 +245,12 @@ fn sn3_staged_group_direct_cuda_event_benchmark() {
     quotient.launch().unwrap();
     let packed_graph = capture.finish().unwrap();
     let capture = fixture.arena.context().capture().unwrap();
-    direct.launch().unwrap();
+    production.launch().unwrap();
     quotient.launch().unwrap();
-    let direct_graph = capture.finish().unwrap();
+    let production_graph = capture.finish().unwrap();
     assert_eq!(
-        direct_graph.kernel_nodes(),
-        packed_graph.kernel_nodes() + 18
+        production_graph.kernel_nodes(),
+        packed_graph.kernel_nodes() + 35
     );
     let (device_free_after_graphs, device_total_after_graphs) = gpu_memory_info();
     assert_eq!(device_total_after_graphs, device_total_bytes);
@@ -265,27 +265,23 @@ fn sn3_staged_group_direct_cuda_event_benchmark() {
         assert_fri_input(&fixture, &quotient, &eager_fri_input, "captured packed");
     poison_outputs(&fixture, &staged_requirements, CAPTURE_HYBRID_POISON);
     poison_fri_input(&fixture, &quotient, CAPTURE_HYBRID_POISON);
-    direct_graph.launch(fixture.arena.context()).unwrap();
+    production_graph.launch(fixture.arena.context()).unwrap();
     fixture.arena.context().sync().unwrap();
-    let captured_direct_blake3 = assert_canonical_output(
+    let captured_production_blake3 = assert_canonical_output(
         &fixture,
         &staged_requirements,
         &eager,
-        "captured group-direct",
+        "captured production",
     );
-    let captured_direct_fri_blake3 = assert_fri_input(
-        &fixture,
-        &quotient,
-        &eager_fri_input,
-        "captured group-direct",
-    );
+    let captured_production_fri_blake3 =
+        assert_fri_input(&fixture, &quotient, &eager_fri_input, "captured production");
 
     for round in 0..DEFAULT_WARMUPS {
         if round % 2 == 0 {
             replay_cuda_ms(&packed_graph, fixture.arena.context());
-            replay_cuda_ms(&direct_graph, fixture.arena.context());
+            replay_cuda_ms(&production_graph, fixture.arena.context());
         } else {
-            replay_cuda_ms(&direct_graph, fixture.arena.context());
+            replay_cuda_ms(&production_graph, fixture.arena.context());
             replay_cuda_ms(&packed_graph, fixture.arena.context());
         }
     }
@@ -323,33 +319,34 @@ fn sn3_staged_group_direct_cuda_event_benchmark() {
     );
     poison_outputs(&fixture, &staged_requirements, TIMED_HYBRID_POISON);
     poison_fri_input(&fixture, &quotient, TIMED_HYBRID_POISON);
-    let causal_validation_direct_ms = replay_cuda_ms(&direct_graph, fixture.arena.context());
-    let timed_direct_blake3 = assert_canonical_output(
+    let causal_validation_production_ms =
+        replay_cuda_ms(&production_graph, fixture.arena.context());
+    let timed_production_blake3 = assert_canonical_output(
         &fixture,
         &staged_requirements,
         &eager,
-        "causal validation group-direct replay",
+        "causal validation production replay",
     );
-    let timed_direct_fri_blake3 = assert_fri_input(
+    let timed_production_fri_blake3 = assert_fri_input(
         &fixture,
         &quotient,
         &eager_fri_input,
-        "causal validation group-direct replay",
+        "causal validation production replay",
     );
 
     // Re-establish an alternating steady state after poison/D2H validation. One unrecorded
     // replay of each graph keeps the transition into measured iteration zero symmetric.
     replay_cuda_ms(&packed_graph, fixture.arena.context());
-    replay_cuda_ms(&direct_graph, fixture.arena.context());
+    replay_cuda_ms(&production_graph, fixture.arena.context());
 
     let mut packed_ms = Vec::with_capacity(iterations);
-    let mut direct_ms = Vec::with_capacity(iterations);
+    let mut production_ms = Vec::with_capacity(iterations);
     for iteration in 0..iterations {
         if iteration % 2 == 0 {
             packed_ms.push(replay_cuda_ms(&packed_graph, fixture.arena.context()));
-            direct_ms.push(replay_cuda_ms(&direct_graph, fixture.arena.context()));
+            production_ms.push(replay_cuda_ms(&production_graph, fixture.arena.context()));
         } else {
-            direct_ms.push(replay_cuda_ms(&direct_graph, fixture.arena.context()));
+            production_ms.push(replay_cuda_ms(&production_graph, fixture.arena.context()));
             packed_ms.push(replay_cuda_ms(&packed_graph, fixture.arena.context()));
         }
     }
@@ -364,32 +361,32 @@ fn sn3_staged_group_direct_cuda_event_benchmark() {
         assert_fri_input(&fixture, &quotient, &eager_fri_input, "post-timing packed");
     poison_outputs(&fixture, &staged_requirements, POST_TIMING_HYBRID_POISON);
     poison_fri_input(&fixture, &quotient, POST_TIMING_HYBRID_POISON);
-    direct_graph.launch(fixture.arena.context()).unwrap();
+    production_graph.launch(fixture.arena.context()).unwrap();
     fixture.arena.context().sync().unwrap();
-    let post_timing_direct_blake3 = assert_canonical_output(
+    let post_timing_production_blake3 = assert_canonical_output(
         &fixture,
         &staged_requirements,
         &eager,
-        "post-timing group-direct",
+        "post-timing production",
     );
-    let post_timing_direct_fri_blake3 = assert_fri_input(
+    let post_timing_production_fri_blake3 = assert_fri_input(
         &fixture,
         &quotient,
         &eager_fri_input,
-        "post-timing group-direct",
+        "post-timing production",
     );
     let artifact_identity = artifact_identity();
 
     let packed_p50 = percentile(&packed_ms, 50);
     let packed_p95 = percentile(&packed_ms, 95);
-    let direct_p50 = percentile(&direct_ms, 50);
-    let direct_p95 = percentile(&direct_ms, 95);
+    let production_p50 = percentile(&production_ms, 50);
+    let production_p95 = percentile(&production_ms, 95);
     println!(
         concat!(
-            "{{\"schema\":\"stwo.sn3_numerator_to_fri_input_group_direct.cuda_event.v1\",",
+            "{{\"schema\":\"stwo.sn3_numerator_to_fri_input_production.cuda_event.v2\",",
             "\"timing_scope\":\"per-replay CUDA-event device elapsed time for captured numerator then ordinary quotient-to-FRI-input graph\",",
             "\"percentile_method\":\"nearest-rank\"," ,
-            "\"result_class\":\"diagnostic same-lineage packed/group-direct A/B; not independent mathematical truth\",",
+            "\"result_class\":\"diagnostic same-lineage packed/production A/B; not independent mathematical truth\",",
             "\"input_pattern\":\"input-recipe-sealed nonzero canonical-M31 affine row and twiddle patterns; bounded chunked upload\",",
             "\"twiddle_provenance\":\"synthetic affine-pattern diagnostic; not transcript-derived canonical STARK twiddles\",",
             "\"topology\":{{\"group_logs\":{:?},\"groups\":19,\"coefficient_columns\":161,",
@@ -412,20 +409,20 @@ fn sn3_staged_group_direct_cuda_event_benchmark() {
             "\"input_recipe_encoding\":\"sealed numerator recipe v2 plus literal ordinary quotient requirements and inverse affine twiddle recipe v2\"," ,
             "\"numerator_input_recipe_blake3\":\"{}\",\"boundary_input_recipe_blake3\":\"{}\"," ,
             "\"eager_packed_blake3\":\"{}\"," ,
-            "\"eager_direct_blake3\":\"{}\",\"captured_packed_blake3\":\"{}\"," ,
-            "\"captured_direct_blake3\":\"{}\"," ,
+            "\"eager_production_blake3\":\"{}\",\"captured_packed_blake3\":\"{}\"," ,
+            "\"captured_production_blake3\":\"{}\"," ,
             "\"causal_validation_replays_excluded_from_samples\":true," ,
             "\"causal_validation_packed_blake3\":\"{}\"," ,
-            "\"causal_validation_direct_blake3\":\"{}\",\"post_timing_packed_blake3\":\"{}\"," ,
-            "\"post_timing_direct_blake3\":\"{}\",\"capture_revalidated\":true," ,
+            "\"causal_validation_production_blake3\":\"{}\",\"post_timing_packed_blake3\":\"{}\"," ,
+            "\"post_timing_production_blake3\":\"{}\",\"capture_revalidated\":true," ,
             "\"post_timing_revalidated\":true}}," ,
             "\"fri_input_identity\":{{\"eager_packed_blake3\":\"{}\",",
-            "\"eager_direct_blake3\":\"{}\",\"captured_packed_blake3\":\"{}\",",
-            "\"captured_direct_blake3\":\"{}\",\"causal_validation_packed_blake3\":\"{}\",",
-            "\"causal_validation_direct_blake3\":\"{}\",\"post_timing_packed_blake3\":\"{}\",",
-            "\"post_timing_direct_blake3\":\"{}\",\"exact_word_comparison\":true}},",
-            "\"capture_topology\":{{\"packed_kernel_nodes\":{},\"group_direct_kernel_nodes\":{},",
-            "\"group_direct_minus_packed_kernel_nodes\":18}},",
+            "\"eager_production_blake3\":\"{}\",\"captured_packed_blake3\":\"{}\",",
+            "\"captured_production_blake3\":\"{}\",\"causal_validation_packed_blake3\":\"{}\",",
+            "\"causal_validation_production_blake3\":\"{}\",\"post_timing_packed_blake3\":\"{}\",",
+            "\"post_timing_production_blake3\":\"{}\",\"exact_word_comparison\":true}},",
+            "\"capture_topology\":{{\"packed_kernel_nodes\":{},\"production_kernel_nodes\":{},",
+            "\"production_minus_packed_kernel_nodes\":35}},",
             "\"artifact_identity\":{{\"boundary_seal_blake3\":\"{}\"," ,
             "\"boundary_rust_source_blake3\":\"{}\"," ,
             "\"ordinary_cuda_source_blake3\":\"{}\"," ,
@@ -436,16 +433,16 @@ fn sn3_staged_group_direct_cuda_event_benchmark() {
             "\"cuda_module_target_sms\":{:?}," ,
             "\"archive_lto_covered_by_module_build_identity\":true," ,
             "\"identity_complete\":{}}}," ,
-            "\"comparator\":{{\"lineage\":\"same staged LDE preparation, exact numerator ownership, and identical ordinary quotient tail; candidate replaces one packed row launch with one launch per exact group\"," ,
+            "\"comparator\":{{\"lineage\":\"same staged LDE preparation, exact numerator ownership, and identical ordinary quotient tail; production selects the sealed native-domain run-sum binding with group-direct fallback\"," ,
             "\"numerator_comparator_source_blake3\":\"{}\"," ,
             "\"independent_truth\":false}}," ,
             "\"warmups_each\":{},\"equalization_replays_each\":1," ,
             "\"iterations_each\":{},\"minimum_iterations\":6,\"iterations_must_be_even\":true," ,
-            "\"causal_validation_cuda_event_ms\":{{\"packed\":{:.6},\"group_direct\":{:.6},",
+            "\"causal_validation_cuda_event_ms\":{{\"packed\":{:.6},\"production\":{:.6},",
             "\"excluded_from_samples\":true}}," ,
-            "\"samples_ms\":{{\"packed\":{},\"group_direct\":{}}}," ,
+            "\"samples_ms\":{{\"packed\":{},\"production\":{}}}," ,
             "\"cuda_event_ms\":{{\"packed\":{{\"p50\":{:.6},\"p95\":{:.6}}}," ,
-            "\"group_direct\":{{\"p50\":{:.6},\"p95\":{:.6}}}}}," ,
+            "\"production\":{{\"p50\":{:.6},\"p95\":{:.6}}}}}," ,
             "\"speedup\":{{\"p50\":{:.9},\"p95\":{:.9}}}}}"
         ),
         GROUP_LOGS,
@@ -468,23 +465,23 @@ fn sn3_staged_group_direct_cuda_event_benchmark() {
         input_recipe_blake3,
         boundary_input_recipe_blake3,
         eager.digest(),
-        eager_direct_blake3,
+        eager_production_blake3,
         captured_packed_blake3,
-        captured_direct_blake3,
+        captured_production_blake3,
         timed_packed_blake3,
-        timed_direct_blake3,
+        timed_production_blake3,
         post_timing_packed_blake3,
-        post_timing_direct_blake3,
+        post_timing_production_blake3,
         eager_fri_input.digest,
-        eager_direct_fri_blake3,
+        eager_production_fri_blake3,
         captured_packed_fri_blake3,
-        captured_direct_fri_blake3,
+        captured_production_fri_blake3,
         timed_packed_fri_blake3,
-        timed_direct_fri_blake3,
+        timed_production_fri_blake3,
         post_timing_packed_fri_blake3,
-        post_timing_direct_fri_blake3,
+        post_timing_production_fri_blake3,
         packed_graph.kernel_nodes(),
-        direct_graph.kernel_nodes(),
+        production_graph.kernel_nodes(),
         artifact_identity.boundary_seal_blake3,
         artifact_identity.boundary_rust_source_blake3,
         artifact_identity.ordinary_cuda_source_blake3,
@@ -500,15 +497,15 @@ fn sn3_staged_group_direct_cuda_event_benchmark() {
         DEFAULT_WARMUPS,
         iterations,
         causal_validation_packed_ms,
-        causal_validation_direct_ms,
+        causal_validation_production_ms,
         json_samples(&packed_ms),
-        json_samples(&direct_ms),
+        json_samples(&production_ms),
         packed_p50,
         packed_p95,
-        direct_p50,
-        direct_p95,
-        packed_p50 / direct_p50,
-        packed_p95 / direct_p95,
+        production_p50,
+        production_p95,
+        packed_p50 / production_p50,
+        packed_p95 / production_p95,
     );
 }
 
