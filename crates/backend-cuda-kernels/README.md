@@ -14,6 +14,11 @@ the first validation gate for the staged sources. No FFI bindings are exposed ye
 belong with the `stwo-backend-cuda` trait
 implementations (see "How to turn this into a backend" below).
 
+`STWO_CUDA_ARCHIVE_LTO=1` compiles only the ordinary archive translation units as LTO IR
+and enables LTO at their matching device-link step. Generated AOT sources remain standalone
+`-cubin` builds. Do not put LTO flags in `STWO_CUDA_NVCC_FLAGS`: those global flags are also
+forwarded to every generated AOT cubin and are rejected deliberately.
+
 ## What was taken
 
 The compute kernels (`.cu`) with their full local include closure (`.cuh`), 55 files:
@@ -85,9 +90,11 @@ Found during review of the prototype; all are inherited by these copies:
    wrapper that exposes `Column::at` over device memory will be catastrophically slow if
    called in a loop; mirror the unified-memory/host-cache design of the Metal columns or
    batch the reads.
-4. **Separable compilation blocks field-op inlining**: `fields.cu` is its own translation
-   unit, so `mul`/`add` cross TU boundaries as real calls. Build with `-dlto` (device
-   link-time optimization) or make field ops header-inline.
+4. **Separable compilation can block field-op inlining**: `fields.cu` is its own translation
+   unit, so `mul`/`add` can cross TU boundaries as real calls. Set
+   `STWO_CUDA_ARCHIVE_LTO=1` to compile ordinary objects with `code=lto_N` and enable `-dlto`
+   at their matching device link, or make field ops header-inline. The scoped switch leaves
+   generated AOT cubins unchanged.
 5. **Quotient denominator inverses must stay row-local**: both quotient entry points now
    compute and consume each inverse in canonical sample order. Do not reintroduce an
    O(samples × domain) global denominator slab; the prepared pass/byte model pins the

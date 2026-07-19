@@ -164,9 +164,12 @@ fn ordinary_source_closure_is_exact_and_excludes_generated_aot() {
 }
 
 #[test]
-fn build_pipeline_applies_dlink_flags_and_keeps_receipt_outside_payload() {
+fn build_pipeline_pairs_archive_lto_and_keeps_aot_isolated() {
     let build = include_str!("build.rs");
     for required in [
+        "let object_gencode_flags = archive_gencode_flags(&target_sms, archive_lto);",
+        "let dlink_gencode_flags = archive_gencode_flags(&target_sms, false);",
+        "dlink_argv.push(\"-dlto\".to_string());",
         "dlink_argv.extend(extra_flags.iter().cloned());",
         "The receipt is deliberately last and excluded from `identity`.",
         "(carrier_staging, carrier)",
@@ -177,6 +180,10 @@ fn build_pipeline_applies_dlink_flags_and_keeps_receipt_outside_payload() {
             "missing build contract: {required}"
         );
     }
+    let aot_builder = &build[build.find("fn build_aot_pack(").unwrap()..];
+    assert!(!aot_builder.contains("STWO_CUDA_ARCHIVE_LTO"));
+    assert!(!aot_builder.contains("archive_lto"));
+
     let carrier = String::from_utf8(receipt_carrier_source([0xab; 32])).unwrap();
     for required in [
         RECEIPT_SYMBOL,

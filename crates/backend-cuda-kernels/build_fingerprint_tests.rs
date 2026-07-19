@@ -17,6 +17,48 @@ fn compiler<'a>(command: &'a str, version: &'a [u8]) -> CompilerIdentity<'a> {
 }
 
 #[test]
+fn archive_lto_policy_is_strict_and_preserves_default_gencode() {
+    assert_eq!(parse_archive_lto(None), Ok(false));
+    assert_eq!(parse_archive_lto(Some("0")), Ok(false));
+    assert_eq!(parse_archive_lto(Some("1")), Ok(true));
+    for invalid in ["", "2", "true", " 1"] {
+        assert!(parse_archive_lto(Some(invalid)).is_err(), "{invalid:?}");
+    }
+
+    assert_eq!(
+        archive_gencode_flags(&[86, 90], false),
+        strings(&[
+            "-gencode",
+            "arch=compute_86,code=sm_86",
+            "-gencode",
+            "arch=compute_90,code=sm_90",
+        ])
+    );
+    assert_eq!(
+        archive_gencode_flags(&[86, 90], true),
+        strings(&[
+            "-gencode",
+            "arch=compute_86,code=lto_86",
+            "-gencode",
+            "arch=compute_90,code=lto_90",
+        ])
+    );
+
+    for global_lto in [
+        "-dlto",
+        "--dlink-time-opt",
+        "-lto",
+        "--lto",
+        "-gen-opt-lto",
+        "--gen-opt-lto",
+        "-ltoir",
+        "--ltoir",
+    ] {
+        assert!(validate_extra_flags(&strings(&[global_lto])).is_err());
+    }
+}
+
+#[test]
 fn command_path_tracks_existing_explicit_executables_but_not_missing_paths() {
     let existing = std::env::current_exe().unwrap();
     assert_eq!(
