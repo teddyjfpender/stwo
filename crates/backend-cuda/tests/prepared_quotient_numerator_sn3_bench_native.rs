@@ -9,6 +9,8 @@
 
 #[path = "support/sn3_quotient_numerator_bench.rs"]
 mod sn3_quotient_numerator_bench;
+#[path = "support/sn3_quotient_run_sum_ab.rs"]
+mod sn3_quotient_run_sum_ab;
 #[path = "support/sn3_quotient_topology_fixture.rs"]
 mod sn3_quotient_topology_fixture;
 
@@ -16,7 +18,7 @@ use blake3::{Hash, Hasher};
 use sn3_quotient_numerator_bench::{
     artifact_identity, assert_affine_pattern_sanity, assert_canonical_output,
     capture_canonical_output, input_recipe_digest, json_samples, percentile, poison_outputs,
-    source_pattern_seed, upload_affine_pattern, TWIDDLE_PATTERN_SEED,
+    source_pattern_seed, upload_affine_pattern, CanonicalOutput, TWIDDLE_PATTERN_SEED,
 };
 use sn3_quotient_topology_fixture::load_sn3_topology_fixture;
 use stwo::core::circle::CirclePoint;
@@ -96,6 +98,12 @@ const SOURCE_BASE: u32 = 1_000;
 const OUTPUT_BASE: u32 = 10_000;
 const PACKED_WORKSPACE_BASE: u32 = 1;
 const DIRECT_WORKSPACE_BASE: u32 = 20;
+
+#[test]
+#[ignore = "requires CUDA and the reported 42.97 GiB numerator-to-FRI-input arena"]
+fn sn3_group_direct_run_sum_same_object_cuda_event_benchmark() {
+    sn3_quotient_run_sum_ab::run();
+}
 
 #[test]
 #[ignore = "requires CUDA and the reported 42.97 GiB numerator-to-FRI-input arena"]

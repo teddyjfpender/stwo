@@ -56,6 +56,14 @@ impl ArtifactIdentity {
         optional_hash_json(self.boundary_cuda_module_sha256.as_deref())
     }
 
+    pub(super) fn boundary_source_projection_sha256(&self) -> Option<&str> {
+        self.boundary_source_projection_sha256.as_deref()
+    }
+
+    pub(super) fn boundary_cuda_module_sha256(&self) -> Option<&str> {
+        self.boundary_cuda_module_sha256.as_deref()
+    }
+
     pub(super) fn is_complete(&self) -> bool {
         self.boundary_source_projection_sha256.is_some()
             && self.boundary_cuda_module_sha256.is_some()
@@ -506,6 +514,10 @@ fn boundary_rust_source_digest() -> Hash {
             include_bytes!("sn3_quotient_numerator_bench.rs").as_slice(),
         ),
         (
+            "tests/support/sn3_quotient_run_sum_ab.rs",
+            include_bytes!("sn3_quotient_run_sum_ab.rs").as_slice(),
+        ),
+        (
             "tests/support/sn3_quotient_topology_fixture.rs",
             include_bytes!("sn3_quotient_topology_fixture.rs").as_slice(),
         ),
@@ -517,6 +529,10 @@ fn boundary_rust_source_digest() -> Hash {
             "src/backend/quotient_numerator_staged_single_write.rs",
             include_bytes!("../../src/backend/quotient_numerator_staged_single_write.rs")
                 .as_slice(),
+        ),
+        (
+            "src/backend/quotient_numerator_run_sum.rs",
+            include_bytes!("../../src/backend/quotient_numerator_run_sum.rs").as_slice(),
         ),
         (
             "src/backend/prepared_quotient_numerator.rs",
@@ -538,6 +554,10 @@ fn boundary_rust_source_digest() -> Hash {
             "src/backend/prepared_quotient_numerator/single_write.rs",
             include_bytes!("../../src/backend/prepared_quotient_numerator/single_write.rs")
                 .as_slice(),
+        ),
+        (
+            "src/backend/prepared_quotient_numerator/run_sum.rs",
+            include_bytes!("../../src/backend/prepared_quotient_numerator/run_sum.rs").as_slice(),
         ),
         (
             "src/backend/prepared_quotient.rs",
@@ -590,12 +610,20 @@ fn candidate_source_digest() -> Hash {
             include_bytes!("sn3_quotient_numerator_bench.rs").as_slice(),
         ),
         (
+            "tests/support/sn3_quotient_run_sum_ab.rs",
+            include_bytes!("sn3_quotient_run_sum_ab.rs").as_slice(),
+        ),
+        (
             "tests/support/sn3_quotient_topology_fixture.rs",
             include_bytes!("sn3_quotient_topology_fixture.rs").as_slice(),
         ),
         (
             "src/backend/quotient_numerator_single_write.rs",
             include_bytes!("../../src/backend/quotient_numerator_single_write.rs").as_slice(),
+        ),
+        (
+            "src/backend/quotient_numerator_run_sum.rs",
+            include_bytes!("../../src/backend/quotient_numerator_run_sum.rs").as_slice(),
         ),
         (
             "src/backend/prepared_quotient_numerator.rs",
@@ -617,6 +645,17 @@ fn candidate_source_digest() -> Hash {
             "src/backend/prepared_quotient_numerator/single_write.rs",
             include_bytes!("../../src/backend/prepared_quotient_numerator/single_write.rs")
                 .as_slice(),
+        ),
+        (
+            "src/backend/prepared_quotient_numerator/run_sum.rs",
+            include_bytes!("../../src/backend/prepared_quotient_numerator/run_sum.rs").as_slice(),
+        ),
+        (
+            "cuda/quotient_numerator_native_run_sum.cu",
+            include_bytes!(
+                "../../../backend-cuda-kernels/cuda/quotient_numerator_native_run_sum.cu"
+            )
+            .as_slice(),
         ),
         (
             "cuda/quotient_numerator_single_write.cu",
