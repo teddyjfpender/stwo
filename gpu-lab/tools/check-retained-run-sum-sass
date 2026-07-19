@@ -49,7 +49,7 @@ dlink_sha=$(sha256sum "$DLINK" | awk '{print $1}')
 elf_count=$(grep -Ec '^ELF file[[:space:]]+[0-9]+:' "$OUT/raw/list-elf.txt" || true)
 [[ "$elf_count" -eq 1 ]] || die "expected one ELF, found $elf_count"
 elf=$(sed -nE 's/^ELF file[[:space:]]+[0-9]+:[[:space:]]+//p' "$OUT/raw/list-elf.txt")
-[[ "$elf" == "stwo_cuda_kernels_dlink.staged.1.sm_86.cubin" ]] ||
+[[ "$elf" == "lto.sm_86.cubin" ]] ||
   die "unexpected ELF: $elf"
 [[ ! -s "$OUT/raw/list-ptx.txt" ]] || die "PTX payload is not admissible"
 mapfile -t sms < <(
