@@ -182,6 +182,8 @@ fn sn3_staged_group_direct_cuda_event_benchmark() {
         .expect("sealed SN3 arena must admit the production run-sum binding");
     assert_eq!((run_sum.target_group, run_sum.victim_group), (0, 12));
     assert_eq!(run_sum.scratch_words_per_coordinate, 8_388_048);
+    assert_eq!(run_sum.manifest.run_count, 17);
+    let run_count = usize::try_from(run_sum.manifest.run_count).unwrap();
     let quotient_sources = production.quotient_sources();
     let quotient = PreparedQuotientGraph::prepare(
         &fixture.arena,
@@ -248,10 +250,11 @@ fn sn3_staged_group_direct_cuda_event_benchmark() {
     production.launch().unwrap();
     quotient.launch().unwrap();
     let production_graph = capture.finish().unwrap();
-    assert_eq!(
-        production_graph.kernel_nodes(),
-        packed_graph.kernel_nodes() + 35
-    );
+    let production_minus_packed_nodes = production_graph
+        .kernel_nodes()
+        .checked_sub(packed_graph.kernel_nodes())
+        .unwrap();
+    assert_eq!(production_minus_packed_nodes, 18 + run_count);
     let (device_free_after_graphs, device_total_after_graphs) = gpu_memory_info();
     assert_eq!(device_total_after_graphs, device_total_bytes);
 
@@ -383,10 +386,11 @@ fn sn3_staged_group_direct_cuda_event_benchmark() {
     let production_p95 = percentile(&production_ms, 95);
     println!(
         concat!(
-            "{{\"schema\":\"stwo.sn3_numerator_to_fri_input_production.cuda_event.v2\",",
+            "{{\"schema\":\"stwo.sn3_numerator_to_fri_input_production_group_direct_dispatch.cuda_event.v2\",",
             "\"timing_scope\":\"per-replay CUDA-event device elapsed time for captured numerator then ordinary quotient-to-FRI-input graph\",",
             "\"percentile_method\":\"nearest-rank\"," ,
-            "\"result_class\":\"diagnostic same-lineage packed/production A/B; not independent mathematical truth\",",
+            "\"result_class\":\"diagnostic same-lineage packed/forced-StagedGroupDirect production-dispatch A/B; not independent mathematical truth or end-to-end planner evidence\",",
+            "\"production_scope\":{{\"prepared_launch_dispatch\":true,\"production_planner_exercised\":false,\"forced_schedule\":\"StagedGroupDirect\"}},",
             "\"input_pattern\":\"input-recipe-sealed nonzero canonical-M31 affine row and twiddle patterns; bounded chunked upload\",",
             "\"twiddle_provenance\":\"synthetic affine-pattern diagnostic; not transcript-derived canonical STARK twiddles\",",
             "\"topology\":{{\"group_logs\":{:?},\"groups\":19,\"coefficient_columns\":161,",
@@ -422,7 +426,7 @@ fn sn3_staged_group_direct_cuda_event_benchmark() {
             "\"causal_validation_production_blake3\":\"{}\",\"post_timing_packed_blake3\":\"{}\",",
             "\"post_timing_production_blake3\":\"{}\",\"exact_word_comparison\":true}},",
             "\"capture_topology\":{{\"packed_kernel_nodes\":{},\"production_kernel_nodes\":{},",
-            "\"production_minus_packed_kernel_nodes\":35}},",
+            "\"production_minus_packed_kernel_nodes\":{},\"run_sum_manifest_runs\":{}}},",
             "\"artifact_identity\":{{\"boundary_seal_blake3\":\"{}\"," ,
             "\"boundary_rust_source_blake3\":\"{}\"," ,
             "\"ordinary_cuda_source_blake3\":\"{}\"," ,
@@ -443,7 +447,7 @@ fn sn3_staged_group_direct_cuda_event_benchmark() {
             "\"samples_ms\":{{\"packed\":{},\"production\":{}}}," ,
             "\"cuda_event_ms\":{{\"packed\":{{\"p50\":{:.6},\"p95\":{:.6}}}," ,
             "\"production\":{{\"p50\":{:.6},\"p95\":{:.6}}}}}," ,
-            "\"speedup\":{{\"p50\":{:.9},\"p95\":{:.9}}}}}"
+            "\"speedup\":{{\"direction\":\"packed_divided_by_production\",\"p50\":{:.9},\"p95\":{:.9}}}}}"
         ),
         GROUP_LOGS,
         validated_numerator_output_bytes,
@@ -482,6 +486,8 @@ fn sn3_staged_group_direct_cuda_event_benchmark() {
         post_timing_production_fri_blake3,
         packed_graph.kernel_nodes(),
         production_graph.kernel_nodes(),
+        production_minus_packed_nodes,
+        run_count,
         artifact_identity.boundary_seal_blake3,
         artifact_identity.boundary_rust_source_blake3,
         artifact_identity.ordinary_cuda_source_blake3,
