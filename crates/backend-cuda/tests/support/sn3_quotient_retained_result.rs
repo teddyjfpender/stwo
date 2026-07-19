@@ -240,6 +240,8 @@ pub(crate) fn publish_result(
             "boundary_input_recipe_blake3": boundary_recipe.to_string(),
             "retained_measurement_source_blake3": measurement_source.to_string(),
             "base_boundary_seal_blake3": artifact.boundary_seal_blake3.to_string(),
+            "boundary_source_projection_sha256": artifact.boundary_source_projection_sha256(),
+            "boundary_cuda_module_sha256": artifact.boundary_cuda_module_sha256(),
             "ordinary_cuda_source_blake3": artifact.ordinary_cuda_source_blake3.to_string(),
             "test_binary_blake3": artifact.test_binary_blake3.to_string(),
             "cuda_build_mode": artifact.cuda_build_mode,
