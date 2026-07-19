@@ -397,6 +397,22 @@ fn assert_outputs(
     actual
 }
 
+fn assert_direct_outputs(
+    base: &CommitProgram,
+    evaluations: &[Vec<u32>],
+    arena: &DeviceArena,
+    leaves: ArenaSlice,
+    retained: &[Option<ArenaSlice>],
+) -> Vec<Blake2sHash> {
+    if base.identity().geometry.lifting_log_size <= 16 {
+        return assert_outputs(base, evaluations, arena, leaves, retained);
+    }
+    for (expected, output) in evaluations.iter().zip(retained) {
+        assert_eq!(&read_words(arena, output.unwrap()), expected);
+    }
+    read_hashes(arena, leaves)
+}
+
 fn run(case: Case) {
     let (base, domain, compact, fused, direct, terminal) = programs(&case);
     let workspace_slots = slots(base.requirements());
@@ -449,14 +465,14 @@ fn run(case: Case) {
 
     baseline.launch().unwrap();
     candidate.launch().unwrap();
-    let eager_baseline = assert_outputs(
+    let eager_baseline = assert_direct_outputs(
         &base,
         &first_evaluations,
         &baseline_arena,
         baseline.leaf_hashes(),
         &baseline_retained,
     );
-    let eager_candidate = assert_outputs(
+    let eager_candidate = assert_direct_outputs(
         &base,
         &first_evaluations,
         &candidate_arena,
@@ -496,7 +512,7 @@ fn run(case: Case) {
     baseline_graph.launch(baseline_arena.context()).unwrap();
     candidate_graph.launch(candidate_arena.context()).unwrap();
     assert_eq!(
-        assert_outputs(
+        assert_direct_outputs(
             &base,
             &first_evaluations,
             &candidate_arena,
@@ -525,14 +541,14 @@ fn run(case: Case) {
     baseline_graph.launch(baseline_arena.context()).unwrap();
     candidate_graph.launch(candidate_arena.context()).unwrap();
     let second_evaluations = evaluations(&base, &second_coefficients);
-    let mutated_baseline = assert_outputs(
+    let mutated_baseline = assert_direct_outputs(
         &base,
         &second_evaluations,
         &baseline_arena,
         baseline.leaf_hashes(),
         &baseline_retained,
     );
-    let mutated_candidate = assert_outputs(
+    let mutated_candidate = assert_direct_outputs(
         &base,
         &second_evaluations,
         &candidate_arena,
@@ -597,16 +613,8 @@ fn fused_expand_absorb_matches_legacy_eager_capture_and_mutation() {
     }
 }
 
-#[test]
-#[cfg_attr(not(stwo_cuda_link), ignore = "requires native CUDA")]
-fn direct_compact_terminal_log13_c16_matches_materialized_eager_capture_and_mutation() {
+fn run_direct_terminal(case: Case, measure: bool) {
     assert!(stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT);
-    let case = Case {
-        name: "direct-terminal-log13-c16",
-        lifting_log_size: 13,
-        groups: vec![vec![12; 16]],
-        transitions: 0,
-    };
     let (base, domain, compact, _fused, direct, terminal) = programs(&case);
     let batch = &terminal.receipt().batches[0];
     assert_eq!(
@@ -618,14 +626,18 @@ fn direct_compact_terminal_log13_c16_matches_materialized_eager_capture_and_muta
         }
     );
     let receipt = terminal.receipt();
-    assert_eq!(receipt.separate_absorb_reread_bytes_removed, 524_288);
+    let retained_bytes = 16u64 * (1u64 << case.lifting_log_size) * 4;
+    assert_eq!(receipt.separate_absorb_reread_bytes_removed, retained_bytes);
     assert_eq!(receipt.terminal_prefinal_read_bytes_added, 0);
     assert_eq!(receipt.compact_tail_reread_bytes_added, 0);
-    assert_eq!(receipt.net_read_bytes_removed, 524_288);
+    assert_eq!(receipt.net_read_bytes_removed, retained_bytes);
     assert_eq!(receipt.terminal_prefinal_write_bytes_added, 0);
-    assert_eq!(receipt.net_device_bytes_removed, 524_288);
-    assert_eq!(receipt.canonical_retained_write_bytes_before, 524_288);
-    assert_eq!(receipt.canonical_retained_write_bytes_after, 524_288);
+    assert_eq!(receipt.net_device_bytes_removed, retained_bytes);
+    assert_eq!(
+        receipt.canonical_retained_write_bytes_before,
+        retained_bytes
+    );
+    assert_eq!(receipt.canonical_retained_write_bytes_after, retained_bytes);
     assert_eq!(receipt.separate_absorb_launches_removed, 1);
     assert_eq!(receipt.fixed_terminal_launches, 1);
     assert_eq!(receipt.extra_remainder_interval_launches, 0);
@@ -681,14 +693,14 @@ fn direct_compact_terminal_log13_c16_matches_materialized_eager_capture_and_muta
 
     baseline.launch().unwrap();
     candidate.launch().unwrap();
-    let eager_baseline = assert_outputs(
+    let eager_baseline = assert_direct_outputs(
         &base,
         &first_oracle.retained_evaluations,
         &baseline_arena,
         baseline.leaf_hashes(),
         baseline.retained_evaluations(),
     );
-    let eager_candidate = assert_outputs(
+    let eager_candidate = assert_direct_outputs(
         &base,
         &first_oracle.retained_evaluations,
         &candidate_arena,
@@ -739,7 +751,7 @@ fn direct_compact_terminal_log13_c16_matches_materialized_eager_capture_and_muta
     baseline_graph.launch(baseline_arena.context()).unwrap();
     candidate_graph.launch(candidate_arena.context()).unwrap();
     assert_eq!(
-        assert_outputs(
+        assert_direct_outputs(
             &base,
             &first_oracle.retained_evaluations,
             &candidate_arena,
@@ -751,6 +763,61 @@ fn direct_compact_terminal_log13_c16_matches_materialized_eager_capture_and_muta
         case.name
     );
 
+    if measure {
+        const WARMUPS: usize = 8;
+        const ITERATIONS: usize = 40;
+        macro_rules! sample {
+            ($arena:expr, $graph:expr) => {{
+                let context = $arena.context();
+                assert!(context.begin_timing().unwrap() >= 1);
+                $graph.launch(context).unwrap();
+                context.mark_timing().unwrap();
+                context.sync().unwrap();
+                f64::from(context.elapsed_timing_ms(1).unwrap()[0])
+            }};
+        }
+        for iteration in 0..WARMUPS {
+            if iteration % 2 == 0 {
+                let _ = sample!(baseline_arena, baseline_graph);
+                let _ = sample!(candidate_arena, candidate_graph);
+            } else {
+                let _ = sample!(candidate_arena, candidate_graph);
+                let _ = sample!(baseline_arena, baseline_graph);
+            }
+        }
+        let mut baseline_ms = Vec::with_capacity(ITERATIONS);
+        let mut candidate_ms = Vec::with_capacity(ITERATIONS);
+        for iteration in 0..ITERATIONS {
+            if iteration % 2 == 0 {
+                baseline_ms.push(sample!(baseline_arena, baseline_graph));
+                candidate_ms.push(sample!(candidate_arena, candidate_graph));
+            } else {
+                candidate_ms.push(sample!(candidate_arena, candidate_graph));
+                baseline_ms.push(sample!(baseline_arena, baseline_graph));
+            }
+        }
+        let median = |samples: &[f64]| {
+            let mut sorted = samples.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            sorted[sorted.len() / 2]
+        };
+        let baseline_median = median(&baseline_ms);
+        let candidate_median = median(&candidate_ms);
+        println!(
+            "DIRECT_TERMINAL_ABBA_JSON={{\"case\":\"{}\",\"warmups\":{},\
+             \"iterations\":{},\"baseline_median_ms\":{},\"candidate_median_ms\":{},\
+             \"candidate_speedup\":{},\"baseline_ms\":{:?},\"candidate_ms\":{:?}}}",
+            case.name,
+            WARMUPS,
+            ITERATIONS,
+            baseline_median,
+            candidate_median,
+            baseline_median / candidate_median,
+            baseline_ms,
+            candidate_ms,
+        );
+    }
+
     let second_sources = coefficients(&base, 0xc001_cafe);
     for (column, words) in baseline_columns.iter().zip(&second_sources) {
         upload(&baseline_arena, column.source_evaluations, words);
@@ -761,14 +828,14 @@ fn direct_compact_terminal_log13_c16_matches_materialized_eager_capture_and_muta
     baseline_graph.launch(baseline_arena.context()).unwrap();
     candidate_graph.launch(candidate_arena.context()).unwrap();
     let second_oracle = direct.oracle(&second_sources).unwrap();
-    let mutated_baseline = assert_outputs(
+    let mutated_baseline = assert_direct_outputs(
         &base,
         &second_oracle.retained_evaluations,
         &baseline_arena,
         baseline.leaf_hashes(),
         baseline.retained_evaluations(),
     );
-    let mutated_candidate = assert_outputs(
+    let mutated_candidate = assert_direct_outputs(
         &base,
         &second_oracle.retained_evaluations,
         &candidate_arena,
@@ -790,5 +857,34 @@ fn direct_compact_terminal_log13_c16_matches_materialized_eager_capture_and_muta
         baseline.read_root_at_transcript_boundary().unwrap(),
         "{} mutated root",
         case.name
+    );
+}
+
+#[test]
+#[cfg_attr(not(stwo_cuda_link), ignore = "requires native CUDA")]
+fn direct_compact_terminal_log13_c16_matches_materialized_eager_capture_and_mutation() {
+    run_direct_terminal(
+        Case {
+            name: "direct-terminal-log13-c16",
+            lifting_log_size: 13,
+            groups: vec![vec![12; 16]],
+            transitions: 0,
+        },
+        false,
+    );
+}
+
+#[test]
+#[ignore = "diagnostic A40 ABBA; run explicitly"]
+#[cfg_attr(not(stwo_cuda_link), ignore = "requires native CUDA")]
+fn direct_compact_terminal_log18_c16_abba() {
+    run_direct_terminal(
+        Case {
+            name: "direct-terminal-log18-c16",
+            lifting_log_size: 18,
+            groups: vec![vec![17; 16]],
+            transitions: 0,
+        },
+        true,
     );
 }
