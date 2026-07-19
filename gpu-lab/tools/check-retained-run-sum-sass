@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# Seal the exact retained run-sum SASS loaded from one static CUDA archive.
+set -euo pipefail
+
+die() {
+  echo "check-retained-run-sum-sass: $*" >&2
+  exit 1
+}
+
+[[ $# -eq 3 ]] || die "usage: $0 <archive> <published-dlink> <new-output-dir>"
+for tool in ar cmp jq sha256sum; do
+  command -v "$tool" >/dev/null || die "missing tool: $tool"
+done
+
+CUOBJDUMP=/usr/local/cuda/bin/cuobjdump
+[[ -x "$CUOBJDUMP" ]] || die "missing executable: $CUOBJDUMP"
+ARCHIVE=$(readlink -f "$1")
+SIBLING=$(readlink -f "$2")
+OUT=$3
+[[ -f "$ARCHIVE" ]] || die "archive is not a file: $ARCHIVE"
+[[ -f "$SIBLING" ]] || die "published dlink is not a file: $SIBLING"
+[[ ! -e "$OUT" ]] || die "output already exists: $OUT"
+mkdir "$OUT"
+mkdir "$OUT/raw"
+
+archive_sha=$(sha256sum "$ARCHIVE" | awk '{print $1}')
+sibling_sha=$(sha256sum "$SIBLING" | awk '{print $1}')
+tool_sha=$(sha256sum "$CUOBJDUMP" | awk '{print $1}')
+ar t "$ARCHIVE" >"$OUT/raw/archive.members.txt"
+member=stwo_cuda_kernels_dlink.staged.o
+[[ $(grep -Fxc "$member" "$OUT/raw/archive.members.txt" || true) -eq 1 ]] ||
+  die "archive must contain exactly one $member"
+(cd "$OUT/raw" && ar x "$ARCHIVE" "$member") \
+  >"$OUT/raw/ar-extract.stdout.txt" 2>"$OUT/raw/ar-extract.stderr.txt"
+DLINK="$OUT/raw/$member"
+[[ -f "$DLINK" ]] || die "ar did not extract $member"
+cmp "$DLINK" "$SIBLING" || die "archive dlink differs from published dlink"
+dlink_sha=$(sha256sum "$DLINK" | awk '{print $1}')
+[[ "$dlink_sha" == "$sibling_sha" ]] || die "dlink SHA mismatch"
+
+"$CUOBJDUMP" --version >"$OUT/raw/cuobjdump.version.txt"
+"$CUOBJDUMP" --list-elf "$DLINK" \
+  >"$OUT/raw/list-elf.txt" 2>"$OUT/raw/list-elf.stderr.txt"
+"$CUOBJDUMP" --list-ptx "$DLINK" \
+  >"$OUT/raw/list-ptx.txt" 2>"$OUT/raw/list-ptx.stderr.txt"
+"$CUOBJDUMP" --dump-resource-usage "$DLINK" \
+  >"$OUT/raw/all.resource.txt" 2>"$OUT/raw/all.resource.stderr.txt"
+
+elf_count=$(grep -Ec '^ELF file[[:space:]]+[0-9]+:' "$OUT/raw/list-elf.txt" || true)
+[[ "$elf_count" -eq 1 ]] || die "expected one ELF, found $elf_count"
+elf=$(sed -nE 's/^ELF file[[:space:]]+[0-9]+:[[:space:]]+//p' "$OUT/raw/list-elf.txt")
+[[ "$elf" == "stwo_cuda_kernels_dlink.staged.1.sm_86.cubin" ]] ||
+  die "unexpected ELF: $elf"
+[[ ! -s "$OUT/raw/list-ptx.txt" ]] || die "PTX payload is not admissible"
+mapfile -t sms < <(
+  awk '/^arch = sm_/ {sub("sm_", "", $3); print $3}' "$OUT/raw/all.resource.txt" |
+    sort -nu
+)
+[[ ${#sms[@]} -eq 1 && ${sms[0]} -eq 86 ]] ||
+  die "expected only sm_86, found: ${sms[*]:-none}"
+
+kernels='{}'
+PRE=stwo_quotient_numerator_native_run_precompute_kernel
+EXP=stwo_quotient_numerator_run_sum_expand_kernel
+for spec in "$PRE:38" "$EXP:40"; do
+  kernel=${spec%:*}
+  expected_registers=${spec##*:}
+  resource="$OUT/raw/$kernel.resource.txt"
+  sass="$OUT/raw/$kernel.sass"
+  "$CUOBJDUMP" --gpu-architecture sm_86 --function "$kernel" \
+    --dump-resource-usage "$DLINK" >"$resource" 2>"$resource.stderr.txt"
+  "$CUOBJDUMP" --gpu-architecture sm_86 --function "$kernel" \
+    --dump-sass "$DLINK" >"$sass" 2>"$sass.stderr.txt"
+  resource_defs=$(grep -Fxc " Function $kernel:" "$resource" || true)
+  sass_defs=$(grep -Ec "Function : $kernel$" "$sass" || true)
+  [[ "$resource_defs" -eq 1 && "$sass_defs" -eq 1 ]] ||
+    die "$kernel definition counts are resource=$resource_defs sass=$sass_defs"
+  line=$(awk -v k="$kernel" '$0==" Function " k ":" {getline; print; exit}' "$resource")
+  if [[ $line =~ REG:([0-9]+)[[:space:]]+STACK:([0-9]+)[[:space:]]+SHARED:([0-9]+)[[:space:]]+LOCAL:([0-9]+) ]]; then
+    registers=${BASH_REMATCH[1]}
+    stack=${BASH_REMATCH[2]}
+    shared=${BASH_REMATCH[3]}
+    local_bytes=${BASH_REMATCH[4]}
+  else
+    die "unparseable resource line for $kernel: $line"
+  fi
+  ldl=$(grep -Ec '/\*[0-9a-fA-F]+\*/.*[[:space:]]LDL(\.|[[:space:]])' "$sass" || true)
+  stl=$(grep -Ec '/\*[0-9a-fA-F]+\*/.*[[:space:]]STL(\.|[[:space:]])' "$sass" || true)
+  call=$(grep -Ec '/\*[0-9a-fA-F]+\*/.*[[:space:]]CALL(\.|[[:space:]])' "$sass" || true)
+  jcal=$(grep -Ec '/\*[0-9a-fA-F]+\*/.*[[:space:]]JCAL(\.|[[:space:]])' "$sass" || true)
+  barriers=$(grep -Ec '/\*[0-9a-fA-F]+\*/.*[[:space:]](BAR|DEPBAR|WARPSYNC)(\.|[[:space:]])' "$sass" || true)
+  flags=$(grep -Fc 'EF_CUDA_SM86 EF_CUDA_VIRTUAL_SM(EF_CUDA_SM86)' "$sass" || true)
+  [[ "$registers" -eq "$expected_registers" ]] ||
+    die "$kernel registers=$registers, expected $expected_registers"
+  [[ "$stack" -eq 0 && "$shared" -eq 0 && "$local_bytes" -eq 0 ]] ||
+    die "$kernel has stack/shared/local bytes"
+  [[ "$ldl" -eq 0 && "$stl" -eq 0 && "$call" -eq 0 && "$jcal" -eq 0 ]] ||
+    die "$kernel has local/spill/call instructions"
+  [[ "$barriers" -eq 0 ]] || die "$kernel has barrier instructions"
+  [[ "$flags" -ge 1 ]] || die "$kernel lacks exact sm_86 header flags"
+  entry=$(jq -cn \
+    --argjson rd "$resource_defs" --argjson sd "$sass_defs" \
+    --argjson r "$registers" --argjson st "$stack" --argjson sh "$shared" \
+    --argjson lo "$local_bytes" --argjson ldl "$ldl" --argjson stl "$stl" \
+    --argjson call "$call" --argjson jcal "$jcal" --argjson flags "$flags" \
+    '{resource_definitions:$rd,sass_definitions:$sd,registers:$r,
+      stack_bytes:$st,shared_bytes:$sh,local_bytes:$lo,ldl:$ldl,stl:$stl,
+      call:$call,jcal:$jcal,sm86_flag_occurrences:$flags}')
+  kernels=$(jq -cn --argjson all "$kernels" --arg k "$kernel" --argjson v "$entry" \
+    '$all + {($k):$v}')
+done
+
+[[ "$(sha256sum "$ARCHIVE" | awk '{print $1}')" == "$archive_sha" ]] ||
+  die "archive changed during inspection"
+[[ "$(sha256sum "$SIBLING" | awk '{print $1}')" == "$sibling_sha" ]] ||
+  die "published dlink changed during inspection"
+[[ "$(sha256sum "$CUOBJDUMP" | awk '{print $1}')" == "$tool_sha" ]] ||
+  die "cuobjdump changed during inspection"
+version=$(<"$OUT/raw/cuobjdump.version.txt")
+jq -n \
+  --arg a "$archive_sha" --arg m "$member" --arg d "$dlink_sha" \
+  --arg s "$sibling_sha" --arg p "$CUOBJDUMP" --arg t "$tool_sha" \
+  --arg v "$version" --arg elf "$elf" --argjson kernels "$kernels" \
+  '{schema:"stwo.cuda.retained_run_sum.static_sass.v1",passed:true,
+    archive:{sha256:$a,dlink_member:$m,dlink_sha256:$d,sibling_sha256:$s,
+      member_matches_sibling:true},
+    tool:{cuobjdump_path:$p,cuobjdump_sha256:$t,version:$v},
+    target:{elf_count:1,elf:$elf,sms:[86],ptx_files:0},
+    kernels:$kernels}' >"$OUT/receipt.json"
+(
+  cd "$OUT"
+  { find raw -type f -print; printf '%s\n' receipt.json; } |
+    LC_ALL=C sort | while IFS= read -r file; do sha256sum "$file"; done
+) >"$OUT/SHA256SUMS"
+echo "$OUT/receipt.json"
