@@ -311,6 +311,64 @@ mod tests {
     }
 
     #[test]
+    fn quotient_group_direct_raw_and_stub_signatures_match() {
+        type DirectFn = unsafe extern "C" fn(
+            *const u32,
+            u32,
+            u32,
+            u32,
+            *const *const u32,
+            *const raw::CudaSecureField,
+            *const raw::CudaSecureField,
+            *mut u32,
+            *mut u32,
+            *mut u32,
+            *mut u32,
+            *mut core::ffi::c_void,
+        ) -> i32;
+        type RawTiledFn = unsafe extern "C" fn(
+            *const u32,
+            u32,
+            u32,
+            u32,
+            *const *const u32,
+            *const raw::CudaSecureField,
+            *const raw::CudaSecureField,
+            *mut u32,
+            *mut u32,
+            *mut u32,
+            *mut u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32;
+        type AttributesFn = unsafe extern "C" fn(*mut raw::CudaFunctionAttributes) -> i32;
+        type RawTiledAttributesFn =
+            unsafe extern "C" fn(u32, *mut raw::CudaFunctionAttributes) -> i32;
+
+        let _: DirectFn = raw::stwo_accumulate_quotient_numerator_group_direct_on;
+        let _: RawTiledFn = raw::stwo_accumulate_quotient_numerator_group_direct_tiled_on;
+        let _: DirectFn =
+            raw::stwo_accumulate_quotient_numerator_group_direct_contribution_tiled_on;
+        let _: RawTiledAttributesFn =
+            raw::stwo_quotient_numerator_group_direct_tiled_function_attributes;
+        let _: AttributesFn =
+            raw::stwo_quotient_numerator_group_direct_contribution_tiled_function_attributes;
+
+        #[cfg(not(stwo_cuda_link))]
+        {
+            let _: DirectFn = super::stubs::stwo_accumulate_quotient_numerator_group_direct_on;
+            let _: RawTiledFn =
+                super::stubs::stwo_accumulate_quotient_numerator_group_direct_tiled_on;
+            let _: DirectFn =
+                super::stubs::stwo_accumulate_quotient_numerator_group_direct_contribution_tiled_on;
+            let _: RawTiledAttributesFn =
+                super::stubs::stwo_quotient_numerator_group_direct_tiled_function_attributes;
+            let _: AttributesFn =
+                super::stubs::stwo_quotient_numerator_group_direct_contribution_tiled_function_attributes;
+        }
+    }
+
+    #[test]
     fn prepared_quotient_symbols_are_linked_in_cuda_and_stub_builds() {
         assert_ne!(raw::stwo_combine_quotients_from_numerators_on as usize, 0);
         assert_ne!(raw::stwo_combine_quotients_b2n_init7_on as usize, 0);
@@ -332,6 +390,23 @@ mod tests {
         );
         assert_ne!(
             raw::stwo_accumulate_quotient_numerator_group_direct_on as usize,
+            0
+        );
+        assert_ne!(
+            raw::stwo_accumulate_quotient_numerator_group_direct_tiled_on as usize,
+            0
+        );
+        assert_ne!(
+            raw::stwo_accumulate_quotient_numerator_group_direct_contribution_tiled_on as usize,
+            0
+        );
+        assert_ne!(
+            raw::stwo_quotient_numerator_group_direct_tiled_function_attributes as usize,
+            0
+        );
+        assert_ne!(
+            raw::stwo_quotient_numerator_group_direct_contribution_tiled_function_attributes
+                as usize,
             0
         );
         assert_ne!(

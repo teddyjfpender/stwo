@@ -13,6 +13,13 @@ use crate::backend::quotient_numerator_staged_single_write::{
     QuotientNumeratorStagedSource, QuotientNumeratorStagingRole,
 };
 
+#[derive(Clone, Copy)]
+enum GroupDirectLaunch {
+    Direct,
+    RawTiled(u32),
+    ContributionTiled,
+}
+
 fn derive_group_direct_ranges(
     group_offsets: &[u32],
     term_descriptors: &[u32],
@@ -673,6 +680,32 @@ impl<'a> PreparedQuotientNumeratorGraph<'a> {
         ranges: &[PreparedGroupDirectRange],
         stream: *mut c_void,
     ) -> Result<(), PreparedQuotientNumeratorError> {
+        self.launch_group_direct_variant(ranges, stream, GroupDirectLaunch::Direct)
+    }
+
+    pub(super) fn launch_group_direct_tiled(
+        &self,
+        ranges: &[PreparedGroupDirectRange],
+        tile_words: u32,
+        stream: *mut c_void,
+    ) -> Result<(), PreparedQuotientNumeratorError> {
+        self.launch_group_direct_variant(ranges, stream, GroupDirectLaunch::RawTiled(tile_words))
+    }
+
+    pub(super) fn launch_group_direct_contribution_tiled(
+        &self,
+        ranges: &[PreparedGroupDirectRange],
+        stream: *mut c_void,
+    ) -> Result<(), PreparedQuotientNumeratorError> {
+        self.launch_group_direct_variant(ranges, stream, GroupDirectLaunch::ContributionTiled)
+    }
+
+    fn launch_group_direct_variant(
+        &self,
+        ranges: &[PreparedGroupDirectRange],
+        stream: *mut c_void,
+        variant: GroupDirectLaunch,
+    ) -> Result<(), PreparedQuotientNumeratorError> {
         if ranges.len() != self.requirements.groups.len() || ranges.len() != self.destinations.len()
         {
             return Err(
@@ -687,25 +720,78 @@ impl<'a> PreparedQuotientNumeratorGraph<'a> {
             .zip(&self.destinations)
         {
             let code = unsafe {
-                stwo_backend_cuda_kernels::raw::stwo_accumulate_quotient_numerator_group_direct_on(
-                    self.batch_terms.as_u32_ptr(),
-                    range.term_begin,
-                    range.term_end,
-                    group.log_size,
-                    self.batch_source_ptrs.as_u32_ptr().cast(),
-                    self.line_coefficients.as_u32_ptr().cast(),
-                    self.line_coefficients
-                        .as_u32_ptr()
-                        .add(range.group_b_term as usize * LINE_COEFFICIENT_WORDS)
-                        .cast(),
-                    destination.coordinates[0].as_u32_ptr(),
-                    destination.coordinates[1].as_u32_ptr(),
-                    destination.coordinates[2].as_u32_ptr(),
-                    destination.coordinates[3].as_u32_ptr(),
-                    stream,
-                )
+                let descriptors = self.batch_terms.as_u32_ptr();
+                let sources = self.batch_source_ptrs.as_u32_ptr().cast();
+                let coefficients = self.line_coefficients.as_u32_ptr().cast();
+                let group_b = self
+                    .line_coefficients
+                    .as_u32_ptr()
+                    .add(range.group_b_term as usize * LINE_COEFFICIENT_WORDS)
+                    .cast();
+                match variant {
+                    GroupDirectLaunch::Direct => {
+                        stwo_backend_cuda_kernels::raw::stwo_accumulate_quotient_numerator_group_direct_on(
+                            descriptors,
+                            range.term_begin,
+                            range.term_end,
+                            group.log_size,
+                            sources,
+                            coefficients,
+                            group_b,
+                            destination.coordinates[0].as_u32_ptr(),
+                            destination.coordinates[1].as_u32_ptr(),
+                            destination.coordinates[2].as_u32_ptr(),
+                            destination.coordinates[3].as_u32_ptr(),
+                            stream,
+                        )
+                    }
+                    GroupDirectLaunch::RawTiled(tile_words) => {
+                        stwo_backend_cuda_kernels::raw::stwo_accumulate_quotient_numerator_group_direct_tiled_on(
+                            descriptors,
+                            range.term_begin,
+                            range.term_end,
+                            group.log_size,
+                            sources,
+                            coefficients,
+                            group_b,
+                            destination.coordinates[0].as_u32_ptr(),
+                            destination.coordinates[1].as_u32_ptr(),
+                            destination.coordinates[2].as_u32_ptr(),
+                            destination.coordinates[3].as_u32_ptr(),
+                            tile_words,
+                            stream,
+                        )
+                    }
+                    GroupDirectLaunch::ContributionTiled => {
+                        stwo_backend_cuda_kernels::raw::stwo_accumulate_quotient_numerator_group_direct_contribution_tiled_on(
+                        descriptors,
+                        range.term_begin,
+                        range.term_end,
+                        group.log_size,
+                        sources,
+                        coefficients,
+                        group_b,
+                        destination.coordinates[0].as_u32_ptr(),
+                        destination.coordinates[1].as_u32_ptr(),
+                        destination.coordinates[2].as_u32_ptr(),
+                        destination.coordinates[3].as_u32_ptr(),
+                        stream,
+                    )
+                    }
+                }
             };
-            check_cuda("prepared_quotient_numerator_group_direct", code)?;
+            check_cuda(
+                match variant {
+                    GroupDirectLaunch::Direct => "prepared_quotient_numerator_group_direct",
+                    GroupDirectLaunch::RawTiled(_) => {
+                        "prepared_quotient_numerator_group_direct_tiled"
+                    }
+                    GroupDirectLaunch::ContributionTiled => {
+                        "prepared_quotient_numerator_group_direct_contribution_tiled"
+                    }
+                },
+                code,
+            )?;
         }
         Ok(())
     }
