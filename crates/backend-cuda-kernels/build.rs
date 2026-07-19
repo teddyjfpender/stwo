@@ -11,6 +11,7 @@
 //! - `STWO_CUDA_ARCH`: comma-separated numeric SMs; detected from the first local GPU, and required
 //!   explicitly on a headless compiler host
 //! - `STWO_CUDA_NVCC_FLAGS`: extra whitespace-separated flags appended to every call
+//! - `STWO_CUDA_ARCHIVE_LTO`: `1` enables device LTO for the ordinary archive only (default: `0`)
 //! - `STWO_CUDA_BUILD_JOBS`: maximum concurrent nvcc processes (default: host parallelism)
 //! - `STWO_CUDA_HOST_COMPILER`: explicit nvcc host compiler (default: `c++` from `PATH`)
 //!
@@ -108,6 +109,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=STWO_CUDA_NVCC");
     println!("cargo:rerun-if-env-changed=STWO_CUDA_ARCH");
     println!("cargo:rerun-if-env-changed=STWO_CUDA_NVCC_FLAGS");
+    println!("cargo:rerun-if-env-changed=STWO_CUDA_ARCHIVE_LTO");
     println!("cargo:rerun-if-env-changed=STWO_CUDA_BUILD_JOBS");
     println!("cargo:rerun-if-env-changed=STWO_CUDA_HOST_COMPILER");
     println!("cargo:rerun-if-env-changed=PATH");
@@ -189,16 +191,10 @@ fn main() {
         .iter()
         .map(|sm| format!("sm_{sm}"))
         .collect::<Vec<_>>();
-    let gencode_flags: Vec<String> = archs
-        .iter()
-        .flat_map(|arch| {
-            let num = arch.trim_start_matches("sm_");
-            [
-                "-gencode".to_string(),
-                format!("arch=compute_{num},code=sm_{num}"),
-            ]
-        })
-        .collect();
+    let archive_lto = parse_archive_lto(env::var("STWO_CUDA_ARCHIVE_LTO").ok().as_deref())
+        .unwrap_or_else(|error| panic!("{error}"));
+    let object_gencode_flags = archive_gencode_flags(&target_sms, archive_lto);
+    let dlink_gencode_flags = archive_gencode_flags(&target_sms, false);
     let extra_flags: Vec<String> = env::var("STWO_CUDA_NVCC_FLAGS")
         .map(|flags| flags.split_whitespace().map(str::to_string).collect())
         .unwrap_or_default();
@@ -228,7 +224,7 @@ fn main() {
     include_dirs.sort();
     let mut object_compile_flags = object_fixed_flags(&include_dirs);
     object_compile_flags.push(compiler_identity.host_flag.to_string());
-    object_compile_flags.extend(gencode_flags.iter().cloned());
+    object_compile_flags.extend(object_gencode_flags.iter().cloned());
     object_compile_flags.extend(extra_flags.iter().cloned());
     let object_compiler_fingerprint = compiler_fingerprint(
         compiler_identity,
@@ -368,7 +364,10 @@ fn main() {
         "-fPIC".to_string(),
         compiler_identity.host_flag.to_string(),
     ];
-    dlink_argv.extend(gencode_flags.iter().cloned());
+    if archive_lto {
+        dlink_argv.push("-dlto".to_string());
+    }
+    dlink_argv.extend(dlink_gencode_flags.iter().cloned());
     dlink_argv.extend(extra_flags.iter().cloned());
     dlink_argv.extend(
         objects

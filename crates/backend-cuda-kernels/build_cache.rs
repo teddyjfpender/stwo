@@ -19,6 +19,31 @@ const COMPILER_FINGERPRINT_SCHEMA: &str = "stwo-cuda-compiler-fingerprint-v1";
 pub(crate) const OBJECT_COMPILER_POLICY: &str = "archive-object-v1";
 pub(crate) const AOT_COMPILER_POLICY: &str = "embedded-aot-cubin-v1";
 
+pub(crate) fn parse_archive_lto(raw: Option<&str>) -> Result<bool, &'static str> {
+    match raw {
+        None | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(_) => Err("STWO_CUDA_ARCHIVE_LTO must be unset, 0, or 1"),
+    }
+}
+
+/// Produce either executable SM targets or LTO IR targets for ordinary archive objects.
+///
+/// nvcc rejects a literal `-dlto` alongside explicit `-gencode`; `code=lto_N` is the documented
+/// compile-side equivalent. The matching device link always requests executable `sm_N` targets.
+pub(crate) fn archive_gencode_flags(target_sms: &[u32], lto_ir: bool) -> Vec<String> {
+    let code = if lto_ir { "lto" } else { "sm" };
+    target_sms
+        .iter()
+        .flat_map(|sm| {
+            [
+                "-gencode".to_string(),
+                format!("arch=compute_{sm},code={code}_{sm}"),
+            ]
+        })
+        .collect()
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct CompilerIdentity<'a> {
     pub(crate) executable: &'a str,
@@ -225,6 +250,26 @@ pub(crate) fn validate_extra_flags(flags: &[String]) -> Result<(), &'static str>
     });
     if overrides_target_sms {
         return Err("use STWO_CUDA_ARCH instead of overriding nvcc architecture/code flags");
+    }
+    let configures_global_lto = flags.iter().any(|flag| {
+        selects(
+            flag,
+            &[
+                "-dlto",
+                "--dlink-time-opt",
+                "-lto",
+                "--lto",
+                "-gen-opt-lto",
+                "--gen-opt-lto",
+                "-ltoir",
+                "--ltoir",
+            ],
+        )
+    });
+    if configures_global_lto {
+        return Err(
+            "use STWO_CUDA_ARCHIVE_LTO=1; global LTO flags also reach generated AOT cubins",
+        );
     }
     let imports_unsealed_flags = flags
         .iter()
