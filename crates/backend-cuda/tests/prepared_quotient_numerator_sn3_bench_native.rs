@@ -62,8 +62,6 @@ const STAGED_OVERFLOW_WORDS: usize = 452_984_832;
 const RETAINED_COLUMN_COUNT: usize = LEGACY_GROUP_COEFFICIENT_SOURCES;
 const RETAINED_IMAGE_WORDS: usize = 979_965_856;
 const MUTATED_RETAINED_COLUMN: usize = 102;
-const EXPECTED_CONTROL_GRAPH_KERNEL_NODES: u64 = 141;
-const EXPECTED_RETAINED_GRAPH_KERNEL_NODES: u64 = 38;
 const CONTROL_LIVE: u16 = 0b01;
 const RETAINED_LIVE: u16 = 0b10;
 const BOTH_LIVE: u16 = CONTROL_LIVE | RETAINED_LIVE;
@@ -201,6 +199,19 @@ fn sn3_staged_group_direct_cuda_event_benchmark() {
         quotient.output_evaluation().len_words(),
         quotient_requirements.output_value_words
     );
+    assert!(
+        quotient.producer_b2n_receipt().is_none(),
+        "node formula covers the ordinary quotient tail only"
+    );
+    let quotient_kernel_nodes = {
+        let capture = fixture.arena.context().capture().unwrap();
+        quotient.launch().unwrap();
+        capture.finish().unwrap().kernel_nodes()
+    };
+    assert_eq!(
+        quotient_kernel_nodes,
+        ordinary_quotient_kernel_nodes(&quotient_requirements)
+    );
 
     initialize(
         &fixture,
@@ -320,17 +331,19 @@ fn sn3_staged_group_direct_cuda_event_benchmark() {
     retained.launch().unwrap();
     quotient.launch().unwrap();
     let retained_graph = capture.finish().unwrap();
-    assert_eq!(
-        control_graph.kernel_nodes(),
-        EXPECTED_CONTROL_GRAPH_KERNEL_NODES
-    );
+    let common_numerator_kernel_nodes = group_direct_common_kernel_nodes(&retained_requirements);
+    let control_lde_kernel_nodes = staged_lde_kernel_nodes(&staged_requirements);
     assert_eq!(
         retained_graph.kernel_nodes(),
-        EXPECTED_RETAINED_GRAPH_KERNEL_NODES
+        common_numerator_kernel_nodes + quotient_kernel_nodes
+    );
+    assert_eq!(
+        control_graph.kernel_nodes(),
+        common_numerator_kernel_nodes + control_lde_kernel_nodes + quotient_kernel_nodes
     );
     assert_eq!(
         control_graph.kernel_nodes() - retained_graph.kernel_nodes(),
-        103
+        control_lde_kernel_nodes
     );
     let (device_free_after_graphs, device_total_after_graphs) = gpu_memory_info();
     assert_eq!(device_total_after_graphs, device_total_bytes);
@@ -646,6 +659,9 @@ fn sn3_staged_group_direct_cuda_event_benchmark() {
                 "post_timing_revalidated": true,
             },
             "capture_topology": {
+                "common_numerator_kernel_nodes": common_numerator_kernel_nodes,
+                "ordinary_quotient_kernel_nodes": quotient_kernel_nodes,
+                "control_lde_kernel_nodes": control_lde_kernel_nodes,
                 "control_kernel_nodes": control_graph.kernel_nodes(),
                 "retained_kernel_nodes": retained_graph.kernel_nodes(),
                 "removed_kernel_nodes": control_graph.kernel_nodes() - retained_graph.kernel_nodes(),
@@ -767,6 +783,20 @@ fn sn3_input_recipe_is_deterministic_and_shape_exact() {
         &plan.control_slots,
     );
     assert_reused_workspace_shape(&plan, &staged);
+    assert_eq!(group_direct_common_kernel_nodes(&retained_requirements), 21);
+    assert_eq!(ordinary_quotient_kernel_nodes(&quotient_requirements), 28);
+    assert_eq!(staged_lde_kernel_nodes(&requirements), 92);
+    assert_eq!(
+        group_direct_common_kernel_nodes(&retained_requirements)
+            + ordinary_quotient_kernel_nodes(&quotient_requirements),
+        49
+    );
+    assert_eq!(
+        group_direct_common_kernel_nodes(&requirements)
+            + staged_lde_kernel_nodes(&requirements)
+            + ordinary_quotient_kernel_nodes(&quotient_requirements),
+        141
+    );
 }
 
 fn assert_sn3_shape(
@@ -933,6 +963,25 @@ fn assert_staged_sn3_shape(
     assert_eq!(report.primary_staging_words, 526_981_024);
     assert_eq!(report.overflow_staging_words, STAGED_OVERFLOW_WORDS);
     assert_eq!(report.overflow_staging_role_count, 1);
+    assert_eq!(
+        requirements
+            .batches
+            .iter()
+            .filter(|batch| batch.coefficient_count != 0)
+            .map(|batch| batch.evaluation_log_size)
+            .collect::<Vec<_>>(),
+        [5, 7, 8, 9, 11, 12, 13, 14, 15, 16, 17, 19, 21, 23, 24, 24]
+    );
+    assert_eq!(
+        requirements
+            .batches
+            .iter()
+            .filter(|batch| batch.coefficient_count == 0)
+            .map(|batch| batch.evaluation_log_size)
+            .collect::<Vec<_>>(),
+        [18, 20, 22]
+    );
+    assert_eq!(staged_lde_kernel_nodes(requirements), 92);
 }
 
 fn assert_retained_sn3_shape(
@@ -981,6 +1030,45 @@ fn assert_retained_sn3_shape(
     assert_eq!(report.primary_staging_words, 0);
     assert_eq!(report.overflow_staging_words, 0);
     assert_eq!(report.overflow_staging_role_count, 0);
+    assert_eq!(staged_lde_kernel_nodes(requirements), 0);
+}
+
+fn group_direct_common_kernel_nodes(requirements: &QuotientNumeratorWorkspaceRequirements) -> u64 {
+    // One term-preparation kernel, one group-finalization kernel, then one
+    // direct accumulation kernel for every exact numerator group.
+    2 + u64::try_from(requirements.groups.len()).unwrap()
+}
+
+fn staged_lde_kernel_nodes(requirements: &QuotientNumeratorWorkspaceRequirements) -> u64 {
+    requirements
+        .batches
+        .iter()
+        // `launch_all_staged_ldes` explicitly skips evaluation-only batches.
+        .filter(|batch| batch.coefficient_count != 0)
+        .map(|batch| {
+            u64::try_from(batch.coefficient_count.div_ceil(65_535)).unwrap()
+                * lde_n2b_kernel_nodes(batch.evaluation_log_size)
+        })
+        .sum()
+}
+
+fn ordinary_quotient_kernel_nodes(requirements: &QuotientWorkspaceRequirements) -> u64 {
+    // Ordinary quotient: one combine kernel, one native B2N kernel per
+    // subdomain stage, then stage+interval kernels for the full-domain LDE.
+    1 + u64::from(requirements.subdomain_log_size)
+        + lde_n2b_kernel_nodes(requirements.config.lifting_log_size)
+}
+
+fn lde_n2b_kernel_nodes(log_size: u32) -> u64 {
+    // `stwo_lde_n2b_columns_on` first stages coefficients, then dispatches
+    // either one native kernel per stage or the table-pinned fused intervals.
+    1 + match log_size {
+        3..=12 => u64::from(log_size),
+        13..=19 => 2,
+        20..=27 => 3,
+        28..=30 => 4,
+        _ => panic!("unsupported exact LDE log size {log_size}"),
+    }
 }
 
 struct BenchmarkArena {
