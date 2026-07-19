@@ -4,6 +4,7 @@
 //! timed baseline and candidate are two launch methods on one retained
 //! prepared numerator object followed by the same ordinary quotient tail.
 
+#[allow(dead_code)]
 #[path = "support/sn3_quotient_numerator_bench.rs"]
 mod sn3_quotient_numerator_bench;
 #[path = "support/sn3_quotient_retained_fixture.rs"]
