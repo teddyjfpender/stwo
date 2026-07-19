@@ -1690,6 +1690,46 @@ extern "C" {
         stream: *mut c_void,
     ) -> i32;
 
+    pub fn stwo_accumulate_quotient_numerator_group_direct_tiled_on(
+        term_descriptors: *const u32,
+        term_begin: u32,
+        term_end: u32,
+        group_log_size: u32,
+        source_evaluations: *const *const u32,
+        line_coefficients: *const CudaSecureField,
+        group_b: *const CudaSecureField,
+        output_0: *mut u32,
+        output_1: *mut u32,
+        output_2: *mut u32,
+        output_3: *mut u32,
+        tile_words: u32,
+        stream: *mut c_void,
+    ) -> i32;
+
+    pub fn stwo_accumulate_quotient_numerator_group_direct_contribution_tiled_on(
+        term_descriptors: *const u32,
+        term_begin: u32,
+        term_end: u32,
+        group_log_size: u32,
+        source_evaluations: *const *const u32,
+        line_coefficients: *const CudaSecureField,
+        group_b: *const CudaSecureField,
+        output_0: *mut u32,
+        output_1: *mut u32,
+        output_2: *mut u32,
+        output_3: *mut u32,
+        stream: *mut c_void,
+    ) -> i32;
+
+    pub fn stwo_quotient_numerator_group_direct_tiled_function_attributes(
+        tile_words: u32,
+        out: *mut CudaFunctionAttributes,
+    ) -> i32;
+
+    pub fn stwo_quotient_numerator_group_direct_contribution_tiled_function_attributes(
+        out: *mut CudaFunctionAttributes,
+    ) -> i32;
+
     pub fn stwo_prepare_quotient_numerator_prepacked_terms_on(
         group_term_offsets: *const u32,
         term_descriptors: *const u32,

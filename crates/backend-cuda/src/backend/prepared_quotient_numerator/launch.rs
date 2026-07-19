@@ -4,7 +4,9 @@
 use super::*;
 
 impl PreparedQuotientNumeratorGraph<'_> {
-    pub fn launch(&self) -> Result<(), PreparedQuotientNumeratorError> {
+    fn prepare_terms_and_groups(
+        &self,
+    ) -> Result<(u32, u32, *mut core::ffi::c_void), PreparedQuotientNumeratorError> {
         let group_count = u32::try_from(self.requirements.groups.len()).map_err(|_| {
             PreparedQuotientNumeratorError::TooManyGroups(self.requirements.groups.len())
         })?;
@@ -40,7 +42,11 @@ impl PreparedQuotientNumeratorGraph<'_> {
             )
         };
         check_cuda("prepared_quotient_numerator_groups", code)?;
+        Ok((group_count, max_output_size, stream))
+    }
 
+    pub fn launch(&self) -> Result<(), PreparedQuotientNumeratorError> {
+        let (group_count, max_output_size, stream) = self.prepare_terms_and_groups()?;
         let output_tables = |coordinate: usize| unsafe {
             self.output_ptrs
                 .as_u32_ptr()
@@ -181,6 +187,71 @@ impl PreparedQuotientNumeratorGraph<'_> {
             check_cuda("prepared_quotient_numerator_accumulate", code)?;
         }
         Ok(())
+    }
+
+    /// Exact 4-KiB diagnostic seam for cooperative lower-log source reuse.
+    #[doc(hidden)]
+    pub fn launch_group_direct_tiled_4k_candidate(
+        &self,
+    ) -> Result<(), PreparedQuotientNumeratorError> {
+        self.launch_group_direct_tiled_candidate(1024)
+    }
+
+    /// Exact 16-KiB diagnostic seam for cooperative lower-log source reuse.
+    #[doc(hidden)]
+    pub fn launch_group_direct_tiled_16k_candidate(
+        &self,
+    ) -> Result<(), PreparedQuotientNumeratorError> {
+        self.launch_group_direct_tiled_candidate(4096)
+    }
+
+    /// Exact 16-KiB product candidate: compute each repeated contribution once.
+    #[doc(hidden)]
+    pub fn launch_group_direct_contribution_tiled_16k_candidate(
+        &self,
+    ) -> Result<(), PreparedQuotientNumeratorError> {
+        if !matches!(
+            self.schedule,
+            PreparedNumeratorSchedule::StagedGroupDirect { .. }
+        ) {
+            return Err(
+                PreparedQuotientNumeratorError::GroupDirectScheduleInvariant(
+                    "cooperative candidate requires the group-direct schedule",
+                ),
+            );
+        }
+        let (_, _, stream) = self.prepare_terms_and_groups()?;
+        self.launch_all_staged_ldes(stream)?;
+        let ranges = self.group_direct_ranges.as_deref().ok_or(
+            PreparedQuotientNumeratorError::GroupDirectScheduleInvariant(
+                "group-direct schedule has no sealed ranges",
+            ),
+        )?;
+        self.launch_group_direct_contribution_tiled(ranges, stream)
+    }
+
+    fn launch_group_direct_tiled_candidate(
+        &self,
+        tile_words: u32,
+    ) -> Result<(), PreparedQuotientNumeratorError> {
+        if !matches!(
+            self.schedule,
+            PreparedNumeratorSchedule::StagedGroupDirect { .. }
+        ) {
+            return Err(
+                PreparedQuotientNumeratorError::GroupDirectScheduleInvariant(
+                    "cooperative candidate requires the group-direct schedule",
+                ),
+            );
+        }
+        let (_, _, stream) = self.prepare_terms_and_groups()?;
+        self.launch_all_staged_ldes(stream)?;
+        let ranges = self.group_direct_ranges.as_deref().ok_or(
+            PreparedQuotientNumeratorError::GroupDirectScheduleInvariant(
+                "group-direct schedule has no sealed ranges",
+            ),
+        )?;
+        self.launch_group_direct_tiled(ranges, tile_words, stream)
     }
 
     fn launch_all_staged_ldes(

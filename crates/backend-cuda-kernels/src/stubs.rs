@@ -1977,6 +1977,58 @@ pub unsafe extern "C" fn stwo_accumulate_quotient_numerator_group_direct_on(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_accumulate_quotient_numerator_group_direct_tiled_on(
+    _term_descriptors: *const u32,
+    _term_begin: u32,
+    _term_end: u32,
+    _group_log_size: u32,
+    _source_evaluations: *const *const u32,
+    _line_coefficients: *const CudaSecureField,
+    _group_b: *const CudaSecureField,
+    _output_0: *mut u32,
+    _output_1: *mut u32,
+    _output_2: *mut u32,
+    _output_3: *mut u32,
+    _tile_words: u32,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_accumulate_quotient_numerator_group_direct_tiled_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_accumulate_quotient_numerator_group_direct_contribution_tiled_on(
+    _term_descriptors: *const u32,
+    _term_begin: u32,
+    _term_end: u32,
+    _group_log_size: u32,
+    _source_evaluations: *const *const u32,
+    _line_coefficients: *const CudaSecureField,
+    _group_b: *const CudaSecureField,
+    _output_0: *mut u32,
+    _output_1: *mut u32,
+    _output_2: *mut u32,
+    _output_3: *mut u32,
+    _stream: *mut core::ffi::c_void,
+) -> i32 {
+    no_cuda_symbol("stwo_accumulate_quotient_numerator_group_direct_contribution_tiled_on")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_quotient_numerator_group_direct_tiled_function_attributes(
+    _tile_words: u32,
+    _out: *mut CudaFunctionAttributes,
+) -> i32 {
+    no_cuda_symbol("stwo_quotient_numerator_group_direct_tiled_function_attributes")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stwo_quotient_numerator_group_direct_contribution_tiled_function_attributes(
+    _out: *mut CudaFunctionAttributes,
+) -> i32 {
+    no_cuda_symbol("stwo_quotient_numerator_group_direct_contribution_tiled_function_attributes")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stwo_prepare_quotient_numerator_prepacked_terms_on(
     _group_term_offsets: *const u32,
     _term_descriptors: *const u32,
