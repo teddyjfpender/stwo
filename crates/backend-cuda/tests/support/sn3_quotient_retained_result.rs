@@ -19,7 +19,6 @@ const SEALED_A40_RETAINED_P50_MS: f64 = 335.177_948;
 const SEALED_A40_RETAINED_P95_MS: f64 = 336.626_038;
 const THREE_X_RETAINED_MAX_MS: f64 = 144.268;
 const FIVE_X_RETAINED_MAX_MS: f64 = 106.086;
-const ARCHIVE_LTO_REQUESTED: bool = matches!(option_env!("STWO_CUDA_ARCHIVE_LTO"), Some("1"));
 const STATIC_SASS_SHA256_ENV: &str = "STWO_SN3_RETAINED_RUN_SUM_STATIC_SASS_SHA256";
 const STATIC_SASS_GATE_ENV: &str = "STWO_SN3_RETAINED_RUN_SUM_STATIC_SASS_GATE";
 const EXACT_NUMERATOR_AND_AUXILIARY_BYTES: u64 = 402_645_136;
@@ -46,8 +45,9 @@ pub(crate) fn publish_result(
     let candidate_p95 = percentile(&candidate_ms, 95);
     let artifact = artifact_identity();
     let measurement_source = retained_measurement_source_digest();
+    let archive_lto_requested = option_env!("STWO_CUDA_ARCHIVE_LTO") == Some("1");
     let artifact_eligible =
-        ARCHIVE_LTO_REQUESTED && artifact.cuda_build_mode == "cuda" && artifact.is_complete();
+        archive_lto_requested && artifact.cuda_build_mode == "cuda" && artifact.is_complete();
     let exact_sample_count = direct_ms.len() == SAMPLES && candidate_ms.len() == SAMPLES;
     let paired_candidate_wins = direct_ms
         .iter()
@@ -207,7 +207,7 @@ pub(crate) fn publish_result(
         "artifact_eligibility": {
             "eligible": artifact_eligible,
             "requires": "CUDA archive-LTO request and complete linked-module artifact identity",
-            "archive_lto_requested_at_compile": ARCHIVE_LTO_REQUESTED,
+            "archive_lto_requested_at_compile": archive_lto_requested,
             "cuda_build_mode": artifact.cuda_build_mode,
             "identity_complete": artifact.is_complete(),
         },
@@ -243,7 +243,7 @@ pub(crate) fn publish_result(
             "ordinary_cuda_source_blake3": artifact.ordinary_cuda_source_blake3.to_string(),
             "test_binary_blake3": artifact.test_binary_blake3.to_string(),
             "cuda_build_mode": artifact.cuda_build_mode,
-            "archive_lto_requested_at_compile": ARCHIVE_LTO_REQUESTED,
+            "archive_lto_requested_at_compile": archive_lto_requested,
             "expected_cuda_module_build_identity": artifact.expected_cuda_module_build_identity.to_string(),
             "linked_cuda_module_build_identity": artifact.linked_cuda_module_build_identity.to_string(),
             "cuda_module_target_sms": artifact.cuda_module_target_sms,
